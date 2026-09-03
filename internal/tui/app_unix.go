@@ -133,19 +133,17 @@ func (a *App) act(ctx context.Context, x Action) error {
 		}
 		return p.Archive(ctx, x.Session.Key)
 	case ActionRename:
-		if x.Session == nil || !x.Session.Capabilities.Rename {
-			return capabilityError(x.Session, "rename")
+		if x.SessionKey == nil {
+			return errors.New("no session selected")
 		}
-		name := strings.TrimSpace(x.Prompt)
-		if name == "" {
-			return errors.New("type the new name in the composer first")
+		if strings.TrimSpace(x.Name) == "" {
+			return errors.New("name must not be empty")
 		}
-		if err := p.Rename(ctx, x.Session.Key, name); err != nil {
+		if err := p.Rename(ctx, *x.SessionKey, x.Name); err != nil {
 			return err
 		}
-		a.Model.Renaming = false
-		a.Model.RenameDraft = ""
-		a.Model.RenameCursor = 0
+		a.Model.clearRename()
+		a.Model.Status = "Renamed session"
 	}
 	return nil
 }
@@ -216,8 +214,17 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 			return "", err
 		}
 		if next == 'O' {
-			_, err := r.ReadByte()
-			return "", err
+			final, err := r.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			switch final {
+			case 'H':
+				return "home", nil
+			case 'F':
+				return "end", nil
+			}
+			return "", nil
 		}
 		if next != '[' {
 			return "", nil
@@ -237,6 +244,12 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 			return "right", nil
 		case "D":
 			return "left", nil
+		case "H", "1~", "7~":
+			return "home", nil
+		case "F", "4~", "8~":
+			return "end", nil
+		case "3~":
+			return "delete", nil
 		}
 		return "", nil
 	case '\r', '\n':
@@ -251,11 +264,23 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 		return "stop-or-archive", nil
 	case 0x12:
 		return "rename", nil
+	case 0x13:
+		return "stash", nil
 	case 0x0c:
 		return "refresh", nil
 	}
 	if b < 0x20 {
 		return "", nil
+	}
+	if b >= 0x80 {
+		if err := r.UnreadByte(); err != nil {
+			return "", err
+		}
+		rn, _, err := r.ReadRune()
+		if err != nil {
+			return "", err
+		}
+		return string(rn), nil
 	}
 	return string([]byte{b}), nil
 }

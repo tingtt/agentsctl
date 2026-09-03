@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/state"
@@ -122,6 +123,9 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutput(&output, "MUST-NOT-SHOW-SIBLING", 3*time.Second); err != nil {
 		t.Fatal("Ctrl+A did not expose all directories")
 	}
+	if strings.Contains(output.String(), "FAKE CODEX ATTACHED") {
+		t.Fatal("Ctrl+A attached a session")
+	}
 	writePTY(t, terminal, "\x01")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
 		return strings.Contains(frame, "agentsctl · current folder") && !strings.Contains(frame, "MUST-NOT-SHOW-SIBLING")
@@ -133,6 +137,26 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutput(&output, "codex >", 3*time.Second); err != nil {
 		t.Fatal(err)
 	}
+
+	writePTY(t, terminal, "First\x13Second\x13")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "codex > First")
+	}); err != nil {
+		t.Fatalf("shared stash did not restore First for Codex: %v", err)
+	}
+	writePTY(t, terminal, "\x13")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "codex > Second")
+	}); err != nil {
+		t.Fatalf("second stash swap did not restore Second: %v", err)
+	}
+	writePTY(t, terminal, strings.Repeat("\x7f", len("Second")))
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "codex > \r\n")
+	}); err != nil {
+		t.Fatalf("composer did not become empty: %v", err)
+	}
+
 	frameCount := strings.Count(output.String(), "\x1b[2J\x1b[H")
 	writePTY(t, terminal, "\x16\x1b[55;5u")
 	if err := waitLatestFrame(&output, 3*time.Second, func(string) bool {
@@ -166,12 +190,53 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	run := waitRunningRun(t, filepath.Join(stateDir, "state.json"))
 	overviewCount := strings.Count(output.String(), "agentsctl · current folder")
-	writePTY(t, terminal, "\x1d")
+	writePTY(t, terminal, "\x13\x1d")
 	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+1, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	childInput, err := os.ReadFile(filepath.Join(fakeDir, "child-input.bin"))
+	if err != nil || !bytes.Contains(childInput, []byte{0x13}) {
+		t.Fatalf("Ctrl+S was not forwarded to child: input=%v err=%v", childInput, err)
+	}
 	if err := syscall.Kill(run.PID, 0); err != nil {
 		t.Fatalf("child did not survive detach: %v", err)
+	}
+
+	writePTY(t, terminal, "Prompt\x12\x1b[H\x1b[3~X\x1b")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "session-099") && strings.Contains(frame, "codex > Prompt") && strings.Contains(frame, "Rename cancelled")
+	}); err != nil {
+		t.Fatalf("rename cancel did not preserve row and composer: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fakeDir, "rename.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cancel invoked provider rename: %v", err)
+	}
+	writePTY(t, terminal, "\x12\x1b[H\x1b[3~X\r")
+	if err := waitLatestFrame(&output, 5*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-099") && strings.Contains(frame, "codex > Prompt")
+	}); err != nil {
+		t.Fatalf("rename success did not refresh the same row: %v", err)
+	}
+	renameLog, err := os.ReadFile(filepath.Join(fakeDir, "rename.log"))
+	if err != nil || strings.Count(strings.TrimSpace(string(renameLog)), "\n") != 0 || !strings.Contains(string(renameLog), `"id": "session-099"`) || !strings.Contains(string(renameLog), `"name": "Xession-099"`) {
+		t.Fatalf("provider rename calls=%q err=%v", renameLog, err)
+	}
+	writePTY(t, terminal, "\x13")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, "codex > First") }); err != nil {
+		t.Fatalf("rename changed stash: %v", err)
+	}
+	writePTY(t, terminal, "\x13")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, "codex > Prompt") }); err != nil {
+		t.Fatalf("rename changed composer: %v", err)
+	}
+	persistedState, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"First", "Second", "Prompt"} {
+		if bytes.Contains(persistedState, []byte(text)) {
+			t.Fatalf("prompt or stash text %q was persisted in state: %s", text, persistedState)
+		}
 	}
 
 	writePTY(t, terminal, "\x18")
@@ -199,6 +264,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutput(&output, "fake-claude-live", 3*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	writePTY(t, terminal, strings.Repeat("\x7f", len("Prompt")))
 	writePTY(t, terminal, "\r")
 	if err := waitOutput(&output, "FAKE CLAUDE ATTACHED", 5*time.Second); err != nil {
 		t.Fatal(err)
@@ -355,16 +421,17 @@ func frameLines(frame string) []string {
 
 func assertScreen(t *testing.T, output string, width, height int, required ...string) {
 	t.Helper()
-	frame := latestFrame(output)
-	if strings.Contains(strings.ReplaceAll(frame, "\r\n", ""), "\n") {
-		t.Fatalf("screen contains bare LF:\n%q", frame)
-	}
-	lines := frameLines(frame)
+	lines := emulateANSIScreen(output, width, height)
+	frame := strings.Join(lines, "\n")
 	if len(lines) != height {
 		t.Fatalf("screen lines=%d want=%d\n%s", len(lines), height, frame)
 	}
 	for _, line := range lines {
-		if len([]rune(line)) > width {
+		cells := 0
+		for _, r := range line {
+			cells += runeCells(r)
+		}
+		if cells > width {
 			t.Fatalf("screen row exceeds width %d: %q", width, line)
 		}
 		if strings.Contains(line, "codex  session-") && strings.Index(line, "codex") != 2 {
@@ -381,6 +448,72 @@ func assertScreen(t *testing.T, output string, width, height int, required ...st
 			t.Fatalf("screen contains %q:\n%s", forbidden, frame)
 		}
 	}
+}
+
+func emulateANSIScreen(output string, width, height int) []string {
+	screen := make([][]rune, height)
+	for row := range screen {
+		screen[row] = make([]rune, width)
+	}
+	row, col := 0, 0
+	for i := 0; i < len(output); {
+		if output[i] == 0x1b && i+1 < len(output) && output[i+1] == '[' {
+			j := i + 2
+			for j < len(output) && !(output[j] >= 0x40 && output[j] <= 0x7e) {
+				j++
+			}
+			if j >= len(output) {
+				break
+			}
+			params, final := output[i+2:j], output[j]
+			switch final {
+			case 'J':
+				if params == "2" {
+					for y := range screen {
+						clear(screen[y])
+					}
+				}
+			case 'H':
+				row, col = 0, 0
+			}
+			i = j + 1
+			continue
+		}
+		switch output[i] {
+		case '\r':
+			col = 0
+			i++
+			continue
+		case '\n':
+			row++
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(output[i:])
+		if size == 0 {
+			break
+		}
+		if r >= 0x20 && r != 0x7f && row >= 0 && row < height && col >= 0 && col < width {
+			screen[row][col] = r
+			col += runeCells(r)
+		}
+		i += size
+	}
+	lines := make([]string, height)
+	for y := range screen {
+		end := len(screen[y])
+		for end > 0 && screen[y][end-1] == 0 {
+			end--
+		}
+		line := append([]rune(nil), screen[y][:end]...)
+		for i := range line {
+			if line[i] == 0 {
+				line[i] = ' '
+			}
+		}
+		lines[y] = string(line)
+	}
+	return lines
 }
 
 func waitRunningRun(t *testing.T, path string) state.Run {

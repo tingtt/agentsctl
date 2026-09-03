@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,9 +10,16 @@ import (
 )
 
 type journeyProvider struct {
-	id       session.ProviderID
-	rows     []session.Session
-	archived []session.Session
+	id        session.ProviderID
+	rows      []session.Session
+	archived  []session.Session
+	renames   []renameCall
+	renameErr error
+}
+
+type renameCall struct {
+	key  session.Key
+	name string
 }
 
 func (p *journeyProvider) ID() session.ProviderID { return p.id }
@@ -62,7 +70,70 @@ func (p *journeyProvider) Unarchive(_ context.Context, k session.Key) error {
 	}
 	return nil
 }
-func (p *journeyProvider) Rename(context.Context, session.Key, string) error { return nil }
+func (p *journeyProvider) Rename(_ context.Context, key session.Key, name string) error {
+	p.renames = append(p.renames, renameCall{key: key, name: name})
+	if p.renameErr != nil {
+		return p.renameErr
+	}
+	for i := range p.rows {
+		if p.rows[i].Key == key {
+			p.rows[i].Name = name
+		}
+	}
+	return nil
+}
+
+func TestRenameActionSuccessAndFailure(t *testing.T) {
+	target := session.Key{Provider: session.ProviderCodex, ID: "target"}
+	other := session.Key{Provider: session.ProviderCodex, ID: "other"}
+	for _, tc := range []struct {
+		name      string
+		renameErr error
+		wantOpen  bool
+	}{
+		{name: "success"},
+		{name: "failure preserves editor", renameErr: errors.New("rename rejected"), wantOpen: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &journeyProvider{id: session.ProviderCodex, renameErr: tc.renameErr, rows: []session.Session{
+				{Key: other, Name: "other", CWD: "/work", Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}},
+				{Key: target, Name: "old", CWD: "/work", Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}},
+			}}
+			m := NewModel()
+			m.Prompt, m.Stash = "composer", "stash"
+			m.Rows = append([]session.Session(nil), provider.rows...)
+			m.Selected = 1
+			m.Update("rename")
+			m.RenameDraft = "new"
+			action := m.Update("enter")
+			app := App{Catalog: session.Catalog{Providers: []session.Provider{provider}}, Model: m, CWD: "/work"}
+			err := app.act(context.Background(), action)
+			if (err != nil) != (tc.renameErr != nil) {
+				t.Fatalf("err=%v", err)
+			}
+			if err != nil {
+				app.Model.Status = "error: " + err.Error()
+			}
+			provider.rows[0], provider.rows[1] = provider.rows[1], provider.rows[0]
+			app.refresh(context.Background())
+			if len(provider.renames) != 1 || provider.renames[0] != (renameCall{key: target, name: "new"}) {
+				t.Fatalf("rename calls=%+v", provider.renames)
+			}
+			if app.Model.Renaming != tc.wantOpen || app.Model.Prompt != "composer" || app.Model.Stash != "stash" {
+				t.Fatalf("model=%+v", app.Model)
+			}
+			if tc.renameErr != nil {
+				if app.Model.Rows[app.Model.Selected].Key != target || app.Model.Rows[app.Model.Selected].Name != "old" || app.Model.RenameDraft != "new" || app.Model.Status != "error: rename rejected" {
+					t.Fatalf("failed rename mutated catalog/editor: %+v", app.Model)
+				}
+				return
+			}
+			if app.Model.Rows[app.Model.Selected].Key != target || app.Model.Rows[app.Model.Selected].Name != "new" {
+				t.Fatalf("selection/name after refresh: %+v", app.Model)
+			}
+		})
+	}
+}
 
 func TestMVPJourneyAcrossProviders(t *testing.T) {
 	ctx := context.Background()

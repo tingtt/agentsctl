@@ -31,7 +31,10 @@ def rpc():
                 if row["id"] == params.get("threadId"):
                     if method == "thread/archive": row["archived"] = True
                     elif method == "thread/unarchive": row["archived"] = False
-                    else: row["name"] = params.get("name")
+                    else:
+                        row["name"] = params.get("name")
+                        with (root / "rename.log").open("a") as log:
+                            log.write(json.dumps({"id":row["id"],"name":row["name"]}) + "\n")
             save(rows)
         else:
             print(json.dumps({"jsonrpc":"2.0","id":req["id"],"error":{"code":-32601,"message":"not found"}}), flush=True); continue
@@ -52,6 +55,8 @@ def interactive(sid, prompt):
         while True:
             b = os.read(0, 1024)
             if not b: break
+            with (root / "child-input.bin").open("ab") as child_input:
+                child_input.write(b)
             os.write(1, b)
     finally:
         termios.tcsetattr(0, termios.TCSADRAIN, old)
