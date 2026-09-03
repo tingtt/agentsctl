@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,11 @@ type journeyProvider struct {
 	archived  []session.Session
 	renames   []renameCall
 	renameErr error
+	// listDelay simulates a slow provider CLI subprocess in latency tests.
+	listDelay time.Duration
+	// listCalls counts List invocations so tests can assert a local-only
+	// operation (pin/unpin) never triggers a provider refresh.
+	listCalls int32
 }
 
 type renameCall struct {
@@ -25,11 +31,17 @@ type renameCall struct {
 func (p *journeyProvider) ID() session.ProviderID { return p.id }
 func (p *journeyProvider) Available() error       { return nil }
 func (p *journeyProvider) List(_ context.Context, archived bool) ([]session.Session, error) {
+	atomic.AddInt32(&p.listCalls, 1)
+	if p.listDelay > 0 {
+		time.Sleep(p.listDelay)
+	}
 	if archived {
 		return append([]session.Session(nil), p.archived...), nil
 	}
 	return append([]session.Session(nil), p.rows...), nil
 }
+
+func (p *journeyProvider) ListCallCount() int { return int(atomic.LoadInt32(&p.listCalls)) }
 func (p *journeyProvider) Dispatch(_ context.Context, prompt, cwd string) (session.Session, error) {
 	id := string(p.id) + "-new"
 	r := session.Session{Key: session.Key{Provider: p.id, ID: id}, Summary: prompt, CWD: cwd, UpdatedAt: time.Now(), Activity: session.ActivityWorking, Runtime: session.RuntimeDetached, Capabilities: session.Capabilities{Attach: true, Stop: true}}

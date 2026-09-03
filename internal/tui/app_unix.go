@@ -68,7 +68,15 @@ func (a *App) Run(ctx context.Context) error {
 		if err := a.act(ctx, action); err != nil {
 			a.Model.Status = "error: " + err.Error()
 		}
-		if action.Kind != ActionNone {
+		// Pin/unpin never touches provider (remote) state, so — unlike
+		// every other action — it must not trigger a full catalog
+		// refresh: that refresh re-runs Available()+List() for every
+		// provider, which is what made pin/unpin feel like a ~0.5s
+		// operation even though the local state-file write it actually
+		// depends on takes low-single-digit milliseconds. act() already
+		// applies the toggled Pinned state (and re-sorts/reselects)
+		// directly on the Model's existing rows via Model.ApplyPin.
+		if action.Kind != ActionNone && action.Kind != ActionPin {
 			a.refresh(ctx)
 		}
 	}
@@ -149,10 +157,15 @@ func (a *App) act(ctx context.Context, x Action) error {
 		if x.Session == nil {
 			return errors.New("no session selected")
 		}
+		// Persist synchronously first: on error, the Model's rows are left
+		// untouched (still consistent with the actual persisted state), so
+		// there is nothing to roll back. Only apply the local row update —
+		// no provider refresh — once persistence has actually succeeded.
 		pinned, err := a.Catalog.TogglePin(x.Session.Key)
 		if err != nil {
 			return err
 		}
+		a.Model.ApplyPin(x.Session.Key, pinned)
 		if pinned {
 			a.Model.Status = "Pinned session"
 		} else {
@@ -301,6 +314,14 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 		return "stash", nil
 	case 0x0c:
 		return "refresh", nil
+	case 0x1f:
+		// Ctrl+/ (and, on terminals that conflate the two physical keys,
+		// Ctrl+_) universally arrives as the C0 code 0x1F (US, Unit
+		// Separator) rather than the naively-computed '/' & 0x1f = 0x0F —
+		// confirmed against macOS Terminal.app and iTerm2, both xterm-
+		// compatible. This is the same convention readline's C-_ (undo)
+		// and tmux's default C-/ binding rely on.
+		return "depth-cycle", nil
 	}
 	if b < 0x20 {
 		return "", nil

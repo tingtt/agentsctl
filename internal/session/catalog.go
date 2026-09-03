@@ -88,8 +88,18 @@ func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 		}
 		result.Sessions = filtered
 	}
-	sort.SliceStable(result.Sessions, func(i, j int) bool {
-		a, b := result.Sessions[i], result.Sessions[j]
+	SortOverview(result.Sessions)
+	return result
+}
+
+// SortOverview sorts sessions into the canonical overview order: pinned
+// sessions first, each group ordered by CreatedAt descending, ties broken
+// by session key. This is the single ordering implementation shared by
+// Catalog.Load and any in-memory update (e.g. a local pin toggle) that
+// must reproduce the same order without a full provider refresh.
+func SortOverview(sessions []Session) {
+	sort.SliceStable(sessions, func(i, j int) bool {
+		a, b := sessions[i], sessions[j]
 		if a.Pinned != b.Pinned {
 			return a.Pinned
 		}
@@ -98,7 +108,6 @@ func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 		}
 		return a.Key.String() < b.Key.String()
 	})
-	return result
 }
 
 // TogglePin changes and returns the pinned state for key.

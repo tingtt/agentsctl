@@ -16,10 +16,23 @@ import (
 	"golang.org/x/term"
 )
 
-// rowPrefix builds the expected "> [runner] [status] " prefix for a row so
-// tests don't hardcode raw icon/ANSI bytes.
+// rowPrefix builds the expected "> [status] <provider-color>" prefix for a
+// row so tests don't hardcode raw ANSI bytes. There is no runner-glyph
+// column: the provider color escape leads directly into the title text
+// (colorizeTitle puts the color code immediately before it), so
+// rowPrefix(...)+"text" reproduces exactly the bytes that precede a row's
+// title in the rendered view.
 func rowPrefix(cursor string, provider session.ProviderID, activity session.Activity) string {
-	return cursor + " " + runnerIcon(provider) + " " + statusIcon(activity) + " "
+	return cursor + " " + statusIcon(activity) + " " + providerTitleColor(provider)
+}
+
+// coloredCursorSuffix reproduces the exact bytes colorizeTitle produces
+// for a mid-title cursor followed by trailing suffix text: the cursor
+// glyph (reverse video, closing with its own ANSI reset), then the
+// provider color re-opened — so the reset doesn't erase provider color
+// for the suffix — immediately before that suffix.
+func coloredCursorSuffix(provider session.ProviderID, glyph, suffix string) string {
+	return cursorStyle(glyph) + providerTitleColor(provider) + suffix
 }
 
 // cellOffset returns the terminal-cell offset of substr's first byte
@@ -112,12 +125,7 @@ func TestTruncateLeftCellsKeepsTailVisible(t *testing.T) {
 	}
 }
 
-func TestRunnerAndStatusIconsAreSingleTerminalCell(t *testing.T) {
-	for _, provider := range []session.ProviderID{session.ProviderClaude, session.ProviderCodex} {
-		if cells := lineCells(runnerIcon(provider)); cells != 1 {
-			t.Fatalf("runner icon for %s is %d cells, want 1", provider, cells)
-		}
-	}
+func TestStatusIconsAreSingleTerminalCell(t *testing.T) {
 	activities := []session.Activity{
 		session.ActivityIdle, session.ActivityCompleted, session.ActivityFailed, session.ActivityStarting,
 		session.ActivityWorking, session.ActivityNeedsInput, session.ActivityWaitingQuota, session.ActivityUnknown,
@@ -126,6 +134,39 @@ func TestRunnerAndStatusIconsAreSingleTerminalCell(t *testing.T) {
 		if cells := lineCells(statusIcon(activity)); cells != 1 {
 			t.Fatalf("status icon for %s is %d cells, want 1", activity, cells)
 		}
+	}
+}
+
+// nerdFontRunnerGlyphs are the two Font Awesome codepoints the runner
+// column used to render (nf-fa-magic for Claude, nf-fa-terminal for
+// Codex), kept here only so a regression that reintroduces them can be
+// detected without depending on a Nerd Font being installed to view them.
+const nerdFontRunnerGlyphs = "\uf0d0\uf120"
+
+func TestRunnerColumnAndGlyphAreAbsent(t *testing.T) {
+	rows := []session.Session{
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "claude-row", Activity: session.ActivityIdle, CWD: "/work"},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "codex-row", Activity: session.ActivityWorking, CWD: "/work"},
+	}
+	m := NewModel()
+	m.SetRows(rows)
+	view := m.View(80, 12)
+	for _, r := range nerdFontRunnerGlyphs {
+		if strings.ContainsRune(view, r) {
+			t.Fatalf("rendered view still contains a Nerd Font runner glyph %q:\n%s", r, view)
+		}
+	}
+	// With no runner column, the title (cursor+status+2 separators = 4
+	// cells) immediately follows the fixed prefix. Offset is measured with
+	// the ANSI-aware lineCells, not naive rune counting, since the title
+	// is now provider-color-wrapped.
+	line := rowLine(t, view, 3) // header(0), blank(1), "Other"(2), row(3): no pinned rows here.
+	byteIdx := strings.Index(line, "claude-row")
+	if byteIdx < 0 {
+		t.Fatalf("title text not found in row:\n%s", line)
+	}
+	if got := lineCells(line[:byteIdx]); got != 4 {
+		t.Fatalf("title does not start at the runner-less column offset: got=%d line=%q", got, line)
 	}
 }
 
