@@ -16,6 +16,60 @@ import (
 	"golang.org/x/term"
 )
 
+func TestPromptStashSwapsAndPreservesOverviewState(t *testing.T) {
+	selected := session.Key{Provider: session.ProviderCodex, ID: "selected"}
+	cases := []struct {
+		name, prompt, stash, wantPrompt, wantStash string
+	}{
+		{name: "both empty"},
+		{name: "store prompt", prompt: "A", wantStash: "A"},
+		{name: "restore stash", stash: "A", wantPrompt: "A"},
+		{name: "swap", prompt: "B", stash: "A", wantPrompt: "A", wantStash: "B"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewModel()
+			m.Provider = session.ProviderCodex
+			m.Prompt = tc.prompt
+			m.Stash = tc.stash
+			m.AllDirectories = true
+			m.Rows = []session.Session{{Key: selected}}
+			m.Selected = 0
+			if action := m.Update("stash"); action.Kind != ActionNone {
+				t.Fatalf("action=%+v", action)
+			}
+			if m.Prompt != tc.wantPrompt || m.Stash != tc.wantStash {
+				t.Fatalf("prompt=%q stash=%q", m.Prompt, m.Stash)
+			}
+			if m.Provider != session.ProviderCodex || !m.AllDirectories || m.Rows[m.Selected].Key != selected {
+				t.Fatalf("overview state changed: %+v", m)
+			}
+		})
+	}
+
+	m := NewModel()
+	m.Prompt = "claude value"
+	m.Update("stash")
+	m.Update("shift+tab")
+	m.Prompt = "codex value"
+	m.Update("stash")
+	if m.Provider != session.ProviderCodex || m.Prompt != "claude value" || m.Stash != "codex value" {
+		t.Fatalf("stash was provider-scoped: %+v", m)
+	}
+}
+
+func TestPromptStashIsInMemoryOnly(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "ephemeral"
+	m.Update("stash")
+	if m.Stash != "ephemeral" {
+		t.Fatalf("stash=%q", m.Stash)
+	}
+	if next := NewModel(); next.Prompt != "" || next.Stash != "" {
+		t.Fatalf("new process model retained prompt state: %+v", next)
+	}
+}
+
 func TestShiftTabPreservesPrompt(t *testing.T) {
 	m := NewModel()
 	m.Prompt = "keep me"
@@ -98,6 +152,114 @@ func TestEnterDispatchesComposerOrAttachesSelection(t *testing.T) {
 	}
 }
 
+func TestEmptyEnterWithoutSelectionIsSafe(t *testing.T) {
+	m := NewModel()
+	a := m.Update("enter")
+	if a.Kind != ActionNone || m.Status != "No session selected" {
+		t.Fatalf("action=%+v status=%q", a, m.Status)
+	}
+}
+
+func TestModeInputPriority(t *testing.T) {
+	key := session.Key{Provider: session.ProviderCodex, ID: "stable"}
+	row := session.Session{Key: key, Name: "old", Capabilities: session.Capabilities{Attach: true, Rename: true}}
+	for _, tc := range []struct {
+		name  string
+		setup func(*Model)
+		key   string
+	}{
+		{name: "rename stash", setup: func(m *Model) { m.Update("rename") }, key: "stash"},
+		{name: "rename selection", setup: func(m *Model) { m.Update("rename") }, key: "down"},
+		{name: "archive stash", setup: func(m *Model) { target := key; m.archiveConfirm = &target }, key: "stash"},
+		{name: "archive enter", setup: func(m *Model) { target := key; m.archiveConfirm = &target }, key: "enter"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewModel()
+			m.Rows = []session.Session{row, {Key: session.Key{Provider: session.ProviderCodex, ID: "other"}}}
+			m.Prompt, m.Stash = "prompt", "stash"
+			tc.setup(&m)
+			a := m.Update(tc.key)
+			if a.Kind != ActionNone || m.Prompt != "prompt" || m.Stash != "stash" || m.Selected != 0 {
+				t.Fatalf("action=%+v model=%+v", a, m)
+			}
+		})
+	}
+}
+
+func TestCtrlAOnlyChangesScope(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Capabilities: session.Capabilities{Attach: true}}}
+	if action := m.Update("folders"); action.Kind != ActionRefresh || !m.AllDirectories {
+		t.Fatalf("action=%+v model=%+v", action, m)
+	}
+}
+
+func TestInlineRenameEditingTargetsStableSession(t *testing.T) {
+	target := session.Key{Provider: session.ProviderCodex, ID: "target"}
+	m := NewModel()
+	m.Prompt, m.Stash = "composer", "stashed"
+	m.Rows = []session.Session{
+		{Key: target, Name: "alpha", Capabilities: session.Capabilities{Rename: true}},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "other"}, Name: "other", Capabilities: session.Capabilities{Rename: true}},
+	}
+	if action := m.Update("rename"); action.Kind != ActionNone || !m.Renaming || m.RenameTarget != target || m.RenameOriginal != "alpha" || m.RenameDraft != "alpha" || m.RenameCursor != 5 {
+		t.Fatalf("rename start action=%+v model=%+v", action, m)
+	}
+	m.Update("home")
+	m.Update("right")
+	m.Update("delete")
+	m.Update("X")
+	m.Update("end")
+	m.Update("backspace")
+	if m.RenameDraft != "aXph" {
+		t.Fatalf("draft=%q cursor=%d", m.RenameDraft, m.RenameCursor)
+	}
+	m.Selected = 1 // A refresh/reorder must not retarget the pending rename.
+	a := m.Update("enter")
+	if a.Kind != ActionRename || a.SessionKey == nil || *a.SessionKey != target || a.Name != "aXph" {
+		t.Fatalf("rename action=%+v", a)
+	}
+	if m.Prompt != "composer" || m.Stash != "stashed" {
+		t.Fatalf("composer state changed: %+v", m)
+	}
+}
+
+func TestInlineRenameCancelAndCapabilityFailurePreserveComposer(t *testing.T) {
+	m := NewModel()
+	m.Prompt, m.Stash = "composer", "stashed"
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "c"}, Name: "old", Capabilities: session.Capabilities{Reason: "provider has no native rename"}}}
+	if action := m.Update("rename"); action.Kind != ActionNone || m.Renaming || !strings.Contains(m.Status, "provider has no native rename") {
+		t.Fatalf("unsupported rename action=%+v model=%+v", action, m)
+	}
+	m.Rows[0].Capabilities.Rename = true
+	m.Update("rename")
+	m.Update("Z")
+	m.Update("quit")
+	if m.Renaming || m.Prompt != "composer" || m.Stash != "stashed" || m.Rows[0].Name != "old" {
+		t.Fatalf("cancel changed state: %+v", m)
+	}
+}
+
+func TestInlineRenameRendersEditorInsideSelectedNameCell(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "old", Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
+	m.Update("rename")
+	view := m.View(80, 12)
+	if !strings.Contains(view, "> codex  old_") || strings.Contains(view, "Rename:") {
+		t.Fatalf("rename editor is not in row name cell:\n%s", view)
+	}
+}
+
+func TestNarrowInlineRenameKeepsRowAndCursorVisible(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: strings.Repeat("n", 40), Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
+	m.Update("rename")
+	view := m.View(24, 10)
+	if !strings.Contains(view, "> codex") || !strings.Contains(view, "_") {
+		t.Fatalf("narrow rename lost selected row or cursor:\n%s", view)
+	}
+}
+
 func TestCodexAgentsKeyTransitions(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "old", Capabilities: session.Capabilities{Attach: true, Stop: true, Rename: true}}}
@@ -114,7 +276,7 @@ func TestCodexAgentsKeyTransitions(t *testing.T) {
 		t.Fatalf("rename start action=%+v model=%+v", a, m)
 	}
 	m.Update("backspace")
-	if a := m.Update("enter"); a.Kind != ActionRename || a.Prompt != "ol" {
+	if a := m.Update("enter"); a.Kind != ActionRename || a.Name != "ol" || a.SessionKey == nil || a.SessionKey.ID != "c" {
 		t.Fatalf("rename commit action=%+v", a)
 	}
 }
@@ -147,6 +309,12 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 		{"\x0f", "open"},
 		{"\x01", "folders"},
 		{"\x18", "stop-or-archive"},
+		{"\x13", "stash"},
+		{"\x1b[H", "home"},
+		{"\x1b[F", "end"},
+		{"\x1b[1~", "home"},
+		{"\x1b[4~", "end"},
+		{"\x1b[3~", "delete"},
 		{"\x1b[55;5uX", ""},
 		{"\x1b[999~X", ""},
 	}
@@ -162,6 +330,18 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 				t.Fatalf("input=%q trailing key=%q err=%v", tc.input, next, err)
 			}
 		}
+	}
+}
+
+func TestReadKeyReturnsCompleteUTF8Rune(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("界x"))
+	first, err := readKey(r)
+	if err != nil || first != "界" {
+		t.Fatalf("first=%q err=%v", first, err)
+	}
+	second, err := readKey(r)
+	if err != nil || second != "x" {
+		t.Fatalf("second=%q err=%v", second, err)
 	}
 }
 

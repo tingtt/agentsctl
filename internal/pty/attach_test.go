@@ -33,3 +33,15 @@ func TestClaudeDetachTranslationUsesNativeControlZ(t *testing.T) {
 		t.Fatalf("sequence=%v", sequence)
 	}
 }
+
+func TestCtrlSIsForwardedToAttachedChild(t *testing.T) {
+	input := bytes.NewReader([]byte{'a', 0x13, 'b', DetachKey})
+	var sent bytes.Buffer
+	err := forwardInput(input, func(b []byte) error { _, e := sent.Write(b); return e }, func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sent.Bytes(), []byte{'a', 0x13, 'b'}) {
+		t.Fatalf("sent=%v", sent.Bytes())
+	}
+}

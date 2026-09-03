@@ -19,16 +19,19 @@ go build ./cmd/agentsctl
 | --- | --- |
 | `Shift+Tab` | Toggle the composer between Claude and Codex without clearing the prompt. |
 | `Enter` | Dispatch the composer prompt in the background, or attach the selected session when the composer is empty. |
+| `Ctrl+S` | Swap the composer text with one shared in-memory stash slot. While attached, forward `Ctrl+S` to the child instead. |
 | `Ctrl+O` | Attach the selected session. |
 | `↑` / `↓` | Move the session selection. |
 | `Ctrl+A` | Toggle current-directory and all-directory session scopes. The initial scope is the directory where `agentsctl` was started. |
-| `Ctrl+R` | Rename the selected session. Edit the current name inline, use `←` / `→` to move the cursor, `Enter` to save, and `Esc` to cancel. |
+| `Ctrl+R` | Rename the selected session. Edit the current name inline with `←` / `→`, `Home`, `End`, `Backspace`, and `Delete`; use `Enter` to save or `Esc` to cancel. |
 | `Ctrl+X` | Stop an active managed session. For an inactive session, press twice to confirm and archive it. |
 | `Ctrl+L` | Refresh the active session catalog and runtime state. |
 | `Ctrl+]` | Detach to the overview without stopping the underlying session. |
 | `Esc` | Cancel rename/archive confirmation, or exit the overview. Background sessions continue. |
 
 Archive removes a session from the MVP catalog and is a one-way TUI operation.
+
+The prompt stash stores text only. It is shared across providers, folders, and selected sessions, and is discarded when `agentsctl` exits. Rename and archive confirmation keep both the composer and stash unchanged.
 
 Claude sessions use Claude's native background supervisor. Detaching translates `Ctrl+]` into Claude's native `Ctrl+Z` detach sequence and waits for `claude attach` to exit; timeout does not kill the attachment or background agent. Claude archive is only a local visibility overlay: it never deletes the session, transcript, or worktree.
 

@@ -21,14 +21,17 @@ const (
 )
 
 type Action struct {
-	Kind     ActionKind
-	Provider session.ProviderID
-	Prompt   string
-	Session  *session.Session
+	Kind       ActionKind
+	Provider   session.ProviderID
+	Prompt     string
+	Name       string
+	Session    *session.Session
+	SessionKey *session.Key
 }
 type Model struct {
 	Provider       session.ProviderID
 	Prompt         string
+	Stash          string
 	Rows           []session.Session
 	Selected       int
 	AllDirectories bool
@@ -37,7 +40,9 @@ type Model struct {
 	RenameDraft    string
 	RenameCursor   int
 	Renaming       bool
-	archiveConfirm string
+	RenameTarget   session.Key
+	RenameOriginal string
+	archiveConfirm *session.Key
 }
 
 type displayLine struct {
@@ -49,16 +54,20 @@ func NewModel() Model {
 	return Model{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}}
 }
 func (m *Model) SetRows(rows []session.Session) {
-	if m.archiveConfirm != "" {
-		m.archiveConfirm = ""
+	if m.archiveConfirm != nil {
+		m.archiveConfirm = nil
 		if m.Status == "Press Ctrl+X again to archive" {
 			m.Status = ""
 		}
 	}
 	var selected session.Key
-	selectedValid := m.Selected >= 0 && m.Selected < len(m.Rows)
-	if selectedValid {
+	selectedValid := false
+	if m.Renaming {
+		selected = m.RenameTarget
+		selectedValid = true
+	} else if m.Selected >= 0 && m.Selected < len(m.Rows) {
 		selected = m.Rows[m.Selected].Key
+		selectedValid = true
 	}
 	m.Rows = rows
 	if selectedValid {
@@ -76,6 +85,9 @@ func (m *Model) SetRows(rows []session.Session) {
 func (m *Model) Update(key string) Action {
 	if m.Renaming {
 		return m.updateRename(key)
+	}
+	if m.archiveConfirm != nil {
+		return m.updateArchiveConfirmation(key)
 	}
 	switch key {
 	case "shift+tab":
@@ -103,6 +115,11 @@ func (m *Model) Update(key string) Action {
 			m.Prompt = string(r[:len(r)-1])
 		}
 		return Action{}
+	case "stash":
+		if m.Prompt != "" || m.Stash != "" {
+			m.Prompt, m.Stash = m.Stash, m.Prompt
+		}
+		return Action{}
 	case "enter":
 		if strings.TrimSpace(m.Prompt) != "" {
 			return Action{Kind: ActionDispatch, Provider: m.Provider, Prompt: m.Prompt}
@@ -113,7 +130,7 @@ func (m *Model) Update(key string) Action {
 	case "folders":
 		m.AllDirectories = !m.AllDirectories
 		m.Selected = 0
-		m.archiveConfirm = ""
+		m.archiveConfirm = nil
 		return Action{Kind: ActionRefresh}
 	case "stop-or-archive":
 		return m.stopOrArchive()
@@ -128,6 +145,8 @@ func (m *Model) Update(key string) Action {
 			return Action{}
 		}
 		m.Renaming = true
+		m.RenameTarget = row.Key
+		m.RenameOriginal = row.Name
 		m.RenameDraft = row.Name
 		m.RenameCursor = len([]rune(row.Name))
 		m.Status = ""
@@ -135,14 +154,9 @@ func (m *Model) Update(key string) Action {
 	case "refresh":
 		return Action{Kind: ActionRefresh}
 	case "quit":
-		if m.archiveConfirm != "" {
-			m.archiveConfirm = ""
-			m.Status = "Archive cancelled"
-			return Action{}
-		}
 		return Action{Kind: ActionQuit}
 	default:
-		if key != "" {
+		if isTextInput(key) {
 			m.Prompt += key
 		}
 		return Action{}
@@ -150,7 +164,7 @@ func (m *Model) Update(key string) Action {
 }
 
 func (m *Model) cancelArchiveConfirmation() {
-	m.archiveConfirm = ""
+	m.archiveConfirm = nil
 	if m.Status == "Press Ctrl+X again to archive" {
 		m.Status = ""
 	}
@@ -160,10 +174,12 @@ func (m *Model) updateRename(key string) Action {
 	runes := []rune(m.RenameDraft)
 	switch key {
 	case "quit":
-		m.Renaming = false
-		m.RenameDraft = ""
-		m.RenameCursor = 0
+		m.clearRename()
 		m.Status = "Rename cancelled"
+	case "home":
+		m.RenameCursor = 0
+	case "end":
+		m.RenameCursor = len(runes)
 	case "left":
 		m.RenameCursor = max(0, m.RenameCursor-1)
 	case "right":
@@ -174,22 +190,45 @@ func (m *Model) updateRename(key string) Action {
 			m.RenameCursor--
 			m.RenameDraft = string(runes)
 		}
+	case "delete":
+		if m.RenameCursor < len(runes) {
+			runes = append(runes[:m.RenameCursor], runes[m.RenameCursor+1:]...)
+			m.RenameDraft = string(runes)
+		}
 	case "enter":
 		if strings.TrimSpace(m.RenameDraft) == "" {
 			m.Status = "Name must not be empty"
 			return Action{}
 		}
-		a := m.selected(ActionRename)
-		a.Prompt = m.RenameDraft
-		return a
+		key := m.RenameTarget
+		return Action{Kind: ActionRename, Provider: key.Provider, SessionKey: &key, Name: m.RenameDraft}
 	default:
-		if key != "" {
+		if isTextInput(key) {
 			insert := []rune(key)
 			before := append([]rune(nil), runes[:m.RenameCursor]...)
 			after := append([]rune(nil), runes[m.RenameCursor:]...)
 			m.RenameDraft = string(append(append(before, insert...), after...))
 			m.RenameCursor += len(insert)
 		}
+	}
+	return Action{}
+}
+
+func (m *Model) clearRename() {
+	m.Renaming = false
+	m.RenameTarget = session.Key{}
+	m.RenameOriginal = ""
+	m.RenameDraft = ""
+	m.RenameCursor = 0
+}
+
+func (m *Model) updateArchiveConfirmation(key string) Action {
+	switch key {
+	case "stop-or-archive":
+		return m.stopOrArchive()
+	case "quit":
+		m.cancelArchiveConfirmation()
+		m.Status = "Archive cancelled"
 	}
 	return Action{}
 }
@@ -201,19 +240,21 @@ func (m *Model) stopOrArchive() Action {
 		return Action{}
 	}
 	if row.Capabilities.Stop {
-		m.archiveConfirm = ""
+		m.archiveConfirm = nil
 		return m.selected(ActionStop)
 	}
 	if !row.Capabilities.Archive {
 		m.Status = capabilityReason(row, "stop or archive")
 		return Action{}
 	}
-	if m.archiveConfirm != row.Key.String() {
-		m.archiveConfirm = row.Key.String()
+	if m.archiveConfirm == nil || *m.archiveConfirm != row.Key {
+		key := row.Key
+		m.archiveConfirm = &key
 		m.Status = "Press Ctrl+X again to archive"
 		return Action{}
 	}
-	m.archiveConfirm = ""
+	m.archiveConfirm = nil
+	m.Status = ""
 	return m.selected(ActionArchive)
 }
 
@@ -257,9 +298,6 @@ func (m Model) View(width, height int) string {
 		view = "all folders"
 	}
 	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", view), width), ""}
-	if m.Renaming {
-		header[1] = clipLine("Rename: "+renameCursor(m.RenameDraft, m.RenameCursor), width)
-	}
 	list := make([]displayLine, 0, len(m.Rows)+8)
 	groups := []struct {
 		title      string
@@ -279,10 +317,14 @@ func (m Model) View(width, height int) string {
 			if i == m.Selected {
 				cursor = ">"
 			}
-			if row.Key.String() == m.archiveConfirm {
+			if m.archiveConfirm != nil && row.Key == *m.archiveConfirm {
 				cursor = "x"
 			}
-			line := fmt.Sprintf("%s %-6s %-24.24s %-18.18s %-28.28s", cursor, row.Key.Provider, row.DisplayName(), row.Activity, shortHome(row.CWD))
+			name := row.DisplayName()
+			if m.Renaming && row.Key == m.RenameTarget {
+				name = renameCursorWindow(m.RenameDraft, m.RenameCursor, min(24, max(1, width-9)))
+			}
+			line := fmt.Sprintf("%s %-6s %-24.24s %-18.18s %-28.28s", cursor, row.Key.Provider, name, row.Activity, shortHome(row.CWD))
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		if shown {
@@ -295,8 +337,8 @@ func (m Model) View(width, height int) string {
 	}
 	footer := []string{
 		clipLine(fmt.Sprintf("%s%s > %s", m.Provider, unavailable, m.Prompt), width),
-		clipLine("Shift+Tab provider / Enter dispatch or attach / Ctrl+O open / Ctrl+A folders", width),
-		clipLine("↑↓ select / Ctrl+R rename / Ctrl+X stop or archive / Ctrl+L refresh / Esc quit", width),
+		clipLine("Shift+Tab provider / Enter send/open / Ctrl+S stash / Ctrl+O open", width),
+		clipLine("↑↓ / Ctrl+A folders / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
 	}
 	if m.Status != "" {
 		footer = append([]string{clipLine("! "+m.Status, width)}, footer...)
@@ -339,6 +381,29 @@ func renameCursor(value string, cursor int) string {
 	runes := []rune(value)
 	cursor = min(max(cursor, 0), len(runes))
 	return string(runes[:cursor]) + "_" + string(runes[cursor:])
+}
+
+func renameCursorWindow(value string, cursor, width int) string {
+	runes := []rune(value)
+	cursor = min(max(cursor, 0), len(runes))
+	start := max(0, cursor-max(0, width-1))
+	for start < cursor && lineCells(string(runes[start:cursor])) > width-1 {
+		start++
+	}
+	return clipLine(string(runes[start:cursor])+"_"+string(runes[cursor:]), width)
+}
+
+func lineCells(value string) int {
+	width := 0
+	for _, r := range value {
+		width += runeCells(r)
+	}
+	return width
+}
+
+func isTextInput(key string) bool {
+	runes := []rune(key)
+	return len(runes) == 1 && runes[0] >= 0x20 && runes[0] != 0x7f
 }
 
 func viewportStart(lines []displayLine, selected, height int) int {
