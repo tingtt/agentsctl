@@ -137,7 +137,7 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 		path = "claude"
 	}
 	cmd := exec.CommandContext(ctx, path, "attach", id)
-	child, err := creackpty.Start(cmd)
+	child, err := startClaudeAttachRaw(cmd)
 	if err != nil {
 		return err
 	}
@@ -194,6 +194,55 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 	}
 }
 
+// startClaudeAttachRaw is creackpty.StartWithSize(cmd, nil), except the
+// pty's slave side is switched to raw mode BEFORE the child process
+// starts rather than after.
+//
+// This closes a real startup race: creackpty.Start leaves the slave in
+// the kernel's default cooked mode (ISIG etc. enabled) until the child
+// process gets around to calling its own raw-mode setup. If the detach
+// byte (literal Ctrl+Z, 0x1a) arrives in that window, the kernel's line
+// discipline intercepts it as the VSUSP special character and raises
+// SIGTSTP instead of ever delivering it to the app as input -- verified
+// against the installed `claude` CLI: sending Ctrl+] immediately after
+// attach starts visibly echoes "^Z" into the client's output and the
+// client never exits, so the detach silently does nothing. Configuring
+// raw mode here, before fork/exec, means every byte -- no matter how
+// early it arrives -- is queued as literal data for the child to read
+// once it starts, never intercepted as a signal. The child's own
+// subsequent raw-mode call (every interactive `claude attach` session
+// makes one) is a harmless no-op once this has already run.
+func startClaudeAttachRaw(cmd *exec.Cmd) (*os.File, error) {
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = slave.Close() }()
+	if _, err := term.MakeRaw(int(slave.Fd())); err != nil {
+		_ = master.Close()
+		return nil, err
+	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setsid = true
+	cmd.SysProcAttr.Setctty = true
+	if cmd.Stdin == nil {
+		cmd.Stdin = slave
+	}
+	if cmd.Stdout == nil {
+		cmd.Stdout = slave
+	}
+	if cmd.Stderr == nil {
+		cmd.Stderr = slave
+	}
+	if err := cmd.Start(); err != nil {
+		_ = master.Close()
+		return nil, err
+	}
+	return master, nil
+}
+
 // detachClaudeClient ends only the `claude attach` client process; the
 // background session is owned and kept alive by Claude's native daemon
 // (verified with the installed CLI: `claude agents --json --all` shows the
@@ -207,6 +256,13 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 // to the client's process group are kept only as a fallback for a client
 // that does not consume the byte (e.g. mid some other input-owning submode),
 // never as the primary path.
+//
+// This byte-consumption behavior is only reachable at all because
+// AttachClaude starts the client via startClaudeAttachRaw, not a bare
+// creackpty.Start: without that, a detach sent early enough to race the
+// client's own raw-mode setup is intercepted by the kernel as SIGTSTP
+// before the client ever sees it as data. See startClaudeAttachRaw's doc
+// comment for how that was found and closed.
 func detachClaudeClient(ctx context.Context, cmd *exec.Cmd, child *os.File, wait <-chan error, timeout time.Duration) error {
 	if cmd.Process == nil {
 		return errors.New("Claude attach client did not start")

@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -75,6 +77,43 @@ func TestClaudeDetachFallsBackToSignalsWhenClientIgnoresControlZ(t *testing.T) {
 	time.Sleep(200 * time.Millisecond) // let `stty -isig` land before the byte is sent
 	if err := detachClaudeClient(context.Background(), cmd, child, wait, time.Second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestStartClaudeAttachRawDeliversByteSentDuringChildStartupWindow proves
+// the fix for a real race found against the installed `claude` CLI:
+// sending the detach byte (literal Ctrl+Z, 0x1a) immediately after attach
+// starts -- before the child has gotten around to putting its own tty
+// into raw mode -- used to be intercepted by the kernel's cooked-mode
+// line discipline as the VSUSP special character (visibly echoed back as
+// "^Z") and turned into SIGTSTP instead of ever reaching the app as
+// input, silently swallowing the detach. startClaudeAttachRaw closes that
+// window by putting the pty's slave side into raw mode before the child
+// process starts. This models that exact window with a child that
+// deliberately delays before touching its own terminal at all.
+func TestStartClaudeAttachRawDeliversByteSentDuringChildStartupWindow(t *testing.T) {
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "got")
+	cmd := exec.Command("sh", "-c", "sleep 0.3; dd bs=1 count=1 of='"+outPath+"' 2>/dev/null")
+	master, err := startClaudeAttachRaw(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	// Sent well before the child's 0.3s sleep elapses: squarely inside
+	// the window a not-yet-raw pty would still be in cooked mode.
+	if _, err := master.Write([]byte{0x1a}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != 0x1a {
+		t.Fatalf("byte sent during the child's startup window was not delivered as literal data: %v", got)
 	}
 }
 

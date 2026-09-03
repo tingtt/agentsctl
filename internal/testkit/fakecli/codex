@@ -24,7 +24,13 @@ def rpc():
         if method == "initialize": result = {"codexHome":str(home),"userAgent":"fake-codex"}
         elif method == "thread/list":
             archived = bool(params.get("archived", False))
-            result = {"data":[r for r in load() if bool(r.get("archived")) == archived],"nextCursor":None}
+            rows = [r for r in load() if bool(r.get("archived")) == archived]
+            limit = int(params.get("limit") or len(rows) or 1)
+            cursor = params.get("cursor")
+            start = int(cursor) if cursor else 0
+            page = rows[start:start+limit]
+            next_cursor = str(start+limit) if start+limit < len(rows) else None
+            result = {"data":page,"nextCursor":next_cursor}
         elif method in ("thread/archive","thread/unarchive","thread/name/set"):
             rows = load()
             for row in rows:

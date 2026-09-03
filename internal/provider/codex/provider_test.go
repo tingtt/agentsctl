@@ -2,7 +2,11 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -115,6 +119,52 @@ func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
 	}
 	if rows[1].Activity != session.ActivityIdle || rows[2].Activity != session.ActivityUnknown {
 		t.Fatalf("rows=%+v", rows)
+	}
+}
+
+// TestCatalogNeverReceivesDuplicateCodexKeys is the end-to-end guarantee:
+// a real CommandAppServer talking (over a real subprocess/JSON-RPC boundary)
+// to a fake codex CLI that reports the same thread ID twice must still
+// produce a session.Catalog with at most one row per session.Key.
+func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available for fake codex CLI")
+	}
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locate test source")
+	}
+	fakePath := filepath.Join(filepath.Dir(file), "..", "..", "testkit", "fakecli", "codex")
+	dir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", dir)
+	rows := []map[string]any{
+		{"id": "solo", "name": "solo", "cwd": "/work", "createdAt": 1, "updatedAt": 1, "status": map[string]any{"type": "idle"}, "archived": false},
+		{"id": "dup-thread", "name": "old-rollout", "cwd": "/work", "createdAt": 2, "updatedAt": 5, "status": map[string]any{"type": "idle"}, "archived": false},
+		{"id": "dup-thread", "name": "new-rollout", "cwd": "/work", "createdAt": 2, "updatedAt": 500, "status": map[string]any{"type": "idle"}, "archived": false},
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "codex.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	provider := &Provider{API: &CommandAppServer{Path: fakePath}, Store: store}
+	catalog := session.Catalog{Providers: []session.Provider{provider}}
+	snap := catalog.Load(context.Background(), session.Scope{CurrentDirectory: "/work", AllDirectories: true})
+	if snap.Warnings[session.ProviderCodex] != nil {
+		t.Fatalf("catalog warning: %v", snap.Warnings[session.ProviderCodex])
+	}
+	seen := map[session.Key]bool{}
+	for _, row := range snap.Sessions {
+		if seen[row.Key] {
+			t.Fatalf("duplicate session.Key %v reached the catalog: %+v", row.Key, snap.Sessions)
+		}
+		seen[row.Key] = true
+	}
+	if len(snap.Sessions) != 2 {
+		t.Fatalf("sessions=%+v, want 2 (solo + deduped dup-thread)", snap.Sessions)
 	}
 }
 

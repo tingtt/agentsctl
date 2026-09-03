@@ -228,6 +228,15 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 			return "", err
 		}
 		if next == 'O' {
+			// SS3-form keys (ESC O <letter>), not just the CSI form (ESC
+			// [ <letter>) handled below. This is not a hypothetical: the
+			// terminfo entry for TERM=xterm-256color (a common default,
+			// including on macOS terminals) declares kcub1/kcuf1/kcuu1/
+			// kcud1 (Left/Right/Up/Down) as \EOD/\EOC/\EOA/\EOB — the
+			// same SS3 family already handled here for khome/kend
+			// (\EOH/\EOF). Terminals that send arrows this way (e.g.
+			// when DECCKM/application-cursor-key mode is active) would
+			// otherwise have their Left/Right/Up/Down silently dropped.
 			final, err := r.ReadByte()
 			if err != nil {
 				return "", err
@@ -237,6 +246,14 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 				return "home", nil
 			case 'F':
 				return "end", nil
+			case 'A':
+				return "up", nil
+			case 'B':
+				return "down", nil
+			case 'C':
+				return "right", nil
+			case 'D':
+				return "left", nil
 			}
 			return "", nil
 		}

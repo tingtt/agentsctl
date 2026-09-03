@@ -16,6 +16,149 @@ import (
 	"golang.org/x/term"
 )
 
+// rowPrefix builds the expected "> [runner] [status] " prefix for a row so
+// tests don't hardcode raw icon/ANSI bytes.
+func rowPrefix(cursor string, provider session.ProviderID, activity session.Activity) string {
+	return cursor + " " + runnerIcon(provider) + " " + statusIcon(activity) + " "
+}
+
+// cellOffset returns the terminal-cell offset of substr's first byte
+// occurrence in line. Multi-byte glyphs (icons, Japanese titles) mean a
+// byte offset (strings.Index) is not the same as a cell offset, so
+// alignment assertions must go through this.
+func cellOffset(t *testing.T, line, substr string) int {
+	t.Helper()
+	byteIdx := strings.Index(line, substr)
+	if byteIdx < 0 {
+		t.Fatalf("substring %q not found in %q", substr, line)
+	}
+	cells := 0
+	for _, r := range line[:byteIdx] {
+		cells += runeCells(r)
+	}
+	return cells
+}
+
+func rowLine(t *testing.T, view string, rowIndex int) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
+	// Line 0 is the header; row rendering starts at line 1 for a single
+	// ungrouped/"Other" section (no rows are pinned in these fixtures, so
+	// there's no "Pinned"/"Other" heading before the first row here).
+	if rowIndex >= len(lines) {
+		t.Fatalf("view has only %d lines, want row %d\n%s", len(lines), rowIndex, view)
+	}
+	return lines[rowIndex]
+}
+
+func TestFullwidthTitleDoesNotShiftStatusOrCWDColumns(t *testing.T) {
+	cwd := "/work/project"
+	rows := []session.Session{
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "short", Activity: session.ActivityIdle, CWD: cwd},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "日本語のタイトル", Activity: session.ActivityWorking, CWD: cwd},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "mix 混在 title", Activity: session.ActivityFailed, CWD: cwd},
+	}
+	m := NewModel()
+	m.SetRows(rows)
+	view := m.View(80, 12)
+	// Lines: 0="agentsctl · ...", 1="" (header blank), 2="Other" heading,
+	// 3.. = rows (none of these rows are pinned).
+	var offsets []int
+	for i := range rows {
+		line := rowLine(t, view, i+3)
+		offsets = append(offsets, cellOffset(t, line, "project"))
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] != offsets[0] {
+			t.Fatalf("cwd column shifted: offsets=%v\n%s", offsets, view)
+		}
+	}
+}
+
+func TestShortHomeExpandsHomeDirectory(t *testing.T) {
+	home := "/Users/foo"
+	cases := []struct {
+		path string
+		want string
+	}{
+		{path: "/Users/foo", want: "~"},
+		{path: "/Users/foo/", want: "~"},
+		{path: "/Users/foo/ghq/github.com/tingtt/agentsctl", want: "~/ghq/github.com/tingtt/agentsctl"},
+		{path: "/Users/foobar", want: "/Users/foobar"},        // sibling dir, not HOME
+		{path: "/Users/foobar/ghq", want: "/Users/foobar/ghq"}, // sibling dir subpath
+		{path: "/var/tmp", want: "/var/tmp"},
+	}
+	for _, tc := range cases {
+		if got := shortenHome(tc.path, home); got != tc.want {
+			t.Fatalf("shortenHome(%q, %q)=%q, want %q", tc.path, home, got, tc.want)
+		}
+	}
+}
+
+func TestTruncateLeftCellsKeepsTailVisible(t *testing.T) {
+	long := "~/ghq/github.com/tingtt/agentsctl"
+	got := truncateLeftCells(long, 19)
+	if !strings.HasSuffix(got, "tingtt/agentsctl") {
+		t.Fatalf("truncated=%q lost the tail directory", got)
+	}
+	if !strings.HasPrefix(got, "…") {
+		t.Fatalf("truncated=%q missing left ellipsis", got)
+	}
+	if lineCells(got) > 19 {
+		t.Fatalf("truncated=%q exceeds width", got)
+	}
+	if lineCells(truncateLeftCells("short", 19)) != len("short") {
+		t.Fatalf("short value should not be altered")
+	}
+}
+
+func TestRunnerAndStatusIconsAreSingleTerminalCell(t *testing.T) {
+	for _, provider := range []session.ProviderID{session.ProviderClaude, session.ProviderCodex} {
+		if cells := lineCells(runnerIcon(provider)); cells != 1 {
+			t.Fatalf("runner icon for %s is %d cells, want 1", provider, cells)
+		}
+	}
+	activities := []session.Activity{
+		session.ActivityIdle, session.ActivityCompleted, session.ActivityFailed, session.ActivityStarting,
+		session.ActivityWorking, session.ActivityNeedsInput, session.ActivityWaitingQuota, session.ActivityUnknown,
+	}
+	for _, activity := range activities {
+		if cells := lineCells(statusIcon(activity)); cells != 1 {
+			t.Fatalf("status icon for %s is %d cells, want 1", activity, cells)
+		}
+	}
+}
+
+func TestANSIStyleIsNotCountedAsVisibleWidth(t *testing.T) {
+	styled := ansiColor("A", colorRed)
+	if cells := lineCells(styled); cells != 1 {
+		t.Fatalf("styled glyph reported as %d cells, want 1: %q", cells, styled)
+	}
+	// Clipping to width 1 must keep the whole styled glyph (escape bytes
+	// are zero-width), not truncate mid-escape-sequence.
+	clipped := clipLine(styled, 1)
+	if clipped != styled {
+		t.Fatalf("clipLine mangled styled glyph: got %q, want %q", clipped, styled)
+	}
+	// Clipping to width 0 must drop the glyph but is not required to keep
+	// the escape bytes.
+	if cells := lineCells(clipLine(styled, 0)); cells != 0 {
+		t.Fatalf("clipLine(width=0) left visible width: %q", clipLine(styled, 0))
+	}
+	padded := fitCells(styled, 5)
+	if lineCells(padded) != 5 {
+		t.Fatalf("fitCells did not pad styled content to width: %q (%d cells)", padded, lineCells(padded))
+	}
+}
+
+func TestCursorWindowStylesJapaneseGlyphAtCursor(t *testing.T) {
+	got := cursorWindow("あiう", 1, 20) // cursor sits on the ASCII "i"
+	want := "あ" + cursorStyle("i") + "う"
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("got=%q, want prefix %q", got, want)
+	}
+}
+
 func TestPromptStashSwapsAndPreservesOverviewState(t *testing.T) {
 	selected := session.Key{Provider: session.ProviderCodex, ID: "selected"}
 	cases := []struct {
@@ -87,7 +230,7 @@ func TestComposerCursorEditingUsesRunes(t *testing.T) {
 	if m.Prompt != "X" || m.PromptCursor != 1 {
 		t.Fatalf("prompt=%q cursor=%d", m.Prompt, m.PromptCursor)
 	}
-	if view := m.View(40, 8); !strings.Contains(view, "claude > X_") {
+	if view := m.View(40, 8); !strings.Contains(view, "claude > X"+cursorStyle(" ")) {
 		t.Fatalf("composer cursor is not visible:\n%s", view)
 	}
 }
@@ -127,8 +270,12 @@ func TestPinnedAndOtherRenderInNavigationOrder(t *testing.T) {
 	})
 	view := m.View(80, 16)
 	positions := []int{
-		strings.Index(view, "Pinned"), strings.Index(view, "> claude A"), strings.Index(view, "codex  B"),
-		strings.Index(view, "Other"), strings.Index(view, "claude C"), strings.Index(view, "codex  D"),
+		strings.Index(view, "Pinned"),
+		strings.Index(view, rowPrefix(">", session.ProviderClaude, "")+"A"),
+		strings.Index(view, rowPrefix(" ", session.ProviderCodex, "")+"B"),
+		strings.Index(view, "Other"),
+		strings.Index(view, rowPrefix(" ", session.ProviderClaude, "")+"C"),
+		strings.Index(view, rowPrefix(" ", session.ProviderCodex, "")+"D"),
 	}
 	for i, position := range positions {
 		if position < 0 || i > 0 && position <= positions[i-1] {
@@ -168,7 +315,7 @@ func TestViewIsBoundedAndKeepsSelectionVisible(t *testing.T) {
 	if lines := strings.Count(view, "\n"); lines != 16 {
 		t.Fatalf("lines=%d", lines)
 	}
-	if !strings.Contains(view, "> codex  session-080") {
+	if !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)+"session-080") {
 		t.Fatalf("selected row is outside viewport:\n%s", view)
 	}
 	if strings.Contains(view, "session-000") {
@@ -308,7 +455,8 @@ func TestInlineRenameRendersEditorInsideSelectedNameCell(t *testing.T) {
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "old", Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
 	m.Update("rename")
 	view := m.View(80, 12)
-	if !strings.Contains(view, "> codex  old_") || strings.Contains(view, "Rename:") {
+	wantEditor := rowPrefix(">", session.ProviderCodex, session.ActivityIdle) + "old" + cursorStyle(" ")
+	if !strings.Contains(view, wantEditor) || strings.Contains(view, "Rename:") {
 		t.Fatalf("rename editor is not in row name cell:\n%s", view)
 	}
 }
@@ -318,7 +466,7 @@ func TestNarrowInlineRenameKeepsRowAndCursorVisible(t *testing.T) {
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: strings.Repeat("n", 40), Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
 	m.Update("rename")
 	view := m.View(24, 10)
-	if !strings.Contains(view, "> codex") || !strings.Contains(view, "_") {
+	if !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)) || !strings.Contains(view, "\x1b[30;47m") {
 		t.Fatalf("narrow rename lost selected row or cursor:\n%s", view)
 	}
 }
@@ -393,6 +541,30 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 			if err != nil || next != "X" {
 				t.Fatalf("input=%q trailing key=%q err=%v", tc.input, next, err)
 			}
+		}
+	}
+}
+
+// TestReadKeySupportsSS3ArrowAndHomeEndSequences covers the ESC O <letter>
+// (SS3) key encoding, not just the ESC [ <letter> (CSI) form covered by
+// TestReadKeyConsumesLegacyAndUnknownSequencesAtomically. This form is not
+// hypothetical: `infocmp` for TERM=xterm-256color (a common default,
+// including on macOS terminals) declares kcub1/kcuf1/kcuu1/kcud1
+// (Left/Right/Up/Down) as \EOD/\EOC/\EOA/\EOB.
+func TestReadKeySupportsSS3ArrowAndHomeEndSequences(t *testing.T) {
+	cases := []struct{ input, want string }{
+		{"\x1bOD", "left"},
+		{"\x1bOC", "right"},
+		{"\x1bOA", "up"},
+		{"\x1bOB", "down"},
+		{"\x1bOH", "home"},
+		{"\x1bOF", "end"},
+	}
+	for _, tc := range cases {
+		r := bufio.NewReader(strings.NewReader(tc.input))
+		got, err := readKey(r)
+		if err != nil || got != tc.want {
+			t.Fatalf("input=%q got=%q want=%q err=%v", tc.input, got, tc.want, err)
 		}
 	}
 }
@@ -524,7 +696,7 @@ func TestViewKeepsFooterComposerSelectionAndErrorWithinNarrowViewport(t *testing
 				t.Fatalf("count=%d missing %q\n%s", count, text, view)
 			}
 		}
-		if count > 0 && !strings.Contains(view, "> codex") {
+		if count > 0 && !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)) {
 			t.Fatalf("count=%d selected row not visible\n%s", count, view)
 		}
 	}

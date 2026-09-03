@@ -81,7 +81,8 @@ func (c *CommandAppServer) withClient(ctx context.Context, fn func(*rpcClient) e
 }
 
 func (c *CommandAppServer) List(ctx context.Context, archived bool) ([]Thread, error) {
-	var rows []Thread
+	var order []string
+	byID := map[string]Thread{}
 	err := c.withClient(ctx, func(cl *rpcClient) error {
 		var cursor *string
 		seen := map[string]bool{}
@@ -97,7 +98,9 @@ func (c *CommandAppServer) List(ctx context.Context, archived bool) ([]Thread, e
 			if err := cl.call(ctx, "thread/list", params, &res); err != nil {
 				return err
 			}
-			rows = append(rows, res.Data...)
+			for _, t := range res.Data {
+				mergeThread(byID, &order, t)
+			}
 			if res.Next == nil || *res.Next == "" {
 				return nil
 			}
@@ -108,7 +111,34 @@ func (c *CommandAppServer) List(ctx context.Context, archived bool) ([]Thread, e
 			cursor = res.Next
 		}
 	})
-	return rows, err
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]Thread, 0, len(order))
+	for _, id := range order {
+		rows = append(rows, byID[id])
+	}
+	return rows, nil
+}
+
+// mergeThread keeps at most one Thread per ID. The installed codex CLI's
+// app-server has been observed (via its real thread/list response) to
+// report the same thread ID twice within a single page, with different
+// UpdatedAt/path values, when a session was resumed into a new rollout
+// file under the same thread ID. Duplicates are also merged across pages
+// since a thread can in principle straddle a page boundary. The row with
+// the newest UpdatedAt wins, so the result is deterministic regardless of
+// which copy the app-server happened to list first.
+func mergeThread(byID map[string]Thread, order *[]string, t Thread) {
+	existing, ok := byID[t.ID]
+	if !ok {
+		byID[t.ID] = t
+		*order = append(*order, t.ID)
+		return
+	}
+	if t.UpdatedAt > existing.UpdatedAt {
+		byID[t.ID] = t
+	}
 }
 func (c *CommandAppServer) Rename(ctx context.Context, id, name string) error {
 	return c.withClient(ctx, func(cl *rpcClient) error {
