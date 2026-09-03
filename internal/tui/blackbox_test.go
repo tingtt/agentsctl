@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/creack/pty"
+	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/state"
 	"github.com/tingtt/agentsctl/internal/supervisor"
 	"golang.org/x/sys/unix"
@@ -364,25 +365,25 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, "\x1b[D\x1b[D\x1b[D") // left x3
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-"+cursorStyle("0")+"99")
+		return strings.Contains(frame, "Xession-"+coloredCursorSuffix(session.ProviderCodex, "0", "99"))
 	}); err != nil {
 		t.Fatalf("left arrow did not move the rename cursor: %v", err)
 	}
 	writePTY(t, terminal, "Z")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-Z"+cursorStyle("0")+"99")
+		return strings.Contains(frame, "Xession-Z"+coloredCursorSuffix(session.ProviderCodex, "0", "99"))
 	}); err != nil {
 		t.Fatalf("mid-rename insert failed: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[C") // right
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-Z0"+cursorStyle("9")+"9")
+		return strings.Contains(frame, "Xession-Z0"+coloredCursorSuffix(session.ProviderCodex, "9", "9"))
 	}); err != nil {
 		t.Fatalf("right arrow did not move the rename cursor: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[H") // home
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, cursorStyle("X")+"ession-Z099")
+		return strings.Contains(frame, coloredCursorSuffix(session.ProviderCodex, "X", "ession-Z099"))
 	}); err != nil {
 		t.Fatalf("home did not move the rename cursor to the start: %v", err)
 	}
@@ -627,9 +628,12 @@ func assertScreen(t *testing.T, output string, width, height int, required ...st
 		if cells > width {
 			t.Fatalf("screen row exceeds width %d: %q", width, line)
 		}
-		// Row layout is "> [runner] [status] title...": the title always
-		// starts at cell 6 regardless of which provider's icon precedes it.
-		if cells := cellIndex(line, "session-"); cells >= 0 && cells != 6 {
+		// Row layout is "> [status] title...": the title always starts at
+		// cell 4 (cursor, separator, status, separator) regardless of
+		// provider — there is no runner-glyph column, and provider is
+		// conveyed only by the title's color, which emulateANSIScreen has
+		// already stripped down to visible glyphs by this point.
+		if cells := cellIndex(line, "session-"); cells >= 0 && cells != 4 {
 			t.Fatalf("session row did not start at the shared column: %q", line)
 		}
 	}

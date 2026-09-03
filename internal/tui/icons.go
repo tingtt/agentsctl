@@ -2,44 +2,40 @@ package tui
 
 import "github.com/tingtt/agentsctl/internal/session"
 
-// Nerd Font glyphs used for the runner column. Both are classic Font
-// Awesome codepoints (present in essentially every Nerd Font variant,
-// including the minimal/mono builds) so they render even without a
-// "complete" Nerd Font install. Neither codepoint falls inside any of the
-// wide ranges runeCells recognizes, so each occupies exactly one terminal
-// cell, matching the Nerd Font convention of patching icons onto
-// otherwise-unassigned narrow codepoints.
+// ANSI SGR color codes used by the status icon mapping below.
 const (
-	glyphClaude = "" // nf-fa-magic
-	glyphCodex  = "" // nf-fa-terminal
-)
-
-// ANSI SGR color codes shared by the runner and status icon mappings below.
-const (
-	colorYellow  = "33"
-	colorGray    = "90"
-	colorRed     = "31"
-	colorBlue    = "34"
-	colorGreen   = "32"
-	colorMagenta = "35"
-	colorCyan    = "36"
+	colorYellow = "33"
+	colorGray   = "90"
+	colorRed    = "31"
+	colorBlue   = "34"
+	colorGreen  = "32"
 )
 
 func ansiColor(glyph, code string) string {
 	return "\x1b[" + code + "m" + glyph + "\x1b[0m"
 }
 
-// runnerIcon is the single centralized mapping from provider to its
-// one-cell colored glyph. Row rendering must never spell out "claude" or
-// "codex" as text; this is the only place that maps provider to glyph.
-func runnerIcon(provider session.ProviderID) string {
+// providerColorClaude and providerColorCodex are the fixed 24-bit ANSI
+// truecolor foreground escapes used to color session titles, so a
+// provider is distinguishable without a Nerd Font runner glyph.
+const (
+	providerColorClaude = "\x1b[38;2;217;119;87m" // #D97757
+	providerColorCodex  = "\x1b[38;2;83;104;235m"  // #5368EB
+)
+
+// providerTitleColor is the single centralized mapping from provider to
+// the ANSI truecolor escape used for its session titles. Row rendering
+// must never spell out "claude" or "codex" as text or a glyph to convey
+// provider identity in the overview list; this is the only place that
+// maps provider to color.
+func providerTitleColor(provider session.ProviderID) string {
 	switch provider {
 	case session.ProviderClaude:
-		return ansiColor(glyphClaude, colorMagenta)
+		return providerColorClaude
 	case session.ProviderCodex:
-		return ansiColor(glyphCodex, colorCyan)
+		return providerColorCodex
 	default:
-		return "?"
+		return ""
 	}
 }
 

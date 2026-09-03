@@ -40,6 +40,7 @@ type Model struct {
 	Rows           []session.Session
 	Selected       int
 	AllDirectories bool
+	CWDDepth       int
 	Status         string
 	Warnings       map[session.ProviderID]error
 	RenameDraft    string
@@ -50,13 +51,33 @@ type Model struct {
 	archiveConfirm *session.Key
 }
 
+// CWDDepthAll is the sentinel Model.CWDDepth value selecting the "all"
+// directory-depth display mode (the shortHome-abbreviated full path,
+// rather than a fixed number of trailing path components).
+const CWDDepthAll = 0
+
+// nextCWDDepth cycles the directory-depth display mode: 1 -> 2 -> 3 ->
+// all -> 1.
+func nextCWDDepth(depth int) int {
+	switch depth {
+	case 1:
+		return 2
+	case 2:
+		return 3
+	case 3:
+		return CWDDepthAll
+	default:
+		return 1
+	}
+}
+
 type displayLine struct {
 	text     string
 	rowIndex int
 }
 
 func NewModel() Model {
-	return Model{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}}
+	return Model{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, CWDDepth: 2}
 }
 func (m *Model) SetRows(rows []session.Session) {
 	if m.archiveConfirm != nil {
@@ -85,6 +106,30 @@ func (m *Model) SetRows(rows []session.Session) {
 	}
 	if m.Selected >= len(rows) {
 		m.Selected = max(0, len(rows)-1)
+	}
+}
+
+// ApplyPin updates the pinned state of the row identified by key within
+// the Model's current rows, re-sorts them with the same ordering Catalog
+// uses (session.SortOverview), and moves the selection to key's new
+// position. Pin/unpin is a local-only operation — it must never require a
+// provider List refresh to reflect the new Pinned/Other grouping, so
+// callers apply it directly to whatever rows the Model already holds
+// rather than reloading the catalog.
+func (m *Model) ApplyPin(key session.Key, pinned bool) {
+	rows := append([]session.Session(nil), m.Rows...)
+	for i := range rows {
+		if rows[i].Key == key {
+			rows[i].Pinned = pinned
+		}
+	}
+	session.SortOverview(rows)
+	m.Rows = rows
+	for i := range rows {
+		if rows[i].Key == key {
+			m.Selected = i
+			return
+		}
 	}
 }
 func (m *Model) Update(key string) Action {
@@ -182,6 +227,14 @@ func (m *Model) Update(key string) Action {
 		return Action{}
 	case "pin":
 		return m.selected(ActionPin)
+	case "depth-cycle":
+		m.CWDDepth = nextCWDDepth(m.CWDDepth)
+		if m.CWDDepth == CWDDepthAll {
+			m.Status = "Directory depth: all"
+		} else {
+			m.Status = fmt.Sprintf("Directory depth: %d", m.CWDDepth)
+		}
+		return Action{}
 	case "refresh":
 		return Action{Kind: ActionRefresh}
 	case "quit":
@@ -361,10 +414,12 @@ func (m Model) View(width, height int) string {
 			if m.archiveConfirm != nil && row.Key == *m.archiveConfirm {
 				cursor = "x"
 			}
-			// Layout: "> [runner] [status] title  cwd", all fixed-width
-			// columns computed in terminal cells (never rune counts or
-			// byte lengths) so full-width titles never shift status/cwd.
-			const fixedCells = 1 /* cursor */ + 1 /* runner */ + 1 /* status */ + 4 /* four single-space separators */
+			// Layout: "> [status] title  cwd", all fixed-width columns
+			// computed in terminal cells (never rune counts or byte
+			// lengths) so full-width titles never shift status/cwd. The
+			// provider is conveyed by the title's color, not a runner
+			// glyph column, so there is no dedicated runner cell here.
+			const fixedCells = 1 /* cursor */ + 1 /* status */ + 3 /* three single-space separators */
 			titleWidth, cwdWidth := splitRemainingWidth(width - fixedCells)
 			var name string
 			if m.Renaming && row.Key == m.RenameTarget {
@@ -372,8 +427,9 @@ func (m Model) View(width, height int) string {
 			} else {
 				name = fitCells(row.DisplayName(), titleWidth)
 			}
-			cwd := fitCells(truncateLeftCells(shortHome(row.CWD), cwdWidth), cwdWidth)
-			line := cursor + " " + runnerIcon(row.Key.Provider) + " " + statusIcon(row.Activity) + " " + name + " " + cwd
+			name = colorizeTitle(providerTitleColor(row.Key.Provider), name)
+			cwd := fitCells(truncateLeftCells(displayCWD(row.CWD, m.CWDDepth), cwdWidth), cwdWidth)
+			line := cursor + " " + statusIcon(row.Activity) + " " + name + " " + cwd
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		if shown {
@@ -387,7 +443,7 @@ func (m Model) View(width, height int) string {
 	promptPrefix := fmt.Sprintf("%s%s > ", m.Provider, unavailable)
 	footer := []string{
 		clipLine(promptPrefix+cursorWindow(m.Prompt, m.PromptCursor, max(1, width-lineCells(promptPrefix))), width),
-		clipLine("Shift+Tab provider / Enter send/open / Ctrl+S stash / Ctrl+O open / Ctrl+T pin", width),
+		clipLine("Shift+Tab / Enter send/open / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
 		clipLine("↑↓ / Ctrl+A folders / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
 	}
 	if m.Status != "" {
@@ -464,18 +520,25 @@ func cursorWindow(value string, cursor, width int) string {
 }
 
 // splitRemainingWidth divides the space left after the fixed cursor/
-// runner/status columns between the session title and the CWD, giving
-// CWD the majority so its meaningful tail stays readable.
+// status columns between the session title and the CWD. The CWD default
+// (directory depth 2, e.g. "owner/repository") is short, so the title
+// gets the majority share; the CWD floor still keeps a couple of trailing
+// path components readable even in a narrow terminal.
 func splitRemainingWidth(remaining int) (title, cwd int) {
 	if remaining < 0 {
 		remaining = 0
 	}
-	const maxTitle = 32
-	title = remaining / 2
+	const maxTitle = 48
+	const minCWD = 12
+	title = remaining * 3 / 5
 	if title > maxTitle {
 		title = maxTitle
 	}
 	cwd = remaining - title
+	if cwd < minCWD {
+		cwd = min(minCWD, remaining)
+		title = remaining - cwd
+	}
 	return title, cwd
 }
 
@@ -492,6 +555,65 @@ func padCells(value string, width int) string {
 		return value + strings.Repeat(" ", pad)
 	}
 	return value
+}
+
+// colorizeTitle wraps text in an ANSI truecolor foreground escape so the
+// provider is distinguishable by title color instead of a runner glyph.
+// text may already contain an embedded cursorStyle segment (used for the
+// rename editor and, at end-of-title, the trailing cursor cell); that
+// segment closes with its own "\x1b[0m" reset, which would otherwise wipe
+// the color for anything after it, so color is re-opened immediately
+// after every embedded reset before the whole thing is closed with a
+// final reset. skipANSI/lineCells treat all of this as zero-width, so it
+// never affects column alignment.
+func colorizeTitle(color, text string) string {
+	if color == "" {
+		return text
+	}
+	reopened := strings.ReplaceAll(text, "\x1b[0m", "\x1b[0m"+color)
+	return color + reopened + "\x1b[0m"
+}
+
+// displayCWD renders row's working directory per the active directory-
+// depth mode: depth 1-3 show that many trailing path components (HOME is
+// never counted as a component); CWDDepthAll shows the shortHome-
+// abbreviated full path, matching the pre-existing behavior.
+func displayCWD(path string, depth int) string {
+	if depth == CWDDepthAll {
+		return shortHome(path)
+	}
+	home, _ := os.UserHomeDir()
+	return trailingComponents(path, home, depth)
+}
+
+// trailingComponents returns the last n path components of path (HOME
+// stripped and not counted as a component). If path has n or fewer
+// components, all of them are returned unchanged — no "/" or "…" is
+// forced in. A path equal to HOME itself has zero components and renders
+// as "~". Split out from displayCWD, mirroring shortHome/shortenHome,
+// so tests can exercise it with a fixed home instead of the process's
+// real one.
+func trailingComponents(path, home string, n int) string {
+	rel := filepath.Clean(path)
+	if home != "" {
+		home = filepath.Clean(home)
+		if rel == home {
+			return "~"
+		}
+		if strings.HasPrefix(rel, home+string(filepath.Separator)) {
+			rel = rel[len(home)+1:]
+		}
+	}
+	var parts []string
+	for _, p := range strings.Split(rel, string(filepath.Separator)) {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) > n {
+		parts = parts[len(parts)-n:]
+	}
+	return strings.Join(parts, "/")
 }
 
 // shortHome renders path with the user's home directory abbreviated to
