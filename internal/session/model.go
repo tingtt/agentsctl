@@ -55,7 +55,9 @@ type Session struct {
 	Name         string       `json:"name"`
 	Summary      string       `json:"summary"`
 	CWD          string       `json:"cwd"`
+	CreatedAt    time.Time    `json:"createdAt"`
 	UpdatedAt    time.Time    `json:"updatedAt"`
+	Pinned       bool         `json:"pinned"`
 	Activity     Activity     `json:"activity"`
 	Runtime      Runtime      `json:"runtime"`
 	Archived     bool         `json:"archived"`

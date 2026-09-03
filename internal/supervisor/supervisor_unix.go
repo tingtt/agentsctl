@@ -51,8 +51,8 @@ type Response struct {
 	Output           string     `json:"output,omitempty"`
 }
 
-const ProtocolVersion = 1
-const BuildVersion = "mvp-2026-09-03"
+const ProtocolVersion = 2
+const BuildVersion = "session-lifecycle-2026-09-03"
 
 type process struct {
 	run         state.Run
@@ -337,9 +337,9 @@ func (s *Server) attach(c net.Conn, id string) {
 		case protocol.Input:
 			_, _ = p.ptmx.Write(b)
 		case protocol.Resize:
-			var sz struct{ Rows, Cols uint16 }
+			var sz protocol.TerminalSize
 			if json.Unmarshal(b, &sz) == nil {
-				_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: sz.Rows, Cols: sz.Cols})
+				syncPTYSize(p, sz)
 			}
 		case protocol.Detach:
 			return
@@ -350,6 +350,49 @@ func (s *Server) attach(c net.Conn, id string) {
 		default:
 		}
 	}
+}
+
+// syncPTYSize applies the client's terminal size to the managed PTY and, on
+// reattach (Redraw requested, size unchanged from before), forces the child
+// to repaint.
+//
+// A manually raised SIGWINCH with no underlying size change (tried first)
+// was verified against the installed Codex CLI to NOT be sufficient: Codex's
+// resize handling re-reads the PTY size on the signal and skips repainting
+// when it finds no difference from what it already has cached, so the
+// attaching client is left staring at whatever was on screen before it
+// connected (nothing, since a new subscriber gets no scrollback replay --
+// see attach() below) until the child happens to repaint on its own. A real
+// TIOCSWINSZ size change, by contrast, makes the kernel deliver SIGWINCH on
+// its own, and Codex's own verified behavior is to always repaint when the
+// size genuinely changes. So on a same-size reattach this bounces the PTY to
+// a harmless alternate size and immediately back: two genuine size changes,
+// landing back at the real terminal size, each a real kernel-delivered
+// SIGWINCH rather than a synthetic one Codex can decide to ignore.
+//
+// The two Setsize calls are separated by a short sleep. SIGWINCH is a
+// standard (non-realtime) signal: POSIX does not queue repeat occurrences,
+// so if both size changes land before the child is scheduled to handle the
+// first signal, the kernel coalesces them into one delivery and the child
+// observes only the final size -- identical to what it already had, so it
+// correctly (from its own honest, verified redraw-on-real-change behavior)
+// does not repaint. This was verified directly: without the delay, a test
+// child modeling Codex's real resize-diffing behavior never saw the bounce.
+func syncPTYSize(p *process, size protocol.TerminalSize) {
+	if size.Rows == 0 || size.Cols == 0 {
+		return
+	}
+	current, err := pty.GetsizeFull(p.ptmx)
+	unchanged := err == nil && current.Rows == size.Rows && current.Cols == size.Cols
+	if unchanged && size.Redraw {
+		bounce := size.Rows - 1
+		if bounce == 0 {
+			bounce = size.Rows + 1
+		}
+		_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: bounce, Cols: size.Cols})
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: size.Rows, Cols: size.Cols})
 }
 func (s *Server) stop(c net.Conn, id string) {
 	s.mu.RLock()

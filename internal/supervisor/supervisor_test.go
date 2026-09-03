@@ -19,6 +19,7 @@ import (
 	processinfo "github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/protocol"
 	"github.com/tingtt/agentsctl/internal/state"
+	"golang.org/x/term"
 )
 
 func TestDetachDoesNotStopManagedChild(t *testing.T) {
@@ -315,6 +316,114 @@ func waitForSocket(t *testing.T, socket string, done <-chan error) {
 func TestSupervisorPTYHelper(t *testing.T) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
+	}
+}
+
+// TestSupervisorPTYSignalHelper is a child process fixture (never run as a
+// test on its own) modeling the installed Codex CLI's verified resize
+// behavior: on SIGWINCH it re-reads the PTY size and only repaints
+// ("WINCH\n" to stdout here) when that size actually differs from what it
+// last saw, exactly as observed by attaching a live Codex session, changing
+// nothing, and finding it does not repaint. A signal raised without a real
+// size change (the naive fix this replaces) is therefore invisible to this
+// helper, same as it was to real Codex -- only a genuine TIOCSWINSZ change
+// makes it print.
+func TestSupervisorPTYSignalHelper(t *testing.T) {
+	winch := make(chan os.Signal, 8)
+	signal.Notify(winch, syscall.SIGWINCH)
+	lastCols, lastRows, _ := term.GetSize(int(os.Stdin.Fd()))
+	go func() {
+		for range winch {
+			cols, rows, err := term.GetSize(int(os.Stdin.Fd()))
+			if err == nil && (cols != lastCols || rows != lastRows) {
+				lastCols, lastRows = cols, rows
+				os.Stdout.WriteString("WINCH\n")
+			}
+		}
+	}()
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+	}
+}
+
+// TestReattachForcesRedrawEvenWhenSizeIsUnchanged fixes the root cause of the
+// Codex reattach redraw bug: a manually raised SIGWINCH with no underlying
+// PTY size change was verified against the installed Codex CLI to not
+// reliably cause a repaint (Codex re-reads the size on the signal and skips
+// redrawing when it sees no difference). syncPTYSize must instead bounce the
+// PTY to a harmless alternate size and back, producing a genuine
+// kernel-delivered SIGWINCH the child cannot distinguish from a real resize.
+// This drives a real child through that exact path (same size, Redraw
+// requested, as happens on reattach) and asserts the child actually
+// receives a SIGWINCH.
+func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	st := state.New(filepath.Join(dir, "state.json"))
+	srv := &Server{Store: st, runs: map[string]*process{}}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.ResolveExecutable = func(string) (string, error) { return exe, nil }
+	res := callServer(t, srv, Request{Action: "start", RunID: "r", SessionID: "thread", Args: []string{"-test.run=TestSupervisorPTYSignalHelper"}, Provider: "codex", CWD: dir})
+	if !res.OK && strings.Contains(res.Error, "operation not permitted") {
+		t.Skip("sandbox does not permit PTY process spawn")
+	}
+	if !res.OK {
+		t.Fatal(res.Error)
+	}
+
+	p := srv.runs["r"]
+	if p == nil {
+		t.Fatal("run not tracked")
+	}
+	// The production drain() goroutine is the only reader of p.ptmx (a second
+	// direct reader would race it for bytes), so observe output the same way
+	// a real attach does: through a subscriber channel fed by that broadcast.
+	sub := make(chan []byte, 64)
+	p.mu.Lock()
+	p.subscribers[sub] = struct{}{}
+	p.mu.Unlock()
+	defer func() { p.mu.Lock(); delete(p.subscribers, sub); p.mu.Unlock() }()
+
+	// Establish a known starting size (mirrors the real attach flow, which
+	// sends a Resize frame on connect) before exercising the same-size
+	// reattach path below, and let the helper's signal.Notify land.
+	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
+	drainSubscriberFor(sub, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
+
+	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
+	requireSubscriberContains(t, sub, "WINCH", 2*time.Second)
+}
+
+func drainSubscriberFor(sub <-chan []byte, d time.Duration) {
+	deadline := time.After(d)
+	for {
+		select {
+		case <-sub:
+		case <-deadline:
+			return
+		}
+	}
+}
+
+func requireSubscriberContains(t *testing.T, sub <-chan []byte, want string, timeout time.Duration) {
+	t.Helper()
+	var collected []byte
+	deadline := time.After(timeout)
+	for {
+		select {
+		case chunk, ok := <-sub:
+			if !ok {
+				t.Fatalf("subscriber channel closed before seeing %q, got %q", want, collected)
+			}
+			collected = append(collected, chunk...)
+			if strings.Contains(string(collected), want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("expected output to contain %q, got %q", want, collected)
+		}
 	}
 }
 

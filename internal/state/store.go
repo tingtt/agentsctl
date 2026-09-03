@@ -29,6 +29,7 @@ type Run struct {
 
 type Data struct {
 	ClaudeArchived map[string]bool `json:"claudeArchived,omitempty"`
+	Pinned         map[string]bool `json:"pinned,omitempty"`
 	Runs           map[string]Run  `json:"runs,omitempty"`
 	Provider       string          `json:"provider,omitempty"`
 }
@@ -70,6 +71,9 @@ func (s *Store) Update(fn func(*Data) error) error {
 	if d.ClaudeArchived == nil {
 		d.ClaudeArchived = map[string]bool{}
 	}
+	if d.Pinned == nil {
+		d.Pinned = map[string]bool{}
+	}
 	if d.Runs == nil {
 		d.Runs = map[string]Run{}
 	}
@@ -92,7 +96,7 @@ func (s *Store) lock(mode int) (func(), error) {
 }
 
 func (s *Store) load() (Data, error) {
-	d := Data{ClaudeArchived: map[string]bool{}, Runs: map[string]Run{}}
+	d := Data{ClaudeArchived: map[string]bool{}, Pinned: map[string]bool{}, Runs: map[string]Run{}}
 	b, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return d, nil
@@ -106,10 +110,41 @@ func (s *Store) load() (Data, error) {
 	if d.ClaudeArchived == nil {
 		d.ClaudeArchived = map[string]bool{}
 	}
+	if d.Pinned == nil {
+		d.Pinned = map[string]bool{}
+	}
 	if d.Runs == nil {
 		d.Runs = map[string]Run{}
 	}
 	return d, nil
+}
+
+// ListPinned returns a copy of the provider-qualified pinned session keys.
+func (s *Store) ListPinned() (map[string]bool, error) {
+	d, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]bool, len(d.Pinned))
+	for key, pinned := range d.Pinned {
+		result[key] = pinned
+	}
+	return result, nil
+}
+
+// TogglePinned atomically changes and returns a session's pinned state.
+func (s *Store) TogglePinned(key string) (bool, error) {
+	pinned := false
+	err := s.Update(func(d *Data) error {
+		pinned = !d.Pinned[key]
+		if pinned {
+			d.Pinned[key] = true
+		} else {
+			delete(d.Pinned, key)
+		}
+		return nil
+	})
+	return pinned, err
 }
 
 func (s *Store) save(d Data) error {

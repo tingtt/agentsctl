@@ -170,26 +170,12 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 		}
 		n, readErr := in.Read(buf)
 		if n > 0 {
-			before, detach, after := splitDetach(buf[:n])
+			before, detach, _ := splitDetach(buf[:n])
 			if len(before) > 0 {
 				_, _ = child.Write(before)
 			}
 			if detach {
-				_, _ = child.Write(claudeNativeDetachSequence())
-				timer := time.NewTimer(timeout)
-				select {
-				case err := <-wait:
-					timer.Stop()
-					return normalizeExit(err)
-				case <-timer.C:
-					fmt.Fprintln(out, "\r\nagentsctl: Claude native detach timed out; attachment remains active")
-				case <-ctx.Done():
-					timer.Stop()
-					return ctx.Err()
-				}
-				if len(after) > 0 {
-					_, _ = child.Write(after)
-				}
+				return detachClaudeClient(ctx, cmd, child, wait, timeout)
 			}
 		}
 		if readErr != nil {
@@ -207,7 +193,64 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 		}
 	}
 }
-func claudeNativeDetachSequence() []byte { return []byte{0x1a} }
+
+// detachClaudeClient ends only the `claude attach` client process; the
+// background session is owned and kept alive by Claude's native daemon
+// (verified with the installed CLI: `claude agents --json --all` shows the
+// same session, still running, after the client below exits).
+//
+// The client is verified (against the installed `claude` build) to treat a
+// literal Ctrl+Z byte (0x1a) on its stdin as its own "detach" hotkey: it
+// unwinds its raw terminal mode and alternate screen and exits on its own,
+// which is why this is tried first — it is the client restoring the real
+// terminal itself, rather than agentsctl guessing at cleanup. SIGHUP/SIGTERM
+// to the client's process group are kept only as a fallback for a client
+// that does not consume the byte (e.g. mid some other input-owning submode),
+// never as the primary path.
+func detachClaudeClient(ctx context.Context, cmd *exec.Cmd, child *os.File, wait <-chan error, timeout time.Duration) error {
+	if cmd.Process == nil {
+		return errors.New("Claude attach client did not start")
+	}
+	_, _ = child.Write([]byte{0x1a})
+	if _, ok := waitForAttachment(ctx, wait, timeout); ok {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGHUP); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("detach Claude client: %w", err)
+	}
+	if _, ok := waitForAttachment(ctx, wait, timeout); ok {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("terminate Claude attach client: %w", err)
+	}
+	if _, ok := waitForAttachment(ctx, wait, timeout); ok {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return nil
+	}
+	return errors.New("Claude attach client did not exit after detach")
+}
+
+func waitForAttachment(ctx context.Context, wait <-chan error, timeout time.Duration) (error, bool) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-wait:
+		return err, true
+	case <-ctx.Done():
+		return ctx.Err(), true
+	case <-timer.C:
+		return nil, false
+	}
+}
 
 func forwardInput(r io.Reader, send func([]byte) error, detach func() error) error {
 	buf := make([]byte, 4096)
@@ -251,14 +294,14 @@ func resizeTerminal(f *os.File, w *lockedFrames) func() {
 	if !term.IsTerminal(int(f.Fd())) {
 		return func() {}
 	}
-	send := func() {
+	send := func(redraw bool) {
 		cols, rows, err := term.GetSize(int(f.Fd()))
 		if err == nil {
-			b, _ := json.Marshal(struct{ Rows, Cols uint16 }{uint16(rows), uint16(cols)})
+			b, _ := json.Marshal(protocol.TerminalSize{Rows: uint16(rows), Cols: uint16(cols), Redraw: redraw})
 			_ = w.write(protocol.Resize, b)
 		}
 	}
-	send()
+	send(true)
 	ch := make(chan os.Signal, 1)
 	done := make(chan struct{})
 	signal.Notify(ch, syscall.SIGWINCH)
@@ -267,7 +310,7 @@ func resizeTerminal(f *os.File, w *lockedFrames) func() {
 		for {
 			select {
 			case <-ch:
-				send()
+				send(false)
 			case <-done:
 				return
 			}

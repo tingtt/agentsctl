@@ -116,6 +116,7 @@ func (a *App) act(ctx context.Context, x Action) error {
 			return err
 		}
 		a.Model.Prompt = ""
+		a.Model.PromptCursor = 0
 		a.Model.Status = "started " + row.Key.String()
 	case ActionAttach:
 		if x.Session == nil || !x.Session.Capabilities.Attach {
@@ -144,6 +145,19 @@ func (a *App) act(ctx context.Context, x Action) error {
 		}
 		a.Model.clearRename()
 		a.Model.Status = "Renamed session"
+	case ActionPin:
+		if x.Session == nil {
+			return errors.New("no session selected")
+		}
+		pinned, err := a.Catalog.TogglePin(x.Session.Key)
+		if err != nil {
+			return err
+		}
+		if pinned {
+			a.Model.Status = "Pinned session"
+		} else {
+			a.Model.Status = "Unpinned session"
+		}
 	}
 	return nil
 }
@@ -258,6 +272,8 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 		return "backspace", nil
 	case 0x0f:
 		return "open", nil
+	case 0x14:
+		return "pin", nil
 	case 0x01:
 		return "folders", nil
 	case 0x18:

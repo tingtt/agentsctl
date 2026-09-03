@@ -2,8 +2,15 @@ package pty
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
+	"os/exec"
 	"testing"
+	"time"
+
+	creackpty "github.com/creack/pty"
+	"github.com/tingtt/agentsctl/internal/protocol"
 )
 
 func TestDetachIsConsumedAndNeverForwarded(t *testing.T) {
@@ -27,10 +34,47 @@ func TestInputEOFIsReported(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
-func TestClaudeDetachTranslationUsesNativeControlZ(t *testing.T) {
-	sequence := claudeNativeDetachSequence()
-	if len(sequence) != 1 || sequence[0] != 0x1a {
-		t.Fatalf("sequence=%v", sequence)
+// TestClaudeDetachUsesControlZWhenClientConsumesIt models the installed
+// `claude attach` client: a well-behaved client puts its own PTY into raw
+// mode (disabling ISIG so a literal 0x1a byte reaches its read loop instead
+// of becoming a kernel-generated SIGTSTP) and exits on Ctrl+Z, mirroring the
+// verified real CLI. detachClaudeClient must succeed via that byte alone,
+// never reaching for a signal.
+func TestClaudeDetachUsesControlZWhenClientConsumesIt(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "stty raw -echo; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0")
+	child, err := creackpty.Start(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	go io.Copy(io.Discard, child) // production drains child output the same way; an unread PTY buffer can wedge a client mid-exit
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	time.Sleep(200 * time.Millisecond) // let `stty raw` land before the byte is sent
+	if err := detachClaudeClient(context.Background(), cmd, child, wait, time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestClaudeDetachFallsBackToSignalsWhenClientIgnoresControlZ covers a client
+// that never consumes the byte (e.g. stuck in a submode that owns input
+// itself). detachClaudeClient must still end only the owned client process,
+// via SIGHUP/SIGTERM, without hanging.
+func TestClaudeDetachFallsBackToSignalsWhenClientIgnoresControlZ(t *testing.T) {
+	// stty -isig keeps the kernel from turning the Ctrl+Z byte into a real
+	// SIGTSTP job-control stop, so the fallback signal path is what's tested.
+	cmd := exec.Command("sh", "-c", "stty -isig; trap 'exit 0' HUP TERM; while :; do sleep 1; done")
+	child, err := creackpty.Start(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer child.Close()
+	go io.Copy(io.Discard, child) // production drains child output the same way; an unread PTY buffer can wedge a client mid-exit
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	time.Sleep(200 * time.Millisecond) // let `stty -isig` land before the byte is sent
+	if err := detachClaudeClient(context.Background(), cmd, child, wait, time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -43,5 +87,34 @@ func TestCtrlSIsForwardedToAttachedChild(t *testing.T) {
 	}
 	if !bytes.Equal(sent.Bytes(), []byte{'a', 0x13, 'b'}) {
 		t.Fatalf("sent=%v", sent.Bytes())
+	}
+}
+
+func TestInitialTerminalSizeIsARedrawResizeFrame(t *testing.T) {
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	if err := creackpty.Setsize(slave, &creackpty.Winsize{Rows: 24, Cols: 80}); err != nil {
+		t.Fatal(err)
+	}
+	var frames bytes.Buffer
+	stop := resizeTerminal(slave, &lockedFrames{w: &frames})
+	stop()
+	kind, payload, err := protocol.Read(&frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var size protocol.TerminalSize
+	if err := json.Unmarshal(payload, &size); err != nil {
+		t.Fatal(err)
+	}
+	if kind != protocol.Resize || !size.Redraw || size.Rows != 24 || size.Cols != 80 {
+		t.Fatalf("kind=%q size=%+v", kind, size)
+	}
+	if kind == protocol.Input {
+		t.Fatal("terminal size sync was encoded as child input")
 	}
 }
