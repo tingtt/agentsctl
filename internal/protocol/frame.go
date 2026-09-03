@@ -6,6 +6,14 @@ import (
 	"io"
 )
 
+// TerminalSize is a PTY resize request. Redraw requests a resize notification
+// even when Rows and Cols already match the managed PTY.
+type TerminalSize struct {
+	Rows   uint16 `json:"rows"`
+	Cols   uint16 `json:"cols"`
+	Redraw bool   `json:"redraw,omitempty"`
+}
+
 const MaxFrame = 8 << 20
 const (
 	Request  byte = 'Q'

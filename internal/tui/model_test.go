@@ -79,6 +79,28 @@ func TestShiftTabPreservesPrompt(t *testing.T) {
 	}
 }
 
+func TestComposerCursorEditingUsesRunes(t *testing.T) {
+	m := NewModel()
+	for _, key := range []string{"A", "界", "B", "left", "left", "X", "right", "delete", "home", "delete", "end", "backspace"} {
+		m.Update(key)
+	}
+	if m.Prompt != "X" || m.PromptCursor != 1 {
+		t.Fatalf("prompt=%q cursor=%d", m.Prompt, m.PromptCursor)
+	}
+	if view := m.View(40, 8); !strings.Contains(view, "claude > X_") {
+		t.Fatalf("composer cursor is not visible:\n%s", view)
+	}
+}
+
+func TestStashRestorePlacesComposerCursorAtEnd(t *testing.T) {
+	m := NewModel()
+	m.Stash = "界x"
+	m.Update("stash")
+	if m.Prompt != "界x" || m.PromptCursor != 2 {
+		t.Fatalf("model=%+v", m)
+	}
+}
+
 func TestSelectionFollowsSessionIdentityAcrossRefresh(t *testing.T) {
 	m := NewModel()
 	m.SetRows([]session.Session{
@@ -92,6 +114,47 @@ func TestSelectionFollowsSessionIdentityAcrossRefresh(t *testing.T) {
 	})
 	if m.Selected != 0 || m.Rows[m.Selected].Key.ID != "selected" {
 		t.Fatalf("selection=%d row=%+v", m.Selected, m.Rows[m.Selected])
+	}
+}
+
+func TestPinnedAndOtherRenderInNavigationOrder(t *testing.T) {
+	m := NewModel()
+	m.SetRows([]session.Session{
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "A"}, Name: "A", Pinned: true},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "B"}, Name: "B", Pinned: true},
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "C"}, Name: "C"},
+		{Key: session.Key{Provider: session.ProviderCodex, ID: "D"}, Name: "D"},
+	})
+	view := m.View(80, 16)
+	positions := []int{
+		strings.Index(view, "Pinned"), strings.Index(view, "> claude A"), strings.Index(view, "codex  B"),
+		strings.Index(view, "Other"), strings.Index(view, "claude C"), strings.Index(view, "codex  D"),
+	}
+	for i, position := range positions {
+		if position < 0 || i > 0 && position <= positions[i-1] {
+			t.Fatalf("render order=%v\n%s", positions, view)
+		}
+	}
+	for _, want := range []string{"B", "C", "D"} {
+		m.Update("down")
+		if got := m.Rows[m.Selected].Key.ID; got != want {
+			t.Fatalf("down selected %s, want %s", got, want)
+		}
+	}
+	for _, want := range []string{"C", "B", "A"} {
+		m.Update("up")
+		if got := m.Rows[m.Selected].Key.ID; got != want {
+			t.Fatalf("up selected %s, want %s", got, want)
+		}
+	}
+}
+
+func TestCtrlTTogglesSelectedPin(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "selected"}}}
+	action := m.Update("pin")
+	if action.Kind != ActionPin || action.Session == nil || action.Session.Key.ID != "selected" {
+		t.Fatalf("action=%+v", action)
 	}
 }
 
@@ -310,6 +373,7 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 		{"\x01", "folders"},
 		{"\x18", "stop-or-archive"},
 		{"\x13", "stash"},
+		{"\x14", "pin"},
 		{"\x1b[H", "home"},
 		{"\x1b[F", "end"},
 		{"\x1b[1~", "home"},

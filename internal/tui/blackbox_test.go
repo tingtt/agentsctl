@@ -152,7 +152,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, strings.Repeat("\x7f", len("Second")))
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "codex > \r\n")
+		return strings.Contains(frame, "codex > _\r\n")
 	}); err != nil {
 		t.Fatalf("composer did not become empty: %v", err)
 	}
@@ -200,6 +200,15 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	if err := syscall.Kill(run.PID, 0); err != nil {
 		t.Fatalf("child did not survive detach: %v", err)
+	}
+	redrawCount := strings.Count(output.String(), "FAKE CODEX REDRAW")
+	writePTY(t, terminal, "\r")
+	if err := waitOutputAfter(&output, "FAKE CODEX REDRAW", redrawCount+1, 5*time.Second); err != nil {
+		t.Fatalf("Codex reattach did not request a full redraw: %v", err)
+	}
+	writePTY(t, terminal, "\x1d")
+	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+2, 5*time.Second); err != nil {
+		t.Fatal(err)
 	}
 
 	writePTY(t, terminal, "Prompt\x12\x1b[H\x1b[3~X\x1b")
@@ -255,7 +264,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	claudeFixture, _ := json.Marshal([]map[string]any{{
 		"id": "claude-live", "name": "fake-claude-live", "summary": "Working", "cwd": project,
-		"updatedAt": time.Now().Unix(), "status": "working",
+		"updatedAt": time.Now().Unix(), "status": "busy", "state": "working",
 	}})
 	if err := os.WriteFile(filepath.Join(fakeDir, "claude.json"), claudeFixture, 0o600); err != nil {
 		t.Fatal(err)
@@ -339,8 +348,8 @@ func writeCatalogFixture(root, current string, count int) error {
 		})
 	}
 	rows = append(rows,
-		map[string]any{"id": "sibling", "name": "MUST-NOT-SHOW-SIBLING", "cwd": filepath.Join(filepath.Dir(current), "sibling"), "updatedAt": count + 2, "status": map[string]any{"type": "idle"}, "archived": false},
-		map[string]any{"id": "archived", "name": "MUST-NOT-SHOW-ARCHIVED", "cwd": current, "updatedAt": count + 3, "status": map[string]any{"type": "idle"}, "archived": true},
+		map[string]any{"id": "sibling", "name": "MUST-NOT-SHOW-SIBLING", "cwd": filepath.Join(filepath.Dir(current), "sibling"), "createdAt": count + 2, "updatedAt": count + 2, "status": map[string]any{"type": "idle"}, "archived": false},
+		map[string]any{"id": "archived", "name": "MUST-NOT-SHOW-ARCHIVED", "cwd": current, "createdAt": count + 3, "updatedAt": count + 3, "status": map[string]any{"type": "idle"}, "archived": true},
 	)
 	b, err := json.Marshal(rows)
 	if err != nil {

@@ -97,3 +97,46 @@ func TestArchivedBoundRunDoesNotReappearAsUnbound(t *testing.T) {
 		t.Fatalf("bound archived run leaked into active catalog: %+v", rows)
 	}
 }
+
+func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	api := &fakeAPI{rows: []Thread{
+		{ID: "working", CreatedAt: 100, UpdatedAt: 900, Status: ThreadStatus{Type: "active"}},
+		{ID: "idle", CreatedAt: 200, UpdatedAt: 800, Status: ThreadStatus{Type: "idle"}},
+		{ID: "unknown", CreatedAt: 300, UpdatedAt: 700, Status: ThreadStatus{Type: "future"}},
+	}}
+	p := Provider{API: api, Store: store}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows[0].CreatedAt.Equal(time.Unix(100, 0)) || rows[0].Activity != session.ActivityWorking {
+		t.Fatalf("working=%+v", rows[0])
+	}
+	if rows[1].Activity != session.ActivityIdle || rows[2].Activity != session.ActivityUnknown {
+		t.Fatalf("rows=%+v", rows)
+	}
+}
+
+func TestCodexNativeStatusMapping(t *testing.T) {
+	cases := []struct {
+		name   string
+		thread Thread
+		want   session.Activity
+	}{
+		{name: "working", thread: Thread{Status: ThreadStatus{Type: "active"}}, want: session.ActivityWorking},
+		{name: "needs input", thread: Thread{Status: ThreadStatus{Type: "needsInput"}}, want: session.ActivityNeedsInput},
+		{name: "quota", thread: Thread{Status: ThreadStatus{Type: "active", ActiveFlags: []string{"rateLimit"}}}, want: session.ActivityWaitingQuota},
+		{name: "idle", thread: Thread{Status: ThreadStatus{Type: "notLoaded"}}, want: session.ActivityIdle},
+		{name: "completed", thread: Thread{Status: ThreadStatus{Type: "completed"}}, want: session.ActivityCompleted},
+		{name: "failed", thread: Thread{Status: ThreadStatus{Type: "failed"}}, want: session.ActivityFailed},
+		{name: "unknown", thread: Thread{Status: ThreadStatus{Type: "future"}}, want: session.ActivityUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := codexActivity(tc.thread); got != tc.want {
+				t.Fatalf("activity=%s, want %s", got, tc.want)
+			}
+		})
+	}
+}

@@ -42,15 +42,72 @@ func TestCatalogKeepsHealthyProviderWhenPeerFails(t *testing.T) {
 	}
 }
 
-func TestCatalogOrdersByActivityThenRecency(t *testing.T) {
+type memoryPins struct{ values map[string]bool }
+
+func (p *memoryPins) ListPinned() (map[string]bool, error) {
+	result := make(map[string]bool, len(p.values))
+	for key, value := range p.values {
+		result[key] = value
+	}
+	return result, nil
+}
+
+func (p *memoryPins) TogglePinned(key string) (bool, error) {
+	p.values[key] = !p.values[key]
+	return p.values[key], nil
+}
+
+func TestCatalogOrdersPinnedAndOtherByCreationTime(t *testing.T) {
 	now := time.Now()
-	c := Catalog{Providers: []Provider{fakeProvider{id: ProviderCodex, rows: []Session{
-		{Key: Key{Provider: ProviderCodex, ID: "idle"}, Activity: ActivityIdle, UpdatedAt: now},
-		{Key: Key{Provider: ProviderCodex, ID: "need"}, Activity: ActivityNeedsInput, UpdatedAt: now.Add(-time.Hour)},
+	pins := &memoryPins{values: map[string]bool{
+		Key{Provider: ProviderCodex, ID: "pinned-old"}.String():  true,
+		Key{Provider: ProviderClaude, ID: "pinned-new"}.String(): true,
+	}}
+	c := Catalog{Pins: pins, Providers: []Provider{fakeProvider{id: ProviderCodex, rows: []Session{
+		{Key: Key{Provider: ProviderCodex, ID: "other-old"}, CreatedAt: now.Add(-4 * time.Hour), UpdatedAt: now, Activity: ActivityNeedsInput},
+		{Key: Key{Provider: ProviderCodex, ID: "pinned-old"}, CreatedAt: now.Add(-3 * time.Hour), UpdatedAt: now.Add(3 * time.Hour), Activity: ActivityWorking},
+		{Key: Key{Provider: ProviderClaude, ID: "pinned-new"}, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-3 * time.Hour), Activity: ActivityCompleted},
+		{Key: Key{Provider: ProviderClaude, ID: "other-new"}, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(4 * time.Hour), Activity: ActivityFailed},
 	}}}}
 	rows := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
-	if rows[0].Key.ID != "need" {
-		t.Fatalf("first=%s", rows[0].Key.ID)
+	want := []string{"pinned-new", "pinned-old", "other-new", "other-old"}
+	for i := range want {
+		if rows[i].Key.ID != want[i] {
+			t.Fatalf("row %d=%s, want %s; rows=%+v", i, rows[i].Key.ID, want[i], rows)
+		}
+	}
+	if !rows[0].Pinned || !rows[1].Pinned || rows[2].Pinned || rows[3].Pinned {
+		t.Fatalf("pin grouping=%+v", rows)
+	}
+}
+
+func TestCatalogOrderDoesNotChangeWithActivityOrUpdateTime(t *testing.T) {
+	now := time.Now()
+	provider := fakeProvider{id: ProviderCodex, rows: []Session{
+		{Key: Key{Provider: ProviderCodex, ID: "new"}, CreatedAt: now},
+		{Key: Key{Provider: ProviderCodex, ID: "old"}, CreatedAt: now.Add(-time.Hour)},
+	}}
+	c := Catalog{Providers: []Provider{provider}}
+	before := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
+	provider.rows[0].Activity, provider.rows[0].UpdatedAt = ActivityCompleted, now.Add(-24*time.Hour)
+	provider.rows[1].Activity, provider.rows[1].UpdatedAt = ActivityNeedsInput, now.Add(24*time.Hour)
+	c.Providers[0] = provider
+	after := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
+	if before[0].Key.ID != "new" || after[0].Key.ID != "new" {
+		t.Fatalf("order changed: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestPinIdentityIncludesProvider(t *testing.T) {
+	pins := &memoryPins{values: map[string]bool{}}
+	c := Catalog{Pins: pins}
+	claude := Key{Provider: ProviderClaude, ID: "same"}
+	codex := Key{Provider: ProviderCodex, ID: "same"}
+	if pinned, err := c.TogglePin(claude); err != nil || !pinned {
+		t.Fatalf("toggle Claude: pinned=%v err=%v", pinned, err)
+	}
+	if pins.values[codex.String()] {
+		t.Fatal("Codex session with the same native ID was pinned")
 	}
 }
 

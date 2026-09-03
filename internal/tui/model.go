@@ -16,6 +16,7 @@ const (
 	ActionStop     ActionKind = "stop"
 	ActionArchive  ActionKind = "archive"
 	ActionRename   ActionKind = "rename"
+	ActionPin      ActionKind = "pin"
 	ActionRefresh  ActionKind = "refresh"
 	ActionQuit     ActionKind = "quit"
 )
@@ -31,6 +32,7 @@ type Action struct {
 type Model struct {
 	Provider       session.ProviderID
 	Prompt         string
+	PromptCursor   int
 	Stash          string
 	Rows           []session.Session
 	Selected       int
@@ -111,13 +113,37 @@ func (m *Model) Update(key string) Action {
 		return Action{}
 	case "backspace":
 		r := []rune(m.Prompt)
-		if len(r) > 0 {
-			m.Prompt = string(r[:len(r)-1])
+		m.clampPromptCursor(r)
+		if m.PromptCursor > 0 {
+			r = append(r[:m.PromptCursor-1], r[m.PromptCursor:]...)
+			m.PromptCursor--
+			m.Prompt = string(r)
 		}
+		return Action{}
+	case "delete":
+		r := []rune(m.Prompt)
+		m.clampPromptCursor(r)
+		if m.PromptCursor < len(r) {
+			r = append(r[:m.PromptCursor], r[m.PromptCursor+1:]...)
+			m.Prompt = string(r)
+		}
+		return Action{}
+	case "home":
+		m.PromptCursor = 0
+		return Action{}
+	case "end":
+		m.PromptCursor = len([]rune(m.Prompt))
+		return Action{}
+	case "left":
+		m.PromptCursor = max(0, min(m.PromptCursor, len([]rune(m.Prompt)))-1)
+		return Action{}
+	case "right":
+		m.PromptCursor = min(len([]rune(m.Prompt)), m.PromptCursor+1)
 		return Action{}
 	case "stash":
 		if m.Prompt != "" || m.Stash != "" {
 			m.Prompt, m.Stash = m.Stash, m.Prompt
+			m.PromptCursor = len([]rune(m.Prompt))
 		}
 		return Action{}
 	case "enter":
@@ -151,16 +177,28 @@ func (m *Model) Update(key string) Action {
 		m.RenameCursor = len([]rune(row.Name))
 		m.Status = ""
 		return Action{}
+	case "pin":
+		return m.selected(ActionPin)
 	case "refresh":
 		return Action{Kind: ActionRefresh}
 	case "quit":
 		return Action{Kind: ActionQuit}
 	default:
 		if isTextInput(key) {
-			m.Prompt += key
+			runes := []rune(m.Prompt)
+			m.clampPromptCursor(runes)
+			insert := []rune(key)
+			before := append([]rune(nil), runes[:m.PromptCursor]...)
+			after := append([]rune(nil), runes[m.PromptCursor:]...)
+			m.Prompt = string(append(append(before, insert...), after...))
+			m.PromptCursor += len(insert)
 		}
 		return Action{}
 	}
+}
+
+func (m *Model) clampPromptCursor(runes []rune) {
+	m.PromptCursor = min(max(m.PromptCursor, 0), len(runes))
 }
 
 func (m *Model) cancelArchiveConfirmation() {
@@ -298,15 +336,15 @@ func (m Model) View(width, height int) string {
 		view = "all folders"
 	}
 	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", view), width), ""}
-	list := make([]displayLine, 0, len(m.Rows)+8)
+	list := make([]displayLine, 0, len(m.Rows)+4)
 	groups := []struct {
-		title      string
-		activities []session.Activity
-	}{{"Needs input", []session.Activity{session.ActivityNeedsInput, session.ActivityWaitingQuota}}, {"Working", []session.Activity{session.ActivityStarting, session.ActivityWorking}}, {"Ready", []session.Activity{session.ActivityIdle, session.ActivityUnknown}}, {"Completed", []session.Activity{session.ActivityCompleted, session.ActivityFailed}}}
+		title  string
+		pinned bool
+	}{{"Pinned", true}, {"Other", false}}
 	for _, g := range groups {
 		shown := false
 		for i, row := range m.Rows {
-			if !contains(g.activities, row.Activity) {
+			if row.Pinned != g.pinned {
 				continue
 			}
 			if !shown {
@@ -335,9 +373,10 @@ func (m Model) View(width, height int) string {
 	if err := m.Warnings[m.Provider]; err != nil {
 		unavailable = " (unavailable: " + err.Error() + ")"
 	}
+	promptPrefix := fmt.Sprintf("%s%s > ", m.Provider, unavailable)
 	footer := []string{
-		clipLine(fmt.Sprintf("%s%s > %s", m.Provider, unavailable, m.Prompt), width),
-		clipLine("Shift+Tab provider / Enter send/open / Ctrl+S stash / Ctrl+O open", width),
+		clipLine(promptPrefix+cursorWindow(m.Prompt, m.PromptCursor, max(1, width-lineCells(promptPrefix))), width),
+		clipLine("Shift+Tab provider / Enter send/open / Ctrl+S stash / Ctrl+O open / Ctrl+T pin", width),
 		clipLine("↑↓ / Ctrl+A folders / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
 	}
 	if m.Status != "" {
@@ -384,6 +423,10 @@ func renameCursor(value string, cursor int) string {
 }
 
 func renameCursorWindow(value string, cursor, width int) string {
+	return cursorWindow(value, cursor, width)
+}
+
+func cursorWindow(value string, cursor, width int) string {
 	runes := []rune(value)
 	cursor = min(max(cursor, 0), len(runes))
 	start := max(0, cursor-max(0, width-1))
@@ -452,13 +495,5 @@ func runeCells(r rune) int {
 		return 2
 	}
 	return 1
-}
-func contains(xs []session.Activity, v session.Activity) bool {
-	for _, x := range xs {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 func shortHome(v string) string { return v }

@@ -50,13 +50,21 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		if isArchived != archived {
 			continue
 		}
-		activity := claudeActivity(text(v, "status", "state"))
+		activity := claudeActivity(text(v, "status"), text(v, "state"))
 		runtime := session.RuntimeDetached
 		if activity == session.ActivityCompleted || activity == session.ActivityFailed {
 			runtime = session.RuntimeStopped
 		}
+		created := timestamp(v["startedAt"])
 		updated := timestamp(v["updatedAt"])
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: text(v, "name", "displayName"), Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: runtime == session.RuntimeDetached, Stop: runtime == session.RuntimeDetached, Rename: false, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
+		if created.IsZero() {
+			created = updated
+		}
+		if updated.IsZero() {
+			updated = created
+		}
+		attachable := runtime == session.RuntimeDetached || activity == session.ActivityCompleted
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: text(v, "name", "displayName"), Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: attachable, Stop: runtime == session.RuntimeDetached, Rename: false, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
 	}
 	return rows, nil
 }
@@ -71,13 +79,16 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		if json.Unmarshal(res.Stdout, &v) == nil {
 			id = text(v, "id", "sessionId")
 		}
+	} else {
+		id = backgroundID(id)
 	}
 	fields := strings.Fields(id)
 	if len(fields) == 0 {
 		return session.Session{}, errors.New("claude --bg returned no session id")
 	}
 	id = fields[0]
-	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, UpdatedAt: time.Now(), Activity: session.ActivityWorking, Runtime: session.RuntimeDetached, Capabilities: session.Capabilities{Attach: true, Stop: true}}, nil
+	createdAt := time.Now()
+	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Capabilities: session.Capabilities{Attach: true, Stop: true}}, nil
 }
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	res, err := p.Runner.Run(ctx, p.path(), []string{"stop", k.ID}, "")
@@ -107,30 +118,71 @@ func text(v map[string]any, keys ...string) string {
 func timestamp(v any) time.Time {
 	switch x := v.(type) {
 	case float64:
-		return time.Unix(int64(x), 0)
+		return unixTimestamp(int64(x))
 	case string:
 		if t, e := time.Parse(time.RFC3339, x); e == nil {
 			return t
 		}
 		if n, e := strconv.ParseInt(x, 10, 64); e == nil {
-			return time.Unix(n, 0)
+			return unixTimestamp(n)
 		}
 	}
 	return time.Time{}
 }
-func claudeActivity(s string) session.Activity {
-	switch strings.ToLower(s) {
+
+func unixTimestamp(value int64) time.Time {
+	if value >= 100_000_000_000 {
+		return time.UnixMilli(value)
+	}
+	return time.Unix(value, 0)
+}
+
+func backgroundID(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		for i := range fields {
+			if fields[i] == "attach" && i+1 < len(fields) {
+				return fields[i+1]
+			}
+		}
+	}
+	fields := strings.Fields(output)
+	if len(fields) > 0 {
+		return fields[len(fields)-1]
+	}
+	return ""
+}
+// claudeActivity maps the installed Claude CLI's native `state` (working,
+// blocked, done, stopped — the lifecycle signal, verified against
+// `claude agents --json --all` output from dispatch through completion) and
+// `status` (busy/idle — a coarser, secondary overlay used only when `state`
+// is absent, as on pre-daemon-tracking rows) fields to the common Activity
+// model. There is no observed native "starting" value: a freshly dispatched
+// session is already reported as state "working" by the time it is first
+// observable, so ActivityStarting is produced only by agentsctl's own
+// Dispatch return value, never derived from List.
+func claudeActivity(status, state string) session.Activity {
+	switch strings.ToLower(state) {
 	case "working", "running", "active":
 		return session.ActivityWorking
-	case "needsinput", "waiting", "waiting_for_input":
+	case "blocked", "needsinput", "waiting", "waiting_for_input":
 		return session.ActivityNeedsInput
-	case "idle", "ready":
-		return session.ActivityIdle
-	case "completed", "done", "stopped":
+	case "waitingforquota", "waiting_for_quota":
+		return session.ActivityWaitingQuota
+	case "done", "completed", "stopped":
 		return session.ActivityCompleted
 	case "failed", "error":
 		return session.ActivityFailed
-	default:
-		return session.ActivityUnknown
+	case "starting", "opening":
+		return session.ActivityStarting
+	case "idle", "ready":
+		return session.ActivityIdle
 	}
+	switch strings.ToLower(status) {
+	case "busy":
+		return session.ActivityWorking
+	case "idle":
+		return session.ActivityIdle
+	}
+	return session.ActivityUnknown
 }

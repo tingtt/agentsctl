@@ -74,7 +74,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			reason = "external or unknown Codex writer cannot be attached or stopped safely"
 		}
 		caps.Reason = reason
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, Capabilities: caps})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, Capabilities: caps})
 	}
 	if !archived {
 		for _, r := range d.Runs {
@@ -87,7 +87,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 				activity, runtime, name = session.ActivityFailed, session.RuntimeStopped, "Unbound run"
 				caps = session.Capabilities{Reason: r.Error}
 			}
-			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Capabilities: caps})
+			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, CreatedAt: r.StartedAt, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Capabilities: caps})
 		}
 	}
 	return rows, nil
@@ -105,7 +105,8 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	if err != nil {
 		return session.Session{}, err
 	}
-	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, UpdatedAt: time.Now(), Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Capabilities: session.Capabilities{Attach: true, Stop: true}}, nil
+	createdAt := time.Now()
+	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Capabilities: session.Capabilities{Attach: true, Stop: true}}, nil
 }
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	d, err := p.Store.Load()

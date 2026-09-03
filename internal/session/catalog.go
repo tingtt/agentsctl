@@ -29,7 +29,16 @@ type Scope struct {
 	AllDirectories   bool
 }
 
-type Catalog struct{ Providers []Provider }
+// PinStore persists provider-qualified session pin metadata.
+type PinStore interface {
+	ListPinned() (map[string]bool, error)
+	TogglePinned(string) (bool, error)
+}
+
+type Catalog struct {
+	Providers []Provider
+	Pins      PinStore
+}
 
 func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 	var wg sync.WaitGroup
@@ -60,6 +69,15 @@ func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 		}()
 	}
 	wg.Wait()
+	pinned := map[string]bool{}
+	if c.Pins != nil {
+		if values, err := c.Pins.ListPinned(); err == nil {
+			pinned = values
+		}
+	}
+	for i := range result.Sessions {
+		result.Sessions[i].Pinned = pinned[result.Sessions[i].Key.String()]
+	}
 	if !scope.AllDirectories {
 		current := normalizeDirectory(scope.CurrentDirectory)
 		filtered := result.Sessions[:0]
@@ -72,15 +90,23 @@ func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 	}
 	sort.SliceStable(result.Sessions, func(i, j int) bool {
 		a, b := result.Sessions[i], result.Sessions[j]
-		if activityRank(a.Activity) != activityRank(b.Activity) {
-			return activityRank(a.Activity) < activityRank(b.Activity)
+		if a.Pinned != b.Pinned {
+			return a.Pinned
 		}
-		if !a.UpdatedAt.Equal(b.UpdatedAt) {
-			return a.UpdatedAt.After(b.UpdatedAt)
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.After(b.CreatedAt)
 		}
 		return a.Key.String() < b.Key.String()
 	})
 	return result
+}
+
+// TogglePin changes and returns the pinned state for key.
+func (c Catalog) TogglePin(key Key) (bool, error) {
+	if c.Pins == nil {
+		return false, errors.New("pin metadata store is not configured")
+	}
+	return c.Pins.TogglePinned(key.String())
 }
 
 // normalizeDirectory intentionally does not resolve symlinks. codex-agents
@@ -94,23 +120,4 @@ func (c Catalog) Provider(id ProviderID) (Provider, error) {
 		}
 	}
 	return nil, errors.New("provider is not configured")
-}
-
-func activityRank(a Activity) int {
-	switch a {
-	case ActivityNeedsInput:
-		return 0
-	case ActivityWaitingQuota:
-		return 1
-	case ActivityStarting, ActivityWorking:
-		return 2
-	case ActivityIdle:
-		return 3
-	case ActivityCompleted:
-		return 4
-	case ActivityFailed:
-		return 5
-	default:
-		return 6
-	}
 }

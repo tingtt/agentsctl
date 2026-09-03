@@ -59,7 +59,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	app := tui.App{Catalog: session.Catalog{Providers: providers}, Model: tui.NewModel(), Input: os.Stdin, Output: os.Stdout, CWD: cwd, ClaudePath: "claude", Socket: socket}
+	app := tui.App{Catalog: session.Catalog{Providers: providers, Pins: store}, Model: tui.NewModel(), Input: os.Stdin, Output: os.Stdout, CWD: cwd, ClaudePath: "claude", Socket: socket}
 	return app.Run(ctx)
 }
 func configDir() (string, error) {

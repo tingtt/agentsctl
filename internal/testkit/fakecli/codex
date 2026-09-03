@@ -50,6 +50,7 @@ def interactive(sid, prompt):
     lock = open(locks / (sid + ".lock"), "w"); fcntl.flock(lock, fcntl.LOCK_EX)
     old = termios.tcgetattr(0); tty.setraw(0)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))
+    signal.signal(signal.SIGWINCH, lambda *_: os.write(1, b"FAKE CODEX REDRAW\r\n"))
     try:
         os.write(1, ("FAKE CODEX ATTACHED " + sid + "\r\n").encode())
         while True:

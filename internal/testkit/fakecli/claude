@@ -7,7 +7,7 @@ path = root / "claude.json"
 
 def load():
     if not path.exists():
-        return [{"id":"claude-ready","name":"fake-claude","summary":"Ready","cwd":os.getcwd(),"updatedAt":1,"status":"idle"}]
+        return [{"id":"claude-ready","name":"fake-claude","summary":"Ready","cwd":os.getcwd(),"updatedAt":1,"status":"idle","state":"done"}]
     return json.loads(path.read_text())
 
 def save(rows):
@@ -19,12 +19,12 @@ if args[:1] == ["agents"]:
 elif args[:1] == ["--bg"]:
     rows = load(); sid = "claude-new"
     rows = [r for r in rows if r["id"] != sid]
-    rows.append({"id":sid,"name":"fake-claude-new","summary":args[1],"cwd":os.getcwd(),"updatedAt":2,"status":"working"})
+    rows.append({"id":sid,"name":"fake-claude-new","summary":args[1],"cwd":os.getcwd(),"updatedAt":2,"status":"busy","state":"working"})
     save(rows); print(sid)
 elif args[:1] == ["stop"]:
     rows = load()
     for row in rows:
-        if row["id"] == args[1]: row["status"] = "completed"
+        if row["id"] == args[1]: row["status"] = "idle"; row["state"] = "stopped"
     save(rows)
 elif args[:1] == ["attach"]:
     old = termios.tcgetattr(0); tty.setraw(0)
