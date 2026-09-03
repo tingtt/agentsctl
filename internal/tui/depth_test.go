@@ -44,6 +44,11 @@ func TestDirectoryDepthTrailingComponents(t *testing.T) {
 	// depth = all uses the shortHome-abbreviated full path, not trailing
 	// components; displayCWD is the entry point that dispatches to it.
 	// shortHome reads the process's real $HOME, so pin it to home here.
+	// displayCWD itself never appends the row-rendering trailing "/" --
+	// that's withTrailingSlash's job, applied by the caller (model.View)
+	// after displayCWD returns; see TestWithTrailingSlash and
+	// TestDisplayCWDDepthsCarryTrailingSlashThroughRowRendering in
+	// title_color_test.go for that.
 	t.Setenv("HOME", home)
 	if got := displayCWD(path, CWDDepthAll); got != "~/ghq/github.com/tingtt/agentsctl" {
 		t.Fatalf("all mode = %q, want shortHome-abbreviated full path", got)

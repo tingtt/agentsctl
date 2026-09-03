@@ -25,6 +25,26 @@ import (
 
 const DetachKey byte = 0x1d
 
+// AttachOutcome distinguishes why an Attach* call returned, so the caller
+// can tell an explicit agentsctl-initiated detach (Ctrl+]) apart from
+// every other reason attach ended (the attached process exiting on its
+// own, an error, or context cancellation). Only AttachDetached should
+// ever be treated as "the user pressed Ctrl+]"; AttachExited covers every
+// other case, including ones that also return a non-nil error.
+type AttachOutcome int
+
+const (
+	// AttachExited means attach returned for any reason other than an
+	// explicit Ctrl+] detach: the attached process exited on its own, an
+	// error occurred, or the context was canceled.
+	AttachExited AttachOutcome = iota
+	// AttachDetached means the DetachKey byte was read from local input
+	// and the detach sequence (Codex: protocol.Detach; Claude: the
+	// client's own Ctrl+Z-consuming detach, or its signal fallback) ran
+	// to completion without error.
+	AttachDetached
+)
+
 type lockedFrames struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -36,33 +56,33 @@ func (f *lockedFrames) write(kind byte, b []byte) error {
 	return protocol.Write(f.w, kind, b)
 }
 
-func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.Writer) error {
+func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.Writer) (AttachOutcome, error) {
 	conn, err := net.Dial("unix", socket)
 	if err != nil {
-		return err
+		return AttachExited, err
 	}
 	defer conn.Close()
 	req, _ := json.Marshal(supervisor.Request{Action: "attach", RunID: runID})
 	if err := protocol.Write(conn, protocol.Request, req); err != nil {
-		return err
+		return AttachExited, err
 	}
 	kind, b, err := protocol.Read(conn)
 	if err != nil {
-		return err
+		return AttachExited, err
 	}
 	if kind != protocol.Response {
-		return errors.New("invalid attach response")
+		return AttachExited, errors.New("invalid attach response")
 	}
 	var res supervisor.Response
 	if err := json.Unmarshal(b, &res); err != nil {
-		return err
+		return AttachExited, err
 	}
 	if !res.OK {
-		return errors.New(res.Error)
+		return AttachExited, errors.New(res.Error)
 	}
 	restore, err := raw(in)
 	if err != nil {
-		return err
+		return AttachExited, err
 	}
 	defer restore()
 	frames := &lockedFrames{w: conn}
@@ -86,26 +106,26 @@ func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return AttachExited, ctx.Err()
 		case msg := <-incomingFrames:
 			if msg.err != nil {
-				return msg.err
+				return AttachExited, msg.err
 			}
 			switch msg.kind {
 			case protocol.Output:
 				if _, err := out.Write(msg.data); err != nil {
-					return err
+					return AttachExited, err
 				}
 			case protocol.Exit:
-				return nil
+				return AttachExited, nil
 			case protocol.Failure:
-				return errors.New(string(msg.data))
+				return AttachExited, errors.New(string(msg.data))
 			}
 		default:
 		}
 		ready, err := pollInput(in, 50*time.Millisecond)
 		if err != nil {
-			return err
+			return AttachExited, err
 		}
 		if !ready {
 			continue
@@ -116,35 +136,35 @@ func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.
 			before, detach, _ := splitDetach(buf[:n])
 			if len(before) > 0 {
 				if err := frames.write(protocol.Input, before); err != nil {
-					return err
+					return AttachExited, err
 				}
 			}
 			if detach {
 				if err := frames.write(protocol.Detach, nil); err != nil {
-					return err
+					return AttachExited, err
 				}
-				return nil
+				return AttachDetached, nil
 			}
 		}
 		if err != nil {
-			return err
+			return AttachExited, err
 		}
 	}
 }
 
-func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writer, timeout time.Duration) error {
+func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writer, timeout time.Duration) (AttachOutcome, error) {
 	if path == "" {
 		path = "claude"
 	}
 	cmd := exec.CommandContext(ctx, path, "attach", id)
 	child, err := startClaudeAttachRaw(cmd)
 	if err != nil {
-		return err
+		return AttachExited, err
 	}
 	defer child.Close()
 	restore, err := raw(in)
 	if err != nil {
-		return err
+		return AttachExited, err
 	}
 	defer restore()
 	stopResize := resizeChildTerminal(in, child)
@@ -156,14 +176,14 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 	for {
 		select {
 		case err := <-wait:
-			return normalizeExit(err)
+			return AttachExited, normalizeExit(err)
 		case <-ctx.Done():
-			return ctx.Err()
+			return AttachExited, ctx.Err()
 		default:
 		}
 		ready, pollErr := pollInput(in, 100*time.Millisecond)
 		if pollErr != nil {
-			return pollErr
+			return AttachExited, pollErr
 		}
 		if !ready {
 			continue
@@ -175,20 +195,31 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 				_, _ = child.Write(before)
 			}
 			if detach {
-				return detachClaudeClient(ctx, cmd, child, wait, timeout)
+				// Only this path -- the DetachKey byte (Ctrl+]) actually
+				// arriving on local input -- can produce AttachDetached.
+				// detachClaudeClient runs the client's own safe detach
+				// sequence (Ctrl+Z, falling back to SIGHUP/SIGTERM only if
+				// the client doesn't consume it); a non-nil error here
+				// means that sequence did not complete (e.g. it raced a
+				// context cancellation), so it is reported as AttachExited
+				// like every other non-explicit-detach ending.
+				if err := detachClaudeClient(ctx, cmd, child, wait, timeout); err != nil {
+					return AttachExited, err
+				}
+				return AttachDetached, nil
 			}
 		}
 		if readErr != nil {
 			select {
 			case err := <-wait:
-				return normalizeExit(err)
+				return AttachExited, normalizeExit(err)
 			default:
-				return readErr
+				return AttachExited, readErr
 			}
 		}
 		select {
 		case err := <-wait:
-			return normalizeExit(err)
+			return AttachExited, normalizeExit(err)
 		default:
 		}
 	}

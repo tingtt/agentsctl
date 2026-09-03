@@ -48,7 +48,13 @@ func (b *lockedBuffer) String() string {
 
 func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	moduleRoot := moduleRoot(t)
-	root, err := os.MkdirTemp("/tmp", "agentsctl-e2e-")
+	// A short prefix keeps the fixture's depth-2 CWD ("<root-basename>/project")
+	// well inside the title budget the new right-block-first row layout
+	// leaves at the narrower 48-column size exercised below (that layout
+	// intentionally shows the CWD in full before giving the title any
+	// remaining width, so an unnecessarily long temp-dir name would
+	// squeeze the title far more than a realistic project path ever would).
+	root, err := os.MkdirTemp("/tmp", "e2e-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,79 +134,79 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	// exercise the kernel pty timing this goes through).
 	writePTY(t, terminal, "abc")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > abc"+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"abc"+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer did not accept typed text: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[D\x1b[D") // left, left
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > a"+cursorStyle("b")+"c")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"a"+cursorStyle("b")+"c")
 	}); err != nil {
 		t.Fatalf("left arrow did not move the composer cursor: %v", err)
 	}
 	writePTY(t, terminal, "X")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > aX"+cursorStyle("b")+"c")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"aX"+cursorStyle("b")+"c")
 	}); err != nil {
 		t.Fatalf("mid-composer insert failed: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[C") // right
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > aXb"+cursorStyle("c"))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"aXb"+cursorStyle("c"))
 	}); err != nil {
 		t.Fatalf("right arrow did not move the composer cursor: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[H") // home
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle("a")+"Xbc")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle("a")+"Xbc")
 	}); err != nil {
 		t.Fatalf("home did not move the composer cursor to the start: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[F") // end
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > aXbc"+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"aXbc"+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("end did not move the composer cursor to the end: %v", err)
 	}
 	writePTY(t, terminal, "\x7f") // backspace
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > aXb"+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"aXb"+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("backspace did not delete a composer character: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[D\x1b[D\x1b[D") // left x3, reaching the start
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle("a")+"Xb")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle("a")+"Xb")
 	}); err != nil {
 		t.Fatalf("left arrow did not reach the composer start: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[3~") // delete
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle("X")+"b")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle("X")+"b")
 	}); err != nil {
 		t.Fatalf("delete did not remove a composer character: %v", err)
 	}
 	writePTY(t, terminal, "界") // insert a full-width rune at the start
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > 界"+cursorStyle("X")+"b")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"界"+cursorStyle("X")+"b")
 	}); err != nil {
 		t.Fatalf("Japanese character insert into the composer failed: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[C") // right, crossing past the inserted rune
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > 界X"+cursorStyle("b"))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"界X"+cursorStyle("b"))
 	}); err != nil {
 		t.Fatalf("right arrow did not cross the Japanese character: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[D\x1b[D") // left, left, landing back on the Japanese character
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle("界")+"Xb")
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle("界")+"Xb")
 	}); err != nil {
 		t.Fatalf("left arrow did not cross back onto the Japanese character: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[F"+strings.Repeat("\x7f", 3)) // end, then clear the composer for later steps
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer was not cleared after the arrow-key exercise: %v", err)
 	}
@@ -212,31 +218,31 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	// the composer cursor too.
 	writePTY(t, terminal, "hi")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > hi"+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"hi"+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer did not accept typed text: %v", err)
 	}
 	writePTY(t, terminal, "\x1bOD") // SS3 left
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > h"+cursorStyle("i"))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"h"+cursorStyle("i"))
 	}); err != nil {
 		t.Fatalf("SS3-form left arrow did not move the composer cursor: %v", err)
 	}
 	writePTY(t, terminal, "!")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > h!"+cursorStyle("i"))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"h!"+cursorStyle("i"))
 	}); err != nil {
 		t.Fatalf("mid-composer insert after SS3 left arrow failed: %v", err)
 	}
 	writePTY(t, terminal, "\x1bOC") // SS3 right
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > h!i"+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+"h!i"+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("SS3-form right arrow did not move the composer cursor: %v", err)
 	}
 	writePTY(t, terminal, strings.Repeat("\x7f", 3)) // clear the composer again
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "claude > "+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderClaude, "")+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer was not cleared after the SS3 arrow-key exercise: %v", err)
 	}
@@ -256,19 +262,19 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 
 	writePTY(t, terminal, "\x1b[Z")
-	if err := waitOutput(&output, "codex >", 3*time.Second); err != nil {
+	if err := waitOutput(&output, composerPrefix(session.ProviderCodex, ""), 3*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
 	writePTY(t, terminal, "First\x13Second\x13")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "codex > First")
+		return strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"First")
 	}); err != nil {
 		t.Fatalf("shared stash did not restore First for Codex: %v", err)
 	}
 	writePTY(t, terminal, "\x13")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "codex > Second")
+		return strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Second")
 	}); err != nil {
 		t.Fatalf("second stash swap did not restore Second: %v", err)
 	}
@@ -276,7 +282,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
 		// An empty composer places the cursor glyph directly after the
 		// prompt prefix with nothing in between.
-		return strings.Contains(frame, "codex > "+cursorStyle(" "))
+		return strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer did not become empty: %v", err)
 	}
@@ -318,6 +324,17 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+1, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	// The explicit Ctrl+] just sent must be recognized end to end (through
+	// AttachCodex's AttachDetached outcome and App.act's MarkDetached call)
+	// as an agentsctl-initiated detach: session-099, still selected, must
+	// render bold on the very next overview frame. The fake CLI leaves the
+	// row's status "active" (ActivityWorking) across a detach -- it only
+	// resets to "completed" when the underlying process actually exits.
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, rowPrefix(">", session.ActivityWorking, true, true)+"session-099")
+	}); err != nil {
+		t.Fatalf("explicit Ctrl+] detach did not mark the session bold on return to overview: %v", err)
+	}
 	childInput, err := os.ReadFile(filepath.Join(fakeDir, "child-input.bin"))
 	if err != nil || !bytes.Contains(childInput, []byte{0x13}) {
 		t.Fatalf("Ctrl+S was not forwarded to child: input=%v err=%v", childInput, err)
@@ -337,7 +354,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 
 	writePTY(t, terminal, "Prompt\x12\x1b[H\x1b[3~X\x1b")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "session-099") && strings.Contains(frame, "codex > Prompt") && strings.Contains(frame, "Rename cancelled")
+		return strings.Contains(frame, "session-099") && strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Prompt") && strings.Contains(frame, "Rename cancelled")
 	}); err != nil {
 		t.Fatalf("rename cancel did not preserve row and composer: %v", err)
 	}
@@ -346,7 +363,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, "\x12\x1b[H\x1b[3~X\r")
 	if err := waitLatestFrame(&output, 5*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-099") && strings.Contains(frame, "codex > Prompt")
+		return strings.Contains(frame, "Xession-099") && strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Prompt")
 	}); err != nil {
 		t.Fatalf("rename success did not refresh the same row: %v", err)
 	}
@@ -365,25 +382,25 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, "\x1b[D\x1b[D\x1b[D") // left x3
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-"+coloredCursorSuffix(session.ProviderCodex, "0", "99"))
+		return strings.Contains(frame, "Xession-"+styledCursorSuffix(true, true, "0", "99"))
 	}); err != nil {
 		t.Fatalf("left arrow did not move the rename cursor: %v", err)
 	}
 	writePTY(t, terminal, "Z")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-Z"+coloredCursorSuffix(session.ProviderCodex, "0", "99"))
+		return strings.Contains(frame, "Xession-Z"+styledCursorSuffix(true, true, "0", "99"))
 	}); err != nil {
 		t.Fatalf("mid-rename insert failed: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[C") // right
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-Z0"+coloredCursorSuffix(session.ProviderCodex, "9", "9"))
+		return strings.Contains(frame, "Xession-Z0"+styledCursorSuffix(true, true, "9", "9"))
 	}); err != nil {
 		t.Fatalf("right arrow did not move the rename cursor: %v", err)
 	}
 	writePTY(t, terminal, "\x1b[H") // home
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, coloredCursorSuffix(session.ProviderCodex, "X", "ession-Z099"))
+		return strings.Contains(frame, styledCursorSuffix(true, true, "X", "ession-Z099"))
 	}); err != nil {
 		t.Fatalf("home did not move the rename cursor to the start: %v", err)
 	}
@@ -416,11 +433,11 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 
 	writePTY(t, terminal, "\x13")
-	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, "codex > First") }); err != nil {
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"First") }); err != nil {
 		t.Fatalf("rename changed stash: %v", err)
 	}
 	writePTY(t, terminal, "\x13")
-	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, "codex > Prompt") }); err != nil {
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Prompt") }); err != nil {
 		t.Fatalf("rename changed composer: %v", err)
 	}
 	persistedState, err := os.ReadFile(filepath.Join(stateDir, "state.json"))

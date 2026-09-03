@@ -130,7 +130,17 @@ func (a *App) act(ctx context.Context, x Action) error {
 		if x.Session == nil || !x.Session.Capabilities.Attach {
 			return capabilityError(x.Session, "attach")
 		}
-		return a.attach(ctx, p, *x.Session)
+		outcome, err := a.attach(ctx, p, *x.Session)
+		if err != nil {
+			return err
+		}
+		// Only an explicit agentsctl Ctrl+] (AttachDetached) marks the
+		// session as last-detached for title styling — a natural
+		// attached-process exit (AttachExited) must leave it unchanged.
+		if outcome == attachpty.AttachDetached {
+			a.Model.MarkDetached(x.Session.Key)
+		}
+		return nil
 	case ActionStop:
 		if x.Session == nil || !x.Session.Capabilities.Stop {
 			return capabilityError(x.Session, "stop")
@@ -174,22 +184,22 @@ func (a *App) act(ctx context.Context, x Action) error {
 	}
 	return nil
 }
-func (a *App) attach(ctx context.Context, p session.Provider, row session.Session) error {
+func (a *App) attach(ctx context.Context, p session.Provider, row session.Session) (attachpty.AttachOutcome, error) {
 	switch row.Key.Provider {
 	case session.ProviderClaude:
 		return attachpty.AttachClaude(ctx, a.ClaudePath, row.Key.ID, a.Input, a.Output, 2*time.Second)
 	case session.ProviderCodex:
 		cp, ok := p.(*codex.Provider)
 		if !ok {
-			return errors.New("invalid Codex attach strategy")
+			return attachpty.AttachExited, errors.New("invalid Codex attach strategy")
 		}
 		run, err := cp.PrepareAttach(ctx, row)
 		if err != nil {
-			return err
+			return attachpty.AttachExited, err
 		}
 		return attachpty.AttachCodex(ctx, a.Socket, run, a.Input, a.Output)
 	default:
-		return errors.New("unknown provider")
+		return attachpty.AttachExited, errors.New("unknown provider")
 	}
 }
 func capabilityError(s *session.Session, action string) error {

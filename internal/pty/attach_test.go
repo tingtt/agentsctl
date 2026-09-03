@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 
 	creackpty "github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/protocol"
+	"github.com/tingtt/agentsctl/internal/supervisor"
 )
 
 func TestDetachIsConsumedAndNeverForwarded(t *testing.T) {
@@ -127,6 +129,225 @@ func TestCtrlSIsForwardedToAttachedChild(t *testing.T) {
 	if !bytes.Equal(sent.Bytes(), []byte{'a', 0x13, 'b'}) {
 		t.Fatalf("sent=%v", sent.Bytes())
 	}
+}
+
+// fakeSupervisorSocket starts a minimal fake supervisor: it accepts one
+// connection, reads the attach Request frame, always answers with an OK
+// Response, then hands the connection to handle to drive the rest of the
+// exchange (e.g. sending an Exit frame to model a session ending on its
+// own, or just blocking to let the caller drive an explicit detach).
+func fakeSupervisorSocket(t *testing.T, handle func(conn net.Conn)) string {
+	t.Helper()
+	// A short-path temp dir, not t.TempDir() (which nests under a long
+	// per-test-name directory): unix socket paths are limited to ~104
+	// bytes (sockaddr_un) on macOS, and a path built from the full test
+	// name here routinely exceeds that.
+	dir, err := os.MkdirTemp("/tmp", "pty-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "supervisor.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		kind, _, err := protocol.Read(conn)
+		if err != nil || kind != protocol.Request {
+			return
+		}
+		res, _ := json.Marshal(supervisor.Response{OK: true})
+		if protocol.Write(conn, protocol.Response, res) != nil {
+			return
+		}
+		handle(conn)
+	}()
+	return sock
+}
+
+// TestAttachCodexExplicitDetachReportsAttachDetached models the DetachKey
+// (Ctrl+]) path end to end at the AttachCodex level: local input carries
+// the detach byte, AttachCodex must intercept it (never forward it as
+// session input), send protocol.Detach, and report AttachDetached -- the
+// only outcome the App layer is allowed to treat as "the user pressed
+// Ctrl+]" (see app_unix.go's act()/MarkDetached wiring).
+func TestAttachCodexExplicitDetachReportsAttachDetached(t *testing.T) {
+	detachSeen := make(chan struct{}, 1)
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		for {
+			kind, _, err := protocol.Read(conn)
+			if err != nil {
+				return
+			}
+			if kind == protocol.Detach {
+				detachSeen <- struct{}{}
+				return
+			}
+		}
+	})
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	type result struct {
+		outcome AttachOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
+		done <- result{outcome, err}
+	}()
+	if _, err := master.Write([]byte{DetachKey}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-detachSeen:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server never observed a protocol.Detach frame")
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("AttachCodex err=%v", r.err)
+		}
+		if r.outcome != AttachDetached {
+			t.Fatalf("outcome=%v, want AttachDetached for an explicit Ctrl+]", r.outcome)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("AttachCodex did not return after sending Detach")
+	}
+}
+
+// TestAttachCodexNaturalExitReportsAttachExited models the session ending
+// on its own (the remote Codex run exits, sending protocol.Exit) with no
+// local Ctrl+] ever pressed. This must report AttachExited, never
+// AttachDetached -- last-detached UI state must not change for a natural
+// exit (see app_unix.go's act(), which only calls Model.MarkDetached on
+// AttachDetached).
+func TestAttachCodexNaturalExitReportsAttachExited(t *testing.T) {
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		_ = protocol.Write(conn, protocol.Exit, nil)
+	})
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
+	if err != nil {
+		t.Fatalf("AttachCodex err=%v", err)
+	}
+	if outcome != AttachExited {
+		t.Fatalf("outcome=%v, want AttachExited for a natural session exit", outcome)
+	}
+}
+
+// TestAttachCodexFailureReportsAttachExited covers an attach-time/runtime
+// error (protocol.Failure) -- like a natural exit, this must never be
+// mistaken for an explicit detach.
+func TestAttachCodexFailureReportsAttachExited(t *testing.T) {
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		_ = protocol.Write(conn, protocol.Failure, []byte("boom"))
+	})
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
+	if err == nil {
+		t.Fatal("expected an error from a protocol.Failure frame")
+	}
+	if outcome != AttachExited {
+		t.Fatalf("outcome=%v, want AttachExited on failure", outcome)
+	}
+}
+
+// TestAttachClaudeExplicitDetachReportsAttachDetached and
+// TestAttachClaudeNaturalExitReportsAttachExited exercise AttachClaude's
+// outcome end to end against a fake `claude attach` client (a tiny shell
+// script, not the installed CLI -- see attach_live_test.go for that live
+// coverage), the same way TestClaudeDetachUsesControlZWhenClientConsumesIt
+// exercises detachClaudeClient alone: this covers the outer AttachClaude
+// loop that decides which of the two outcomes to report.
+func TestAttachClaudeExplicitDetachReportsAttachDetached(t *testing.T) {
+	script := writeFakeClaudeAttachScript(t, "stty raw -echo; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0")
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	type result struct {
+		outcome AttachOutcome
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		outcome, err := AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
+		done <- result{outcome, err}
+	}()
+	time.Sleep(200 * time.Millisecond) // let the fake client's own `stty raw` land
+	if _, err := master.Write([]byte{DetachKey}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("AttachClaude err=%v", r.err)
+		}
+		if r.outcome != AttachDetached {
+			t.Fatalf("outcome=%v, want AttachDetached for an explicit Ctrl+]", r.outcome)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AttachClaude did not return after Ctrl+]")
+	}
+}
+
+func TestAttachClaudeNaturalExitReportsAttachExited(t *testing.T) {
+	script := writeFakeClaudeAttachScript(t, "stty raw -echo; exit 0")
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	outcome, err := AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
+	if err != nil {
+		t.Fatalf("AttachClaude err=%v", err)
+	}
+	if outcome != AttachExited {
+		t.Fatalf("outcome=%v, want AttachExited for the client exiting on its own", outcome)
+	}
+}
+
+// writeFakeClaudeAttachScript writes an executable shell script standing
+// in for `claude attach <id>` and returns its path, for tests that need
+// to drive AttachClaude's outer outcome logic without the installed CLI.
+func writeFakeClaudeAttachScript(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "fake-claude")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestInitialTerminalSizeIsARedrawResizeFrame(t *testing.T) {

@@ -16,23 +16,39 @@ import (
 	"golang.org/x/term"
 )
 
-// rowPrefix builds the expected "> [status] <provider-color>" prefix for a
+// rowPrefix builds the expected "> [status] <title-style>" prefix for a
 // row so tests don't hardcode raw ANSI bytes. There is no runner-glyph
-// column: the provider color escape leads directly into the title text
-// (colorizeTitle puts the color code immediately before it), so
+// column and titles no longer carry provider color; the style escape
+// (see titleStyleCodes) leads directly into the title text, so
 // rowPrefix(...)+"text" reproduces exactly the bytes that precede a row's
-// title in the rendered view.
-func rowPrefix(cursor string, provider session.ProviderID, activity session.Activity) string {
-	return cursor + " " + statusIcon(activity) + " " + providerTitleColor(provider)
+// title in the rendered view. selected/lastDetached mirror the row's
+// state the same way titleStyleCodes expects.
+func rowPrefix(cursor string, activity session.Activity, selected, lastDetached bool) string {
+	return cursor + " " + statusIcon(activity) + " " + titleStylePrefix(selected, lastDetached)
 }
 
-// coloredCursorSuffix reproduces the exact bytes colorizeTitle produces
-// for a mid-title cursor followed by trailing suffix text: the cursor
-// glyph (reverse video, closing with its own ANSI reset), then the
-// provider color re-opened — so the reset doesn't erase provider color
-// for the suffix — immediately before that suffix.
-func coloredCursorSuffix(provider session.ProviderID, glyph, suffix string) string {
-	return cursorStyle(glyph) + providerTitleColor(provider) + suffix
+// titleStylePrefix reproduces the single ANSI SGR escape styleText opens
+// with for the given selection/last-detached state, without its closing
+// reset (the title text and, in the rename editor, a mid-title cursor
+// segment, follow it).
+func titleStylePrefix(selected, lastDetached bool) string {
+	return "\x1b[" + strings.Join(titleStyleCodes(selected, lastDetached), ";") + "m"
+}
+
+// styledCursorSuffix reproduces the exact bytes styleText produces for a
+// mid-title cursor followed by trailing suffix text: the cursor glyph
+// (reverse video, closing with its own ANSI reset), then the title style
+// re-opened — so the reset doesn't erase it for the suffix — immediately
+// before that suffix.
+func styledCursorSuffix(selected, lastDetached bool, glyph, suffix string) string {
+	return cursorStyle(glyph) + titleStylePrefix(selected, lastDetached) + suffix
+}
+
+// providerLabelPrefix reproduces the exact bytes a session row's right
+// block starts with: the provider label, colored and padded to
+// providerFieldWidth cells.
+func providerLabelPrefix(provider session.ProviderID) string {
+	return styleText(providerLabel(provider), providerColor(provider))
 }
 
 // cellOffset returns the terminal-cell offset of substr's first byte
@@ -159,7 +175,7 @@ func TestRunnerColumnAndGlyphAreAbsent(t *testing.T) {
 	// With no runner column, the title (cursor+status+2 separators = 4
 	// cells) immediately follows the fixed prefix. Offset is measured with
 	// the ANSI-aware lineCells, not naive rune counting, since the title
-	// is now provider-color-wrapped.
+	// is now selection/last-detached-style-wrapped (see titleStyleCodes).
 	line := rowLine(t, view, 3) // header(0), blank(1), "Other"(2), row(3): no pinned rows here.
 	byteIdx := strings.Index(line, "claude-row")
 	if byteIdx < 0 {
@@ -271,7 +287,7 @@ func TestComposerCursorEditingUsesRunes(t *testing.T) {
 	if m.Prompt != "X" || m.PromptCursor != 1 {
 		t.Fatalf("prompt=%q cursor=%d", m.Prompt, m.PromptCursor)
 	}
-	if view := m.View(40, 8); !strings.Contains(view, "claude > X"+cursorStyle(" ")) {
+	if view := m.View(40, 8); !strings.Contains(view, composerPrefix(session.ProviderClaude, "")+"X"+cursorStyle(" ")) {
 		t.Fatalf("composer cursor is not visible:\n%s", view)
 	}
 }
@@ -312,11 +328,11 @@ func TestPinnedAndOtherRenderInNavigationOrder(t *testing.T) {
 	view := m.View(80, 16)
 	positions := []int{
 		strings.Index(view, "Pinned"),
-		strings.Index(view, rowPrefix(">", session.ProviderClaude, "")+"A"),
-		strings.Index(view, rowPrefix(" ", session.ProviderCodex, "")+"B"),
+		strings.Index(view, rowPrefix(">", "", true, false)+"A"),
+		strings.Index(view, rowPrefix(" ", "", false, false)+"B"),
 		strings.Index(view, "Other"),
-		strings.Index(view, rowPrefix(" ", session.ProviderClaude, "")+"C"),
-		strings.Index(view, rowPrefix(" ", session.ProviderCodex, "")+"D"),
+		strings.Index(view, rowPrefix(" ", "", false, false)+"C"),
+		strings.Index(view, rowPrefix(" ", "", false, false)+"D"),
 	}
 	for i, position := range positions {
 		if position < 0 || i > 0 && position <= positions[i-1] {
@@ -356,7 +372,7 @@ func TestViewIsBoundedAndKeepsSelectionVisible(t *testing.T) {
 	if lines := strings.Count(view, "\n"); lines != 16 {
 		t.Fatalf("lines=%d", lines)
 	}
-	if !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)+"session-080") {
+	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)+"session-080") {
 		t.Fatalf("selected row is outside viewport:\n%s", view)
 	}
 	if strings.Contains(view, "session-000") {
@@ -496,7 +512,7 @@ func TestInlineRenameRendersEditorInsideSelectedNameCell(t *testing.T) {
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "old", Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
 	m.Update("rename")
 	view := m.View(80, 12)
-	wantEditor := rowPrefix(">", session.ProviderCodex, session.ActivityIdle) + "old" + cursorStyle(" ")
+	wantEditor := rowPrefix(">", session.ActivityIdle, true, false) + "old" + cursorStyle(" ")
 	if !strings.Contains(view, wantEditor) || strings.Contains(view, "Rename:") {
 		t.Fatalf("rename editor is not in row name cell:\n%s", view)
 	}
@@ -507,7 +523,7 @@ func TestNarrowInlineRenameKeepsRowAndCursorVisible(t *testing.T) {
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: strings.Repeat("n", 40), Activity: session.ActivityIdle, Capabilities: session.Capabilities{Rename: true}}}
 	m.Update("rename")
 	view := m.View(24, 10)
-	if !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)) || !strings.Contains(view, "\x1b[30;47m") {
+	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)) || !strings.Contains(view, "\x1b[30;47m") {
 		t.Fatalf("narrow rename lost selected row or cursor:\n%s", view)
 	}
 }
@@ -732,12 +748,12 @@ func TestViewKeepsFooterComposerSelectionAndErrorWithinNarrowViewport(t *testing
 		if lines := strings.Count(view, "\n"); lines != 10 {
 			t.Fatalf("count=%d lines=%d\n%s", count, lines, view)
 		}
-		for _, text := range []string{"claude >", "Ctrl+X", "fixture error"} {
+		for _, text := range []string{composerPrefix(session.ProviderClaude, ""), "Ctrl+X", "fixture error"} {
 			if !strings.Contains(view, text) {
 				t.Fatalf("count=%d missing %q\n%s", count, text, view)
 			}
 		}
-		if count > 0 && !strings.Contains(view, rowPrefix(">", session.ProviderCodex, session.ActivityIdle)) {
+		if count > 0 && !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)) {
 			t.Fatalf("count=%d selected row not visible\n%s", count, view)
 		}
 	}

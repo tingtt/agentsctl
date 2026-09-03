@@ -48,7 +48,26 @@ type Model struct {
 	Renaming       bool
 	RenameTarget   session.Key
 	RenameOriginal string
-	archiveConfirm *session.Key
+	// LastDetachedKey/HasLastDetached identify the session most recently
+	// detached from via agentsctl's own Ctrl+] — never a natural
+	// attached-process exit, an attach error, or context cancellation.
+	// Runtime-only UI state (never persisted to the state file); tracked
+	// by session.Key so it survives row reordering (pin/unpin, refresh)
+	// intact. See MarkDetached, the only place that sets it.
+	LastDetachedKey session.Key
+	HasLastDetached bool
+	archiveConfirm  *session.Key
+}
+
+// MarkDetached records key as the session most recently detached from via
+// an explicit agentsctl Ctrl+]. Callers must only invoke this for that
+// specific case — a natural attached-process exit, an attach error, or
+// context cancellation must all leave LastDetachedKey unchanged — so the
+// session title style (see titleStyleCodes) reflects agentsctl's own
+// detach action, not just "attach returned".
+func (m *Model) MarkDetached(key session.Key) {
+	m.LastDetachedKey = key
+	m.HasLastDetached = true
 }
 
 // CWDDepthAll is the sentinel Model.CWDDepth value selecting the "all"
@@ -404,7 +423,7 @@ func (m Model) View(width, height int) string {
 				continue
 			}
 			if !shown {
-				list = append(list, displayLine{text: g.title, rowIndex: -1})
+				list = append(list, displayLine{text: clipLine(g.title, width), rowIndex: -1})
 				shown = true
 			}
 			cursor := " "
@@ -414,22 +433,28 @@ func (m Model) View(width, height int) string {
 			if m.archiveConfirm != nil && row.Key == *m.archiveConfirm {
 				cursor = "x"
 			}
-			// Layout: "> [status] title  cwd", all fixed-width columns
-			// computed in terminal cells (never rune counts or byte
-			// lengths) so full-width titles never shift status/cwd. The
-			// provider is conveyed by the title's color, not a runner
-			// glyph column, so there is no dedicated runner cell here.
-			const fixedCells = 1 /* cursor */ + 1 /* status */ + 3 /* three single-space separators */
-			titleWidth, cwdWidth := splitRemainingWidth(width - fixedCells)
+			// Layout: "> [status] title...spacer...[provider] cwd/". The
+			// right block (provider field + cwd, right-aligned to the
+			// terminal edge) is sized from its own content first; the title
+			// gets whatever cells are left, padded so the row fills the
+			// terminal width exactly. Provider identity lives in the right
+			// block's label, not the title's color — the title's color/
+			// weight instead conveys selection and last-detached state (see
+			// titleStyleCodes).
+			cwdPlain := withTrailingSlash(displayCWD(row.CWD, m.CWDDepth))
+			titleWidth, cwdWidth := splitRowWidth(width, lineCells(cwdPlain))
 			var name string
 			if m.Renaming && row.Key == m.RenameTarget {
 				name = cursorWindow(m.RenameDraft, m.RenameCursor, titleWidth)
 			} else {
 				name = fitCells(row.DisplayName(), titleWidth)
 			}
-			name = colorizeTitle(providerTitleColor(row.Key.Provider), name)
-			cwd := fitCells(truncateLeftCells(displayCWD(row.CWD, m.CWDDepth), cwdWidth), cwdWidth)
-			line := cursor + " " + statusIcon(row.Activity) + " " + name + " " + cwd
+			selected := i == m.Selected
+			lastDetached := m.HasLastDetached && row.Key == m.LastDetachedKey
+			name = styleText(name, titleStyleCodes(selected, lastDetached)...)
+			cwd := fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth)
+			provider := styleText(providerLabel(row.Key.Provider), providerColor(row.Key.Provider))
+			line := cursor + " " + statusIcon(row.Activity) + " " + name + provider + " " + cwd
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		if shown {
@@ -440,7 +465,7 @@ func (m Model) View(width, height int) string {
 	if err := m.Warnings[m.Provider]; err != nil {
 		unavailable = " (unavailable: " + err.Error() + ")"
 	}
-	promptPrefix := fmt.Sprintf("%s%s > ", m.Provider, unavailable)
+	promptPrefix := composerPrefix(m.Provider, unavailable)
 	footer := []string{
 		clipLine(promptPrefix+cursorWindow(m.Prompt, m.PromptCursor, max(1, width-lineCells(promptPrefix))), width),
 		clipLine("Shift+Tab / Enter send/open / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
@@ -519,27 +544,32 @@ func cursorWindow(value string, cursor, width int) string {
 	return fitCells(result, width)
 }
 
-// splitRemainingWidth divides the space left after the fixed cursor/
-// status columns between the session title and the CWD. The CWD default
-// (directory depth 2, e.g. "owner/repository") is short, so the title
-// gets the majority share; the CWD floor still keeps a couple of trailing
-// path components readable even in a narrow terminal.
-func splitRemainingWidth(remaining int) (title, cwd int) {
-	if remaining < 0 {
-		remaining = 0
+// rowLeftFixed is the terminal-cell width of a session row's left prefix
+// before the title starts: cursor(1) + separator(1) + status(1) +
+// separator(1).
+const rowLeftFixed = 4
+
+// rowRightFixed is the terminal-cell width of the right block's fixed
+// portion, before the CWD: the provider field plus the single separator
+// space between it and the CWD. The CWD itself is variable-width.
+const rowRightFixed = providerFieldWidth + 1
+
+// splitRowWidth lays out a session row right-block-first: the CWD (with
+// its trailing "/" already counted in cwdCells) is shown in full whenever
+// the terminal is wide enough, and the title receives whatever cells
+// remain so the row fills the terminal width exactly. Only when the
+// terminal is too narrow for the full CWD alongside the fixed left/
+// provider cells does the CWD itself give up width (to be left-truncated
+// by the caller), at which point the title gets none.
+func splitRowWidth(width, cwdCells int) (title, cwd int) {
+	available := width - rowLeftFixed - rowRightFixed
+	if available < 0 {
+		available = 0
 	}
-	const maxTitle = 48
-	const minCWD = 12
-	title = remaining * 3 / 5
-	if title > maxTitle {
-		title = maxTitle
+	if cwdCells <= available {
+		return available - cwdCells, cwdCells
 	}
-	cwd = remaining - title
-	if cwd < minCWD {
-		cwd = min(minCWD, remaining)
-		title = remaining - cwd
-	}
-	return title, cwd
+	return 0, available
 }
 
 // fitCells clips or space-pads value to exactly width terminal cells,
@@ -557,21 +587,44 @@ func padCells(value string, width int) string {
 	return value
 }
 
-// colorizeTitle wraps text in an ANSI truecolor foreground escape so the
-// provider is distinguishable by title color instead of a runner glyph.
-// text may already contain an embedded cursorStyle segment (used for the
-// rename editor and, at end-of-title, the trailing cursor cell); that
-// segment closes with its own "\x1b[0m" reset, which would otherwise wipe
-// the color for anything after it, so color is re-opened immediately
-// after every embedded reset before the whole thing is closed with a
-// final reset. skipANSI/lineCells treat all of this as zero-width, so it
-// never affects column alignment.
-func colorizeTitle(color, text string) string {
-	if color == "" {
+// styleText wraps text in a single ANSI SGR escape built from codes (e.g.
+// styleText(s, "1", "97") for bold+white), the shared style-composition
+// primitive for every foreground/weight span in a row: status glyphs,
+// provider labels, and session titles. text may already contain an
+// embedded cursorStyle segment (the rename editor's cursor, or the
+// prompt composer's); that segment closes with its own "\x1b[0m" reset,
+// which would otherwise wipe codes' style for anything after it, so the
+// style is re-opened immediately after every embedded reset before the
+// whole thing is closed with one final reset — codes never leaks past the
+// text it wraps into the row's spacer, the right block, or the next row.
+// Empty codes are dropped, so a "no style" caller (e.g. an unknown
+// provider) gets text back unchanged. skipANSI/lineCells treat all of
+// this as zero-width, so it never affects column alignment.
+func styleText(text string, codes ...string) string {
+	var active []string
+	for _, c := range codes {
+		if c != "" {
+			active = append(active, c)
+		}
+	}
+	if len(active) == 0 {
 		return text
 	}
-	reopened := strings.ReplaceAll(text, "\x1b[0m", "\x1b[0m"+color)
-	return color + reopened + "\x1b[0m"
+	prefix := "\x1b[" + strings.Join(active, ";") + "m"
+	reopened := strings.ReplaceAll(text, "\x1b[0m", "\x1b[0m"+prefix)
+	return prefix + reopened + "\x1b[0m"
+}
+
+// composerPrefix builds the prompt composer's "<provider> > " prefix. The
+// provider label is fixed to providerFieldWidth visible cells (via
+// providerLabel) and colored via providerColor — the same mapping the
+// session list's provider label uses — so Shift+Tab switching providers
+// never moves the column the prompt body starts at. unavailable (when
+// non-empty) is appended after the fixed-width label and before " > ";
+// it is not itself constrained to any width, since only the
+// available-provider case needs the start-column guarantee.
+func composerPrefix(provider session.ProviderID, unavailable string) string {
+	return styleText(providerLabel(provider), providerColor(provider)) + unavailable + " > "
 }
 
 // displayCWD renders row's working directory per the active directory-
@@ -584,6 +637,21 @@ func displayCWD(path string, depth int) string {
 	}
 	home, _ := os.UserHomeDir()
 	return trailingComponents(path, home, depth)
+}
+
+// withTrailingSlash appends a directory separator "/" to a displayed CWD
+// (matching common shell prompt conventions), unless value already ends
+// in one — guarding both root ("/", which must stay "/" and never become
+// "//") and any other already-slash-terminated input against a doubled
+// slash. Applied after displayCWD, so the slash is part of the CWD's
+// visible width for clipping/right-alignment purposes, and — since
+// truncateLeftCells only ever drops characters from the left — it always
+// survives left-truncation in a narrow terminal.
+func withTrailingSlash(value string) string {
+	if strings.HasSuffix(value, "/") {
+		return value
+	}
+	return value + "/"
 }
 
 // trailingComponents returns the last n path components of path (HOME
