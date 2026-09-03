@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+import fcntl, json, os, signal, sys, termios, time, tty
+from pathlib import Path
+
+root = Path(os.environ["AGENTSCTL_FAKE_DIR"])
+home = root / "codex-home"; locks = home / "thread-writer-locks"
+home.mkdir(parents=True, exist_ok=True); locks.mkdir(parents=True, exist_ok=True)
+catalog = root / "codex.json"
+
+def load():
+    if not catalog.exists():
+        return [{"id":"codex-ready","name":"fake-codex","preview":"Ready","cwd":os.getcwd(),"createdAt":1,"updatedAt":1,"status":{"type":"idle"},"archived":False}]
+    return json.loads(catalog.read_text())
+
+def save(rows):
+    tmp = catalog.with_suffix(".tmp"); tmp.write_text(json.dumps(rows)); tmp.replace(catalog)
+
+def rpc():
+    for line in sys.stdin:
+        try: req = json.loads(line)
+        except Exception: continue
+        if "id" not in req: continue
+        method = req.get("method"); params = req.get("params") or {}; result = {}
+        if method == "initialize": result = {"codexHome":str(home),"userAgent":"fake-codex"}
+        elif method == "thread/list":
+            archived = bool(params.get("archived", False))
+            result = {"data":[r for r in load() if bool(r.get("archived")) == archived],"nextCursor":None}
+        elif method in ("thread/archive","thread/unarchive","thread/name/set"):
+            rows = load()
+            for row in rows:
+                if row["id"] == params.get("threadId"):
+                    if method == "thread/archive": row["archived"] = True
+                    elif method == "thread/unarchive": row["archived"] = False
+                    else: row["name"] = params.get("name")
+            save(rows)
+        else:
+            print(json.dumps({"jsonrpc":"2.0","id":req["id"],"error":{"code":-32601,"message":"not found"}}), flush=True); continue
+        print(json.dumps({"jsonrpc":"2.0","id":req["id"],"result":result}), flush=True)
+
+def interactive(sid, prompt):
+    rows = load(); found = False
+    for row in rows:
+        if row["id"] == sid:
+            row["status"] = {"type":"active"}; row["updatedAt"] = int(time.time()); found = True
+    if not found: rows.append({"id":sid,"name":"fake-codex-new","preview":prompt,"cwd":os.getcwd(),"createdAt":2,"updatedAt":int(time.time()),"status":{"type":"active"},"archived":False})
+    save(rows)
+    lock = open(locks / (sid + ".lock"), "w"); fcntl.flock(lock, fcntl.LOCK_EX)
+    old = termios.tcgetattr(0); tty.setraw(0)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(SystemExit(0)))
+    try:
+        os.write(1, ("FAKE CODEX ATTACHED " + sid + "\r\n").encode())
+        while True:
+            b = os.read(0, 1024)
+            if not b: break
+            os.write(1, b)
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+        rows = load()
+        for row in rows:
+            if row["id"] == sid:
+                row["status"] = {"type":"completed"}; row["updatedAt"] = int(time.time())
+        save(rows)
+
+args = sys.argv[1:]
+if args[:2] == ["app-server","--stdio"]: rpc()
+elif args[:1] == ["resume"]: interactive(args[1], "resume")
+elif args: interactive("codex-new", args[0])
+else: sys.exit(2)
