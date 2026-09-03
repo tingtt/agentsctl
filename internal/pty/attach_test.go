@@ -172,13 +172,15 @@ func fakeSupervisorSocket(t *testing.T, handle func(conn net.Conn)) string {
 	return sock
 }
 
-// TestAttachCodexExplicitDetachReportsAttachDetached models the DetachKey
+// TestAttachCodexExplicitDetachReturnsCleanly models the DetachKey
 // (Ctrl+]) path end to end at the AttachCodex level: local input carries
 // the detach byte, AttachCodex must intercept it (never forward it as
-// session input), send protocol.Detach, and report AttachDetached -- the
-// only outcome the App layer is allowed to treat as "the user pressed
-// Ctrl+]" (see app_unix.go's act()/MarkDetached wiring).
-func TestAttachCodexExplicitDetachReportsAttachDetached(t *testing.T) {
+// session input), send protocol.Detach, and return with no error. Which
+// session the overview marks as "last attached" no longer depends on
+// this path specifically — see app_unix.go's act()/Model.MarkAttached,
+// which fires on any successful attach return — but the underlying
+// detach mechanism itself is still exercised here as a regression check.
+func TestAttachCodexExplicitDetachReturnsCleanly(t *testing.T) {
 	detachSeen := make(chan struct{}, 1)
 	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
 		for {
@@ -199,14 +201,9 @@ func TestAttachCodexExplicitDetachReportsAttachDetached(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	type result struct {
-		outcome AttachOutcome
-		err     error
-	}
-	done := make(chan result, 1)
+	done := make(chan error, 1)
 	go func() {
-		outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
-		done <- result{outcome, err}
+		done <- AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
 	}()
 	if _, err := master.Write([]byte{DetachKey}); err != nil {
 		t.Fatal(err)
@@ -217,25 +214,21 @@ func TestAttachCodexExplicitDetachReportsAttachDetached(t *testing.T) {
 		t.Fatal("server never observed a protocol.Detach frame")
 	}
 	select {
-	case r := <-done:
-		if r.err != nil {
-			t.Fatalf("AttachCodex err=%v", r.err)
-		}
-		if r.outcome != AttachDetached {
-			t.Fatalf("outcome=%v, want AttachDetached for an explicit Ctrl+]", r.outcome)
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AttachCodex err=%v", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("AttachCodex did not return after sending Detach")
 	}
 }
 
-// TestAttachCodexNaturalExitReportsAttachExited models the session ending
-// on its own (the remote Codex run exits, sending protocol.Exit) with no
-// local Ctrl+] ever pressed. This must report AttachExited, never
-// AttachDetached -- last-detached UI state must not change for a natural
-// exit (see app_unix.go's act(), which only calls Model.MarkDetached on
-// AttachDetached).
-func TestAttachCodexNaturalExitReportsAttachExited(t *testing.T) {
+// TestAttachCodexNaturalExitReturnsCleanly models the session ending on
+// its own (the remote Codex run exits, sending protocol.Exit) with no
+// local Ctrl+] ever pressed -- this must also return with no error, since
+// the App layer treats any error-free attach return as "this session was
+// last attached", regardless of how it ended.
+func TestAttachCodexNaturalExitReturnsCleanly(t *testing.T) {
 	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
 		_ = protocol.Write(conn, protocol.Exit, nil)
 	})
@@ -246,19 +239,15 @@ func TestAttachCodexNaturalExitReportsAttachExited(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
-	if err != nil {
+	if err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard); err != nil {
 		t.Fatalf("AttachCodex err=%v", err)
-	}
-	if outcome != AttachExited {
-		t.Fatalf("outcome=%v, want AttachExited for a natural session exit", outcome)
 	}
 }
 
-// TestAttachCodexFailureReportsAttachExited covers an attach-time/runtime
-// error (protocol.Failure) -- like a natural exit, this must never be
-// mistaken for an explicit detach.
-func TestAttachCodexFailureReportsAttachExited(t *testing.T) {
+// TestAttachCodexFailureReturnsError covers an attach-time/runtime error
+// (protocol.Failure): the App layer must not mark a session last-attached
+// when attach itself failed.
+func TestAttachCodexFailureReturnsError(t *testing.T) {
 	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
 		_ = protocol.Write(conn, protocol.Failure, []byte("boom"))
 	})
@@ -269,23 +258,18 @@ func TestAttachCodexFailureReportsAttachExited(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	outcome, err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard)
-	if err == nil {
+	if err := AttachCodex(context.Background(), sock, "run1", slave, io.Discard); err == nil {
 		t.Fatal("expected an error from a protocol.Failure frame")
-	}
-	if outcome != AttachExited {
-		t.Fatalf("outcome=%v, want AttachExited on failure", outcome)
 	}
 }
 
-// TestAttachClaudeExplicitDetachReportsAttachDetached and
-// TestAttachClaudeNaturalExitReportsAttachExited exercise AttachClaude's
-// outcome end to end against a fake `claude attach` client (a tiny shell
-// script, not the installed CLI -- see attach_live_test.go for that live
-// coverage), the same way TestClaudeDetachUsesControlZWhenClientConsumesIt
-// exercises detachClaudeClient alone: this covers the outer AttachClaude
-// loop that decides which of the two outcomes to report.
-func TestAttachClaudeExplicitDetachReportsAttachDetached(t *testing.T) {
+// TestAttachClaudeExplicitDetachReturnsCleanly and
+// TestAttachClaudeNaturalExitReturnsCleanly exercise AttachClaude end to
+// end against a fake `claude attach` client (a tiny shell script, not the
+// installed CLI -- see attach_live_test.go for that live coverage), the
+// same way TestClaudeDetachUsesControlZWhenClientConsumesIt exercises
+// detachClaudeClient alone.
+func TestAttachClaudeExplicitDetachReturnsCleanly(t *testing.T) {
 	script := writeFakeClaudeAttachScript(t, "stty raw -echo; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0")
 	master, slave, err := creackpty.Open()
 	if err != nil {
@@ -294,33 +278,25 @@ func TestAttachClaudeExplicitDetachReportsAttachDetached(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	type result struct {
-		outcome AttachOutcome
-		err     error
-	}
-	done := make(chan result, 1)
+	done := make(chan error, 1)
 	go func() {
-		outcome, err := AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
-		done <- result{outcome, err}
+		done <- AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
 	}()
 	time.Sleep(200 * time.Millisecond) // let the fake client's own `stty raw` land
 	if _, err := master.Write([]byte{DetachKey}); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case r := <-done:
-		if r.err != nil {
-			t.Fatalf("AttachClaude err=%v", r.err)
-		}
-		if r.outcome != AttachDetached {
-			t.Fatalf("outcome=%v, want AttachDetached for an explicit Ctrl+]", r.outcome)
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AttachClaude err=%v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("AttachClaude did not return after Ctrl+]")
 	}
 }
 
-func TestAttachClaudeNaturalExitReportsAttachExited(t *testing.T) {
+func TestAttachClaudeNaturalExitReturnsCleanly(t *testing.T) {
 	script := writeFakeClaudeAttachScript(t, "stty raw -echo; exit 0")
 	master, slave, err := creackpty.Open()
 	if err != nil {
@@ -329,18 +305,14 @@ func TestAttachClaudeNaturalExitReportsAttachExited(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	outcome, err := AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
-	if err != nil {
+	if err := AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second); err != nil {
 		t.Fatalf("AttachClaude err=%v", err)
-	}
-	if outcome != AttachExited {
-		t.Fatalf("outcome=%v, want AttachExited for the client exiting on its own", outcome)
 	}
 }
 
 // writeFakeClaudeAttachScript writes an executable shell script standing
 // in for `claude attach <id>` and returns its path, for tests that need
-// to drive AttachClaude's outer outcome logic without the installed CLI.
+// to drive AttachClaude end to end without the installed CLI.
 func writeFakeClaudeAttachScript(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "fake-claude")

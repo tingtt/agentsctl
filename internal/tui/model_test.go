@@ -21,18 +21,18 @@ import (
 // column and titles no longer carry provider color; the style escape
 // (see titleStyleCodes) leads directly into the title text, so
 // rowPrefix(...)+"text" reproduces exactly the bytes that precede a row's
-// title in the rendered view. selected/lastDetached mirror the row's
+// title in the rendered view. selected/lastAttached mirror the row's
 // state the same way titleStyleCodes expects.
-func rowPrefix(cursor string, activity session.Activity, selected, lastDetached bool) string {
-	return cursor + " " + statusIcon(activity) + " " + titleStylePrefix(selected, lastDetached)
+func rowPrefix(cursor string, activity session.Activity, selected, lastAttached bool) string {
+	return cursor + " " + statusIcon(activity) + " " + titleStylePrefix(selected, lastAttached)
 }
 
 // titleStylePrefix reproduces the single ANSI SGR escape styleText opens
-// with for the given selection/last-detached state, without its closing
+// with for the given selection/last-attached state, without its closing
 // reset (the title text and, in the rename editor, a mid-title cursor
 // segment, follow it).
-func titleStylePrefix(selected, lastDetached bool) string {
-	return "\x1b[" + strings.Join(titleStyleCodes(selected, lastDetached), ";") + "m"
+func titleStylePrefix(selected, lastAttached bool) string {
+	return "\x1b[" + strings.Join(titleStyleCodes(selected, lastAttached), ";") + "m"
 }
 
 // styledCursorSuffix reproduces the exact bytes styleText produces for a
@@ -40,8 +40,8 @@ func titleStylePrefix(selected, lastDetached bool) string {
 // (reverse video, closing with its own ANSI reset), then the title style
 // re-opened — so the reset doesn't erase it for the suffix — immediately
 // before that suffix.
-func styledCursorSuffix(selected, lastDetached bool, glyph, suffix string) string {
-	return cursorStyle(glyph) + titleStylePrefix(selected, lastDetached) + suffix
+func styledCursorSuffix(selected, lastAttached bool, glyph, suffix string) string {
+	return cursorStyle(glyph) + titleStylePrefix(selected, lastAttached) + suffix
 }
 
 // providerLabelPrefix reproduces the exact bytes a session row's right
@@ -175,7 +175,7 @@ func TestRunnerColumnAndGlyphAreAbsent(t *testing.T) {
 	// With no runner column, the title (cursor+status+2 separators = 4
 	// cells) immediately follows the fixed prefix. Offset is measured with
 	// the ANSI-aware lineCells, not naive rune counting, since the title
-	// is now selection/last-detached-style-wrapped (see titleStyleCodes).
+	// is now selection/last-attached-style-wrapped (see titleStyleCodes).
 	line := rowLine(t, view, 3) // header(0), blank(1), "Other"(2), row(3): no pinned rows here.
 	byteIdx := strings.Index(line, "claude-row")
 	if byteIdx < 0 {

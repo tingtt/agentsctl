@@ -57,15 +57,8 @@ func TestRealClaudeCtrlBracketDetachSurvivesEarlyRace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	var output bytes.Buffer
-	type attachResult struct {
-		outcome AttachOutcome
-		err     error
-	}
-	attachDone := make(chan attachResult, 1)
-	go func() {
-		outcome, err := AttachClaude(ctx, claudePath, id, slave, &output, 2*time.Second)
-		attachDone <- attachResult{outcome, err}
-	}()
+	attachErr := make(chan error, 1)
+	go func() { attachErr <- AttachClaude(ctx, claudePath, id, slave, &output, 2*time.Second) }()
 
 	// Send the detach key as early as possible: this is the race.
 	if _, err := master.Write([]byte{DetachKey}); err != nil {
@@ -73,12 +66,9 @@ func TestRealClaudeCtrlBracketDetachSurvivesEarlyRace(t *testing.T) {
 	}
 
 	select {
-	case result := <-attachDone:
-		if result.err != nil {
-			t.Fatalf("AttachClaude did not detach cleanly: %v", result.err)
-		}
-		if result.outcome != AttachDetached {
-			t.Fatalf("AttachClaude outcome=%v, want AttachDetached for an explicit Ctrl+]", result.outcome)
+	case err := <-attachErr:
+		if err != nil {
+			t.Fatalf("AttachClaude did not detach cleanly: %v", err)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("AttachClaude did not return after an early Ctrl+] -- the race reproduced")

@@ -324,16 +324,17 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+1, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	// The explicit Ctrl+] just sent must be recognized end to end (through
-	// AttachCodex's AttachDetached outcome and App.act's MarkDetached call)
-	// as an agentsctl-initiated detach: session-099, still selected, must
-	// render bold on the very next overview frame. The fake CLI leaves the
-	// row's status "active" (ActivityWorking) across a detach -- it only
-	// resets to "completed" when the underlying process actually exits.
+	// A successful attach return -- via AttachCodex returning with no
+	// error and App.act's Model.MarkAttached call, regardless of how the
+	// attachment ended -- marks session-099 as last-attached: still
+	// selected, it must render bold on the very next overview frame. The
+	// fake CLI leaves the row's status "active" (ActivityWorking) across a
+	// detach -- it only resets to "completed" when the underlying process
+	// actually exits.
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
 		return strings.Contains(frame, rowPrefix(">", session.ActivityWorking, true, true)+"session-099")
 	}); err != nil {
-		t.Fatalf("explicit Ctrl+] detach did not mark the session bold on return to overview: %v", err)
+		t.Fatalf("returning to overview after attach did not mark the session bold: %v", err)
 	}
 	childInput, err := os.ReadFile(filepath.Join(fakeDir, "child-input.bin"))
 	if err != nil || !bytes.Contains(childInput, []byte{0x13}) {

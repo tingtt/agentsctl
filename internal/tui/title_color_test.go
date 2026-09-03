@@ -128,7 +128,7 @@ func TestRenameCursorPreservesTitleStyleBeforeAndAfter(t *testing.T) {
 	m.Update("right") // cursor now sits on the second rune ('l'), with "d" trailing
 	view := m.View(80, 12)
 	// Rename target is always the selected row, so its base foreground is
-	// white (selected=true); not last-detached here, so not bold.
+	// white (selected=true); not last-attached here, so not bold.
 	want := styledCursorSuffix(true, false, "l", "d")
 	if !strings.Contains(view, "o"+want) {
 		t.Fatalf("rename cursor did not preserve the selected-row title style across the cursor glyph:\n%s\nwant substring: %q", view, "o"+want)
@@ -145,11 +145,11 @@ func TestEndOfTitleCursorRendersWithSelectedTitleStyle(t *testing.T) {
 	}
 }
 
-// --- Session title context styling (selection / last-detached) ---
+// --- Session title context styling (selection / last-attached) ---
 
 func TestTitleStyleCodesMatrix(t *testing.T) {
 	cases := []struct {
-		selected, lastDetached bool
+		selected, lastAttached bool
 		want                   []string
 	}{
 		{false, false, []string{colorGray}},
@@ -158,9 +158,9 @@ func TestTitleStyleCodesMatrix(t *testing.T) {
 		{true, true, []string{codeBold, colorWhite}},
 	}
 	for _, tc := range cases {
-		got := titleStyleCodes(tc.selected, tc.lastDetached)
+		got := titleStyleCodes(tc.selected, tc.lastAttached)
 		if strings.Join(got, ";") != strings.Join(tc.want, ";") {
-			t.Fatalf("titleStyleCodes(selected=%v, lastDetached=%v)=%v, want %v", tc.selected, tc.lastDetached, got, tc.want)
+			t.Fatalf("titleStyleCodes(selected=%v, lastAttached=%v)=%v, want %v", tc.selected, tc.lastAttached, got, tc.want)
 		}
 	}
 }
@@ -188,43 +188,43 @@ func TestSelectedRowTitleIsWhiteNotBoldByDefault(t *testing.T) {
 	}
 }
 
-func TestLastDetachedRowNotSelectedIsGrayBold(t *testing.T) {
+func TestLastAttachedRowNotSelectedIsGrayBold(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{
 		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle},
 		{Key: session.Key{Provider: session.ProviderClaude, ID: "b"}, Name: "B", Activity: session.ActivityIdle},
 	}
 	m.Selected = 0
-	m.MarkDetached(session.Key{Provider: session.ProviderClaude, ID: "b"})
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "b"})
 	view := m.View(80, 12)
 	if !strings.Contains(view, rowPrefix(" ", session.ActivityIdle, false, true)+"B") {
-		t.Fatalf("last-detached, unselected row title is not gray+bold:\n%s", view)
+		t.Fatalf("last-attached, unselected row title is not gray+bold:\n%s", view)
 	}
 	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)+"A") {
 		t.Fatalf("selected row lost its plain white style:\n%s", view)
 	}
 }
 
-func TestSelectedAndLastDetachedRowIsWhiteBold(t *testing.T) {
+func TestSelectedAndLastAttachedRowIsWhiteBold(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle}}
 	m.Selected = 0
-	m.MarkDetached(session.Key{Provider: session.ProviderClaude, ID: "a"})
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "a"})
 	view := m.View(80, 12)
 	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, true)+"A") {
-		t.Fatalf("selected+last-detached row title is not white+bold:\n%s", view)
+		t.Fatalf("selected+last-attached row title is not white+bold:\n%s", view)
 	}
 }
 
-func TestWhiteStyleFollowsSelectionMovementBoldStaysOnDetachedKey(t *testing.T) {
+func TestWhiteStyleFollowsSelectionMovementBoldStaysOnAttachedKey(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{
 		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle},
 		{Key: session.Key{Provider: session.ProviderClaude, ID: "b"}, Name: "B", Activity: session.ActivityIdle},
 	}
 	m.Selected = 0
-	m.MarkDetached(session.Key{Provider: session.ProviderClaude, ID: "b"})
-	m.Update("down") // select "b": now selected AND last-detached
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "b"})
+	m.Update("down") // select "b": now selected AND last-attached
 	view := m.View(80, 12)
 	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, true)+"B") {
 		t.Fatalf("selection did not carry white style to the now-selected row:\n%s", view)
@@ -234,7 +234,7 @@ func TestWhiteStyleFollowsSelectionMovementBoldStaysOnDetachedKey(t *testing.T) 
 	}
 }
 
-func TestLastDetachedKeySurvivesPinReorder(t *testing.T) {
+func TestLastAttachedKeySurvivesPinReorder(t *testing.T) {
 	aKey := session.Key{Provider: session.ProviderClaude, ID: "a"}
 	bKey := session.Key{Provider: session.ProviderClaude, ID: "b"}
 	m := NewModel()
@@ -243,23 +243,23 @@ func TestLastDetachedKeySurvivesPinReorder(t *testing.T) {
 		{Key: bKey, Name: "B", Activity: session.ActivityIdle},
 	}
 	m.Selected = 0
-	m.MarkDetached(bKey)
+	m.MarkAttached(bKey)
 	// ApplyPin both reorders "b" into Pinned (ahead of "a") and, per the
 	// pre-existing pin fix, moves the selection to follow it -- so "b" ends
-	// up selected AND last-detached here (white+bold), exercising both
-	// "row reordering does not lose LastDetachedKey" and "selected key
+	// up selected AND last-attached here (white+bold), exercising both
+	// "row reordering does not lose LastAttachedKey" and "selected key
 	// behavior from previous pin fix remains intact" together.
 	m.ApplyPin(bKey, true)
-	if m.LastDetachedKey != bKey || m.Rows[m.Selected].Key != bKey {
-		t.Fatalf("pin reorder lost the last-detached key or the pin-fix selection: lastDetached=%+v selected=%+v", m.LastDetachedKey, m.Rows[m.Selected].Key)
+	if m.LastAttachedKey != bKey || m.Rows[m.Selected].Key != bKey {
+		t.Fatalf("pin reorder lost the last-attached key or the pin-fix selection: lastAttached=%+v selected=%+v", m.LastAttachedKey, m.Rows[m.Selected].Key)
 	}
 	view := m.View(80, 12)
 	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, true)+"B") {
-		t.Fatalf("selected+last-detached styling did not follow \"b\" through the pin reorder:\n%s", view)
+		t.Fatalf("selected+last-attached styling did not follow \"b\" through the pin reorder:\n%s", view)
 	}
 }
 
-func TestLastDetachedKeySurvivesSetRowsRefreshWithoutMovingByIndex(t *testing.T) {
+func TestLastAttachedKeySurvivesSetRowsRefreshWithoutMovingByIndex(t *testing.T) {
 	aKey := session.Key{Provider: session.ProviderCodex, ID: "a"}
 	bKey := session.Key{Provider: session.ProviderCodex, ID: "b"}
 	m := NewModel()
@@ -267,23 +267,23 @@ func TestLastDetachedKeySurvivesSetRowsRefreshWithoutMovingByIndex(t *testing.T)
 		{Key: aKey, Name: "A", Activity: session.ActivityIdle},
 		{Key: bKey, Name: "B", Activity: session.ActivityIdle},
 	})
-	m.MarkDetached(aKey)
+	m.MarkAttached(aKey)
 	// A provider refresh rebuilds the row slice (new backing values,
 	// reordered by index: "b" is now first) but must track the
-	// last-detached row by key, not position -- and selection, tracked the
+	// last-attached row by key, not position -- and selection, tracked the
 	// same way, keeps "a" selected across the reorder too.
 	m.SetRows([]session.Session{
 		{Key: bKey, Name: "B", Activity: session.ActivityWorking},
 		{Key: aKey, Name: "A", Activity: session.ActivityWorking},
 	})
-	if m.LastDetachedKey != aKey || m.Rows[m.Selected].Key != aKey {
-		t.Fatalf("refresh lost the last-detached key or selection-by-key: lastDetached=%+v selected=%+v", m.LastDetachedKey, m.Rows[m.Selected].Key)
+	if m.LastAttachedKey != aKey || m.Rows[m.Selected].Key != aKey {
+		t.Fatalf("refresh lost the last-attached key or selection-by-key: lastAttached=%+v selected=%+v", m.LastAttachedKey, m.Rows[m.Selected].Key)
 	}
 	view := m.View(80, 12)
 	if !strings.Contains(view, rowPrefix(">", session.ActivityWorking, true, true)+"A") {
-		t.Fatalf("selected+last-detached styling did not follow \"a\" by key across the refresh:\n%s", view)
+		t.Fatalf("selected+last-attached styling did not follow \"a\" by key across the refresh:\n%s", view)
 	}
-	// "b" moved into the last-detached row's old index (0) but must not
+	// "b" moved into the last-attached row's old index (0) but must not
 	// have inherited its bold styling -- proving bold tracks the key, not
 	// the row's position in the (re-sorted) list.
 	if !strings.Contains(view, rowPrefix(" ", session.ActivityWorking, false, false)+"B") {
@@ -359,7 +359,7 @@ func TestANSIStyleDoesNotAffectRightEdge(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "s", Activity: session.ActivityWorking, CWD: "/work/project"}}
 	m.Selected = 0
-	m.MarkDetached(session.Key{Provider: session.ProviderClaude, ID: "a"}) // adds bold on top of white, more embedded ANSI
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "a"}) // adds bold on top of white, more embedded ANSI
 	view := m.View(80, 12)
 	if got := lineCells(rowLine(t, view, 3)); got != 80 {
 		t.Fatalf("styled row width=%d, want 80:\n%s", got, view)

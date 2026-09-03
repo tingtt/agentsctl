@@ -29,6 +29,13 @@ type App struct {
 	ClaudePath string
 	Socket     string
 	ReadInput  func(*bufio.Reader) (string, error)
+	// AttachFunc, when set, overrides attach()'s real Claude/Codex PTY
+	// dispatch — a test seam for exercising act()'s ActionAttach path
+	// (specifically, when it does and doesn't call Model.MarkAttached)
+	// without a real attach client process or Codex supervisor socket.
+	// Production leaves this nil, in which case attach() dispatches to
+	// the real attachpty.AttachClaude/AttachCodex.
+	AttachFunc func(ctx context.Context, p session.Provider, row session.Session) error
 }
 
 func (a *App) Run(ctx context.Context) error {
@@ -130,16 +137,15 @@ func (a *App) act(ctx context.Context, x Action) error {
 		if x.Session == nil || !x.Session.Capabilities.Attach {
 			return capabilityError(x.Session, "attach")
 		}
-		outcome, err := a.attach(ctx, p, *x.Session)
-		if err != nil {
+		if err := a.attach(ctx, p, *x.Session); err != nil {
 			return err
 		}
-		// Only an explicit agentsctl Ctrl+] (AttachDetached) marks the
-		// session as last-detached for title styling — a natural
-		// attached-process exit (AttachExited) must leave it unchanged.
-		if outcome == attachpty.AttachDetached {
-			a.Model.MarkDetached(x.Session.Key)
-		}
+		// A successful attach — regardless of how it ended (an explicit
+		// Ctrl+] detach, or the attached client/session exiting on its
+		// own) — marks the session as last-attached for title styling.
+		// Only an attach that returned an error (invalid provider,
+		// PrepareAttach failure, client startup failure, ...) skips this.
+		a.Model.MarkAttached(x.Session.Key)
 		return nil
 	case ActionStop:
 		if x.Session == nil || !x.Session.Capabilities.Stop {
@@ -184,22 +190,25 @@ func (a *App) act(ctx context.Context, x Action) error {
 	}
 	return nil
 }
-func (a *App) attach(ctx context.Context, p session.Provider, row session.Session) (attachpty.AttachOutcome, error) {
+func (a *App) attach(ctx context.Context, p session.Provider, row session.Session) error {
+	if a.AttachFunc != nil {
+		return a.AttachFunc(ctx, p, row)
+	}
 	switch row.Key.Provider {
 	case session.ProviderClaude:
 		return attachpty.AttachClaude(ctx, a.ClaudePath, row.Key.ID, a.Input, a.Output, 2*time.Second)
 	case session.ProviderCodex:
 		cp, ok := p.(*codex.Provider)
 		if !ok {
-			return attachpty.AttachExited, errors.New("invalid Codex attach strategy")
+			return errors.New("invalid Codex attach strategy")
 		}
 		run, err := cp.PrepareAttach(ctx, row)
 		if err != nil {
-			return attachpty.AttachExited, err
+			return err
 		}
 		return attachpty.AttachCodex(ctx, a.Socket, run, a.Input, a.Output)
 	default:
-		return attachpty.AttachExited, errors.New("unknown provider")
+		return errors.New("unknown provider")
 	}
 }
 func capabilityError(s *session.Session, action string) error {

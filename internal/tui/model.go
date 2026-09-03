@@ -48,26 +48,33 @@ type Model struct {
 	Renaming       bool
 	RenameTarget   session.Key
 	RenameOriginal string
-	// LastDetachedKey/HasLastDetached identify the session most recently
-	// detached from via agentsctl's own Ctrl+] — never a natural
-	// attached-process exit, an attach error, or context cancellation.
+	// LastAttachedKey/HasLastAttached identify the session most recently
+	// attached to from the overview — regardless of how that attachment
+	// ended (an explicit agentsctl Ctrl+] detach, or the attached client/
+	// session exiting on its own): what the session list wants to convey
+	// is simply "which session was open right before this return to the
+	// overview", not anything about the PTY detach mechanism. Only a
+	// successful attach (no error) updates it — see MarkAttached, the only
+	// place that sets it, and app_unix.go's act(), the only caller.
 	// Runtime-only UI state (never persisted to the state file); tracked
 	// by session.Key so it survives row reordering (pin/unpin, refresh)
-	// intact. See MarkDetached, the only place that sets it.
-	LastDetachedKey session.Key
-	HasLastDetached bool
+	// intact.
+	LastAttachedKey session.Key
+	HasLastAttached bool
 	archiveConfirm  *session.Key
 }
 
-// MarkDetached records key as the session most recently detached from via
-// an explicit agentsctl Ctrl+]. Callers must only invoke this for that
-// specific case — a natural attached-process exit, an attach error, or
-// context cancellation must all leave LastDetachedKey unchanged — so the
-// session title style (see titleStyleCodes) reflects agentsctl's own
-// detach action, not just "attach returned".
-func (m *Model) MarkDetached(key session.Key) {
-	m.LastDetachedKey = key
-	m.HasLastDetached = true
+// MarkAttached records key as the session most recently attached to from
+// the overview. Callers must only invoke this after attach actually
+// completed without error and control returned to the overview — an
+// attach error must leave LastAttachedKey unchanged — but it must be
+// called regardless of *how* the attachment ended (explicit Ctrl+] detach
+// or the attached client/session exiting on its own): both are "this
+// session was the one last open", which is all the title style (see
+// titleStyleCodes) conveys.
+func (m *Model) MarkAttached(key session.Key) {
+	m.LastAttachedKey = key
+	m.HasLastAttached = true
 }
 
 // CWDDepthAll is the sentinel Model.CWDDepth value selecting the "all"
@@ -439,7 +446,7 @@ func (m Model) View(width, height int) string {
 			// gets whatever cells are left, padded so the row fills the
 			// terminal width exactly. Provider identity lives in the right
 			// block's label, not the title's color — the title's color/
-			// weight instead conveys selection and last-detached state (see
+			// weight instead conveys selection and last-attached state (see
 			// titleStyleCodes).
 			cwdPlain := withTrailingSlash(displayCWD(row.CWD, m.CWDDepth))
 			titleWidth, cwdWidth := splitRowWidth(width, lineCells(cwdPlain))
@@ -450,8 +457,8 @@ func (m Model) View(width, height int) string {
 				name = fitCells(row.DisplayName(), titleWidth)
 			}
 			selected := i == m.Selected
-			lastDetached := m.HasLastDetached && row.Key == m.LastDetachedKey
-			name = styleText(name, titleStyleCodes(selected, lastDetached)...)
+			lastAttached := m.HasLastAttached && row.Key == m.LastAttachedKey
+			name = styleText(name, titleStyleCodes(selected, lastAttached)...)
 			cwd := fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth)
 			provider := styleText(providerLabel(row.Key.Provider), providerColor(row.Key.Provider))
 			line := cursor + " " + statusIcon(row.Activity) + " " + name + provider + " " + cwd

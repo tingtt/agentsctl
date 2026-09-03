@@ -27,7 +27,7 @@ func ansiColor(glyph, code string) string {
 // label and the prompt composer's runner label, which share this single
 // mapping so the two stay in sync. Session titles no longer carry
 // provider color; see titleStyleCodes for what a title's style conveys
-// instead (selection / last-detached state).
+// instead (selection / last-attached state).
 const (
 	providerColorClaudeCodes = "38;2;217;119;87" // #D97757
 	providerColorCodexCodes  = "38;2;83;104;235" // #5368EB
@@ -75,18 +75,19 @@ func providerLabel(provider session.ProviderID) string {
 }
 
 // titleStyleCodes is the single centralized mapping from a session row's
-// selection/last-detach state to its title's SGR codes: selected rows are
-// white, others gray; a session that was last explicitly detached from
-// (via agentsctl's own Ctrl+], never a natural attached-process exit) is
+// selection/last-attached state to its title's SGR codes: selected rows
+// are white, others gray; the session most recently attached to from the
+// overview (regardless of how that attachment ended — an explicit Ctrl+]
+// detach or the attached client/session exiting on its own) is
 // additionally bold. Bold composes with — never replaces — the foreground
-// color, so all four combinations (selected x last-detached) are
+// color, so all four combinations (selected x last-attached) are
 // distinguishable.
-func titleStyleCodes(selected, lastDetached bool) []string {
+func titleStyleCodes(selected, lastAttached bool) []string {
 	color := colorGray
 	if selected {
 		color = colorWhite
 	}
-	if lastDetached {
+	if lastAttached {
 		return []string{codeBold, color}
 	}
 	return []string{color}
