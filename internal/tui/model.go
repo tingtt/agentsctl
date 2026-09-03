@@ -2,7 +2,10 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
@@ -358,11 +361,19 @@ func (m Model) View(width, height int) string {
 			if m.archiveConfirm != nil && row.Key == *m.archiveConfirm {
 				cursor = "x"
 			}
-			name := row.DisplayName()
+			// Layout: "> [runner] [status] title  cwd", all fixed-width
+			// columns computed in terminal cells (never rune counts or
+			// byte lengths) so full-width titles never shift status/cwd.
+			const fixedCells = 1 /* cursor */ + 1 /* runner */ + 1 /* status */ + 4 /* four single-space separators */
+			titleWidth, cwdWidth := splitRemainingWidth(width - fixedCells)
+			var name string
 			if m.Renaming && row.Key == m.RenameTarget {
-				name = renameCursorWindow(m.RenameDraft, m.RenameCursor, min(24, max(1, width-9)))
+				name = cursorWindow(m.RenameDraft, m.RenameCursor, titleWidth)
+			} else {
+				name = fitCells(row.DisplayName(), titleWidth)
 			}
-			line := fmt.Sprintf("%s %-6s %-24.24s %-18.18s %-28.28s", cursor, row.Key.Provider, name, row.Activity, shortHome(row.CWD))
+			cwd := fitCells(truncateLeftCells(shortHome(row.CWD), cwdWidth), cwdWidth)
+			line := cursor + " " + runnerIcon(row.Key.Provider) + " " + statusIcon(row.Activity) + " " + name + " " + cwd
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		if shown {
@@ -416,32 +427,162 @@ func (m Model) View(width, height int) string {
 	return b.String()
 }
 
-func renameCursor(value string, cursor int) string {
-	runes := []rune(value)
-	cursor = min(max(cursor, 0), len(runes))
-	return string(runes[:cursor]) + "_" + string(runes[cursor:])
+// cursorStyle renders a single glyph in reverse video (white background,
+// black text), representing the insertion point immediately before it.
+// Shared by both the rename editor and the prompt composer so their
+// cursor rendering stays identical.
+func cursorStyle(glyph string) string {
+	return "\x1b[30;47m" + glyph + "\x1b[0m"
 }
 
-func renameCursorWindow(value string, cursor, width int) string {
-	return cursorWindow(value, cursor, width)
-}
-
+// cursorWindow renders value with a horizontally-scrolled window around a
+// rune-index cursor, fit into width terminal cells. The rune at the
+// cursor position is recolored via cursorStyle to mark the insertion
+// point; if cursor is at the end of value, a trailing reverse-video space
+// cell marks it instead. This is the single cursor-rendering/-windowing
+// implementation shared by the rename editor and the prompt composer.
 func cursorWindow(value string, cursor, width int) string {
+	if width <= 0 {
+		return ""
+	}
 	runes := []rune(value)
 	cursor = min(max(cursor, 0), len(runes))
-	start := max(0, cursor-max(0, width-1))
-	for start < cursor && lineCells(string(runes[start:cursor])) > width-1 {
+	glyph := " "
+	var suffix []rune
+	if cursor < len(runes) {
+		glyph = string(runes[cursor])
+		suffix = runes[cursor+1:]
+	}
+	budget := max(0, width-lineCells(glyph))
+	start := max(0, cursor-budget)
+	for start < cursor && lineCells(string(runes[start:cursor])) > budget {
 		start++
 	}
-	return clipLine(string(runes[start:cursor])+"_"+string(runes[cursor:]), width)
+	prefix := string(runes[start:cursor])
+	result := clipLine(prefix+cursorStyle(glyph)+string(suffix), width)
+	return fitCells(result, width)
 }
 
+// splitRemainingWidth divides the space left after the fixed cursor/
+// runner/status columns between the session title and the CWD, giving
+// CWD the majority so its meaningful tail stays readable.
+func splitRemainingWidth(remaining int) (title, cwd int) {
+	if remaining < 0 {
+		remaining = 0
+	}
+	const maxTitle = 32
+	title = remaining / 2
+	if title > maxTitle {
+		title = maxTitle
+	}
+	cwd = remaining - title
+	return title, cwd
+}
+
+// fitCells clips or space-pads value to exactly width terminal cells,
+// tolerating embedded ANSI SGR sequences (their bytes are zero-width and
+// pass through untouched).
+func fitCells(value string, width int) string {
+	clipped := clipLine(value, width)
+	return padCells(clipped, width)
+}
+
+func padCells(value string, width int) string {
+	if pad := width - lineCells(value); pad > 0 {
+		return value + strings.Repeat(" ", pad)
+	}
+	return value
+}
+
+// shortHome renders path with the user's home directory abbreviated to
+// "~", matching common shell prompt conventions.
+func shortHome(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	return shortenHome(path, home)
+}
+
+func shortenHome(path, home string) string {
+	home = filepath.Clean(home)
+	clean := filepath.Clean(path)
+	if clean == home {
+		return "~"
+	}
+	if strings.HasPrefix(clean, home+string(filepath.Separator)) {
+		return "~" + clean[len(home):]
+	}
+	return clean
+}
+
+// truncateLeftCells fits value into width terminal cells by dropping
+// characters from the left (prefixing an ellipsis) so the tail — the
+// part a user most needs, e.g. the current directory name — stays
+// visible.
+func truncateLeftCells(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if lineCells(value) <= width {
+		return value
+	}
+	const ellipsis = "…"
+	ellipsisCells := lineCells(ellipsis)
+	if width <= ellipsisCells {
+		return tailCells(value, width)
+	}
+	return ellipsis + tailCells(value, width-ellipsisCells)
+}
+
+// tailCells returns the longest suffix of value that fits in width cells.
+func tailCells(value string, width int) string {
+	runes := []rune(value)
+	total := 0
+	start := len(runes)
+	for start > 0 {
+		c := runeCells(runes[start-1])
+		if total+c > width {
+			break
+		}
+		total += c
+		start--
+	}
+	return string(runes[start:])
+}
+
+// lineCells returns the visible terminal-cell width of value, skipping
+// ANSI CSI escape sequences (which occupy zero visible cells) so styled
+// text can be measured and padded/clipped like plain text.
 func lineCells(value string) int {
 	width := 0
-	for _, r := range value {
+	for i := 0; i < len(value); {
+		if value[i] == 0x1b {
+			i = skipANSI(value, i)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(value[i:])
 		width += runeCells(r)
+		i += size
 	}
 	return width
+}
+
+// skipANSI returns the index just past an ANSI CSI escape sequence
+// starting at i (value[i] must be ESC), or i+1 if it isn't a recognized
+// CSI sequence, so scanning always makes forward progress.
+func skipANSI(value string, i int) int {
+	if i+1 >= len(value) || value[i+1] != '[' {
+		return i + 1
+	}
+	j := i + 2
+	for j < len(value) && !(value[j] >= 0x40 && value[j] <= 0x7e) {
+		j++
+	}
+	if j < len(value) {
+		return j + 1
+	}
+	return j
 }
 
 func isTextInput(key string) bool {
@@ -476,13 +617,21 @@ func clipLine(value string, width int) string {
 	}
 	used := 0
 	var b strings.Builder
-	for _, r := range value {
+	for i := 0; i < len(value); {
+		if value[i] == 0x1b {
+			j := skipANSI(value, i)
+			b.WriteString(value[i:j])
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(value[i:])
 		cells := runeCells(r)
 		if used+cells > width {
 			break
 		}
 		b.WriteRune(r)
 		used += cells
+		i += size
 	}
 	return b.String()
 }
@@ -496,4 +645,3 @@ func runeCells(r rune) int {
 	}
 	return 1
 }
-func shortHome(v string) string { return v }

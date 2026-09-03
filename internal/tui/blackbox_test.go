@@ -119,6 +119,127 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertScreen(t, output.String(), 80, 24, "session-099", "Ctrl+X", "claude >")
+
+	// Composer left/right/home/end/insert/backspace/delete, including
+	// crossing a full-width Japanese rune, driven by real terminal escape
+	// sequences written to a real PTY (not the synthetic
+	// bufio.NewReader(strings.NewReader(...)) unit tests, which never
+	// exercise the kernel pty timing this goes through).
+	writePTY(t, terminal, "abc")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > abc"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("composer did not accept typed text: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[D\x1b[D") // left, left
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > a"+cursorStyle("b")+"c")
+	}); err != nil {
+		t.Fatalf("left arrow did not move the composer cursor: %v", err)
+	}
+	writePTY(t, terminal, "X")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > aX"+cursorStyle("b")+"c")
+	}); err != nil {
+		t.Fatalf("mid-composer insert failed: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[C") // right
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > aXb"+cursorStyle("c"))
+	}); err != nil {
+		t.Fatalf("right arrow did not move the composer cursor: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[H") // home
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle("a")+"Xbc")
+	}); err != nil {
+		t.Fatalf("home did not move the composer cursor to the start: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[F") // end
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > aXbc"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("end did not move the composer cursor to the end: %v", err)
+	}
+	writePTY(t, terminal, "\x7f") // backspace
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > aXb"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("backspace did not delete a composer character: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[D\x1b[D\x1b[D") // left x3, reaching the start
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle("a")+"Xb")
+	}); err != nil {
+		t.Fatalf("left arrow did not reach the composer start: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[3~") // delete
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle("X")+"b")
+	}); err != nil {
+		t.Fatalf("delete did not remove a composer character: %v", err)
+	}
+	writePTY(t, terminal, "界") // insert a full-width rune at the start
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > 界"+cursorStyle("X")+"b")
+	}); err != nil {
+		t.Fatalf("Japanese character insert into the composer failed: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[C") // right, crossing past the inserted rune
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > 界X"+cursorStyle("b"))
+	}); err != nil {
+		t.Fatalf("right arrow did not cross the Japanese character: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[D\x1b[D") // left, left, landing back on the Japanese character
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle("界")+"Xb")
+	}); err != nil {
+		t.Fatalf("left arrow did not cross back onto the Japanese character: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[F"+strings.Repeat("\x7f", 3)) // end, then clear the composer for later steps
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("composer was not cleared after the arrow-key exercise: %v", err)
+	}
+
+	// SS3-form arrow keys (ESC O <letter>): terminfo for TERM=xterm-256color
+	// (a common default, including on macOS terminals) declares
+	// kcub1/kcuf1 (Left/Right) as \EOD/\EOC rather than the CSI form
+	// \E[D/\E[C exercised above. A terminal sending this form must move
+	// the composer cursor too.
+	writePTY(t, terminal, "hi")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > hi"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("composer did not accept typed text: %v", err)
+	}
+	writePTY(t, terminal, "\x1bOD") // SS3 left
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > h"+cursorStyle("i"))
+	}); err != nil {
+		t.Fatalf("SS3-form left arrow did not move the composer cursor: %v", err)
+	}
+	writePTY(t, terminal, "!")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > h!"+cursorStyle("i"))
+	}); err != nil {
+		t.Fatalf("mid-composer insert after SS3 left arrow failed: %v", err)
+	}
+	writePTY(t, terminal, "\x1bOC") // SS3 right
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > h!i"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("SS3-form right arrow did not move the composer cursor: %v", err)
+	}
+	writePTY(t, terminal, strings.Repeat("\x7f", 3)) // clear the composer again
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "claude > "+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("composer was not cleared after the SS3 arrow-key exercise: %v", err)
+	}
+
 	writePTY(t, terminal, "\x01")
 	if err := waitOutput(&output, "MUST-NOT-SHOW-SIBLING", 3*time.Second); err != nil {
 		t.Fatal("Ctrl+A did not expose all directories")
@@ -152,7 +273,9 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, strings.Repeat("\x7f", len("Second")))
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "codex > _\r\n")
+		// An empty composer places the cursor glyph directly after the
+		// prompt prefix with nothing in between.
+		return strings.Contains(frame, "codex > "+cursorStyle(" "))
 	}); err != nil {
 		t.Fatalf("composer did not become empty: %v", err)
 	}
@@ -230,6 +353,67 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err != nil || strings.Count(strings.TrimSpace(string(renameLog)), "\n") != 0 || !strings.Contains(string(renameLog), `"id": "session-099"`) || !strings.Contains(string(renameLog), `"name": "Xession-099"`) {
 		t.Fatalf("provider rename calls=%q err=%v", renameLog, err)
 	}
+
+	// Rename editor left/right/home/end, mid-word insert, and crossing a
+	// full-width Japanese rune, again over a real PTY.
+	writePTY(t, terminal, "\x12")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-099"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("rename editor did not open with the cursor at the end: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[D\x1b[D\x1b[D") // left x3
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-"+cursorStyle("0")+"99")
+	}); err != nil {
+		t.Fatalf("left arrow did not move the rename cursor: %v", err)
+	}
+	writePTY(t, terminal, "Z")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-Z"+cursorStyle("0")+"99")
+	}); err != nil {
+		t.Fatalf("mid-rename insert failed: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[C") // right
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-Z0"+cursorStyle("9")+"9")
+	}); err != nil {
+		t.Fatalf("right arrow did not move the rename cursor: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[H") // home
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, cursorStyle("X")+"ession-Z099")
+	}); err != nil {
+		t.Fatalf("home did not move the rename cursor to the start: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[F") // end
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-Z099"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("end did not move the rename cursor to the end: %v", err)
+	}
+	writePTY(t, terminal, "界") // insert a full-width rune at the end
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-Z099界"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("Japanese character insert into the rename editor failed: %v", err)
+	}
+	writePTY(t, terminal, "\x1b[D") // left, landing on the Japanese character
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-Z099"+cursorStyle("界"))
+	}); err != nil {
+		t.Fatalf("left arrow did not cross onto the Japanese character in rename: %v", err)
+	}
+	writePTY(t, terminal, "\x1b") // cancel; must not call provider.Rename again
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "Xession-099") && strings.Contains(frame, "Rename cancelled")
+	}); err != nil {
+		t.Fatalf("second rename cancel did not restore the committed name: %v", err)
+	}
+	if renameLogAfterCursorTest, err := os.ReadFile(filepath.Join(fakeDir, "rename.log")); err != nil || string(renameLogAfterCursorTest) != string(renameLog) {
+		t.Fatalf("cancelled rename invoked provider rename again: %q vs %q (err=%v)", renameLogAfterCursorTest, renameLog, err)
+	}
+
 	writePTY(t, terminal, "\x13")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool { return strings.Contains(frame, "codex > First") }); err != nil {
 		t.Fatalf("rename changed stash: %v", err)
@@ -443,7 +627,9 @@ func assertScreen(t *testing.T, output string, width, height int, required ...st
 		if cells > width {
 			t.Fatalf("screen row exceeds width %d: %q", width, line)
 		}
-		if strings.Contains(line, "codex  session-") && strings.Index(line, "codex") != 2 {
+		// Row layout is "> [runner] [status] title...": the title always
+		// starts at cell 6 regardless of which provider's icon precedes it.
+		if cells := cellIndex(line, "session-"); cells >= 0 && cells != 6 {
 			t.Fatalf("session row did not start at the shared column: %q", line)
 		}
 	}
@@ -457,6 +643,22 @@ func assertScreen(t *testing.T, output string, width, height int, required ...st
 			t.Fatalf("screen contains %q:\n%s", forbidden, frame)
 		}
 	}
+}
+
+// cellIndex returns the terminal-cell offset of substr's first occurrence
+// in line, or -1 if absent. Byte/rune offsets are not cell offsets once a
+// line mixes multi-byte icon glyphs, so alignment checks must go through
+// this instead of strings.Index.
+func cellIndex(line, substr string) int {
+	byteIdx := strings.Index(line, substr)
+	if byteIdx < 0 {
+		return -1
+	}
+	cells := 0
+	for _, r := range line[:byteIdx] {
+		cells += runeCells(r)
+	}
+	return cells
 }
 
 func emulateANSIScreen(output string, width, height int) []string {
