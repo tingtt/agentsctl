@@ -13,7 +13,7 @@ const (
 	colorRed    = "31"
 	colorBlue   = "34"
 	colorGreen  = "32"
-	colorWhite  = "97"
+	colorWhite  = "37"
 	codeBold    = "1"
 )
 
@@ -75,22 +75,24 @@ func providerLabel(provider session.ProviderID) string {
 }
 
 // titleStyleCodes is the single centralized mapping from a session row's
-// selection/last-attached state to its title's SGR codes: selected rows
-// are white, others gray; the session most recently attached to from the
-// overview (regardless of how that attachment ended — an explicit Ctrl+]
-// detach or the attached client/session exiting on its own) is
-// additionally bold. Bold composes with — never replaces — the foreground
-// color, so all four combinations (selected x last-attached) are
-// distinguishable.
+// selection/last-attached state to its title's SGR codes. Last-attached
+// state takes priority over selection, not just weight on top of it: the
+// session most recently attached to from the overview (regardless of how
+// that attachment ended — an explicit Ctrl+] detach or the attached
+// client/session exiting on its own) is always white + bold, whether or
+// not it is currently selected. A selected-but-not-last-attached row is
+// white + normal, distinguishing it from last-attached's bold. Every other
+// row is gray + normal. Selection and last-attached are therefore not two
+// independent axes (foreground vs. weight) — last-attached alone decides
+// both.
 func titleStyleCodes(selected, lastAttached bool) []string {
-	color := colorGray
-	if selected {
-		color = colorWhite
-	}
 	if lastAttached {
-		return []string{codeBold, color}
+		return []string{codeBold, colorWhite}
 	}
-	return []string{color}
+	if selected {
+		return []string{colorWhite}
+	}
+	return []string{colorGray}
 }
 
 // statusIcon is the single centralized mapping from session activity to

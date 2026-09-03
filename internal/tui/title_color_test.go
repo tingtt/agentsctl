@@ -154,7 +154,7 @@ func TestTitleStyleCodesMatrix(t *testing.T) {
 	}{
 		{false, false, []string{colorGray}},
 		{true, false, []string{colorWhite}},
-		{false, true, []string{codeBold, colorGray}},
+		{false, true, []string{codeBold, colorWhite}},
 		{true, true, []string{codeBold, colorWhite}},
 	}
 	for _, tc := range cases {
@@ -188,7 +188,13 @@ func TestSelectedRowTitleIsWhiteNotBoldByDefault(t *testing.T) {
 	}
 }
 
-func TestLastAttachedRowNotSelectedIsGrayBold(t *testing.T) {
+// TestLastAttachedRowNotSelectedIsWhiteBold pins the core semantics fix:
+// last-attached state must never be dropped to gray just because the row
+// isn't currently selected. Foreground/weight are asserted against literal
+// ANSI bytes ("\x1b[1;37m"), not by round-tripping through
+// titleStyleCodes, so a regression in either the matrix or the "37"
+// foreground choice is actually caught.
+func TestLastAttachedRowNotSelectedIsWhiteBold(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{
 		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle},
@@ -197,11 +203,14 @@ func TestLastAttachedRowNotSelectedIsGrayBold(t *testing.T) {
 	m.Selected = 0
 	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "b"})
 	view := m.View(80, 12)
-	if !strings.Contains(view, rowPrefix(" ", session.ActivityIdle, false, true)+"B") {
-		t.Fatalf("last-attached, unselected row title is not gray+bold:\n%s", view)
+	if !strings.Contains(view, "\x1b[1;37mB") {
+		t.Fatalf("last-attached, unselected row title is not white+bold (want literal \\x1b[1;37m):\n%s", view)
 	}
-	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)+"A") {
-		t.Fatalf("selected row lost its plain white style:\n%s", view)
+	if strings.Contains(view, "\x1b[1;90mB") {
+		t.Fatalf("last-attached, unselected row title regressed to gray+bold:\n%s", view)
+	}
+	if !strings.Contains(view, "\x1b[37mA") {
+		t.Fatalf("selected-only row lost its plain white style (want literal \\x1b[37m):\n%s", view)
 	}
 }
 
@@ -231,6 +240,115 @@ func TestWhiteStyleFollowsSelectionMovementBoldStaysOnAttachedKey(t *testing.T) 
 	}
 	if !strings.Contains(view, rowPrefix(" ", session.ActivityIdle, false, false)+"A") {
 		t.Fatalf("previously-selected row did not revert to plain gray:\n%s", view)
+	}
+}
+
+// TestLastAttachedStaysBoldWhenSelectionMovesAway is the most direct
+// regression test for the reported bug: A is last-attached and initially
+// selected; moving selection to B must leave A's white+bold style
+// untouched (literal "\x1b[1;37m") and give B plain white (literal
+// "\x1b[37m", no bold code).
+func TestLastAttachedStaysBoldWhenSelectionMovesAway(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle},
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "b"}, Name: "B", Activity: session.ActivityIdle},
+	}
+	m.Selected = 0
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "a"})
+	view := m.View(80, 12)
+	if !strings.Contains(view, "\x1b[1;37mA") {
+		t.Fatalf("A is not white+bold before moving selection:\n%s", view)
+	}
+	m.Update("down") // select "b"; "a" is no longer selected but is still last-attached
+	view = m.View(80, 12)
+	if !strings.Contains(view, "\x1b[1;37mA") {
+		t.Fatalf("A lost white+bold after selection moved away from it:\n%s", view)
+	}
+	if !strings.Contains(view, "\x1b[37mB") || strings.Contains(view, "\x1b[1;37mB") {
+		t.Fatalf("B (selected-only) is not plain white, or wrongly picked up bold:\n%s", view)
+	}
+}
+
+// TestLastAttachedStyleSurvivesRepeatedSelectionMoves moves the selection
+// across every row (A -> B -> C -> B) while A stays last-attached the
+// whole time: A's white+bold style must never change, proving bold does
+// not "follow" the selection cursor around.
+func TestLastAttachedStyleSurvivesRepeatedSelectionMoves(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle},
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "b"}, Name: "B", Activity: session.ActivityIdle},
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "c"}, Name: "C", Activity: session.ActivityIdle},
+	}
+	m.Selected = 0
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "a"})
+	for _, step := range []string{"down", "down", "up"} { // select b, then c, then back to b
+		m.Update(step)
+		view := m.View(80, 12)
+		if !strings.Contains(view, "\x1b[1;37mA") {
+			t.Fatalf("after %q: A lost white+bold:\n%s", step, view)
+		}
+		if strings.Contains(view, "\x1b[1;90mA") || strings.Contains(view, "\x1b[90mA") {
+			t.Fatalf("after %q: A regressed to gray:\n%s", step, view)
+		}
+	}
+}
+
+// TestNewLastAttachedReplacesOldStyle covers re-attaching to a different
+// session: after MarkAttached(B), A (the old last-attached session) must
+// drop to gray unless separately selected, and B alone becomes white+bold.
+func TestNewLastAttachedReplacesOldStyle(t *testing.T) {
+	aKey := session.Key{Provider: session.ProviderClaude, ID: "a"}
+	bKey := session.Key{Provider: session.ProviderClaude, ID: "b"}
+	m := NewModel()
+	m.Rows = []session.Session{
+		{Key: aKey, Name: "A", Activity: session.ActivityIdle},
+		{Key: bKey, Name: "B", Activity: session.ActivityIdle},
+	}
+	m.MarkAttached(aKey)
+	m.MarkAttached(bKey) // re-attach: B replaces A as last-attached
+	m.Selected = 0       // select A, which is last-attached no longer
+	view := m.View(80, 12)
+	if !strings.Contains(view, "\x1b[1;37mB") {
+		t.Fatalf("new last-attached B is not white+bold:\n%s", view)
+	}
+	if strings.Contains(view, "\x1b[1;37mA") || strings.Contains(view, "\x1b[1;90mA") {
+		t.Fatalf("old last-attached A kept bold styling after being replaced:\n%s", view)
+	}
+	if !strings.Contains(view, "\x1b[37mA") {
+		t.Fatalf("A (now selected-only) is not plain white:\n%s", view)
+	}
+}
+
+// TestSelectedOnlyTitleHasNoBoldCode checks the literal ANSI sequence for
+// a selected-but-not-last-attached row: it must be exactly "\x1b[37m"
+// (plain white), never containing the bold SGR code "1" anywhere in the
+// escape.
+func TestSelectedOnlyTitleHasNoBoldCode(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle}}
+	m.Selected = 0
+	view := m.View(80, 12)
+	if !strings.Contains(view, "\x1b[37mA") {
+		t.Fatalf("selected-only row is not plain white (literal \\x1b[37m):\n%s", view)
+	}
+	if strings.Contains(view, "\x1b[1;37mA") || strings.Contains(view, "\x1b[1mA") {
+		t.Fatalf("selected-only row's ANSI sequence carries the bold code \"1\":\n%s", view)
+	}
+}
+
+// TestLastAttachedTitleContainsBoldAndWhite checks the literal ANSI
+// sequence for a last-attached row: it must contain both the bold SGR
+// code "1" and the white foreground code "37", composed as "\x1b[1;37m".
+func TestLastAttachedTitleContainsBoldAndWhite(t *testing.T) {
+	m := NewModel()
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", Activity: session.ActivityIdle}}
+	m.Selected = 0
+	m.MarkAttached(session.Key{Provider: session.ProviderClaude, ID: "a"})
+	view := m.View(80, 12)
+	if !strings.Contains(view, "\x1b[1;37mA") {
+		t.Fatalf("last-attached row's ANSI sequence does not contain bold+white (\\x1b[1;37m):\n%s", view)
 	}
 }
 
