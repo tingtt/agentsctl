@@ -324,15 +324,22 @@ func writeFakeClaudeAttachScript(t *testing.T, body string) string {
 }
 
 // TestDetachScannerRecognizesCSIuCtrlBracket covers issue #4: iTerm2 (and
-// any other terminal that honors the CSI-u / "Kitty keyboard protocol"
-// extension a client like `claude` negotiates for its own key handling,
-// which gets proxied through to the real terminal by AttachClaude's output
-// copy) sends Ctrl+] as an escape sequence instead of the classic literal
-// byte 0x1d. Terminal.app doesn't support the extension and keeps sending
-// the literal byte, which is why the same build detached cleanly there but
+// any other terminal that honors extended-key-reporting a client like
+// `claude` negotiates for its own key handling, which gets proxied
+// through to the real terminal by AttachClaude's output copy) sends
+// Ctrl+] as an escape sequence instead of the classic literal byte 0x1d.
+// Terminal.app doesn't support the extension and keeps sending the
+// literal byte, which is why the same build detached cleanly there but
 // silently did nothing in iTerm2. A scanner that only recognized the
 // literal byte would forward these sequences straight into the child as
 // ordinary, unbound, silently-ignored input.
+//
+// The `ESC [ 27 ; 5 ; 93 ~` (xterm modifyOtherKeys) cases are the real,
+// confirmed encoding: captured with a debug byte-dump build against the
+// installed `claude` CLI + iTerm2 3.6.11 (see detachScanner's doc
+// comment). The CSI-u ("Kitty keyboard protocol") cases are kept as a
+// forward-looking match; no real terminal has been observed sending that
+// form for this key.
 func TestDetachScannerRecognizesCSIuCtrlBracket(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -340,6 +347,11 @@ func TestDetachScannerRecognizesCSIuCtrlBracket(t *testing.T) {
 		detach bool
 	}{
 		{"literal byte, one chunk", [][]byte{{'a', DetachKey, 'b'}}, true},
+		{"modifyOtherKeys form, one chunk (confirmed: iTerm2 3.6.11)", [][]byte{[]byte("hi\x1b[27;5;93~")}, true},
+		{"modifyOtherKeys split across two reads", [][]byte{[]byte("hi\x1b[27;5;"), []byte("93~")}, true},
+		{"modifyOtherKeys split mid marker", [][]byte{[]byte("\x1b[2"), []byte("7;5;93~")}, true},
+		{"modifyOtherKeys without Ctrl held (shift only) is not a match", [][]byte{[]byte("\x1b[27;1;93~")}, false},
+		{"modifyOtherKeys for a different key (']' vs 'z'=122) is not a match", [][]byte{[]byte("\x1b[27;5;122~")}, false},
 		{"CSI-u plain modifier form, one chunk", [][]byte{[]byte("hi\x1b[93;5u")}, true},
 		{"CSI-u event-typed modifier form", [][]byte{[]byte("\x1b[93;5:1u")}, true},
 		{"CSI-u with alternate-key-codes prefix", [][]byte{[]byte("\x1b[93:125;5u")}, true},
@@ -372,12 +384,14 @@ func TestDetachScannerRecognizesCSIuCtrlBracket(t *testing.T) {
 	}
 }
 
-// TestAttachClaudeDetachesOnCSIuCtrlBracket drives AttachClaude end to end
-// (fake client, real PTY) with the outer input sending Ctrl+] in the CSI-u
-// form iTerm2 uses instead of the classic literal byte, proving the fix
-// for issue #4 at the same level TestAttachClaudeExplicitDetachReturnsCleanly
-// already covers for the classic byte.
-func TestAttachClaudeDetachesOnCSIuCtrlBracket(t *testing.T) {
+// TestAttachClaudeDetachesOnModifyOtherKeysCtrlBracket drives AttachClaude
+// end to end (fake client, real PTY) with the outer input sending Ctrl+]
+// in the exact byte sequence captured from a real, failing iTerm2 session
+// (issue #4) -- xterm's modifyOtherKeys form -- instead of the classic
+// literal byte, proving the fix at the same level
+// TestAttachClaudeExplicitDetachReturnsCleanly already covers for the
+// classic byte.
+func TestAttachClaudeDetachesOnModifyOtherKeysCtrlBracket(t *testing.T) {
 	script := writeFakeClaudeAttachScript(t, "stty raw -echo; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0")
 	master, slave, err := creackpty.Open()
 	if err != nil {
@@ -391,7 +405,7 @@ func TestAttachClaudeDetachesOnCSIuCtrlBracket(t *testing.T) {
 		done <- AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
 	}()
 	time.Sleep(200 * time.Millisecond) // let the fake client's own `stty raw` land
-	if _, err := master.Write([]byte("\x1b[93;5u")); err != nil {
+	if _, err := master.Write([]byte("\x1b[27;5;93~")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -400,7 +414,7 @@ func TestAttachClaudeDetachesOnCSIuCtrlBracket(t *testing.T) {
 			t.Fatalf("AttachClaude err=%v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("AttachClaude did not return after a CSI-u encoded Ctrl+]")
+		t.Fatal("AttachClaude did not return after a modifyOtherKeys encoded Ctrl+]")
 	}
 }
 
