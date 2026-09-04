@@ -51,11 +51,11 @@ func TestPinDoesNotInvokeProviderList(t *testing.T) {
 	if !app.Model.Rows[0].Pinned {
 		t.Fatal("pin was not applied to the model row")
 	}
-	// Pin/unpin must not produce a Status/Error/Notice message — the
+	// Pin/unpin must not produce any composer-top notification — the
 	// pinned/unpinned row moving between the "Pinned"/"Other" groups is
 	// already visible in the rendered view.
-	if app.Model.Error != "" || app.Model.Notice != "" {
-		t.Fatalf("pin produced a redundant notification: error=%q notice=%q", app.Model.Error, app.Model.Notice)
+	if app.Model.Error != "" {
+		t.Fatalf("pin produced a redundant error notification: %q", app.Model.Error)
 	}
 
 	// Unpin: same guarantee, the other direction.
@@ -69,8 +69,8 @@ func TestPinDoesNotInvokeProviderList(t *testing.T) {
 	if app.Model.Rows[0].Pinned {
 		t.Fatal("unpin did not clear Pinned on the model row")
 	}
-	if app.Model.Error != "" || app.Model.Notice != "" {
-		t.Fatalf("unpin produced a redundant notification: error=%q notice=%q", app.Model.Error, app.Model.Notice)
+	if app.Model.Error != "" {
+		t.Fatalf("unpin produced a redundant error notification: %q", app.Model.Error)
 	}
 }
 

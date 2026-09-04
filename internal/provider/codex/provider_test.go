@@ -238,13 +238,59 @@ func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
 	}
 }
 
-// TestArchiveDoesNotLocallyDeleteRunningOrStartingUnboundRun guards the
-// "active/starting run を誤って消さない" requirement: local cleanup only
-// ever applies to a run in a terminal state. A running/starting run's Key
-// should never reach Archive() through the UI (List gives it no Archive
-// capability), but Provider.Archive itself must not delete it either, as a
-// second line of defense — it must fall through to the app-server call.
-func TestArchiveDoesNotLocallyDeleteRunningOrStartingUnboundRun(t *testing.T) {
+// TestDeleteUnboundTerminalRunRecheckesAtUpdateTime is the deterministic
+// stand-in for the race Archive's doc comment describes: state.Run's
+// terminal-unbound shape is checked once in Archive (Store.Load, outside
+// any lock) and must be re-checked atomically with the delete itself
+// (inside Store.Update) — a run that no longer matches by the time Update
+// actually runs (bound to a thread, left its terminal state, or already
+// gone) must survive. Rather than manufacturing a real goroutine race,
+// this calls deleteUnboundTerminalRun directly against a store already
+// seeded with the "changed by Update time" state — deleteUnboundTerminalRun
+// always re-reads from the store inside its own Update callback, so this
+// exercises exactly the same re-check a genuine race would hit.
+func TestDeleteUnboundTerminalRunRecheckesAtUpdateTime(t *testing.T) {
+	cases := []struct {
+		name     string
+		seed     *state.Run // nil means the run is gone by Update time
+		wantKept bool
+	}{
+		{name: "became bound to a thread", seed: &state.Run{ID: "r", Provider: "codex", SessionID: "thread-abc", State: "failed"}, wantKept: true},
+		{name: "left terminal state", seed: &state.Run{ID: "r", Provider: "codex", State: "running"}, wantKept: true},
+		{name: "already deleted", seed: nil, wantKept: false},
+		{name: "still terminal and unbound", seed: &state.Run{ID: "r", Provider: "codex", State: "stopped"}, wantKept: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := state.New(filepath.Join(t.TempDir(), "state.json"))
+			if tc.seed != nil {
+				run := *tc.seed
+				_ = store.Update(func(d *state.Data) error { d.Runs["r"] = run; return nil })
+			}
+			p := Provider{Store: store, API: &fakeAPI{}}
+			if err := p.deleteUnboundTerminalRun("r"); err != nil {
+				t.Fatal(err)
+			}
+			d, _ := store.Load()
+			_, ok := d.Runs["r"]
+			if tc.wantKept && !ok {
+				t.Fatal("run was deleted despite no longer matching the unbound-terminal shape at Update time")
+			}
+			if !tc.wantKept && ok {
+				t.Fatal("run was not deleted despite still matching the unbound-terminal shape at Update time")
+			}
+		})
+	}
+}
+
+// TestArchiveRejectsRunningOrStartingUnboundRun guards the "active/starting
+// run を誤って消さない" requirement, fail-closed at the provider boundary
+// (not just relying on the UI never offering Archive for such a row): a
+// running/starting unbound run's Key.ID is agentsctl's own local run ID,
+// never a Codex thread ID, so it must be neither deleted locally nor
+// forwarded to the app-server's thread/archive under any circumstance —
+// Provider.Archive must instead return an error.
+func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 	for _, state_ := range []string{"running", "starting"} {
 		t.Run(state_, func(t *testing.T) {
 			store := state.New(filepath.Join(t.TempDir(), "state.json"))
@@ -254,13 +300,16 @@ func TestArchiveDoesNotLocallyDeleteRunningOrStartingUnboundRun(t *testing.T) {
 			})
 			api := &fakeAPI{}
 			p := Provider{Store: store, API: api}
-			_ = p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
+			err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
+			if err == nil {
+				t.Fatal("expected an error archiving an active unbound run, got nil")
+			}
 			d, _ := store.Load()
 			if _, ok := d.Runs["r"]; !ok {
 				t.Fatal("running/starting unbound run was locally deleted by Archive")
 			}
-			if api.archived != "r" {
-				t.Fatalf("expected fallthrough to app-server thread/archive with id=r, got archived=%q", api.archived)
+			if api.archived != "" {
+				t.Fatalf("running/starting unbound run's local ID reached the app-server thread/archive: id=%q", api.archived)
 			}
 		})
 	}

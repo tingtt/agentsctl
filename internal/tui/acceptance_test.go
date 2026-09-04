@@ -1,12 +1,16 @@
 package tui
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -144,6 +148,70 @@ func TestRenameActionSuccessAndFailure(t *testing.T) {
 				t.Fatalf("selection/name after refresh: %+v", app.Model)
 			}
 		})
+	}
+}
+
+// TestDispatchSuccessProducesNoNotification covers the generic-notice
+// removal policy for dispatch: a successful dispatch used to set
+// Model.Notice to "started <session>"; that field is gone and no
+// composer-top notification (error or otherwise) replaces it — the new
+// session appearing in the list on the next refresh is the only feedback.
+func TestDispatchSuccessProducesNoNotification(t *testing.T) {
+	codex := &journeyProvider{id: session.ProviderCodex}
+	catalog := session.Catalog{Providers: []session.Provider{codex}}
+	m := NewModel()
+	m.Provider = session.ProviderCodex
+	m.Prompt = "hello"
+	app := App{Catalog: catalog, Model: m, CWD: "/work"}
+	action := app.Model.Update("enter")
+	if action.Kind != ActionDispatch {
+		t.Fatalf("action=%+v", action)
+	}
+	if err := app.act(context.Background(), action); err != nil {
+		t.Fatal(err)
+	}
+	if app.Model.Error != "" {
+		t.Fatalf("dispatch success produced an error notification: %q", app.Model.Error)
+	}
+	if app.Model.Prompt != "" {
+		t.Fatalf("composer not cleared after dispatch: %q", app.Model.Prompt)
+	}
+	if view := app.Model.View(80, 12); strings.Contains(view, "started") {
+		t.Fatalf("dispatch success rendered a notification:\n%s", view)
+	}
+}
+
+// TestErrorClearsOnNextSuccessfulAction covers the minimal Error-lifecycle
+// cleanup this task asks for: a stale Error from a failed action must not
+// linger once the user has moved on to something that worked. "open" with
+// no session selected sets an Error via Model.Update itself (Action{Kind:
+// ActionNone}, so App.act never runs and never gets a chance to clear it);
+// the following Ctrl+G scope-cycle (a real, always-successful action) must
+// clear it.
+func TestErrorClearsOnNextSuccessfulAction(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	if err := pty.Setsize(slave, &pty.Winsize{Rows: 24, Cols: 80}); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{"open", "scope-cycle", "quit"}
+	idx := 0
+	readInput := func(*bufio.Reader) (string, error) {
+		k := keys[idx]
+		idx++
+		return k, nil
+	}
+	var output bytes.Buffer
+	app := App{Model: NewModel(), Input: slave, Output: &output, CWD: "/work", ReadInput: readInput}
+	if err := app.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if app.Model.Error != "" {
+		t.Fatalf("error survived a subsequent successful action: %q", app.Model.Error)
 	}
 }
 

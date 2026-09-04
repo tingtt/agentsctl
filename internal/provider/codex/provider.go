@@ -83,7 +83,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			}
 			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, "Starting"
 			caps := session.Capabilities{Attach: true, Stop: true}
-			if r.State == "failed" || r.State == "stale" || r.State == "stopped" {
+			if isTerminalRunState(r.State) {
 				// This row never became a real Codex app-server thread — its
 				// Key.ID is agentsctl's own run ID, not a thread ID
 				// thread/archive would accept. r.Error (the startup
@@ -130,34 +130,64 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	return errors.New("refusing to stop a Codex writer not owned by agentsctl")
 }
 
-// Archive removes k's session. For an actual Codex thread this calls the
-// app-server's native thread/archive. For an agentsctl-owned unbound run —
-// a local run that started but never got proven to any app-server thread
-// (state.Run.SessionID == ""), reached a terminal state (failed/stale/
-// stopped), and therefore surfaced as the diagnostic "Unbound run" row in
-// List — k.ID is agentsctl's own run ID, not a Codex thread ID, so it is
-// never passed to the app-server; instead the run is deleted from
-// state.Store, a one-way local cleanup consistent with archive already
-// being a one-way TUI operation for real threads.
+// Archive removes k's session. For an actual Codex thread (no local run
+// record shares k.ID, or that record is already bound to a thread) this
+// calls the app-server's native thread/archive. For an agentsctl-owned
+// unbound run — a local run that started but never got proven to any
+// app-server thread (state.Run.SessionID == "") — k.ID is agentsctl's own
+// run ID, never a Codex thread ID, so it must never reach the app-server
+// under any state, not just the terminal one List() actually offers
+// Archive for: a running/starting unbound run is rejected outright rather
+// than silently falling through to a native call that would misuse its ID.
+// Only a terminal (failed/stale/stopped) unbound run is deleted, and that
+// deletion re-verifies the same shape inside the Store.Update callback (see
+// deleteUnboundTerminalRun) so a run that changed between this Load and
+// that Update — e.g. it got bound to a thread, or left its terminal state
+// — is never wrongly removed.
 func (p *Provider) Archive(ctx context.Context, k session.Key) error {
 	d, err := p.Store.Load()
 	if err != nil {
 		return err
 	}
-	if r, ok := d.Runs[k.ID]; ok && isUnboundTerminalRun(r) {
-		return p.Store.Update(func(next *state.Data) error { delete(next.Runs, k.ID); return nil })
+	if r, ok := d.Runs[k.ID]; ok && r.SessionID == "" {
+		if !isTerminalRunState(r.State) {
+			return fmt.Errorf("refusing to archive an active unbound Codex run: %s", k.ID)
+		}
+		return p.deleteUnboundTerminalRun(k.ID)
 	}
 	return p.API.Archive(ctx, k.ID)
 }
 
-// isUnboundTerminalRun reports whether r is an agentsctl-owned local run
-// that never got proven to a Codex app-server thread and has reached a
-// terminal state — the only runs Archive cleans up locally rather than
-// forwarding to the app-server. Active/starting unbound runs (r.State
-// "running" or "starting") are deliberately excluded so they can never be
-// removed by this path.
-func isUnboundTerminalRun(r state.Run) bool {
-	return r.SessionID == "" && (r.State == "failed" || r.State == "stale" || r.State == "stopped")
+// deleteUnboundTerminalRun deletes state.Run id from local state, but only
+// after re-confirming — inside the Store.Update callback, under the same
+// exclusive lock the write itself takes — that it is still an unbound
+// (SessionID == "") run in a terminal state. The condition is checked
+// twice by design: once in Archive (Store.Load, outside any lock, to
+// decide which path to take at all) and again here, since only the second
+// check is atomic with the delete. If the run no longer matches — deleted
+// already, bound to a thread, or no longer terminal — it is left alone and
+// this reports no error, since nothing unsafe happened: the row will
+// simply reflect its current, up-to-date state on the next catalog
+// refresh.
+func (p *Provider) deleteUnboundTerminalRun(id string) error {
+	return p.Store.Update(func(next *state.Data) error {
+		r, ok := next.Runs[id]
+		if !ok || r.SessionID != "" || !isTerminalRunState(r.State) {
+			return nil
+		}
+		delete(next.Runs, id)
+		return nil
+	})
+}
+
+// isTerminalRunState reports whether a state.Run.State value is terminal —
+// the run reached an end state without (or, for a previously-bound run,
+// regardless of) further progress. Shared by List (which state.Run shape
+// becomes a diagnostic "Unbound run" row) and Archive/
+// deleteUnboundTerminalRun (which local runs are eligible for local
+// cleanup), so the two stay in agreement about what "terminal" means.
+func isTerminalRunState(state string) bool {
+	return state == "failed" || state == "stale" || state == "stopped"
 }
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
 	return p.API.Unarchive(ctx, k.ID)
@@ -284,5 +314,3 @@ func codexActivity(t Thread) session.Activity {
 		return session.ActivityUnknown
 	}
 }
-
-var _ = fmt.Sprintf

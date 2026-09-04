@@ -74,6 +74,12 @@ func (a *App) Run(ctx context.Context) error {
 		}
 		if err := a.act(ctx, action); err != nil {
 			a.Model.Error = "error: " + err.Error()
+		} else if action.Kind != ActionNone {
+			// A dispatched action that succeeded (including a plain
+			// Ctrl+L/Ctrl+G refresh) means the user has moved on to
+			// something that worked — don't leave a stale error from an
+			// earlier failed action on screen.
+			a.Model.Error = ""
 		}
 		// Pin/unpin never touches provider (remote) state, so — unlike
 		// every other action — it must not trigger a full catalog
@@ -126,13 +132,11 @@ func (a *App) act(ctx context.Context, x Action) error {
 		if err := p.Available(); err != nil {
 			return err
 		}
-		row, err := p.Dispatch(ctx, x.Prompt, a.CWD)
-		if err != nil {
+		if _, err := p.Dispatch(ctx, x.Prompt, a.CWD); err != nil {
 			return err
 		}
 		a.Model.Prompt = ""
 		a.Model.PromptCursor = 0
-		a.Model.Notice = "started " + row.Key.String()
 	case ActionAttach:
 		if x.Session == nil || !x.Session.Capabilities.Attach {
 			return capabilityError(x.Session, "attach")

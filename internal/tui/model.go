@@ -48,19 +48,18 @@ type Model struct {
 	CWDDepth int
 	// Error holds the most recent action failure (a rejected rename, an
 	// unavailable capability, an empty selection, ...). It is the only
-	// thing rendered in the composer-top notification area — an operation
-	// whose result is already visible elsewhere in the UI (pin/unpin
-	// reordering a row, a rename changing its title, an archive removing
-	// it) does not get a message here. See rowNotice for the session-
-	// scoped, non-error counterpart.
-	Error string
-	// Notice holds transient, non-error, non-session-scoped feedback whose
-	// result is not otherwise visible on screen — currently only the
-	// directory-depth cycle's current depth (Ctrl+/), since the depth
-	// number itself appears nowhere else in the UI. It renders in the same
-	// composer-top line as Error (Error takes priority when both are set)
-	// but without error styling.
-	Notice         string
+	// thing ever rendered in the composer-top notification area, which is
+	// reserved for errors exclusively — an operation whose result is
+	// already visible elsewhere in the UI (pin/unpin reordering a row, a
+	// rename changing its title, an archive removing it, the CWD depth
+	// cycle changing every row's displayed CWD) gets no notification at
+	// all, error or otherwise. See rowNotice for the session-scoped,
+	// non-error counterpart. Cleared on entering rename/archive-confirm
+	// mode, on cancelling out of either, and whenever an action dispatched
+	// through App.act succeeds (see app_unix.go's Run loop) — so a stale
+	// error from a previous failed action does not linger once the user
+	// has moved on to something that worked.
+	Error          string
 	Warnings       map[session.ProviderID]error
 	RenameDraft    string
 	RenameCursor   int
@@ -294,12 +293,9 @@ func (m *Model) Update(key string) Action {
 	case "pin":
 		return m.selected(ActionPin)
 	case "depth-cycle":
+		// The CWD column itself changing for every row is the feedback;
+		// no notification (see Model.Error's doc comment).
 		m.CWDDepth = nextCWDDepth(m.CWDDepth)
-		if m.CWDDepth == CWDDepthAll {
-			m.Notice = "Directory depth: all"
-		} else {
-			m.Notice = fmt.Sprintf("Directory depth: %d", m.CWDDepth)
-		}
 		return Action{}
 	case "refresh":
 		return Action{Kind: ActionRefresh}
@@ -331,8 +327,11 @@ func (m *Model) updateRename(key string) Action {
 	runes := []rune(m.RenameDraft)
 	switch key {
 	case "quit":
+		// The inline editor closing and the row reverting to its committed
+		// name is the feedback; no notification (see Model.Error's doc
+		// comment).
 		m.clearRename()
-		m.Notice = "Rename cancelled"
+		m.Error = ""
 	case "home":
 		m.RenameCursor = 0
 	case "end":
@@ -384,8 +383,10 @@ func (m *Model) updateArchiveConfirmation(key string) Action {
 	case "stop-or-archive":
 		return m.stopOrArchive()
 	case "quit":
+		// The red row confirmation disappearing is the feedback; no
+		// notification (see Model.Error's doc comment).
 		m.cancelArchiveConfirmation()
-		m.Notice = "Archive cancelled"
+		m.Error = ""
 	case "up", "down":
 		// Moving the selection cancels a pending archive confirmation (no
 		// "cancelled" notice here, unlike Esc — the confirmation simply
@@ -416,6 +417,7 @@ func (m *Model) stopOrArchive() Action {
 	if m.archiveConfirm == nil || *m.archiveConfirm != row.Key {
 		key := row.Key
 		m.archiveConfirm = &key
+		m.Error = ""
 		return Action{}
 	}
 	m.archiveConfirm = nil
@@ -564,13 +566,11 @@ func (m Model) View(width, height int) string {
 		clipLine("Shift+Tab / Enter send/open / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
 		clipLine("↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
 	}
-	// Error takes priority over Notice — an action failure is more
-	// important than transient informational feedback (e.g. the depth-cycle
-	// readout), and only one line is reserved for either.
+	// The composer-top notification area is reserved for Error exclusively
+	// (see Model.Error's doc comment) — there is no generic non-error
+	// notice here.
 	if m.Error != "" {
 		footer = append([]string{clipLine("! "+m.Error, width)}, footer...)
-	} else if m.Notice != "" {
-		footer = append([]string{clipLine(m.Notice, width)}, footer...)
 	}
 	if height < 0 {
 		height = 0

@@ -141,14 +141,26 @@ func TestDepthCycleDoesNotTriggerCatalogRefresh(t *testing.T) {
 	}
 }
 
-func TestDepthCycleSetsTransientNotice(t *testing.T) {
+// TestDepthCycleProducesNoComposerTopNotification covers the current
+// generic-notice-removal policy: the composer-top notification area is
+// reserved for Error exclusively (see Model.Error's doc comment), so
+// Ctrl+/ — whose effect is already visible as every row's CWD column
+// changing — must not populate it. The depth cycling itself
+// (TestCtrlSlashCyclesDirectoryDepth) and its effect on rendered CWD text
+// (TestDirectoryDepthTrailingComponents et al.) are covered elsewhere.
+func TestDepthCycleProducesNoComposerTopNotification(t *testing.T) {
 	m := NewModel()
-	m.Update("depth-cycle") // 2 -> 3
-	if m.Notice != "Directory depth: 3" {
-		t.Fatalf("notice=%q", m.Notice)
+	for i, want := range []int{3, CWDDepthAll, 1, 2} {
+		m.Update("depth-cycle")
+		if m.CWDDepth != want {
+			t.Fatalf("step %d: CWDDepth=%d, want %d", i, m.CWDDepth, want)
+		}
+		if m.Error != "" {
+			t.Fatalf("step %d: depth-cycle produced an Error: %q", i, m.Error)
+		}
 	}
-	m.Update("depth-cycle") // 3 -> all
-	if m.Notice != "Directory depth: all" {
-		t.Fatalf("notice=%q", m.Notice)
+	view := m.View(80, 12)
+	if strings.Contains(view, "Directory depth") {
+		t.Fatalf("depth-cycle notification still rendered:\n%s", view)
 	}
 }

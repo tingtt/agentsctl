@@ -387,9 +387,15 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 
 	writePTY(t, terminal, "Prompt\x12\x1b[H\x1b[3~X\x1b")
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "session-099") && strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Prompt") && strings.Contains(frame, "Rename cancelled")
+		return strings.Contains(frame, "session-099") && strings.Contains(frame, composerPrefix(session.ProviderCodex, "")+"Prompt")
 	}); err != nil {
 		t.Fatalf("rename cancel did not preserve row and composer: %v", err)
+	}
+	// The row reverting is the only feedback — no composer-top
+	// notification (generic non-error notice was removed; that area is
+	// Error-only).
+	if strings.Contains(latestFrame(output.String()), "Rename cancelled") {
+		t.Fatal("rename cancel produced a composer-top notification")
 	}
 	if _, err := os.Stat(filepath.Join(fakeDir, "rename.log")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("cancel invoked provider rename: %v", err)
@@ -457,9 +463,12 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	}
 	writePTY(t, terminal, "\x1b") // cancel; must not call provider.Rename again
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "Xession-099") && strings.Contains(frame, "Rename cancelled")
+		return strings.Contains(frame, "Xession-099")
 	}); err != nil {
 		t.Fatalf("second rename cancel did not restore the committed name: %v", err)
+	}
+	if strings.Contains(latestFrame(output.String()), "Rename cancelled") {
+		t.Fatal("rename cancel produced a composer-top notification")
 	}
 	if renameLogAfterCursorTest, err := os.ReadFile(filepath.Join(fakeDir, "rename.log")); err != nil || string(renameLogAfterCursorTest) != string(renameLog) {
 		t.Fatalf("cancelled rename invoked provider rename again: %q vs %q (err=%v)", renameLogAfterCursorTest, renameLog, err)

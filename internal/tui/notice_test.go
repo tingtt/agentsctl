@@ -25,8 +25,14 @@ func TestArchiveConfirmationCancelsOnEscAndOnSelectionMove(t *testing.T) {
 		if _, _, ok := m.rowNotice(key); ok {
 			t.Fatal("archive confirmation survived Esc")
 		}
-		if m.Notice != "Archive cancelled" {
-			t.Fatalf("notice=%q, want an explicit cancellation notice", m.Notice)
+		// The row confirmation disappearing is the only feedback — no
+		// composer-top notification (generic Notice was removed; the
+		// composer-top area is Error-only).
+		if m.Error != "" {
+			t.Fatalf("error=%q, want none", m.Error)
+		}
+		if view := m.View(80, 12); strings.Contains(view, "Archive cancelled") {
+			t.Fatalf("archive-cancel notification still rendered:\n%s", view)
 		}
 	})
 
