@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+import json, os, sys, termios, tty
+from pathlib import Path
+
+root = Path(os.environ["AGENTSCTL_FAKE_DIR"])
+path = root / "claude.json"
+
+def load():
+    if not path.exists():
+        return [{"id":"claude-ready","name":"fake-claude","summary":"Ready","cwd":os.getcwd(),"updatedAt":1,"status":"idle","state":"done"}]
+    return json.loads(path.read_text())
+
+def save(rows):
+    path.write_text(json.dumps(rows))
+
+args = sys.argv[1:]
+if args[:1] == ["agents"]:
+    print(json.dumps(load()))
+elif args[:1] == ["--bg"]:
+    rows = load(); sid = "claude-new"
+    rows = [r for r in rows if r["id"] != sid]
+    rows.append({"id":sid,"name":"fake-claude-new","summary":args[1],"cwd":os.getcwd(),"updatedAt":2,"status":"busy","state":"working"})
+    save(rows); print(sid)
+elif args[:1] == ["stop"]:
+    rows = load()
+    for row in rows:
+        if row["id"] == args[1]: row["status"] = "idle"; row["state"] = "stopped"
+    save(rows)
+elif args[:1] == ["attach"]:
+    old = termios.tcgetattr(0); tty.setraw(0)
+    try:
+        os.write(1, b"FAKE CLAUDE ATTACHED\r\n")
+        while True:
+            b = os.read(0, 1)
+            if not b or b == b"\x1a": break
+            os.write(1, b)
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+else:
+    sys.exit(2)
