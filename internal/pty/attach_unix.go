@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -83,6 +85,7 @@ func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.
 			}
 		}
 	}()
+	var scanner detachScanner
 	for {
 		select {
 		case <-ctx.Done():
@@ -113,7 +116,7 @@ func AttachCodex(ctx context.Context, socket, runID string, in *os.File, out io.
 		buf := make([]byte, 4096)
 		n, err := in.Read(buf)
 		if n > 0 {
-			before, detach, _ := splitDetach(buf[:n])
+			before, detach := scanner.feed(buf[:n])
 			if len(before) > 0 {
 				if err := frames.write(protocol.Input, before); err != nil {
 					return err
@@ -153,6 +156,7 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	buf := make([]byte, 4096)
+	var scanner detachScanner
 	for {
 		select {
 		case err := <-wait:
@@ -170,7 +174,7 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 		}
 		n, readErr := in.Read(buf)
 		if n > 0 {
-			before, detach, _ := splitDetach(buf[:n])
+			before, detach := scanner.feed(buf[:n])
 			if len(before) > 0 {
 				_, _ = child.Write(before)
 			}
@@ -335,6 +339,122 @@ func splitDetach(b []byte) (before []byte, found bool, after []byte) {
 		}
 	}
 	return b, false, nil
+}
+
+// detachScanner recognizes the detach key (Ctrl+]) in the raw byte stream
+// from the real, outer terminal -- whether that terminal sends it as the
+// classic C0 byte (DetachKey, 0x1d) or as a CSI-u ("Kitty keyboard
+// protocol" / xterm modifyOtherKeys) escape sequence instead.
+//
+// The CSI-u path is real, not hypothetical: the attached child (`claude`,
+// and potentially other clients) negotiates that extension for its own
+// enhanced key handling by writing an escape sequence to its pty, which
+// AttachClaude/AttachCodex proxy verbatim to the real outer terminal via
+// their output copy. The outer terminal has no way to know that sequence
+// "really" came from a nested child rather than agentsctl itself, so a
+// terminal that honors the extension (confirmed: iTerm2) switches its own
+// key encoding in response -- meaning it starts sending Ctrl+] as
+// `ESC [ 93 ; 5 u` (93 = ']', 5 = 1+Ctrl) instead of the literal byte.
+// Terminal.app doesn't support the extension and keeps sending the
+// classic byte regardless, which is why the same build detaches cleanly
+// there but not in iTerm2: a scanner that only ever looked for the literal
+// byte would forward the CSI-u form straight into the child as ordinary
+// (unbound, silently ignored) input instead of detaching, matching the
+// exact "Ctrl+] does nothing at all" symptom reported against iTerm2.
+//
+// One scanner instance must be used for an entire attach session (not
+// recreated per read): a CSI-u sequence can arrive split across separate
+// Read() calls, and the scanner holds back a possibly-incomplete trailing
+// escape sequence across feed calls rather than risk forwarding partial
+// escape bytes to the child or splitting a real match in two.
+type detachScanner struct {
+	pending []byte
+}
+
+// feed processes one new chunk of raw terminal input and returns the
+// bytes that should be forwarded to the child right now (deliver) and
+// whether the detach key was found in this chunk (detach). Mirrors
+// splitDetach's contract: when detach is true, everything from the
+// detach key onward in this chunk (including any bytes after it) is
+// intentionally dropped, not delivered.
+func (d *detachScanner) feed(chunk []byte) (deliver []byte, detach bool) {
+	buf := append(d.pending, chunk...)
+	d.pending = nil
+	for i := 0; i < len(buf); i++ {
+		if buf[i] == DetachKey {
+			return buf[:i], true
+		}
+		if buf[i] != 0x1b {
+			continue
+		}
+		n, complete := scanEscape(buf[i:])
+		if !complete {
+			// Possibly-incomplete escape sequence at the tail: hold it
+			// back for the next read instead of forwarding partial bytes
+			// or risking a match split across two chunks.
+			d.pending = append(d.pending, buf[i:]...)
+			return buf[:i], false
+		}
+		if isCtrlBracketCSIu(buf[i : i+n]) {
+			return buf[:i], true
+		}
+		i += n - 1 // -1 to offset the loop's i++
+	}
+	return buf, false
+}
+
+// scanEscape reports how many leading bytes of buf (which starts with ESC)
+// form one complete escape sequence, and whether a complete sequence was
+// actually found (false means buf is truncated so far and more input is
+// needed). Only the CSI form (ESC '[' ... final-byte in 0x40-0x7E, which
+// covers CSI-u) is parsed structurally; any other escape form is treated
+// as complete after its second byte so it is never held back indefinitely.
+func scanEscape(buf []byte) (n int, complete bool) {
+	if len(buf) < 2 {
+		return 0, false
+	}
+	if buf[1] != '[' {
+		return 2, true
+	}
+	for i := 2; i < len(buf); i++ {
+		if buf[i] >= 0x40 && buf[i] <= 0x7e {
+			return i + 1, true
+		}
+	}
+	return 0, false
+}
+
+// isCtrlBracketCSIu reports whether seq is a complete CSI-u sequence
+// encoding Ctrl+']' (unicode codepoint 93), in either the plain
+// (`93;5u`) or event-typed (`93;5:1u`) modifier form, and tolerating an
+// alternate-key-codes suffix on the key-code field itself (`93:125;5u`).
+// The modifier field is 1 + the sum of active modifier bits (Shift=1,
+// Alt=2, Ctrl=4, ...); Ctrl being held is (mod-1)&4 != 0.
+func isCtrlBracketCSIu(seq []byte) bool {
+	if len(seq) < 4 || seq[0] != 0x1b || seq[1] != '[' || seq[len(seq)-1] != 'u' {
+		return false
+	}
+	body := string(seq[2 : len(seq)-1])
+	parts := strings.SplitN(body, ";", 2)
+	keyCode := parts[0]
+	if idx := strings.IndexByte(keyCode, ':'); idx >= 0 {
+		keyCode = keyCode[:idx]
+	}
+	if keyCode != "93" {
+		return false
+	}
+	if len(parts) < 2 {
+		return false // no modifier field at all -- not Ctrl+]
+	}
+	modField := parts[1]
+	if idx := strings.IndexByte(modField, ':'); idx >= 0 {
+		modField = modField[:idx]
+	}
+	mod, err := strconv.Atoi(modField)
+	if err != nil || mod < 1 {
+		return false
+	}
+	return (mod-1)&0x4 != 0
 }
 func raw(f *os.File) (func(), error) {
 	if !term.IsTerminal(int(f.Fd())) {

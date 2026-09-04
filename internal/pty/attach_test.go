@@ -38,6 +38,7 @@ func TestInputEOFIsReported(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
 // TestClaudeDetachUsesControlZWhenClientConsumesIt models the installed
 // `claude attach` client: a well-behaved client puts its own PTY into raw
 // mode (disabling ISIG so a literal 0x1a byte reaches its read loop instead
@@ -320,6 +321,87 @@ func writeFakeClaudeAttachScript(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestDetachScannerRecognizesCSIuCtrlBracket covers issue #4: iTerm2 (and
+// any other terminal that honors the CSI-u / "Kitty keyboard protocol"
+// extension a client like `claude` negotiates for its own key handling,
+// which gets proxied through to the real terminal by AttachClaude's output
+// copy) sends Ctrl+] as an escape sequence instead of the classic literal
+// byte 0x1d. Terminal.app doesn't support the extension and keeps sending
+// the literal byte, which is why the same build detached cleanly there but
+// silently did nothing in iTerm2. A scanner that only recognized the
+// literal byte would forward these sequences straight into the child as
+// ordinary, unbound, silently-ignored input.
+func TestDetachScannerRecognizesCSIuCtrlBracket(t *testing.T) {
+	cases := []struct {
+		name   string
+		chunks [][]byte
+		detach bool
+	}{
+		{"literal byte, one chunk", [][]byte{{'a', DetachKey, 'b'}}, true},
+		{"CSI-u plain modifier form, one chunk", [][]byte{[]byte("hi\x1b[93;5u")}, true},
+		{"CSI-u event-typed modifier form", [][]byte{[]byte("\x1b[93;5:1u")}, true},
+		{"CSI-u with alternate-key-codes prefix", [][]byte{[]byte("\x1b[93:125;5u")}, true},
+		{"CSI-u split across two reads", [][]byte{[]byte("hi\x1b[93;"), []byte("5u")}, true},
+		{"CSI-u split mid keycode", [][]byte{[]byte("\x1b[9"), []byte("3;5u")}, true},
+		{"CSI-u without Ctrl held (shift only) is not a match", [][]byte{[]byte("\x1b[93;2u")}, false},
+		{"CSI-u for a different key (']' vs 'a'=97) is not a match", [][]byte{[]byte("\x1b[97;5u")}, false},
+		{"CSI-u with no modifier field is not a match", [][]byte{[]byte("\x1b[93u")}, false},
+		{"unrelated CSI sequence (e.g. an arrow key) passes through", [][]byte{[]byte("\x1b[A")}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var scanner detachScanner
+			var delivered []byte
+			detach := false
+			for _, chunk := range tc.chunks {
+				before, found := scanner.feed(chunk)
+				delivered = append(delivered, before...)
+				if found {
+					detach = true
+				}
+			}
+			if detach != tc.detach {
+				t.Fatalf("detach=%v, want %v (delivered=%q, pending=%q)", detach, tc.detach, delivered, scanner.pending)
+			}
+			if tc.detach && bytes.Contains(delivered, []byte{DetachKey}) {
+				t.Fatal("detach key reached the delivered/forwarded bytes")
+			}
+		})
+	}
+}
+
+// TestAttachClaudeDetachesOnCSIuCtrlBracket drives AttachClaude end to end
+// (fake client, real PTY) with the outer input sending Ctrl+] in the CSI-u
+// form iTerm2 uses instead of the classic literal byte, proving the fix
+// for issue #4 at the same level TestAttachClaudeExplicitDetachReturnsCleanly
+// already covers for the classic byte.
+func TestAttachClaudeDetachesOnCSIuCtrlBracket(t *testing.T) {
+	script := writeFakeClaudeAttachScript(t, "stty raw -echo; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0")
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- AttachClaude(context.Background(), script, "id", slave, io.Discard, time.Second)
+	}()
+	time.Sleep(200 * time.Millisecond) // let the fake client's own `stty raw` land
+	if _, err := master.Write([]byte("\x1b[93;5u")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("AttachClaude err=%v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AttachClaude did not return after a CSI-u encoded Ctrl+]")
+	}
 }
 
 func TestInitialTerminalSizeIsARedrawResizeFrame(t *testing.T) {
