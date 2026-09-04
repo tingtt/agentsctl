@@ -14,6 +14,7 @@ const (
 	colorBlue   = "34"
 	colorGreen  = "32"
 	colorWhite  = "37"
+	colorCyan   = "36"
 	codeBold    = "1"
 )
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -24,9 +25,24 @@ type Snapshot struct {
 	Warnings map[ProviderID]error
 }
 
+// DirectoryScope selects which sessions' CWDs the overview shows, relative
+// to the directory agentsctl was started in.
+type DirectoryScope int
+
+const (
+	// ScopeCWD shows only sessions whose CWD is exactly the directory
+	// agentsctl was started in.
+	ScopeCWD DirectoryScope = iota
+	// ScopeSubtree shows sessions whose CWD is the starting directory
+	// itself or any descendant of it (an inclusive recursive subtree).
+	ScopeSubtree
+	// ScopeAll shows every session regardless of CWD.
+	ScopeAll
+)
+
 type Scope struct {
 	CurrentDirectory string
-	AllDirectories   bool
+	Directory        DirectoryScope
 }
 
 // PinStore persists provider-qualified session pin metadata.
@@ -78,7 +94,19 @@ func (c Catalog) Load(ctx context.Context, scope Scope) Snapshot {
 	for i := range result.Sessions {
 		result.Sessions[i].Pinned = pinned[result.Sessions[i].Key.String()]
 	}
-	if !scope.AllDirectories {
+	switch scope.Directory {
+	case ScopeAll:
+		// No directory filter.
+	case ScopeSubtree:
+		current := normalizeDirectory(scope.CurrentDirectory)
+		filtered := result.Sessions[:0]
+		for _, row := range result.Sessions {
+			if isWithinSubtree(current, row.CWD) {
+				filtered = append(filtered, row)
+			}
+		}
+		result.Sessions = filtered
+	default: // ScopeCWD
 		current := normalizeDirectory(scope.CurrentDirectory)
 		filtered := result.Sessions[:0]
 		for _, row := range result.Sessions {
@@ -121,6 +149,28 @@ func (c Catalog) TogglePin(key Key) (bool, error) {
 // normalizeDirectory intentionally does not resolve symlinks. codex-agents
 // compares filepath-cleaned logical paths and agentsctl keeps that UX contract.
 func normalizeDirectory(path string) string { return filepath.Clean(path) }
+
+// isWithinSubtree reports whether candidate is root itself or a descendant
+// of root, using filepath.Rel on cleaned logical paths (no symlink
+// resolution, matching normalizeDirectory) rather than strings.HasPrefix —
+// a prefix match alone cannot tell "/foo/bar" apart from the sibling
+// "/foo/bar-other", since the latter starts with the former as a string
+// but not as a path.
+func isWithinSubtree(root, candidate string) bool {
+	root = normalizeDirectory(root)
+	candidate = normalizeDirectory(candidate)
+	if root == candidate {
+		return true
+	}
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
 
 func (c Catalog) Provider(id ProviderID) (Provider, error) {
 	for _, p := range c.Providers {

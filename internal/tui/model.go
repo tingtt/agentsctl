@@ -33,15 +33,34 @@ type Action struct {
 	SessionKey *session.Key
 }
 type Model struct {
-	Provider       session.ProviderID
-	Prompt         string
-	PromptCursor   int
-	Stash          string
-	Rows           []session.Session
-	Selected       int
-	AllDirectories bool
-	CWDDepth       int
-	Status         string
+	Provider     session.ProviderID
+	Prompt       string
+	PromptCursor int
+	Stash        string
+	Rows         []session.Session
+	Selected     int
+	// Scope selects which sessions' CWDs are shown, cycled by Ctrl+G
+	// (cwd -> cwd/** -> all -> cwd; see nextScope). Unlike the bool it
+	// replaces, this can never collapse two different filters into one
+	// state — session.ScopeCWD is the zero value, so a fresh Model starts
+	// scoped to the current directory without an explicit default here.
+	Scope    session.DirectoryScope
+	CWDDepth int
+	// Error holds the most recent action failure (a rejected rename, an
+	// unavailable capability, an empty selection, ...). It is the only
+	// thing rendered in the composer-top notification area — an operation
+	// whose result is already visible elsewhere in the UI (pin/unpin
+	// reordering a row, a rename changing its title, an archive removing
+	// it) does not get a message here. See rowNotice for the session-
+	// scoped, non-error counterpart.
+	Error string
+	// Notice holds transient, non-error, non-session-scoped feedback whose
+	// result is not otherwise visible on screen — currently only the
+	// directory-depth cycle's current depth (Ctrl+/), since the depth
+	// number itself appears nowhere else in the UI. It renders in the same
+	// composer-top line as Error (Error takes priority when both are set)
+	// but without error styling.
+	Notice         string
 	Warnings       map[session.ProviderID]error
 	RenameDraft    string
 	RenameCursor   int
@@ -97,6 +116,32 @@ func nextCWDDepth(depth int) int {
 	}
 }
 
+// nextScope cycles the session-list directory scope: cwd -> cwd/** -> all
+// -> cwd, bound to Ctrl+G.
+func nextScope(scope session.DirectoryScope) session.DirectoryScope {
+	switch scope {
+	case session.ScopeCWD:
+		return session.ScopeSubtree
+	case session.ScopeSubtree:
+		return session.ScopeAll
+	default:
+		return session.ScopeCWD
+	}
+}
+
+// scopeLabel is the short header text for scope, distinguishing all three
+// states without adding a dedicated notification (see Model.Scope).
+func scopeLabel(scope session.DirectoryScope) string {
+	switch scope {
+	case session.ScopeSubtree:
+		return "cwd/**"
+	case session.ScopeAll:
+		return "all"
+	default:
+		return "cwd"
+	}
+}
+
 type displayLine struct {
 	text     string
 	rowIndex int
@@ -106,12 +151,7 @@ func NewModel() Model {
 	return Model{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, CWDDepth: 2}
 }
 func (m *Model) SetRows(rows []session.Session) {
-	if m.archiveConfirm != nil {
-		m.archiveConfirm = nil
-		if m.Status == "Press Ctrl+X again to archive" {
-			m.Status = ""
-		}
-	}
+	m.archiveConfirm = nil
 	var selected session.Key
 	selectedValid := false
 	if m.Renaming {
@@ -227,8 +267,8 @@ func (m *Model) Update(key string) Action {
 		return m.selectedOrStatus(ActionAttach, "open")
 	case "open":
 		return m.selectedOrStatus(ActionAttach, "open")
-	case "folders":
-		m.AllDirectories = !m.AllDirectories
+	case "scope-cycle":
+		m.Scope = nextScope(m.Scope)
 		m.Selected = 0
 		m.archiveConfirm = nil
 		return Action{Kind: ActionRefresh}
@@ -237,11 +277,11 @@ func (m *Model) Update(key string) Action {
 	case "rename":
 		row, ok := m.selectedRow()
 		if !ok {
-			m.Status = "No session selected"
+			m.Error = "No session selected"
 			return Action{}
 		}
 		if !row.Capabilities.Rename {
-			m.Status = capabilityReason(row, "rename")
+			m.Error = capabilityReason(row, "rename")
 			return Action{}
 		}
 		m.Renaming = true
@@ -249,16 +289,16 @@ func (m *Model) Update(key string) Action {
 		m.RenameOriginal = row.Name
 		m.RenameDraft = row.Name
 		m.RenameCursor = len([]rune(row.Name))
-		m.Status = ""
+		m.Error = ""
 		return Action{}
 	case "pin":
 		return m.selected(ActionPin)
 	case "depth-cycle":
 		m.CWDDepth = nextCWDDepth(m.CWDDepth)
 		if m.CWDDepth == CWDDepthAll {
-			m.Status = "Directory depth: all"
+			m.Notice = "Directory depth: all"
 		} else {
-			m.Status = fmt.Sprintf("Directory depth: %d", m.CWDDepth)
+			m.Notice = fmt.Sprintf("Directory depth: %d", m.CWDDepth)
 		}
 		return Action{}
 	case "refresh":
@@ -285,9 +325,6 @@ func (m *Model) clampPromptCursor(runes []rune) {
 
 func (m *Model) cancelArchiveConfirmation() {
 	m.archiveConfirm = nil
-	if m.Status == "Press Ctrl+X again to archive" {
-		m.Status = ""
-	}
 }
 
 func (m *Model) updateRename(key string) Action {
@@ -295,7 +332,7 @@ func (m *Model) updateRename(key string) Action {
 	switch key {
 	case "quit":
 		m.clearRename()
-		m.Status = "Rename cancelled"
+		m.Notice = "Rename cancelled"
 	case "home":
 		m.RenameCursor = 0
 	case "end":
@@ -317,7 +354,7 @@ func (m *Model) updateRename(key string) Action {
 		}
 	case "enter":
 		if strings.TrimSpace(m.RenameDraft) == "" {
-			m.Status = "Name must not be empty"
+			m.Error = "Name must not be empty"
 			return Action{}
 		}
 		key := m.RenameTarget
@@ -348,7 +385,16 @@ func (m *Model) updateArchiveConfirmation(key string) Action {
 		return m.stopOrArchive()
 	case "quit":
 		m.cancelArchiveConfirmation()
-		m.Status = "Archive cancelled"
+		m.Notice = "Archive cancelled"
+	case "up", "down":
+		// Moving the selection cancels a pending archive confirmation (no
+		// "cancelled" notice here, unlike Esc — the confirmation simply
+		// disappearing from its row as selection moves off it is enough).
+		// Update's normal dispatch only reaches the main switch's own
+		// up/down cases when archiveConfirm is already nil, so the
+		// cancellation and the move must both happen here.
+		m.cancelArchiveConfirmation()
+		return m.Update(key)
 	}
 	return Action{}
 }
@@ -356,7 +402,7 @@ func (m *Model) updateArchiveConfirmation(key string) Action {
 func (m *Model) stopOrArchive() Action {
 	row, ok := m.selectedRow()
 	if !ok {
-		m.Status = "No session selected"
+		m.Error = "No session selected"
 		return Action{}
 	}
 	if row.Capabilities.Stop {
@@ -364,17 +410,16 @@ func (m *Model) stopOrArchive() Action {
 		return m.selected(ActionStop)
 	}
 	if !row.Capabilities.Archive {
-		m.Status = capabilityReason(row, "stop or archive")
+		m.Error = capabilityReason(row, "stop or archive")
 		return Action{}
 	}
 	if m.archiveConfirm == nil || *m.archiveConfirm != row.Key {
 		key := row.Key
 		m.archiveConfirm = &key
-		m.Status = "Press Ctrl+X again to archive"
 		return Action{}
 	}
 	m.archiveConfirm = nil
-	m.Status = ""
+	m.Error = ""
 	return m.selected(ActionArchive)
 }
 
@@ -388,15 +433,47 @@ func (m *Model) selectedRow() (session.Session, bool) {
 func (m *Model) selectedOrStatus(kind ActionKind, name string) Action {
 	row, ok := m.selectedRow()
 	if !ok {
-		m.Status = "No session selected"
+		m.Error = "No session selected"
 		return Action{}
 	}
 	allowed := kind == ActionAttach && row.Capabilities.Attach
 	if !allowed {
-		m.Status = capabilityReason(row, name)
+		m.Error = capabilityReason(row, name)
 		return Action{}
 	}
 	return m.selected(kind)
+}
+
+// noticeSeverity is a row-scoped notice's color/urgency. Only alert is
+// currently produced (archive confirmation), but View's rendering path
+// handles both so a future non-error info notice needs no new plumbing —
+// just another case in rowNotice below.
+type noticeSeverity int
+
+const (
+	noticeInfo noticeSeverity = iota
+	noticeAlert
+)
+
+// noticeColor maps a noticeSeverity to its ANSI SGR color code: info is
+// cyan, alert is red.
+func noticeColor(severity noticeSeverity) string {
+	if severity == noticeAlert {
+		return colorRed
+	}
+	return colorCyan
+}
+
+// rowNotice returns the row-scoped, non-error notice for the session
+// identified by key, if any. Text is derived here from current state on
+// every call — never cached as a display string — so it can never go stale
+// across selection moves, pin/reorder, or a refresh: those all act on the
+// same session.Key-keyed state (currently just archiveConfirm) this reads.
+func (m Model) rowNotice(key session.Key) (string, noticeSeverity, bool) {
+	if m.archiveConfirm != nil && *m.archiveConfirm == key {
+		return "Press Ctrl+X again to archive", noticeAlert, true
+	}
+	return "", noticeInfo, false
 }
 
 func capabilityReason(row session.Session, action string) string {
@@ -413,11 +490,7 @@ func (m *Model) selected(kind ActionKind) Action {
 	return Action{Kind: kind, Provider: row.Key.Provider, Session: &row, Prompt: m.Prompt}
 }
 func (m Model) View(width, height int) string {
-	view := "current folder"
-	if m.AllDirectories {
-		view = "all folders"
-	}
-	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", view), width), ""}
+	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", scopeLabel(m.Scope)), width), ""}
 	list := make([]displayLine, 0, len(m.Rows)+4)
 	groups := []struct {
 		title  string
@@ -440,16 +513,25 @@ func (m Model) View(width, height int) string {
 			if m.archiveConfirm != nil && row.Key == *m.archiveConfirm {
 				cursor = "x"
 			}
-			// Layout: "> [status] title...spacer...[provider] cwd/". The
-			// right block (provider field + cwd, right-aligned to the
-			// terminal edge) is sized from its own content first; the title
-			// gets whatever cells are left, padded so the row fills the
-			// terminal width exactly. Provider identity lives in the right
-			// block's label, not the title's color — the title's color/
-			// weight instead conveys selection and last-attached state (see
-			// titleStyleCodes).
+			// Layout: "> [status] title...spacer...[notice] [provider] cwd/".
+			// The right block (an optional notice, then the provider field
+			// and cwd, right-aligned to the terminal edge) is sized from its
+			// own content first; the title gets whatever cells are left,
+			// padded so the row fills the terminal width exactly. Provider
+			// identity lives in the right block's label, not the title's
+			// color — the title's color/weight instead conveys selection and
+			// last-attached state (see titleStyleCodes). A notice never
+			// shrinks the provider/cwd block: splitRowWidth reserves cwd's
+			// width first, then gives a notice whatever is left before the
+			// title, clipping or dropping the notice — never cwd/provider —
+			// under width pressure.
 			cwdPlain := withTrailingSlash(displayCWD(row.CWD, m.CWDDepth))
-			titleWidth, cwdWidth := splitRowWidth(width, lineCells(cwdPlain))
+			noticeText, severity, hasNotice := m.rowNotice(row.Key)
+			noticeCells := 0
+			if hasNotice {
+				noticeCells = lineCells(noticeText)
+			}
+			titleWidth, noticeWidth, cwdWidth := splitRowWidth(width, lineCells(cwdPlain), noticeCells)
 			var name string
 			if m.Renaming && row.Key == m.RenameTarget {
 				name = cursorWindow(m.RenameDraft, m.RenameCursor, titleWidth)
@@ -459,9 +541,13 @@ func (m Model) View(width, height int) string {
 			selected := i == m.Selected
 			lastAttached := m.HasLastAttached && row.Key == m.LastAttachedKey
 			name = styleText(name, titleStyleCodes(selected, lastAttached)...)
+			noticeSegment := ""
+			if noticeWidth > 0 {
+				noticeSegment = styleText(clipLine(noticeText, noticeWidth), noticeColor(severity)) + " "
+			}
 			cwd := fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth)
 			provider := styleText(providerLabel(row.Key.Provider), providerColor(row.Key.Provider))
-			line := cursor + " " + statusIcon(row.Activity) + " " + name + provider + " " + cwd
+			line := cursor + " " + statusIcon(row.Activity) + " " + name + noticeSegment + provider + " " + cwd
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		if shown {
@@ -476,10 +562,15 @@ func (m Model) View(width, height int) string {
 	footer := []string{
 		clipLine(promptPrefix+cursorWindow(m.Prompt, m.PromptCursor, max(1, width-lineCells(promptPrefix))), width),
 		clipLine("Shift+Tab / Enter send/open / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
-		clipLine("↑↓ / Ctrl+A folders / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
+		clipLine("↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
 	}
-	if m.Status != "" {
-		footer = append([]string{clipLine("! "+m.Status, width)}, footer...)
+	// Error takes priority over Notice — an action failure is more
+	// important than transient informational feedback (e.g. the depth-cycle
+	// readout), and only one line is reserved for either.
+	if m.Error != "" {
+		footer = append([]string{clipLine("! "+m.Error, width)}, footer...)
+	} else if m.Notice != "" {
+		footer = append([]string{clipLine(m.Notice, width)}, footer...)
 	}
 	if height < 0 {
 		height = 0
@@ -561,22 +652,41 @@ const rowLeftFixed = 4
 // space between it and the CWD. The CWD itself is variable-width.
 const rowRightFixed = providerFieldWidth + 1
 
-// splitRowWidth lays out a session row right-block-first: the CWD (with
-// its trailing "/" already counted in cwdCells) is shown in full whenever
-// the terminal is wide enough, and the title receives whatever cells
-// remain so the row fills the terminal width exactly. Only when the
-// terminal is too narrow for the full CWD alongside the fixed left/
-// provider cells does the CWD itself give up width (to be left-truncated
-// by the caller), at which point the title gets none.
-func splitRowWidth(width, cwdCells int) (title, cwd int) {
+// splitRowWidth lays out a session row in strict priority order — provider
+// field + CWD first, then an optional row notice, then the title gets
+// whatever cells remain — so the row fills the terminal width exactly. The
+// CWD (with its trailing "/" already counted in cwdCells) is shown in full
+// whenever the terminal is wide enough; only when the terminal is too
+// narrow for the full CWD alongside the fixed left/provider cells does the
+// CWD itself give up width (to be left-truncated by the caller), at which
+// point both notice and title get none. A notice (noticeCells; pass 0 for
+// none) never takes width from CWD/provider: it is sized from whatever
+// remains after they're placed, and is clipped or dropped entirely before
+// the title ever loses width to it.
+func splitRowWidth(width, cwdCells, noticeCells int) (title, notice, cwd int) {
 	available := width - rowLeftFixed - rowRightFixed
 	if available < 0 {
 		available = 0
 	}
-	if cwdCells <= available {
-		return available - cwdCells, cwdCells
+	if cwdCells > available {
+		return 0, 0, available
 	}
-	return 0, available
+	cwd = cwdCells
+	remaining := available - cwd
+	if noticeCells == 0 {
+		return remaining, 0, cwd
+	}
+	// +1 for the separator space between the notice and the provider field.
+	if noticeFixed := noticeCells + 1; noticeFixed <= remaining {
+		return remaining - noticeFixed, noticeCells, cwd
+	}
+	// Not enough room for the full notice alongside its separator; give it
+	// whatever is left (clipped) with no title, or drop it entirely if
+	// there isn't even room for one cell of it plus the separator.
+	if remaining >= 2 {
+		return 0, remaining - 1, cwd
+	}
+	return 0, 0, cwd
 }
 
 // fitCells clips or space-pads value to exactly width terminal cells,

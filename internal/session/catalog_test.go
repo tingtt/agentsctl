@@ -33,7 +33,7 @@ func TestCatalogKeepsHealthyProviderWhenPeerFails(t *testing.T) {
 		fakeProvider{id: ProviderClaude, err: errors.New("bad json")},
 		fakeProvider{id: ProviderCodex, rows: []Session{{Key: Key{Provider: ProviderCodex, ID: "2"}, Activity: ActivityIdle, UpdatedAt: now}}},
 	}}
-	s := c.Load(context.Background(), Scope{AllDirectories: true})
+	s := c.Load(context.Background(), Scope{Directory: ScopeAll})
 	if len(s.Sessions) != 1 || s.Sessions[0].Key.Provider != ProviderCodex {
 		t.Fatalf("sessions=%+v", s.Sessions)
 	}
@@ -69,7 +69,7 @@ func TestCatalogOrdersPinnedAndOtherByCreationTime(t *testing.T) {
 		{Key: Key{Provider: ProviderClaude, ID: "pinned-new"}, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-3 * time.Hour), Activity: ActivityCompleted},
 		{Key: Key{Provider: ProviderClaude, ID: "other-new"}, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(4 * time.Hour), Activity: ActivityFailed},
 	}}}}
-	rows := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
+	rows := c.Load(context.Background(), Scope{Directory: ScopeAll}).Sessions
 	want := []string{"pinned-new", "pinned-old", "other-new", "other-old"}
 	for i := range want {
 		if rows[i].Key.ID != want[i] {
@@ -88,11 +88,11 @@ func TestCatalogOrderDoesNotChangeWithActivityOrUpdateTime(t *testing.T) {
 		{Key: Key{Provider: ProviderCodex, ID: "old"}, CreatedAt: now.Add(-time.Hour)},
 	}}
 	c := Catalog{Providers: []Provider{provider}}
-	before := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
+	before := c.Load(context.Background(), Scope{Directory: ScopeAll}).Sessions
 	provider.rows[0].Activity, provider.rows[0].UpdatedAt = ActivityCompleted, now.Add(-24*time.Hour)
 	provider.rows[1].Activity, provider.rows[1].UpdatedAt = ActivityNeedsInput, now.Add(24*time.Hour)
 	c.Providers[0] = provider
-	after := c.Load(context.Background(), Scope{AllDirectories: true}).Sessions
+	after := c.Load(context.Background(), Scope{Directory: ScopeAll}).Sessions
 	if before[0].Key.ID != "new" || after[0].Key.ID != "new" {
 		t.Fatalf("order changed: before=%+v after=%+v", before, after)
 	}
@@ -128,13 +128,44 @@ func TestCatalogDirectoryScope(t *testing.T) {
 	}
 	catalog := Catalog{Providers: []Provider{fakeProvider{id: ProviderCodex, rows: rows}}}
 
+	// Default zero value (ScopeCWD): exact match only, cleaned-path comparison.
 	got := catalog.Load(context.Background(), Scope{CurrentDirectory: current + "/."}).Sessions
 	if ids := sessionIDs(got); len(ids) != 2 || ids[0] != "exact" || ids[1] != "normalized" {
 		t.Fatalf("current-directory sessions=%v", ids)
 	}
-	all := catalog.Load(context.Background(), Scope{CurrentDirectory: current, AllDirectories: true}).Sessions
+	all := catalog.Load(context.Background(), Scope{CurrentDirectory: current, Directory: ScopeAll}).Sessions
 	if len(all) != len(rows) {
 		t.Fatalf("all-directory sessions=%d, want %d", len(all), len(rows))
+	}
+	subtree := catalog.Load(context.Background(), Scope{CurrentDirectory: current, Directory: ScopeSubtree}).Sessions
+	if ids := sessionIDs(subtree); len(ids) != 3 || ids[0] != "child" || ids[1] != "exact" || ids[2] != "normalized" {
+		t.Fatalf("subtree sessions=%v, want [child exact normalized] (cwd itself + descendants, sibling/parent excluded)", ids)
+	}
+}
+
+// TestCatalogSubtreeScopeDistinguishesSamePrefixSiblings guards the
+// specific pitfall a strings.HasPrefix-based subtree check would fall
+// into: "/foo/bar-other" starts with the string "/foo/bar" but is not a
+// descendant of it. isWithinSubtree must use path-boundary-aware
+// comparison (filepath.Rel), not a raw string prefix.
+func TestCatalogSubtreeScopeDistinguishesSamePrefixSiblings(t *testing.T) {
+	root := t.TempDir()
+	bar := filepath.Join(root, "bar")
+	barOther := filepath.Join(root, "bar-other")
+	if err := os.MkdirAll(bar, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(barOther, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rows := []Session{
+		{Key: Key{Provider: ProviderCodex, ID: "bar"}, CWD: bar},
+		{Key: Key{Provider: ProviderCodex, ID: "bar-other"}, CWD: barOther},
+	}
+	catalog := Catalog{Providers: []Provider{fakeProvider{id: ProviderCodex, rows: rows}}}
+	got := catalog.Load(context.Background(), Scope{CurrentDirectory: bar, Directory: ScopeSubtree}).Sessions
+	if ids := sessionIDs(got); len(ids) != 1 || ids[0] != "bar" {
+		t.Fatalf("subtree scope leaked a same-prefix sibling: %v", ids)
 	}
 }
 

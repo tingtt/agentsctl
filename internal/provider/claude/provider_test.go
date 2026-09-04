@@ -108,6 +108,70 @@ func TestArchiveIsLocalOverlayAndDoesNotInvokeClaudeDelete(t *testing.T) {
 		t.Fatalf("unexpected command args: %v", r.args)
 	}
 }
+
+// TestListExposesRenameForWorkingAndStoppedSessions fixes the capability
+// bug this fixes: Rename must be available for any non-archived Claude
+// session regardless of Activity/Runtime — active sessions included, since
+// the local display-name overlay (see Rename) never stops or otherwise
+// touches the session, unlike Stop/Archive.
+func TestListExposesRenameForWorkingAndStoppedSessions(t *testing.T) {
+	r := &fakeRunner{result: base.Result{Stdout: []byte(`[
+		{"id":"working","status":"busy","state":"working"},
+		{"id":"done","status":"idle","state":"done"}
+	]`)}}
+	p := Provider{Path: "ignored", Runner: r, Store: state.New(filepath.Join(t.TempDir(), "state.json"))}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if !row.Capabilities.Rename {
+			t.Fatalf("row %+v has no Rename capability", row)
+		}
+	}
+}
+
+// TestRenamePersistsLocalOverlayWithoutTouchingSessionState is the
+// regression for the Claude rename bug: Provider.Rename must not error
+// ("installed Claude CLI has no native rename operation"/archive-reason
+// leakage) and must not invoke the Claude CLI at all — it persists a local
+// display-name override (state.Data.ClaudeNames), which List then applies
+// on top of the native name.
+func TestRenamePersistsLocalOverlayWithoutTouchingSessionState(t *testing.T) {
+	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","name":"native-name","status":"busy","state":"working"}]`)}}
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	p := Provider{Path: "ignored", Runner: r, Store: store}
+	key := session.Key{Provider: session.ProviderClaude, ID: "c1"}
+	if err := p.Rename(context.Background(), key, "My New Name"); err != nil {
+		t.Fatal(err)
+	}
+	// Rename must be pure local state — no CLI invocation at all.
+	if len(r.args) != 0 {
+		t.Fatalf("rename invoked the claude CLI: args=%v", r.args)
+	}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Name != "My New Name" {
+		t.Fatalf("rows=%+v, want overridden name", rows)
+	}
+	d, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.ClaudeNames["c1"] != "My New Name" {
+		t.Fatalf("override not persisted: %+v", d.ClaudeNames)
+	}
+}
+
+func TestRenameRejectsBlankName(t *testing.T) {
+	p := Provider{Path: "ignored", Runner: &fakeRunner{}, Store: state.New(filepath.Join(t.TempDir(), "state.json"))}
+	if err := p.Rename(context.Background(), session.Key{Provider: session.ProviderClaude, ID: "c1"}, "   "); err == nil {
+		t.Fatal("blank rename was accepted")
+	}
+}
+
 func TestMissingBinaryIsReported(t *testing.T) {
 	p := Provider{Path: filepath.Join(t.TempDir(), "missing")}
 	if p.Available() == nil {

@@ -29,9 +29,19 @@ type Run struct {
 
 type Data struct {
 	ClaudeArchived map[string]bool `json:"claudeArchived,omitempty"`
-	Pinned         map[string]bool `json:"pinned,omitempty"`
-	Runs           map[string]Run  `json:"runs,omitempty"`
-	Provider       string          `json:"provider,omitempty"`
+	// ClaudeNames holds agentsctl-local display-name overrides for Claude
+	// sessions, keyed by native Claude session ID. Claude's CLI has no
+	// headless/native operation to rename an existing background session in
+	// place (confirmed: any flag passed to `claude --bg --resume <id>`,
+	// including --name, always forks a new session rather than mutating the
+	// original's saved options), so this is a display-only overlay — it
+	// never touches Claude's own session state or transcript. See
+	// provider/claude's Rename/List and the README's "agentsctl-local
+	// rename" note.
+	ClaudeNames map[string]string `json:"claudeNames,omitempty"`
+	Pinned      map[string]bool   `json:"pinned,omitempty"`
+	Runs        map[string]Run    `json:"runs,omitempty"`
+	Provider    string            `json:"provider,omitempty"`
 }
 
 type Store struct {
@@ -71,6 +81,9 @@ func (s *Store) Update(fn func(*Data) error) error {
 	if d.ClaudeArchived == nil {
 		d.ClaudeArchived = map[string]bool{}
 	}
+	if d.ClaudeNames == nil {
+		d.ClaudeNames = map[string]string{}
+	}
 	if d.Pinned == nil {
 		d.Pinned = map[string]bool{}
 	}
@@ -96,7 +109,7 @@ func (s *Store) lock(mode int) (func(), error) {
 }
 
 func (s *Store) load() (Data, error) {
-	d := Data{ClaudeArchived: map[string]bool{}, Pinned: map[string]bool{}, Runs: map[string]Run{}}
+	d := Data{ClaudeArchived: map[string]bool{}, ClaudeNames: map[string]string{}, Pinned: map[string]bool{}, Runs: map[string]Run{}}
 	b, err := os.ReadFile(s.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return d, nil
@@ -109,6 +122,9 @@ func (s *Store) load() (Data, error) {
 	}
 	if d.ClaudeArchived == nil {
 		d.ClaudeArchived = map[string]bool{}
+	}
+	if d.ClaudeNames == nil {
+		d.ClaudeNames = map[string]string{}
 	}
 	if d.Pinned == nil {
 		d.Pinned = map[string]bool{}

@@ -73,7 +73,7 @@ func (a *App) Run(ctx context.Context) error {
 			return nil
 		}
 		if err := a.act(ctx, action); err != nil {
-			a.Model.Status = "error: " + err.Error()
+			a.Model.Error = "error: " + err.Error()
 		}
 		// Pin/unpin never touches provider (remote) state, so — unlike
 		// every other action — it must not trigger a full catalog
@@ -109,7 +109,7 @@ func beginTerminal(w io.Writer) { _, _ = io.WriteString(w, "\x1b[?1049h\x1b[?25l
 func endTerminal(w io.Writer)   { _, _ = io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l") }
 
 func (a *App) refresh(ctx context.Context) {
-	snap := a.Catalog.Load(ctx, session.Scope{CurrentDirectory: a.CWD, AllDirectories: a.Model.AllDirectories})
+	snap := a.Catalog.Load(ctx, session.Scope{CurrentDirectory: a.CWD, Directory: a.Model.Scope})
 	a.Model.SetRows(snap.Sessions)
 	a.Model.Warnings = snap.Warnings
 }
@@ -132,7 +132,7 @@ func (a *App) act(ctx context.Context, x Action) error {
 		}
 		a.Model.Prompt = ""
 		a.Model.PromptCursor = 0
-		a.Model.Status = "started " + row.Key.String()
+		a.Model.Notice = "started " + row.Key.String()
 	case ActionAttach:
 		if x.Session == nil || !x.Session.Capabilities.Attach {
 			return capabilityError(x.Session, "attach")
@@ -168,7 +168,6 @@ func (a *App) act(ctx context.Context, x Action) error {
 			return err
 		}
 		a.Model.clearRename()
-		a.Model.Status = "Renamed session"
 	case ActionPin:
 		if x.Session == nil {
 			return errors.New("no session selected")
@@ -182,11 +181,6 @@ func (a *App) act(ctx context.Context, x Action) error {
 			return err
 		}
 		a.Model.ApplyPin(x.Session.Key, pinned)
-		if pinned {
-			a.Model.Status = "Pinned session"
-		} else {
-			a.Model.Status = "Unpinned session"
-		}
 	}
 	return nil
 }
@@ -323,8 +317,11 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 		return "open", nil
 	case 0x14:
 		return "pin", nil
-	case 0x01:
-		return "folders", nil
+	case 0x07:
+		// Ctrl+G (C0 code 0x07, BEL) cycles the session-list directory
+		// scope: cwd -> cwd/** -> all -> cwd. Ctrl+A previously toggled a
+		// two-state version of this and is no longer bound to anything.
+		return "scope-cycle", nil
 	case 0x18:
 		return "stop-or-archive", nil
 	case 0x12:

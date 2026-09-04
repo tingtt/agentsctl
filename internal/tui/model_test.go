@@ -232,7 +232,7 @@ func TestPromptStashSwapsAndPreservesOverviewState(t *testing.T) {
 			m.Provider = session.ProviderCodex
 			m.Prompt = tc.prompt
 			m.Stash = tc.stash
-			m.AllDirectories = true
+			m.Scope = session.ScopeAll
 			m.Rows = []session.Session{{Key: selected}}
 			m.Selected = 0
 			if action := m.Update("stash"); action.Kind != ActionNone {
@@ -241,7 +241,7 @@ func TestPromptStashSwapsAndPreservesOverviewState(t *testing.T) {
 			if m.Prompt != tc.wantPrompt || m.Stash != tc.wantStash {
 				t.Fatalf("prompt=%q stash=%q", m.Prompt, m.Stash)
 			}
-			if m.Provider != session.ProviderCodex || !m.AllDirectories || m.Rows[m.Selected].Key != selected {
+			if m.Provider != session.ProviderCodex || m.Scope != session.ScopeAll || m.Rows[m.Selected].Key != selected {
 				t.Fatalf("overview state changed: %+v", m)
 			}
 		})
@@ -422,8 +422,8 @@ func TestEnterDispatchesComposerOrAttachesSelection(t *testing.T) {
 func TestEmptyEnterWithoutSelectionIsSafe(t *testing.T) {
 	m := NewModel()
 	a := m.Update("enter")
-	if a.Kind != ActionNone || m.Status != "No session selected" {
-		t.Fatalf("action=%+v status=%q", a, m.Status)
+	if a.Kind != ActionNone || m.Error != "No session selected" {
+		t.Fatalf("action=%+v error=%q", a, m.Error)
 	}
 }
 
@@ -453,11 +453,42 @@ func TestModeInputPriority(t *testing.T) {
 	}
 }
 
-func TestCtrlAOnlyChangesScope(t *testing.T) {
+// TestCtrlAIsUnboundAndDoesNotChangeScope covers the acceptance criterion
+// "Ctrl+A では scope が変わらない": Ctrl+A no longer maps to any key action
+// (readKey returns "" for its raw byte, see TestReadKeyConsumesLegacy...),
+// and even if that empty string somehow reached Update, it must not be
+// interpreted as any scope-changing key.
+func TestCtrlAIsUnboundAndDoesNotChangeScope(t *testing.T) {
 	m := NewModel()
-	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Capabilities: session.Capabilities{Attach: true}}}
-	if action := m.Update("folders"); action.Kind != ActionRefresh || !m.AllDirectories {
-		t.Fatalf("action=%+v model=%+v", action, m)
+	before := m.Scope
+	key, err := readKey(bufio.NewReader(strings.NewReader("\x01")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "" {
+		t.Fatalf("Ctrl+A (0x01) decoded to key=%q, want unbound", key)
+	}
+	if action := m.Update(key); action.Kind != ActionNone || m.Scope != before {
+		t.Fatalf("action=%+v scope=%v, want unchanged", action, m.Scope)
+	}
+}
+
+// TestCtrlGCyclesScopeThreeWaysThenWraps covers the acceptance criterion
+// "Ctrl+G で cwd -> cwd/** -> all -> cwd と cycle する".
+func TestCtrlGCyclesScopeThreeWaysThenWraps(t *testing.T) {
+	m := NewModel()
+	if m.Scope != session.ScopeCWD {
+		t.Fatalf("initial scope=%v, want ScopeCWD", m.Scope)
+	}
+	want := []session.DirectoryScope{session.ScopeSubtree, session.ScopeAll, session.ScopeCWD, session.ScopeSubtree}
+	for i, w := range want {
+		action := m.Update("scope-cycle")
+		if action.Kind != ActionRefresh {
+			t.Fatalf("step %d: action=%+v, want ActionRefresh", i, action)
+		}
+		if m.Scope != w {
+			t.Fatalf("step %d: scope=%v, want %v", i, m.Scope, w)
+		}
 	}
 }
 
@@ -494,8 +525,8 @@ func TestInlineRenameEditingTargetsStableSession(t *testing.T) {
 func TestInlineRenameCancelAndCapabilityFailurePreserveComposer(t *testing.T) {
 	m := NewModel()
 	m.Prompt, m.Stash = "composer", "stashed"
-	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "c"}, Name: "old", Capabilities: session.Capabilities{Reason: "provider has no native rename"}}}
-	if action := m.Update("rename"); action.Kind != ActionNone || m.Renaming || !strings.Contains(m.Status, "provider has no native rename") {
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "c"}, Name: "old", Capabilities: session.Capabilities{Reason: "session is archived"}}}
+	if action := m.Update("rename"); action.Kind != ActionNone || m.Renaming || !strings.Contains(m.Error, "session is archived") {
 		t.Fatalf("unsupported rename action=%+v model=%+v", action, m)
 	}
 	m.Rows[0].Capabilities.Rename = true
@@ -537,8 +568,8 @@ func TestCodexAgentsKeyTransitions(t *testing.T) {
 	if a := m.Update("stop-or-archive"); a.Kind != ActionStop {
 		t.Fatalf("stop action=%+v", a)
 	}
-	if a := m.Update("folders"); a.Kind != ActionRefresh || !m.AllDirectories {
-		t.Fatalf("folders action=%+v model=%+v", a, m)
+	if a := m.Update("scope-cycle"); a.Kind != ActionRefresh || m.Scope != session.ScopeSubtree {
+		t.Fatalf("scope-cycle action=%+v model=%+v", a, m)
 	}
 	if a := m.Update("rename"); a.Kind != ActionNone || !m.Renaming || m.RenameDraft != "old" {
 		t.Fatalf("rename start action=%+v model=%+v", a, m)
@@ -550,21 +581,34 @@ func TestCodexAgentsKeyTransitions(t *testing.T) {
 }
 
 func TestCtrlXRequiresConfirmationBeforeArchive(t *testing.T) {
+	key := session.Key{Provider: session.ProviderClaude, ID: "done"}
 	m := NewModel()
-	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "done"}, Capabilities: session.Capabilities{Archive: true}}}
-	if a := m.Update("stop-or-archive"); a.Kind != ActionNone || !strings.Contains(m.Status, "again") {
-		t.Fatalf("first action=%+v status=%q", a, m.Status)
+	m.Rows = []session.Session{{Key: key, Capabilities: session.Capabilities{Archive: true}}}
+	if a := m.Update("stop-or-archive"); a.Kind != ActionNone {
+		t.Fatalf("first action=%+v", a)
+	}
+	// The confirmation is not a Status/Error string — it is derived from
+	// session.Key state (see rowNotice) so it always tracks the right row.
+	text, severity, ok := m.rowNotice(key)
+	if !ok || !strings.Contains(text, "again") || severity != noticeAlert {
+		t.Fatalf("row notice=%q severity=%v ok=%v, want an alert-severity confirmation", text, severity, ok)
+	}
+	if m.Error != "" {
+		t.Fatalf("archive confirmation must not use the error notification: %q", m.Error)
 	}
 	if a := m.Update("stop-or-archive"); a.Kind != ActionArchive {
 		t.Fatalf("action=%+v", a)
+	}
+	if _, _, ok := m.rowNotice(key); ok {
+		t.Fatal("row notice remained after the second Ctrl+X committed the archive")
 	}
 }
 
 func TestUnsupportedActionExplainsWhy(t *testing.T) {
 	m := NewModel()
 	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "external"}, Capabilities: session.Capabilities{Reason: "external writer"}}}
-	if a := m.Update("open"); a.Kind != ActionNone || !strings.Contains(m.Status, "external writer") {
-		t.Fatalf("action=%+v status=%q", a, m.Status)
+	if a := m.Update("open"); a.Kind != ActionNone || !strings.Contains(m.Error, "external writer") {
+		t.Fatalf("action=%+v error=%q", a, m.Error)
 	}
 }
 
@@ -575,7 +619,8 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 	}{
 		{"\x1b[Z", "shift+tab"},
 		{"\x0f", "open"},
-		{"\x01", "folders"},
+		{"\x01", ""}, // Ctrl+A is no longer bound to anything.
+		{"\x07", "scope-cycle"},
 		{"\x18", "stop-or-archive"},
 		{"\x13", "stash"},
 		{"\x14", "pin"},
@@ -667,7 +712,7 @@ func TestInputBytesDriveActionsWithoutLeakingProtocolText(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := m.Prompt
-		if action := m.Update(key); action.Kind != ActionNone || m.Prompt != before || m.AllDirectories {
+		if action := m.Update(key); action.Kind != ActionNone || m.Prompt != before || m.Scope != session.ScopeCWD {
 			t.Fatalf("input=%q key=%q action=%+v model=%+v", input, key, action, m)
 		}
 	}
@@ -743,7 +788,7 @@ func TestViewKeepsFooterComposerSelectionAndErrorWithinNarrowViewport(t *testing
 		if count > 0 {
 			m.Selected = count - 1
 		}
-		m.Status = "fixture error"
+		m.Error = "fixture error"
 		view := m.View(48, 10)
 		if lines := strings.Count(view, "\n"); lines != 10 {
 			t.Fatalf("count=%d lines=%d\n%s", count, lines, view)

@@ -124,7 +124,7 @@ func TestRenameActionSuccessAndFailure(t *testing.T) {
 				t.Fatalf("err=%v", err)
 			}
 			if err != nil {
-				app.Model.Status = "error: " + err.Error()
+				app.Model.Error = "error: " + err.Error()
 			}
 			provider.rows[0], provider.rows[1] = provider.rows[1], provider.rows[0]
 			app.refresh(context.Background())
@@ -135,7 +135,7 @@ func TestRenameActionSuccessAndFailure(t *testing.T) {
 				t.Fatalf("model=%+v", app.Model)
 			}
 			if tc.renameErr != nil {
-				if app.Model.Rows[app.Model.Selected].Key != target || app.Model.Rows[app.Model.Selected].Name != "old" || app.Model.RenameDraft != "new" || app.Model.Status != "error: rename rejected" {
+				if app.Model.Rows[app.Model.Selected].Key != target || app.Model.Rows[app.Model.Selected].Name != "old" || app.Model.RenameDraft != "new" || app.Model.Error != "error: rename rejected" {
 					t.Fatalf("failed rename mutated catalog/editor: %+v", app.Model)
 				}
 				return
@@ -153,7 +153,7 @@ func TestMVPJourneyAcrossProviders(t *testing.T) {
 	codex := &journeyProvider{id: session.ProviderCodex, rows: []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "x0"}, Activity: session.ActivityIdle}}}
 	catalog := session.Catalog{Providers: []session.Provider{claude, codex}}
 	m := NewModel()
-	scope := session.Scope{CurrentDirectory: "/work", AllDirectories: true}
+	scope := session.Scope{CurrentDirectory: "/work", Directory: session.ScopeAll}
 	m.SetRows(catalog.Load(ctx, scope).Sessions)
 	if len(m.Rows) != 2 {
 		t.Fatal("mixed catalog missing")

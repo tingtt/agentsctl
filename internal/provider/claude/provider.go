@@ -64,7 +64,16 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			updated = created
 		}
 		attachable := runtime == session.RuntimeDetached || activity == session.ActivityCompleted
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: text(v, "name", "displayName"), Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: attachable, Stop: runtime == session.RuntimeDetached, Rename: false, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
+		name := text(v, "name", "displayName")
+		if override, ok := d.ClaudeNames[id]; ok {
+			name = override
+		}
+		// Rename is an agentsctl-local display-name overlay (see
+		// state.Data.ClaudeNames): it never stops or otherwise touches the
+		// session, so — unlike Stop/Archive — it is available for any
+		// non-archived row regardless of Activity/Runtime, active sessions
+		// included.
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: attachable, Stop: runtime == session.RuntimeDetached, Rename: !isArchived, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
 	}
 	return rows, nil
 }
@@ -103,8 +112,25 @@ func (p *Provider) Archive(_ context.Context, k session.Key) error {
 func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeArchived, k.ID); return nil })
 }
-func (p *Provider) Rename(context.Context, session.Key, string) error {
-	return errors.New("installed Claude CLI has no native rename operation")
+
+// Rename sets an agentsctl-local display-name override for a Claude
+// session. This is deliberately not a native operation: the installed
+// Claude CLI has no headless/native way to rename an existing background
+// session in place — `claude --bg --resume <id> --name <name>` was verified
+// (against `claude` 2.1.260) to always fork a new session rather than
+// mutate the original's saved options, for any session state (active or
+// stopped) and even given the full (not short) session ID. Claude's own
+// auto-naming does update session-owned state (an `agent-name` record
+// appended to the session's JSONL transcript), but that is an undocumented
+// internal format with no locking against the live daemon process that may
+// be concurrently appending to the same file, so agentsctl does not write
+// it. The override is purely local display metadata: it never touches
+// Claude's own session, transcript, or worktree (see README).
+func (p *Provider) Rename(_ context.Context, k session.Key, name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("name is required")
+	}
+	return p.Store.Update(func(d *state.Data) error { d.ClaudeNames[k.ID] = name; return nil })
 }
 
 func text(v map[string]any, keys ...string) string {
@@ -152,6 +178,7 @@ func backgroundID(output string) string {
 	}
 	return ""
 }
+
 // claudeActivity maps the installed Claude CLI's native `state` (working,
 // blocked, done, stopped — the lifecycle signal, verified against
 // `claude agents --json --all` output from dispatch through completion) and

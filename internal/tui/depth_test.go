@@ -141,14 +141,14 @@ func TestDepthCycleDoesNotTriggerCatalogRefresh(t *testing.T) {
 	}
 }
 
-func TestDepthCycleSetsTransientStatus(t *testing.T) {
+func TestDepthCycleSetsTransientNotice(t *testing.T) {
 	m := NewModel()
 	m.Update("depth-cycle") // 2 -> 3
-	if m.Status != "Directory depth: 3" {
-		t.Fatalf("status=%q", m.Status)
+	if m.Notice != "Directory depth: 3" {
+		t.Fatalf("notice=%q", m.Notice)
 	}
 	m.Update("depth-cycle") // 3 -> all
-	if m.Status != "Directory depth: all" {
-		t.Fatalf("status=%q", m.Status)
+	if m.Notice != "Directory depth: all" {
+		t.Fatalf("notice=%q", m.Notice)
 	}
 }

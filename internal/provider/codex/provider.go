@@ -84,8 +84,17 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, "Starting"
 			caps := session.Capabilities{Attach: true, Stop: true}
 			if r.State == "failed" || r.State == "stale" || r.State == "stopped" {
+				// This row never became a real Codex app-server thread — its
+				// Key.ID is agentsctl's own run ID, not a thread ID
+				// thread/archive would accept. r.Error (the startup
+				// failure, e.g. a fork/exec error) is kept as diagnostic
+				// Summary text but must not gate Archive: "why the run
+				// failed" and "whether this row can be archived" are
+				// unrelated. Archive() (below) detects this same
+				// SessionID=="" + terminal-state shape and performs a local
+				// state.Store cleanup instead of calling the app-server.
 				activity, runtime, name = session.ActivityFailed, session.RuntimeStopped, "Unbound run"
-				caps = session.Capabilities{Reason: r.Error}
+				caps = session.Capabilities{Archive: true}
 			}
 			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, CreatedAt: r.StartedAt, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Capabilities: caps})
 		}
@@ -120,7 +129,36 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	}
 	return errors.New("refusing to stop a Codex writer not owned by agentsctl")
 }
-func (p *Provider) Archive(ctx context.Context, k session.Key) error { return p.API.Archive(ctx, k.ID) }
+
+// Archive removes k's session. For an actual Codex thread this calls the
+// app-server's native thread/archive. For an agentsctl-owned unbound run —
+// a local run that started but never got proven to any app-server thread
+// (state.Run.SessionID == ""), reached a terminal state (failed/stale/
+// stopped), and therefore surfaced as the diagnostic "Unbound run" row in
+// List — k.ID is agentsctl's own run ID, not a Codex thread ID, so it is
+// never passed to the app-server; instead the run is deleted from
+// state.Store, a one-way local cleanup consistent with archive already
+// being a one-way TUI operation for real threads.
+func (p *Provider) Archive(ctx context.Context, k session.Key) error {
+	d, err := p.Store.Load()
+	if err != nil {
+		return err
+	}
+	if r, ok := d.Runs[k.ID]; ok && isUnboundTerminalRun(r) {
+		return p.Store.Update(func(next *state.Data) error { delete(next.Runs, k.ID); return nil })
+	}
+	return p.API.Archive(ctx, k.ID)
+}
+
+// isUnboundTerminalRun reports whether r is an agentsctl-owned local run
+// that never got proven to a Codex app-server thread and has reached a
+// terminal state — the only runs Archive cleans up locally rather than
+// forwarding to the app-server. Active/starting unbound runs (r.State
+// "running" or "starting") are deliberately excluded so they can never be
+// removed by this path.
+func isUnboundTerminalRun(r state.Run) bool {
+	return r.SessionID == "" && (r.State == "failed" || r.State == "stale" || r.State == "stopped")
+}
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
 	return p.API.Unarchive(ctx, k.ID)
 }

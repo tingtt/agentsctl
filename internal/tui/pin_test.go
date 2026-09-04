@@ -51,8 +51,11 @@ func TestPinDoesNotInvokeProviderList(t *testing.T) {
 	if !app.Model.Rows[0].Pinned {
 		t.Fatal("pin was not applied to the model row")
 	}
-	if app.Model.Status != "Pinned session" {
-		t.Fatalf("status=%q", app.Model.Status)
+	// Pin/unpin must not produce a Status/Error/Notice message — the
+	// pinned/unpinned row moving between the "Pinned"/"Other" groups is
+	// already visible in the rendered view.
+	if app.Model.Error != "" || app.Model.Notice != "" {
+		t.Fatalf("pin produced a redundant notification: error=%q notice=%q", app.Model.Error, app.Model.Notice)
 	}
 
 	// Unpin: same guarantee, the other direction.
@@ -66,8 +69,8 @@ func TestPinDoesNotInvokeProviderList(t *testing.T) {
 	if app.Model.Rows[0].Pinned {
 		t.Fatal("unpin did not clear Pinned on the model row")
 	}
-	if app.Model.Status != "Unpinned session" {
-		t.Fatalf("status=%q", app.Model.Status)
+	if app.Model.Error != "" || app.Model.Notice != "" {
+		t.Fatalf("unpin produced a redundant notification: error=%q notice=%q", app.Model.Error, app.Model.Notice)
 	}
 }
 
@@ -202,7 +205,7 @@ func TestPinFrameUpdateDoesNotWaitForSlowProviderList(t *testing.T) {
 	}
 
 	model := NewModel()
-	model.AllDirectories = true
+	model.Scope = session.ScopeAll
 	app := App{Catalog: catalog, Model: model, Input: slave, Output: trackedOutput, CWD: "/work", ReadInput: readInput}
 	if err := app.Run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -220,7 +223,10 @@ func TestPinFrameUpdateDoesNotWaitForSlowProviderList(t *testing.T) {
 	if elapsed > delay/2 {
 		t.Fatalf("pin frame update took %v after the Ctrl+T key, wanted well under the injected %v provider List delay (proves it does not wait on provider refresh)", elapsed, delay)
 	}
-	if !strings.Contains(output.String(), "Pinned session") {
+	// Pin/unpin produces no Status/Notice text (see
+	// TestPinDoesNotInvokeProviderList); the pin is instead visible as the
+	// row moving under the "Pinned" group heading.
+	if !strings.Contains(latestFrame(output.String()), "Pinned") {
 		t.Fatalf("rendered output never reflected the pin:\n%s", output.String())
 	}
 }

@@ -24,7 +24,8 @@ type fakeAPI struct {
 
 func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
 	api := &fakeAPI{}
-	p := Provider{API: api}
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	p := Provider{API: api, Store: store}
 	key := session.Key{Provider: session.ProviderCodex, ID: "thread"}
 	if err := p.Archive(context.Background(), key); err != nil {
 		t.Fatal(err)
@@ -152,7 +153,7 @@ func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	provider := &Provider{API: &CommandAppServer{Path: fakePath}, Store: store}
 	catalog := session.Catalog{Providers: []session.Provider{provider}}
-	snap := catalog.Load(context.Background(), session.Scope{CurrentDirectory: "/work", AllDirectories: true})
+	snap := catalog.Load(context.Background(), session.Scope{CurrentDirectory: "/work", Directory: session.ScopeAll})
 	if snap.Warnings[session.ProviderCodex] != nil {
 		t.Fatalf("catalog warning: %v", snap.Warnings[session.ProviderCodex])
 	}
@@ -165,6 +166,103 @@ func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
 	}
 	if len(snap.Sessions) != 2 {
 		t.Fatalf("sessions=%+v, want 2 (solo + deduped dup-thread)", snap.Sessions)
+	}
+}
+
+// TestFailedUnboundRunExposesArchiveNotStop fixes the capability shape for
+// a local run that started but was never proven to any app-server thread
+// (state.Run.SessionID == "") and reached a terminal state: it must be
+// archivable (a local cleanup, see below) but not stoppable, and the
+// startup error must not gate Archive — "why the run failed" and "whether
+// this row can be archived" are unrelated (the error remains visible only
+// as diagnostic Summary text).
+func TestFailedUnboundRunExposesArchiveNotStop(t *testing.T) {
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	_ = store.Update(func(d *state.Data) error {
+		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec /usr/local/bin/codex: operation not permitted"}
+		return nil
+	})
+	p := Provider{Store: store, API: &fakeAPI{}}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%+v", rows)
+	}
+	row := rows[0]
+	if row.Name != "Unbound run" || row.Activity != session.ActivityFailed {
+		t.Fatalf("row=%+v", row)
+	}
+	if row.Capabilities.Stop {
+		t.Fatalf("unbound failed run must not be stoppable: %+v", row.Capabilities)
+	}
+	if !row.Capabilities.Archive {
+		t.Fatalf("unbound failed run must be archivable: %+v", row.Capabilities)
+	}
+	if row.Capabilities.Reason != "" {
+		t.Fatalf("startup error leaked into Capabilities.Reason (would show as an archive-unavailable reason): %q", row.Capabilities.Reason)
+	}
+}
+
+// TestArchiveUnboundRunIsLocalCleanupNotThreadArchive is the core
+// regression for the reported bug: archiving a failed "Unbound run" (whose
+// Key.ID is agentsctl's own run ID, never a real Codex thread ID) must
+// delete the local state.Store run and must NOT call the app-server's
+// thread/archive — passing a non-thread ID to thread/archive would either
+// error or, worse, silently no-op against an unrelated/nonexistent thread.
+func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
+	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	_ = store.Update(func(d *state.Data) error {
+		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec: operation not permitted"}
+		return nil
+	})
+	api := &fakeAPI{}
+	p := Provider{Store: store, API: api}
+	if err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if api.archived != "" {
+		t.Fatalf("unbound run archive called app-server thread/archive with id=%q", api.archived)
+	}
+	d, _ := store.Load()
+	if _, ok := d.Runs["r"]; ok {
+		t.Fatal("unbound run was not removed from local state")
+	}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("archived unbound run still appears in List: %+v", rows)
+	}
+}
+
+// TestArchiveDoesNotLocallyDeleteRunningOrStartingUnboundRun guards the
+// "active/starting run を誤って消さない" requirement: local cleanup only
+// ever applies to a run in a terminal state. A running/starting run's Key
+// should never reach Archive() through the UI (List gives it no Archive
+// capability), but Provider.Archive itself must not delete it either, as a
+// second line of defense — it must fall through to the app-server call.
+func TestArchiveDoesNotLocallyDeleteRunningOrStartingUnboundRun(t *testing.T) {
+	for _, state_ := range []string{"running", "starting"} {
+		t.Run(state_, func(t *testing.T) {
+			store := state.New(filepath.Join(t.TempDir(), "state.json"))
+			_ = store.Update(func(d *state.Data) error {
+				d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: state_}
+				return nil
+			})
+			api := &fakeAPI{}
+			p := Provider{Store: store, API: api}
+			_ = p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
+			d, _ := store.Load()
+			if _, ok := d.Runs["r"]; !ok {
+				t.Fatal("running/starting unbound run was locally deleted by Archive")
+			}
+			if api.archived != "r" {
+				t.Fatalf("expected fallthrough to app-server thread/archive with id=r, got archived=%q", api.archived)
+			}
+		})
 	}
 }
 

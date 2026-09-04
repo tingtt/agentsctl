@@ -247,18 +247,50 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 		t.Fatalf("composer was not cleared after the SS3 arrow-key exercise: %v", err)
 	}
 
+	// Ctrl+A is no longer bound to anything (superseded by the Ctrl+G
+	// 3-state scope cycle below): it must not change the scope or leak the
+	// sibling-directory session into view.
+	preCtrlA := latestFrame(output.String())
 	writePTY(t, terminal, "\x01")
-	if err := waitOutput(&output, "MUST-NOT-SHOW-SIBLING", 3*time.Second); err != nil {
-		t.Fatal("Ctrl+A did not expose all directories")
+	if err := waitLatestFrame(&output, time.Second, func(frame string) bool { return frame != preCtrlA }); err == nil {
+		t.Fatalf("Ctrl+A (no longer bound) changed the frame:\nbefore:\n%s\nafter:\n%s", preCtrlA, latestFrame(output.String()))
+	}
+	if strings.Contains(latestFrame(output.String()), "MUST-NOT-SHOW-SIBLING") {
+		t.Fatal("Ctrl+A exposed the sibling-directory session")
+	}
+
+	// Ctrl+G: cwd -> cwd/** (the sibling directory is not a descendant of
+	// cwd, so it must still not appear).
+	writePTY(t, terminal, "\x07")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "agentsctl · cwd/**")
+	}); err != nil {
+		t.Fatalf("Ctrl+G did not switch to the cwd/** scope:\n%s", latestFrame(output.String()))
+	}
+	if strings.Contains(latestFrame(output.String()), "MUST-NOT-SHOW-SIBLING") {
+		t.Fatal("cwd/** scope exposed a sibling directory outside the subtree")
 	}
 	if strings.Contains(output.String(), "FAKE CODEX ATTACHED") {
-		t.Fatal("Ctrl+A attached a session")
+		t.Fatal("Ctrl+G attached a session")
 	}
-	writePTY(t, terminal, "\x01")
+
+	// Ctrl+G: cwd/** -> all (no directory filter; the sibling now appears).
+	writePTY(t, terminal, "\x07")
+	if err := waitOutput(&output, "MUST-NOT-SHOW-SIBLING", 3*time.Second); err != nil {
+		t.Fatal("Ctrl+G did not expose all directories")
+	}
 	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
-		return strings.Contains(frame, "agentsctl · current folder") && !strings.Contains(frame, "MUST-NOT-SHOW-SIBLING")
+		return strings.Contains(frame, "agentsctl · all")
 	}); err != nil {
-		t.Fatalf("Ctrl+A did not restore current-directory scope:\n%s", latestFrame(output.String()))
+		t.Fatalf("Ctrl+G did not switch to the all scope:\n%s", latestFrame(output.String()))
+	}
+
+	// Ctrl+G: all -> cwd (back to the start; the sibling disappears again).
+	writePTY(t, terminal, "\x07")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, "agentsctl · cwd") && !strings.Contains(frame, "cwd/**") && !strings.Contains(frame, "MUST-NOT-SHOW-SIBLING")
+	}); err != nil {
+		t.Fatalf("Ctrl+G did not wrap back to the cwd scope:\n%s", latestFrame(output.String()))
 	}
 
 	writePTY(t, terminal, "\x1b[Z")
@@ -319,9 +351,9 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	run := waitRunningRun(t, filepath.Join(stateDir, "state.json"))
-	overviewCount := strings.Count(output.String(), "agentsctl · current folder")
+	overviewCount := strings.Count(output.String(), "agentsctl · cwd")
 	writePTY(t, terminal, "\x13\x1d")
-	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+1, 5*time.Second); err != nil {
+	if err := waitOutputAfter(&output, "agentsctl · cwd", overviewCount+1, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	// A successful attach return -- via AttachCodex returning with no
@@ -349,7 +381,7 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 		t.Fatalf("Codex reattach did not request a full redraw: %v", err)
 	}
 	writePTY(t, terminal, "\x1d")
-	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+2, 5*time.Second); err != nil {
+	if err := waitOutputAfter(&output, "agentsctl · cwd", overviewCount+2, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 
@@ -456,9 +488,23 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := syscall.Kill(run.PID, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("child remained alive after Stop: %v", err)
 	}
+	// The archive confirmation must appear on the target session's own row
+	// (immediately before the provider/cwd block), in red — not as a
+	// footer/composer-area status line.
+	confirmText := styleText("Press Ctrl+X again to archive", colorRed)
 	writePTY(t, terminal, "\x18")
-	if err := waitOutput(&output, "Press Ctrl+X again to archive", 3*time.Second); err != nil {
-		t.Fatal(err)
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		for _, line := range strings.Split(frame, "\r\n") {
+			if strings.Contains(line, "Xession-099") && strings.Contains(line, confirmText) {
+				return true
+			}
+		}
+		return false
+	}); err != nil {
+		t.Fatalf("archive confirmation was not shown, in red, on the target session row:\n%s", latestFrame(output.String()))
+	}
+	if strings.Contains(latestFrame(output.String()), composerPrefix(session.ProviderCodex, "")+confirmText) {
+		t.Fatal("archive confirmation leaked into the composer/footer area")
 	}
 	writePTY(t, terminal, "\x18")
 	waitArchived(t, filepath.Join(fakeDir, "codex.json"), "session-099", &output)
@@ -481,9 +527,9 @@ func TestBuiltBinaryRealPTYJourney(t *testing.T) {
 	if err := waitOutput(&output, "FAKE CLAUDE ATTACHED", 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	overviewCount = strings.Count(output.String(), "agentsctl · current folder")
+	overviewCount = strings.Count(output.String(), "agentsctl · cwd")
 	writePTY(t, terminal, "\x1d")
-	if err := waitOutputAfter(&output, "agentsctl · current folder", overviewCount+1, 5*time.Second); err != nil {
+	if err := waitOutputAfter(&output, "agentsctl · cwd", overviewCount+1, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	claudeData, err := os.ReadFile(filepath.Join(fakeDir, "claude.json"))
