@@ -17,6 +17,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	creackpty "github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/protocol"
@@ -196,6 +197,142 @@ func AttachClaude(ctx context.Context, path, id string, in *os.File, out io.Writ
 		default:
 		}
 	}
+}
+
+// RenameClaude performs Claude's native, in-place session rename. It drives
+// a transient, headless `claude attach <id>` client -- no real terminal is
+// involved, unlike AttachClaude -- sends the CLI's own `/rename <name>`
+// slash command, then ends only that attach client via the exact same
+// native-detach-first lifecycle AttachClaude uses (see detachClaudeClient):
+// the background session itself is never signaled.
+//
+// Verified against the installed `claude` CLI (2.1.263) with disposable
+// sessions in a throwaway repo: attaching and sending `/rename <name>\r`
+// mutates the existing session in place for both a working (mid-tool-call)
+// and a completed session alike -- same `id`, same `sessionId`, same pid,
+// confirmed via `claude agents --json --all` before and after -- and does
+// not interrupt an in-flight background tool call. `claude --bg --resume
+// <id> --name <name>` was not used for this: that flag combination forks a
+// new session rather than mutating the original (see the doc comment on
+// Provider.Rename in internal/provider/claude).
+//
+// This function does not itself decide whether the rename "succeeded": the
+// client prints a "Session renamed to: ..." confirmation almost immediately
+// after Enter, but that is human-facing PTY output, not a machine-readable
+// contract, so it is never parsed here for identity or success. The caller
+// (Provider.Rename) re-queries `claude agents --json --all` -- the same
+// native, machine-readable source List() uses -- to confirm the rename
+// actually landed.
+func RenameClaude(ctx context.Context, path, id, name string, timeout time.Duration) error {
+	if path == "" {
+		path = "claude"
+	}
+	if err := validateRenameName(name); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, path, "attach", id)
+	child, err := startClaudeAttachRaw(cmd)
+	if err != nil {
+		return err
+	}
+	defer child.Close()
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	if err := drainWhileWaiting(child, wait, attachSettle); err != nil {
+		return fmt.Errorf("claude attach did not stay up long enough to send rename: %w", err)
+	}
+	// The full remaining line (including internal spaces) is the argument:
+	// verified against the installed CLI with names containing spaces and
+	// Japanese text, neither of which needed quoting. '\r' submits the
+	// slash command exactly like Enter on a real terminal; validateRenameName
+	// above has already rejected any '\r'/'\n'/other control byte inside
+	// name itself, so this is the only place in the constructed input that
+	// a command separator can appear.
+	if _, err := child.Write([]byte("/rename " + name + "\r")); err != nil {
+		return fmt.Errorf("send /rename to claude attach client: %w", err)
+	}
+	if err := drainWhileWaiting(child, wait, commandSettle); err != nil {
+		return fmt.Errorf("claude attach exited before rename could be sent: %w", err)
+	}
+	return detachClaudeClient(ctx, cmd, child, wait, timeout)
+}
+
+// attachSettle and commandSettle are empirically chosen, not measured
+// synchronization points: observed against the installed `claude` CLI, the
+// attach screen is interactive well within attachSettle of the client
+// starting, and the `/rename` confirmation appears well within
+// commandSettle of Enter. Neither delay is load-bearing for correctness --
+// Provider.Rename independently confirms success via `claude agents --json
+// --all` -- they only need to be long enough that the input isn't dropped.
+const (
+	attachSettle  = 1500 * time.Millisecond
+	commandSettle = 1200 * time.Millisecond
+)
+
+// drainWhileWaiting reads and discards the attach client's output for up to
+// d. This headless caller has no real terminal to forward output to, and an
+// unread pty buffer can make the child block on its own writes (the same
+// reason AttachClaude/tests elsewhere always run an output copy loop
+// concurrently) -- so the bytes are read and thrown away, never inspected.
+// It returns an error only if the client process exits during the window:
+// an unexpected exit here means whatever was just written was never
+// durably processed by a live client.
+func drainWhileWaiting(child *os.File, wait <-chan error, d time.Duration) error {
+	deadline := time.Now().Add(d)
+	buf := make([]byte, 4096)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil
+		}
+		select {
+		case err := <-wait:
+			if err != nil {
+				return fmt.Errorf("claude attach client exited unexpectedly: %w", err)
+			}
+			return errors.New("claude attach client exited unexpectedly")
+		default:
+		}
+		poll := remaining
+		if poll > 100*time.Millisecond {
+			poll = 100 * time.Millisecond
+		}
+		ready, err := pollInput(child, poll)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			continue
+		}
+		if _, err := child.Read(buf); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+	}
+}
+
+// validateRenameName is the last line of defense against PTY command
+// injection via a session name: it runs immediately before RenameClaude
+// assembles the literal bytes written to the child's pty, independently of
+// whatever validation the caller (Provider.Rename) already did. Rejecting
+// every Unicode control character -- not just '\r'/'\n' -- blocks '\r'
+// (submits the /rename command early and turns the remainder of name into
+// a brand-new prompt the live agent will actually execute -- reproduced
+// against the installed CLI: a name containing "evil\rhi there" renamed the
+// session to "evil" and then had the agent answer "hi there" as a real
+// chat turn), ESC (could start an escape sequence a well-behaved client
+// might interpret as a key), and every other C0/C1 control byte, while
+// leaving ordinary Unicode -- including Japanese text and plain spaces,
+// both verified against the installed CLI -- untouched.
+func validateRenameName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("name is required")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("name must not contain control characters")
+		}
+	}
+	return nil
 }
 
 // startClaudeAttachRaw is creackpty.StartWithSize(cmd, nil), except the

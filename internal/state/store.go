@@ -29,15 +29,17 @@ type Run struct {
 
 type Data struct {
 	ClaudeArchived map[string]bool `json:"claudeArchived,omitempty"`
-	// ClaudeNames holds agentsctl-local display-name overrides for Claude
-	// sessions, keyed by native Claude session ID. Claude's CLI has no
-	// headless/native operation to rename an existing background session in
-	// place (confirmed: any flag passed to `claude --bg --resume <id>`,
-	// including --name, always forks a new session rather than mutating the
-	// original's saved options), so this is a display-only overlay — it
-	// never touches Claude's own session state or transcript. See
-	// provider/claude's Rename/List and the README's "agentsctl-local
-	// rename" note.
+	// ClaudeNames is a legacy migration fallback, keyed by native Claude
+	// session ID: entries can only be left over from before agentsctl's
+	// Claude Rename became a native, in-place rename (see
+	// provider/claude.Provider.Rename, which today performs Claude's own
+	// `/rename` via a transient attach and confirms it against `claude
+	// agents --json --all`). New renames are never written here.
+	// provider/claude.Provider.List only consults an entry when Claude's own
+	// native catalog reports no name at all for that session, so a stale
+	// entry can no longer hide a name Claude itself now reports; Rename
+	// also deletes a session's stale entry here the moment a native rename
+	// for it is confirmed.
 	ClaudeNames map[string]string `json:"claudeNames,omitempty"`
 	Pinned      map[string]bool   `json:"pinned,omitempty"`
 	Runs        map[string]Run    `json:"runs,omitempty"`

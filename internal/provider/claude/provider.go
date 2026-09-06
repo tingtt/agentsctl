@@ -9,16 +9,40 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	base "github.com/tingtt/agentsctl/internal/provider"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/state"
 )
 
+// NativeRenamer performs Claude's native, in-place session rename (see
+// Provider.Rename). It is an interface -- rather than Provider calling
+// straight into internal/pty -- so this package stays buildable on every
+// platform even though the only real implementation
+// (NewNativeRenamer/internal/pty's transient-attach transport, in
+// rename_unix.go) is darwin/linux only.
+type NativeRenamer interface {
+	Rename(ctx context.Context, path, id, name string, timeout time.Duration) error
+}
+
+// renameTimeout is looser than AttachClaude's interactive detach timeout
+// (app_unix.go passes 2s there, where a slow detach is directly visible to
+// a waiting user): RenameClaude's headless detach has no one watching it in
+// real time, and was observed, under heavy concurrent-claude-process load,
+// to occasionally take noticeably longer than 5s for the attach client to
+// actually exit after SIGTERM even though it reliably did exit.
+const renameTimeout = 8 * time.Second
+
 type Provider struct {
 	Path   string
 	Runner base.Runner
 	Store  *state.Store
+	// Renamer is the native rename transport Rename delegates to. Required
+	// for Rename to work; production wires it from NewNativeRenamer(). A nil
+	// Renamer makes Rename fail closed rather than silently falling back to
+	// a local-only rename.
+	Renamer NativeRenamer
 }
 
 func (p *Provider) ID() session.ProviderID { return session.ProviderClaude }
@@ -64,15 +88,20 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			updated = created
 		}
 		attachable := runtime == session.RuntimeDetached || activity == session.ActivityCompleted
+		// Claude's own native `name` is canonical (see Provider.Rename):
+		// state.Data.ClaudeNames is only consulted when the native catalog
+		// has no name at all, which is legacy migration compatibility for
+		// overrides written before native rename existed (see
+		// state.Data.ClaudeNames' doc comment) -- it never hides a name
+		// Claude itself now reports.
 		name := text(v, "name", "displayName")
-		if override, ok := d.ClaudeNames[id]; ok {
-			name = override
+		if name == "" {
+			name = d.ClaudeNames[id]
 		}
-		// Rename is an agentsctl-local display-name overlay (see
-		// state.Data.ClaudeNames): it never stops or otherwise touches the
-		// session, so — unlike Stop/Archive — it is available for any
-		// non-archived row regardless of Activity/Runtime, active sessions
-		// included.
+		// Rename never stops or otherwise touches the session (it is a
+		// rename-only session action -- see Provider.Rename), so — unlike
+		// Stop/Archive — it is available for any non-archived row
+		// regardless of Activity/Runtime, active sessions included.
 		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: attachable, Stop: runtime == session.RuntimeDetached, Rename: !isArchived, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
 	}
 	return rows, nil
@@ -113,24 +142,100 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeArchived, k.ID); return nil })
 }
 
-// Rename sets an agentsctl-local display-name override for a Claude
-// session. This is deliberately not a native operation: the installed
-// Claude CLI has no headless/native way to rename an existing background
-// session in place — `claude --bg --resume <id> --name <name>` was verified
-// (against `claude` 2.1.260) to always fork a new session rather than
-// mutate the original's saved options, for any session state (active or
-// stopped) and even given the full (not short) session ID. Claude's own
-// auto-naming does update session-owned state (an `agent-name` record
-// appended to the session's JSONL transcript), but that is an undocumented
-// internal format with no locking against the live daemon process that may
-// be concurrently appending to the same file, so agentsctl does not write
-// it. The override is purely local display metadata: it never touches
-// Claude's own session, transcript, or worktree (see README).
-func (p *Provider) Rename(_ context.Context, k session.Key, name string) error {
+// Rename performs Claude's own native, in-place session rename via a
+// Claude-specific transport (NativeRenamer/internal/pty.RenameClaude on
+// darwin/linux): it drives a transient, headless `claude attach <id>`
+// client that sends the CLI's own `/rename <name>` slash command, then
+// detaches only that client — the native session, its lifetime, and its
+// identity (id/sessionId/pid) are all left untouched. See the doc comment
+// on internal/pty.RenameClaude for what was verified against the installed
+// CLI, and NativeRenamer's for why this is an interface rather than a
+// direct call into internal/pty.
+//
+// `claude --bg --resume <id> --name <name>` is deliberately not used here:
+// verified (against `claude` 2.1.260/2.1.263) to always fork a new session
+// rather than mutate the original's saved options, for any session state
+// (active or stopped) and even given the full (not short) session ID.
+//
+// Rename is rename-only: on failure, no state changes at all — in
+// particular, it never falls back to writing a local-only override, and it
+// never touches state.Data.ClaudeArchived or any other session-lifecycle
+// field. On confirmed success it deletes any stale
+// state.Data.ClaudeNames[k.ID] left over from before native rename existed
+// (see that field's doc comment), since List() now treats it purely as a
+// legacy fallback and a stale entry must not go on hiding the new native
+// name.
+//
+// The native catalog check (confirmRenamed) always runs and is what
+// actually decides success/failure here, even when the transport itself
+// returned an error: verified against the installed CLI in a
+// resource-constrained sandbox, the transport's own detach step (ending the
+// transient attach client — see internal/pty.RenameClaude) can time out
+// well after `/rename` has already been durably applied, which would
+// otherwise report a rename that plainly succeeded (name changed, same
+// session, confirmed via the catalog) as a failure to the caller. A
+// transport error is only surfaced if the catalog also fails to confirm the
+// name — i.e. the rename genuinely didn't happen.
+func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")
 	}
-	return p.Store.Update(func(d *state.Data) error { d.ClaudeNames[k.ID] = name; return nil })
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return errors.New("name must not contain control characters")
+		}
+	}
+	if p.Renamer == nil {
+		return errors.New("claude native rename is not supported on this platform")
+	}
+	transportErr := p.Renamer.Rename(ctx, p.path(), k.ID, name, renameTimeout)
+	if err := p.confirmRenamed(ctx, k.ID, name); err != nil {
+		if transportErr != nil {
+			return fmt.Errorf("claude rename: %w (native catalog also did not confirm the rename: %v)", transportErr, err)
+		}
+		return err
+	}
+	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeNames, k.ID); return nil })
+}
+
+// confirmRenamed re-queries `claude agents --json --all` -- the same
+// native, machine-readable source List() uses, never PTY output -- to
+// confirm the rename actually landed in Claude's own catalog before Rename
+// reports success or touches local state. A short bounded retry absorbs
+// the small propagation delay observed against the installed CLI between
+// the attach client detaching and `claude agents` reflecting the new name.
+func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		res, err := p.Runner.Run(ctx, p.path(), []string{"agents", "--json", "--all"}, "")
+		if err != nil {
+			lastErr = fmt.Errorf("claude agents: %w: %s", err, strings.TrimSpace(string(res.Stderr)))
+		} else {
+			var raw []map[string]any
+			if err := json.Unmarshal(res.Stdout, &raw); err != nil {
+				lastErr = fmt.Errorf("decode claude agents JSON: %w", err)
+			} else if got, found := nativeNameByID(raw, id); !found {
+				lastErr = fmt.Errorf("session %s not found in claude agents catalog after rename", id)
+			} else if got != name {
+				lastErr = fmt.Errorf("native session name is %q, want %q", got, name)
+			} else {
+				return nil
+			}
+		}
+		if attempt >= 4 {
+			return fmt.Errorf("could not confirm native rename: %w", lastErr)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+func nativeNameByID(raw []map[string]any, id string) (name string, found bool) {
+	for _, v := range raw {
+		if text(v, "id", "sessionId") == id {
+			return text(v, "name", "displayName"), true
+		}
+	}
+	return "", false
 }
 
 func text(v map[string]any, keys ...string) string {
