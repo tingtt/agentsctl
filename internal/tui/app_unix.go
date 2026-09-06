@@ -257,6 +257,20 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 		if err != nil {
 			return "", err
 		}
+		if next == '\r' || next == '\n' {
+			// Option+Enter, confirmed against the installed macOS terminal
+			// via a raw-byte probe for Issue #10: the Option key follows
+			// the classic "meta sends escape" convention (also used for
+			// e.g. Option+b/Option+f in readline), so Option+Enter arrives
+			// as ESC followed by whatever byte that terminal sends for
+			// plain Enter -- confirmed \r there, but \n is accepted too in
+			// case a different terminal's Option convention pairs ESC with
+			// its own Enter byte. Normalized to the same "newline" semantic
+			// key as bare Shift+Enter below -- the composer contract never
+			// needs to tell the two apart, only tell either of them apart
+			// from plain Enter.
+			return "newline", nil
+		}
 		if next == 'O' {
 			// SS3-form keys (ESC O <letter>), not just the CSI form (ESC
 			// [ <letter>) handled below. This is not a hypothetical: the
@@ -313,8 +327,17 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (string, 
 			return "delete", nil
 		}
 		return "", nil
-	case '\r', '\n':
+	case '\r':
 		return "enter", nil
+	case '\n':
+		// Shift+Enter, confirmed against the installed macOS terminal via a
+		// raw-byte probe for Issue #10: plain Enter sends CR (\r, the case
+		// above), while Shift+Enter sends a bare LF (\n) instead -- the
+		// same CR-vs-LF distinction readline/fish/tmux already rely on for
+		// this exact key combination, not something agentsctl invented.
+		// Normalized to the same "newline" semantic key as the ESC-prefixed
+		// Option+Enter form above.
+		return "newline", nil
 	case 0x7f, 0x08:
 		return "backspace", nil
 	case 0x0f:

@@ -853,6 +853,231 @@ func waitArchived(t *testing.T, path, id string, output *lockedBuffer) {
 	t.Fatalf("session was not archived; catalog=%s\nscreen=%s", b, latestFrame(output.String()))
 }
 
+// TestBuiltBinaryMultilineComposerJourney is the Issue #10 real-PTY
+// acceptance journey: the built binary, driven over a real PTY with the
+// exact byte sequences a real macOS terminal sends (confirmed via a raw-
+// byte probe -- see readKeyWithEscapeWait's "newline" cases), builds a
+// multiline prompt with Option+Enter and Shift+Enter, edits across the
+// embedded newline, survives a Shift+Tab provider switch, and dispatches
+// the complete multiline prompt -- verified by decoding the fake Claude
+// CLI's on-disk catalog (not raw substring matching, since json.dumps
+// escapes "\n" as the two-byte sequence \n rather than a literal newline
+// byte) rather than trusting model-level state alone. It also re-confirms
+// the pre-existing "empty composer + Enter opens the selected session"
+// behavior is unchanged.
+func TestBuiltBinaryMultilineComposerJourney(t *testing.T) {
+	moduleRoot := moduleRoot(t)
+	root, err := os.MkdirTemp("/tmp", "e2e-multiline-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	probe, err := net.Listen("unix", filepath.Join(root, "probe.sock"))
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skipf("sandbox does not permit Unix sockets: %v", err)
+		}
+		t.Fatal(err)
+	}
+	_ = probe.Close()
+	_ = os.Remove(filepath.Join(root, "probe.sock"))
+	bin := filepath.Join(root, "bin")
+	project := filepath.Join(root, "project")
+	fakeDir := filepath.Join(root, "fake")
+	stateDir := filepath.Join(root, "state")
+	for _, dir := range []string{bin, project, fakeDir, stateDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	project, err = filepath.EvalSymlinks(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "agentsctl")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/agentsctl")
+	build.Dir = moduleRoot
+	build.Env = environmentForTest(os.Environ(), "GOCACHE", filepath.Join(root, "go-cache"))
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build agentsctl: %v\n%s", err, output)
+	}
+	for _, name := range []string{"codex", "claude"} {
+		if err := os.Symlink(filepath.Join(moduleRoot, "internal", "testkit", "fakecli", name), filepath.Join(bin, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeCatalogFixture(fakeDir, project, 1); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(binary)
+	command.Dir = project
+	command.Env = append(os.Environ(),
+		"AGENTSCTL_FAKE_DIR="+fakeDir,
+		"AGENTSCTL_STATE_DIR="+stateDir,
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	t.Cleanup(func() { stopTestDaemon(stateDir) })
+	terminal, err := pty.StartWithSize(command, &pty.Winsize{Rows: 24, Cols: 80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer terminal.Close()
+	var output lockedBuffer
+	readDone := make(chan struct{})
+	go func() { _, _ = io.Copy(&output, terminal); close(readDone) }()
+
+	if err := waitOutput(&output, "session-000", 8*time.Second); err != nil {
+		if strings.Contains(strings.ToLower(output.String()), "operation not permitted") {
+			t.Skipf("sandbox does not permit daemon/PTY boundary: %s", output.String())
+		}
+		t.Fatal(err)
+	}
+
+	claudePrefix := composerPrefix(session.ProviderClaude, "")
+	codexPrefix := composerPrefix(session.ProviderCodex, "")
+	indent := strings.Repeat(" ", lineCells(claudePrefix))
+
+	writePTY(t, terminal, "first")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("composer did not accept typed text: %v", err)
+	}
+
+	writePTY(t, terminal, "\x1b\r") // Option+Enter: newline, not dispatch
+	writePTY(t, terminal, "second")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first") && strings.Contains(frame, indent+"second"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("Option+Enter did not insert a newline row: %v\n%s", err, latestFrame(output.String()))
+	}
+
+	// Cursor across the embedded newline: 7 lefts from the end of "second"
+	// (rune index 12: "first" + "\n" + "second") lands at rune index 5,
+	// just after "first" and before the "\n", on the first logical row.
+	writePTY(t, terminal, strings.Repeat("\x1b[D", 7))
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("left arrow did not cross the embedded newline onto the first row: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "X") // insert at the crossed position
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"firstX"+cursorStyle(" ")) && strings.Contains(frame, indent+"second")
+	}); err != nil {
+		t.Fatalf("insert after crossing the newline failed: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "\x7f") // backspace the "X" back out
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first"+cursorStyle(" ")) && strings.Contains(frame, indent+"second")
+	}); err != nil {
+		t.Fatalf("backspace after crossing the newline failed: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "\x1b[3~") // delete the "\n" itself, rejoining the two lines
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first"+cursorStyle("s")+"econd")
+	}); err != nil {
+		t.Fatalf("delete did not remove the embedded newline: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "\n") // put the newline back (Shift+Enter, bare LF) before continuing
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first") && strings.Contains(frame, indent+cursorStyle("s")+"econd")
+	}); err != nil {
+		t.Fatalf("Shift+Enter did not re-insert the newline: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "\x1b[F") // end: land at the end of the composer for the rest of this journey
+
+	// Shift+Tab: the multiline prompt must survive a provider switch.
+	writePTY(t, terminal, "\x1b[Z")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, codexPrefix+"first") && strings.Contains(frame, indent+"second"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("Shift+Tab did not preserve the multiline prompt: %v\n%s", err, latestFrame(output.String()))
+	}
+	writePTY(t, terminal, "\x1b[Z") // back to Claude, so the dispatch below hits the simple synchronous claude.json path
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first") && strings.Contains(frame, indent+"second"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("Shift+Tab back to Claude did not preserve the multiline prompt: %v\n%s", err, latestFrame(output.String()))
+	}
+
+	writePTY(t, terminal, "\x1b\r") // Option+Enter again: a second newline
+	writePTY(t, terminal, "third")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		return strings.Contains(frame, claudePrefix+"first") && strings.Contains(frame, indent+"second") && strings.Contains(frame, indent+"third"+cursorStyle(" "))
+	}); err != nil {
+		t.Fatalf("second newline (Option+Enter) did not add a third row: %v\n%s", err, latestFrame(output.String()))
+	}
+
+	// Enter with a non-empty composer dispatches the complete multiline
+	// prompt, exactly as typed, rather than opening the selected session.
+	writePTY(t, terminal, "\r")
+	if err := waitLatestFrame(&output, 3*time.Second, func(frame string) bool {
+		// An empty composer places the cursor glyph directly after the
+		// prompt prefix with nothing in between (see the analogous check
+		// in TestBuiltBinaryRealPTYJourney) -- and, being a single logical
+		// line again, has no continuation row indented under it.
+		return strings.Contains(frame, claudePrefix+cursorStyle(" ")) && !strings.Contains(frame, "\r\n"+indent)
+	}); err != nil {
+		t.Fatalf("composer was not cleared after dispatch: %v\n%s", err, latestFrame(output.String()))
+	}
+	found := false
+	var lastRows []map[string]any
+	for deadline := time.Now().Add(5 * time.Second); !found && time.Now().Before(deadline); {
+		if data, readErr := os.ReadFile(filepath.Join(fakeDir, "claude.json")); readErr == nil {
+			var rows []map[string]any
+			if json.Unmarshal(data, &rows) == nil {
+				lastRows = rows
+				for _, row := range rows {
+					if row["id"] != "claude-new" {
+						continue
+					}
+					if summary, _ := row["summary"].(string); summary == "first\nsecond\nthird" {
+						found = true
+					}
+				}
+			}
+		}
+		if !found {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if !found {
+		t.Fatalf("dispatched prompt did not reach the fake Claude CLI intact: rows=%v", lastRows)
+	}
+
+	// Empty composer + Enter still opens (attaches) the selected session --
+	// the pre-existing behavior this journey must not have disturbed. The
+	// fixture's only pre-existing (still-selected) row is the Codex
+	// session-000 seeded by writeCatalogFixture.
+	writePTY(t, terminal, "\r")
+	if err := waitOutput(&output, "FAKE CODEX ATTACHED", 5*time.Second); err != nil {
+		t.Fatalf("empty composer + Enter did not attach the selected session: %v", err)
+	}
+
+	// Tear down by killing the agentsctl process directly rather than
+	// detaching and sending Esc: across repeated runs of this test file, a
+	// second real Codex-supervisor-mediated attach+detach immediately
+	// followed by quit, within the same test binary process as
+	// TestBuiltBinaryRealPTYJourney's own attach/detach/quit sequence, was
+	// found to occasionally race the supervisor daemon's own lifecycle and
+	// hang command.Wait(). That race is in the pre-existing attach/detach/
+	// supervisor teardown path this task does not touch, not in the
+	// multiline composer contract this test exists to cover -- and the
+	// full graceful attach-then-detach-then-quit sequence is already
+	// exercised, stably, by TestBuiltBinaryRealPTYJourney above. The
+	// supervisor daemon is designed to outlive an ungracefully-terminated
+	// TUI (see DesignDoc.md's Codex supervisor lifetime section), so
+	// killing the TUI here and separately stopping the daemon via
+	// stopTestDaemon below is a realistic teardown, not a workaround.
+	if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("failed to terminate agentsctl: %v", err)
+	}
+	_, _ = command.Process.Wait()
+	<-readDone
+	stopTestDaemon(stateDir)
+}
+
 func stopTestDaemon(stateDir string) {
 	client := supervisor.Client{Socket: filepath.Join(stateDir, "supervisor.sock")}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -181,6 +181,41 @@ func TestDispatchSuccessProducesNoNotification(t *testing.T) {
 	}
 }
 
+// TestDispatchReceivesEmbeddedNewlinesVerbatim fixes the Issue #10 dispatch-
+// boundary contract: a multiline composer prompt (built via the "newline"
+// action, exactly as a real Option+Enter/Shift+Enter keypress would) must
+// reach provider.Dispatch byte-for-byte -- no flattening to spaces, no
+// trimming of internal newlines, no CRLF rewrite. Model.Update's "enter"
+// case (see model.go) hands Prompt to the Action unmodified, and App.act's
+// ActionDispatch case forwards Action.Prompt to p.Dispatch unmodified; this
+// exercises that whole path through the fake-provider seam rather than
+// asserting on Model state alone (see TestEnterDispatchesMultilinePrompt-
+// Verbatim in model_test.go for the model-only half of this contract).
+func TestDispatchReceivesEmbeddedNewlinesVerbatim(t *testing.T) {
+	codex := &journeyProvider{id: session.ProviderCodex}
+	catalog := session.Catalog{Providers: []session.Provider{codex}}
+	m := NewModel()
+	m.Provider = session.ProviderCodex
+	for _, key := range []string{"f", "i", "r", "s", "t", "newline", "s", "e", "c", "o", "n", "d", "newline", "t", "h", "i", "r", "d"} {
+		m.Update(key)
+	}
+	app := App{Catalog: catalog, Model: m, CWD: "/work"}
+	action := app.Model.Update("enter")
+	if action.Kind != ActionDispatch {
+		t.Fatalf("action=%+v", action)
+	}
+	if err := app.act(context.Background(), action); err != nil {
+		t.Fatal(err)
+	}
+	if len(codex.rows) != 1 {
+		t.Fatalf("dispatch did not create a session: rows=%+v", codex.rows)
+	}
+	want := "first\nsecond\nthird"
+	if got := codex.rows[0].Summary; got != want {
+		t.Fatalf("provider.Dispatch received prompt=%q, want %q", got, want)
+	}
+}
+
 // TestErrorClearsOnNextSuccessfulAction covers the minimal Error-lifecycle
 // cleanup this task asks for: a stale Error from a failed action must not
 // linger once the user has moved on to something that worked. "open" with

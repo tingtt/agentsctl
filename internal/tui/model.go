@@ -264,6 +264,17 @@ func (m *Model) Update(key string) Action {
 			return Action{Kind: ActionDispatch, Provider: m.Provider, Prompt: m.Prompt}
 		}
 		return m.selectedOrStatus(ActionAttach, "open")
+	case "newline":
+		// Option+Enter / Shift+Enter (normalized by the terminal parser --
+		// see readKeyWithEscapeWait): insert a literal "\n" into the
+		// composer at the cursor, exactly like any other inserted text, and
+		// never dispatch. This is the only way to put an embedded newline
+		// into Prompt, since plain Enter always dispatches/opens instead
+		// (see the "enter" case above) and isTextInput rejects control
+		// bytes including '\n' (so raw newline bytes from the terminal
+		// can't reach the composer through the default text-input case).
+		m.insertAtCursor("\n")
+		return Action{}
 	case "open":
 		return m.selectedOrStatus(ActionAttach, "open")
 	case "scope-cycle":
@@ -303,16 +314,26 @@ func (m *Model) Update(key string) Action {
 		return Action{Kind: ActionQuit}
 	default:
 		if isTextInput(key) {
-			runes := []rune(m.Prompt)
-			m.clampPromptCursor(runes)
-			insert := []rune(key)
-			before := append([]rune(nil), runes[:m.PromptCursor]...)
-			after := append([]rune(nil), runes[m.PromptCursor:]...)
-			m.Prompt = string(append(append(before, insert...), after...))
-			m.PromptCursor += len(insert)
+			m.insertAtCursor(key)
 		}
 		return Action{}
 	}
+}
+
+// insertAtCursor splices text into Prompt at PromptCursor (a rune index)
+// and advances the cursor past the inserted runes. Shared by ordinary
+// character insertion and the "newline" action (see Update's "newline"
+// case) so an embedded "\n" is spliced in exactly like any other
+// composer text -- not appended, and not treated as a separate line
+// buffer.
+func (m *Model) insertAtCursor(text string) {
+	runes := []rune(m.Prompt)
+	m.clampPromptCursor(runes)
+	insert := []rune(text)
+	before := append([]rune(nil), runes[:m.PromptCursor]...)
+	after := append([]rune(nil), runes[m.PromptCursor:]...)
+	m.Prompt = string(append(append(before, insert...), after...))
+	m.PromptCursor += len(insert)
 }
 
 func (m *Model) clampPromptCursor(runes []rune) {
@@ -561,11 +582,10 @@ func (m Model) View(width, height int) string {
 		unavailable = " (unavailable: " + err.Error() + ")"
 	}
 	promptPrefix := composerPrefix(m.Provider, unavailable)
-	footer := []string{
-		clipLine(promptPrefix+cursorWindow(m.Prompt, m.PromptCursor, max(1, width-lineCells(promptPrefix))), width),
-		clipLine("Shift+Tab / Enter send/open / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
+	footer := append(composerLines(m.Prompt, m.PromptCursor, promptPrefix, width),
+		clipLine("Shift+Tab / Enter send/open / Option+Enter/Shift+Enter newline / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
 		clipLine("↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
-	}
+	)
 	// The composer-top notification area is reserved for Error exclusively
 	// (see Model.Error's doc comment) — there is no generic non-error
 	// notice here.
@@ -640,6 +660,69 @@ func cursorWindow(value string, cursor, width int) string {
 	prefix := string(runes[start:cursor])
 	result := clipLine(prefix+cursorStyle(glyph)+string(suffix), width)
 	return fitCells(result, width)
+}
+
+// composerLines renders the composer Prompt as one visual row per logical
+// line -- Prompt split on embedded "\n" (see the "newline" action in
+// Update) -- so an embedded newline actually shows as a separate terminal
+// row instead of a literal control character folded into one horizontally-
+// scrolled line. The first row carries prefix (the "<provider> > " label);
+// continuation rows are left-padded to the same cell width so the prompt
+// body stays visually aligned under it:
+//
+//	claude > first line
+//	         second line
+//	         third |line
+//
+// Only the logical line the cursor is actually on is rendered through
+// cursorWindow (which both marks the cursor and horizontally scrolls that
+// one line to fit); every other line is independently fit to the same
+// available width via fitCells. This keeps two different concerns apart --
+// "\n" splits Prompt into logical lines, while terminal width only ever
+// clips/scrolls *within* one logical line -- so the cursor's on-screen row
+// is always exactly the logical line promptCursorPosition says it's on,
+// never shifted by wrapping math.
+func composerLines(prompt string, cursor int, prefix string, width int) []string {
+	lines := strings.Split(prompt, "\n")
+	cursorLine, cursorCol := promptCursorPosition(lines, cursor)
+	indent := strings.Repeat(" ", lineCells(prefix))
+	available := max(1, width-lineCells(prefix))
+	rows := make([]string, len(lines))
+	for i, line := range lines {
+		var rendered string
+		if i == cursorLine {
+			rendered = cursorWindow(line, cursorCol, available)
+		} else {
+			rendered = fitCells(line, available)
+		}
+		leader := prefix
+		if i > 0 {
+			leader = indent
+		}
+		rows[i] = clipLine(leader+rendered, width)
+	}
+	return rows
+}
+
+// promptCursorPosition converts cursor -- a rune index into the full
+// Prompt string, counting every rune including embedded "\n" (Model.
+// PromptCursor's existing contract, unchanged by multiline support) --
+// into the (logical line index, rune offset within that line) pair
+// matching lines (Prompt split on "\n"), so composerLines can hand each
+// line's own local cursor position to cursorWindow. A cursor value beyond
+// the end of prompt (should not happen; PromptCursor is always clamped by
+// clampPromptCursor) falls through to the last line's end rather than
+// panicking on an out-of-range index.
+func promptCursorPosition(lines []string, cursor int) (line, col int) {
+	remaining := cursor
+	for i, l := range lines {
+		n := len([]rune(l))
+		if remaining <= n {
+			return i, remaining
+		}
+		remaining -= n + 1 // +1 for the "\n" separating this line from the next
+	}
+	return len(lines) - 1, len([]rune(lines[len(lines)-1]))
 }
 
 // rowLeftFixed is the terminal-cell width of a session row's left prefix

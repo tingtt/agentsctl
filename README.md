@@ -19,6 +19,7 @@ go build ./cmd/agentsctl
 | --- | --- |
 | `Shift+Tab` | Toggle the composer between Claude and Codex without clearing the prompt. |
 | `Enter` | Dispatch the composer prompt in the background, or attach the selected session when the composer is empty. |
+| `Option+Enter` / `Shift+Enter` | Insert a newline into the composer prompt at the cursor, without dispatching. |
 | `Ctrl+S` | Swap the composer text with one shared in-memory stash slot. While attached, forward `Ctrl+S` to the child instead. |
 | `Ctrl+O` | Attach the selected session. |
 | `Ctrl+T` | Pin or unpin the selected session. Pin state is persisted by `agentsctl`. |
@@ -34,7 +35,9 @@ Archive removes a session from the MVP catalog and is a one-way TUI operation.
 
 The overview has `Pinned` and `Other` groups. Each group is ordered by native session creation time, newest first, so activity and status refreshes do not move sessions. Selection, rendering, and viewport calculation use this same order.
 
-The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
+The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. It supports multiline prompts: `Option+Enter` or `Shift+Enter` inserts a newline at the cursor instead of dispatching, and each embedded newline renders as its own row, indented to align under the `<provider> >` prefix; `←` / `→` move across a newline like any other character, and `Home` / `End` still jump to the start/end of the whole prompt (not just the current line). Only plain `Enter` dispatches (or, on an empty composer, attaches). The prompt stash and the `Shift+Tab` provider toggle preserve multiline content, including embedded newlines, exactly as typed. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
+
+Whether `Shift+Enter` is distinguishable from plain `Enter` depends on the terminal: `agentsctl` recognizes it when the terminal sends a bare line feed (`\n`) for `Shift+Enter` as opposed to a carriage return (`\r`) for plain `Enter` (confirmed against a real macOS terminal via a raw-byte probe). A terminal that instead sends the identical byte for both cannot be distinguished at the application level. `Option+Enter` works wherever the terminal sends the classic "meta sends escape" convention (`ESC` followed by the Enter byte) for the Option modifier, which is how it was confirmed.
 
 ### Directory scope
 
