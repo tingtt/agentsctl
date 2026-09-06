@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -133,30 +134,34 @@ func TestListExposesRenameForWorkingAndStoppedSessions(t *testing.T) {
 	}
 }
 
-// fakeRenamer is a test NativeRenamer: it records the arguments it was
+// fakeRenamer is a test NativeRenamer: it records the arguments Send was
 // called with and, on success, updates fakeRunner's canned `claude agents`
 // response so Provider.confirmRenamed's follow-up native-catalog check
 // observes the new name — mirroring what the real transport (a successful
-// `/rename` against the live daemon) actually causes.
+// `/rename` against the live daemon, which durably lands before its
+// transient client's cleanup ever runs) actually causes. sendErr and
+// cleanupErr are deliberately separate fields, matching the real
+// NativeRenamer.Send/cleanup split: a Send failure means the rename was
+// never attempted, while a cleanup failure is unrelated to whether the
+// rename happened -- see TestRenameSucceedsWhenCleanupErrors.
 type fakeRenamer struct {
-	err                  error
+	sendErr              error
+	cleanupErr           error
 	calls                []renameCall
+	cleanupCalls         int
 	runner               *fakeRunner
 	confirmWithNativeID  string // id key to update in runner's canned JSON on success
 	confirmWithFieldName string // "name" or "displayName" — which native field carries it
 }
 type renameCall struct {
 	path, id, name string
-	timeout        time.Duration
 }
 
-func (f *fakeRenamer) Rename(_ context.Context, path, id, name string, timeout time.Duration) error {
-	f.calls = append(f.calls, renameCall{path, id, name, timeout})
-	// Mirrors the real transport: the native mutation (and so the catalog
-	// update) happens before the transport's own detach/cleanup step, so a
-	// transport error (e.g. a slow-to-exit attach client) does not mean the
-	// rename itself never reached the catalog -- see
-	// TestRenameSucceedsWhenCatalogConfirmsDespiteTransportError.
+func (f *fakeRenamer) Send(_ context.Context, path, id, name string) (func(context.Context, time.Duration) error, error) {
+	f.calls = append(f.calls, renameCall{path, id, name})
+	if f.sendErr != nil {
+		return nil, f.sendErr
+	}
 	if f.runner != nil {
 		field := f.confirmWithFieldName
 		if field == "" {
@@ -168,7 +173,10 @@ func (f *fakeRenamer) Rename(_ context.Context, path, id, name string, timeout t
 		}
 		f.runner.result.Stdout = []byte(fmt.Sprintf(`[{"id":%q,%q:%q,"status":"idle","state":"done"}]`, targetID, field, name))
 	}
-	return f.err
+	return func(context.Context, time.Duration) error {
+		f.cleanupCalls++
+		return f.cleanupErr
+	}, nil
 }
 
 // TestRenameInvokesNativeTransportForTheGivenSessionAndConfirmsViaCatalog
@@ -201,14 +209,16 @@ func TestRenameInvokesNativeTransportForTheGivenSessionAndConfirmsViaCatalog(t *
 }
 
 // TestRenameReturnsNativeTransportFailureWithoutTouchingLocalState fixes
-// that a failing native rename (e.g. the transport couldn't attach, or the
-// attach client died) must be reported to the caller as an error — and
-// must never be silently treated as a successful local-only rename.
+// that a failing Send (e.g. the transient client couldn't even attach)
+// must be reported to the caller as an error — and must never be silently
+// treated as a successful local-only rename.
 func TestRenameReturnsNativeTransportFailureWithoutTouchingLocalState(t *testing.T) {
 	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","name":"native-name","status":"busy","state":"working"}]`)}}
-	renamer := &fakeRenamer{err: errors.New("claude attach did not stay up long enough to send rename")}
+	renamer := &fakeRenamer{sendErr: errors.New("claude attach did not stay up long enough to send rename")}
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	p := Provider{Path: "ignored", Runner: r, Store: store, Renamer: renamer}
+	// Send failing means nothing was ever sent, so confirmRenamed can only
+	// fail too; a short ceiling keeps that deterministic wait fast.
+	p := Provider{Path: "ignored", Runner: r, Store: store, Renamer: renamer, ConfirmPollInterval: time.Millisecond, ConfirmMaxWait: 20 * time.Millisecond}
 	key := session.Key{Provider: session.ProviderClaude, ID: "c1"}
 	if err := p.Rename(context.Background(), key, "My New Name"); err == nil {
 		t.Fatal("native transport failure was swallowed")
@@ -229,18 +239,19 @@ func TestRenameReturnsNativeTransportFailureWithoutTouchingLocalState(t *testing
 	}
 }
 
-// TestRenameSucceedsWhenCatalogConfirmsDespiteTransportError fixes a real
-// observation against the installed CLI in a resource-constrained sandbox:
-// the native `/rename` mutation was durably applied and immediately visible
-// in `claude agents --json --all` (same id), yet the transient attach
-// client's own detach step (unrelated to whether the rename happened)
-// separately timed out and returned an error. Provider.Rename must report
-// this as success — the catalog, not the transport's own return value, is
-// authoritative for whether the rename happened — never leave a confirmed
-// rename looking like a failure to the caller.
-func TestRenameSucceedsWhenCatalogConfirmsDespiteTransportError(t *testing.T) {
+// TestRenameSucceedsWhenCleanupErrors fixes a real observation against the
+// installed CLI in a resource-constrained sandbox: the native `/rename`
+// mutation was durably applied and immediately visible in `claude agents
+// --json --all` (same id), yet the transient attach client's own cleanup
+// step (unrelated to whether the rename happened) separately timed out and
+// returned an error. Provider.Rename must report this as success — the
+// catalog, not cleanup's return value, is authoritative for whether the
+// rename happened — never leave a confirmed rename looking like a failure
+// to the caller. It must also actually run cleanup (never skip it just
+// because confirmation already succeeded), so nothing is left to leak.
+func TestRenameSucceedsWhenCleanupErrors(t *testing.T) {
 	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","name":"native-name","status":"busy","state":"working"}]`)}}
-	renamer := &fakeRenamer{runner: r, err: errors.New("claude attach client did not exit after detach")}
+	renamer := &fakeRenamer{runner: r, cleanupErr: errors.New("claude attach client did not exit after detach")}
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
 	p := Provider{Path: "ignored", Runner: r, Store: store, Renamer: renamer}
 	key := session.Key{Provider: session.ProviderClaude, ID: "c1"}
@@ -254,19 +265,21 @@ func TestRenameSucceedsWhenCatalogConfirmsDespiteTransportError(t *testing.T) {
 	if rows[0].Name != "My New Name" {
 		t.Fatalf("rows=%+v", rows)
 	}
+	if renamer.cleanupCalls != 1 {
+		t.Fatalf("cleanup was called %d times, want exactly 1 -- a cleanup error must not be used as an excuse to skip cleanup", renamer.cleanupCalls)
+	}
 }
 
-// TestRenameFailsWhenNativeCatalogNeverConfirms covers the transport
-// reporting success while the native catalog disagrees (e.g. the attach
-// client exited before the daemon durably applied /rename): Rename must
-// surface this as an error — the UI must never look like it succeeded when
-// the catalog can't back that up — rather than declaring victory on the
-// transport call alone.
+// TestRenameFailsWhenNativeCatalogNeverConfirms covers Send succeeding
+// while the native catalog disagrees (e.g. the attach client exited before
+// the daemon durably applied /rename): Rename must surface this as an
+// error — the UI must never look like it succeeded when the catalog can't
+// back that up — rather than declaring victory on Send alone.
 func TestRenameFailsWhenNativeCatalogNeverConfirms(t *testing.T) {
 	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","name":"still-old-name","status":"busy","state":"working"}]`)}}
 	renamer := &fakeRenamer{} // succeeds, but deliberately does not update r's canned response
 	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	p := Provider{Path: "ignored", Runner: r, Store: store, Renamer: renamer}
+	p := Provider{Path: "ignored", Runner: r, Store: store, Renamer: renamer, ConfirmPollInterval: time.Millisecond, ConfirmMaxWait: 20 * time.Millisecond}
 	key := session.Key{Provider: session.ProviderClaude, ID: "c1"}
 	if err := p.Rename(context.Background(), key, "My New Name"); err == nil {
 		t.Fatal("rename reported success despite the native catalog never reflecting the new name")
@@ -278,6 +291,49 @@ func TestRenameFailsWhenNativeCatalogNeverConfirms(t *testing.T) {
 	if len(d.ClaudeNames) != 0 {
 		t.Fatalf("unconfirmed rename must not fall back to a local overlay: %+v", d.ClaudeNames)
 	}
+}
+
+// TestConfirmRenamedPollsUntilDeadlineNotFixedAttemptCount fixes the
+// latency-oriented shape of confirmRenamed itself: it must keep polling
+// for roughly ConfirmMaxWait (bounded by wall time), not stop after a
+// small fixed number of attempts regardless of how much time is actually
+// left -- and it must succeed as soon as the catalog reflects the name,
+// not wait out the rest of the budget once it already has.
+func TestConfirmRenamedPollsUntilDeadlineNotFixedAttemptCount(t *testing.T) {
+	r := &raceSafeRunner{}
+	r.set([]byte(`[{"id":"c1","name":"native-name","status":"busy","state":"working"}]`))
+	p := Provider{Path: "ignored", Runner: r, Store: state.New(filepath.Join(t.TempDir(), "state.json")), ConfirmPollInterval: 2 * time.Millisecond, ConfirmMaxWait: time.Second}
+	go func() {
+		time.Sleep(30 * time.Millisecond) // several poll intervals in
+		r.set([]byte(`[{"id":"c1","name":"My New Name","status":"busy","state":"working"}]`))
+	}()
+	start := time.Now()
+	if err := p.confirmRenamed(context.Background(), "c1", "My New Name"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("confirmRenamed took %v to notice a name that appeared after ~30ms -- it should return promptly once confirmed, not wait out the full budget", elapsed)
+	}
+}
+
+// raceSafeRunner is a base.Runner whose canned response can be swapped
+// concurrently with Run being called -- fakeRunner is not safe for that,
+// and TestConfirmRenamedPollsUntilDeadlineNotFixedAttemptCount needs to
+// change the response while confirmRenamed's poll loop is mid-flight.
+type raceSafeRunner struct {
+	mu     sync.Mutex
+	stdout []byte
+}
+
+func (r *raceSafeRunner) set(b []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stdout = b
+}
+func (r *raceSafeRunner) Run(context.Context, string, []string, string) (base.Result, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return base.Result{Stdout: append([]byte(nil), r.stdout...)}, nil
 }
 
 // TestRenameDeletesStaleLocalOverrideOnConfirmedSuccess fixes the

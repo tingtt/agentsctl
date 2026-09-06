@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -22,17 +23,31 @@ import (
 // platform even though the only real implementation
 // (NewNativeRenamer/internal/pty's transient-attach transport, in
 // rename_unix.go) is darwin/linux only.
+//
+// Send is split from cleanup (its own return value) rather than being one
+// blocking call, specifically so Provider.Rename can run native-catalog
+// confirmation and transient-client cleanup concurrently instead of
+// serially: cleanup ending the transient attach client has nothing to do
+// with whether the rename itself succeeded (see Provider.Rename), and
+// serializing them was the single largest source of avoidable rename
+// latency (see internal/pty.SendClaudeRename's doc comment for the
+// real-CLI measurements behind this).
 type NativeRenamer interface {
-	Rename(ctx context.Context, path, id, name string, timeout time.Duration) error
+	// Send starts a transient attach client and submits the rename
+	// command, returning once that submission is durable. cleanup is nil
+	// only if err is non-nil.
+	Send(ctx context.Context, path, id, name string) (cleanup func(context.Context, time.Duration) error, err error)
 }
 
-// renameTimeout is looser than AttachClaude's interactive detach timeout
-// (app_unix.go passes 2s there, where a slow detach is directly visible to
-// a waiting user): RenameClaude's headless detach has no one watching it in
+// renameCleanupTimeout is looser than AttachClaude's interactive detach
+// timeout (app_unix.go passes 2s there, where a slow detach is directly
+// visible to a waiting user): rename's cleanup has no one watching it in
 // real time, and was observed, under heavy concurrent-claude-process load,
 // to occasionally take noticeably longer than 5s for the attach client to
-// actually exit after SIGTERM even though it reliably did exit.
-const renameTimeout = 8 * time.Second
+// actually exit after SIGTERM even though it reliably did exit. Unlike the
+// old design, this no longer sits on the critical path a caller waits on
+// to see the rename succeed -- see Provider.Rename.
+const renameCleanupTimeout = 8 * time.Second
 
 type Provider struct {
 	Path   string
@@ -43,6 +58,26 @@ type Provider struct {
 	// Renamer makes Rename fail closed rather than silently falling back to
 	// a local-only rename.
 	Renamer NativeRenamer
+	// ConfirmPollInterval and ConfirmMaxWait override confirmRenamed's
+	// native-catalog poll cadence and ceiling; zero uses the documented
+	// defaults (confirmPollInterval/confirmMaxWait). Exposed so a test that
+	// deliberately never confirms doesn't have to wait out the full
+	// production ceiling to stay deterministic.
+	ConfirmPollInterval time.Duration
+	ConfirmMaxWait      time.Duration
+}
+
+func (p *Provider) confirmPollInterval() time.Duration {
+	if p.ConfirmPollInterval > 0 {
+		return p.ConfirmPollInterval
+	}
+	return confirmPollInterval
+}
+func (p *Provider) confirmMaxWait() time.Duration {
+	if p.ConfirmMaxWait > 0 {
+		return p.ConfirmMaxWait
+	}
+	return confirmMaxWait
 }
 
 func (p *Provider) ID() session.ProviderID { return session.ProviderClaude }
@@ -167,15 +202,24 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 // name.
 //
 // The native catalog check (confirmRenamed) always runs and is what
-// actually decides success/failure here, even when the transport itself
-// returned an error: verified against the installed CLI in a
-// resource-constrained sandbox, the transport's own detach step (ending the
-// transient attach client — see internal/pty.RenameClaude) can time out
-// well after `/rename` has already been durably applied, which would
-// otherwise report a rename that plainly succeeded (name changed, same
-// session, confirmed via the catalog) as a failure to the caller. A
-// transport error is only surfaced if the catalog also fails to confirm the
-// name — i.e. the rename genuinely didn't happen.
+// actually decides success/failure here, even when Send itself returned an
+// error: verified against the installed CLI in a resource-constrained
+// sandbox, the transient client's own cleanup can time out well after
+// `/rename` has already been durably applied, which would otherwise report
+// a rename that plainly succeeded (name changed, same session, confirmed
+// via the catalog) as a failure to the caller. A Send error is only
+// surfaced if the catalog also fails to confirm the name — i.e. the rename
+// genuinely didn't happen.
+//
+// confirmRenamed and the transient client's cleanup run concurrently, not
+// sequentially: cleanup is unrelated to whether the rename succeeded (see
+// NativeRenamer), and serializing "wait for the client to exit" before
+// "check whether the rename landed" was the single largest source of
+// avoidable rename latency (see internal/pty.SendClaudeRename's doc
+// comment). Rename still waits for cleanup to finish (bounded by
+// renameCleanupTimeout) before returning, the same as before -- only the
+// order changed from serial to parallel -- so a transient attach client is
+// never left to outlive this call.
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")
@@ -188,25 +232,56 @@ func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error
 	if p.Renamer == nil {
 		return errors.New("claude native rename is not supported on this platform")
 	}
-	transportErr := p.Renamer.Rename(ctx, p.path(), k.ID, name, renameTimeout)
-	if err := p.confirmRenamed(ctx, k.ID, name); err != nil {
-		if transportErr != nil {
-			return fmt.Errorf("claude rename: %w (native catalog also did not confirm the rename: %v)", transportErr, err)
+	cleanup, sendErr := p.Renamer.Send(ctx, p.path(), k.ID, name)
+
+	var cleanupWG sync.WaitGroup
+	if cleanup != nil {
+		cleanupWG.Add(1)
+		go func() {
+			defer cleanupWG.Done()
+			// The cleanup error is deliberately discarded: ending the
+			// transient attach client has no bearing on whether the
+			// rename itself succeeded, which confirmRenamed below decides
+			// independently against the native catalog.
+			_ = cleanup(ctx, renameCleanupTimeout)
+		}()
+	}
+
+	confirmErr := p.confirmRenamed(ctx, k.ID, name)
+	cleanupWG.Wait()
+
+	if confirmErr != nil {
+		if sendErr != nil {
+			return fmt.Errorf("claude rename: %w (native catalog also did not confirm the rename: %v)", sendErr, confirmErr)
 		}
-		return err
+		return confirmErr
 	}
 	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeNames, k.ID); return nil })
 }
 
-// confirmRenamed re-queries `claude agents --json --all` -- the same
-// native, machine-readable source List() uses, never PTY output -- to
-// confirm the rename actually landed in Claude's own catalog before Rename
-// reports success or touches local state. A short bounded retry absorbs
-// the small propagation delay observed against the installed CLI between
-// the attach client detaching and `claude agents` reflecting the new name.
+// confirmPollInterval and confirmMaxWait bound confirmRenamed's polling of
+// `claude agents --json --all`. Real-CLI measurement (6 runs, both a
+// working and a completed disposable session) showed the catalog reflects
+// a rename within 300-350ms of the command being sent, so confirmMaxWait
+// is a generous safety ceiling, not an expected wait.
+const (
+	confirmPollInterval = 100 * time.Millisecond
+	confirmMaxWait      = 5 * time.Second
+)
+
+// confirmRenamed polls `claude agents --json --all` -- the same native,
+// machine-readable source List() uses, never PTY output -- until it
+// reflects the new name, to confirm the rename actually landed in Claude's
+// own catalog before Rename reports success or touches local state. It is
+// time-bounded (confirmMaxWait) rather than a fixed attempt count, so a
+// slow individual `claude agents` call cannot silently balloon the total
+// wait past what confirmMaxWait actually allows.
 func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
+	maxWait := p.confirmMaxWait()
+	pollInterval := p.confirmPollInterval()
+	deadline := time.Now().Add(maxWait)
 	var lastErr error
-	for attempt := 0; ; attempt++ {
+	for {
 		res, err := p.Runner.Run(ctx, p.path(), []string{"agents", "--json", "--all"}, "")
 		if err != nil {
 			lastErr = fmt.Errorf("claude agents: %w: %s", err, strings.TrimSpace(string(res.Stderr)))
@@ -222,10 +297,14 @@ func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
 				return nil
 			}
 		}
-		if attempt >= 4 {
-			return fmt.Errorf("could not confirm native rename: %w", lastErr)
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("could not confirm native rename within %s: %w", maxWait, lastErr)
 		}
-		time.Sleep(300 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
 	}
 }
 
