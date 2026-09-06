@@ -38,7 +38,7 @@ Claude と Codex では、バックグラウンド実行の仕組みが異なる
 | Dispatch             | `claude --bg`           | supervisor に Codex CLI の起動を依頼                |
 | Attach               | `claude attach`         | supervisor が保持する PTY へ接続                    |
 | Stop                 | `claude stop`           | supervisor が所有するプロセスを停止                 |
-| Rename               | agentsctl-local overlay | Codex app-server                                    |
+| Rename               | `/rename` via transient attach | Codex app-server                             |
 | Archive              | agentsctl-local overlay | Codex app-server、または unbound run のローカル削除 |
 | Pin                  | agentsctl-local state   | agentsctl-local state                               |
 
@@ -240,12 +240,13 @@ Rename は、既存 session の表示名を変更する。
 
 **Claude**
 
-- agentsctl-local overlay とする。
-- session ID に対応する表示名を agentsctl が保持する。
-- Claude 自身の以下には変更を加えない。
-  - session state
-  - transcript
-  - worktree
+- Claude 自身が保持する session を native に rename する。
+- 実装上は、agentsctl が transient (使い捨て) な `claude attach <id>` client を起動し、Claude 自身の `/rename` slash command を送信したうえで、その attach client だけを detach する。
+- session ID・sessionId・pid・実行中 process のいずれも変化しない。working session に対して行っても実行を中断しない。
+- rename 成否は、attach client 自身の終了確認ではなく `claude agents --json --all` による native catalog の再取得で判定する。attach client の detach 自体が失敗しても、catalog が新しい名前を確認できていれば rename は成功として扱う。
+- native catalog confirmation (rename の完了判定) と attach client の cleanup (lifecycle の後始末) は並行して行う。cleanup は rename の成否そのものには関与しないため、user-visible な完了を cleanup の完了で遅延させない。ただし、agentsctl 自身のプロセス寿命内で attach client を残さないため、呼び出しは cleanup の完了も待ち合わせたうえで返る。
+- `claude --bg --resume <id> --name <name>` は使用しない。別 session (別 ID) を生成することが確認されているため。
+- 過去バージョンの agentsctl-local overlay (`state.Data.ClaudeNames`) は、native catalog が名前を持たない session に対してのみ表示上のフォールバックとして残る。native rename が成功した session については、そのタイミングで overlay を削除する。
 
 **Codex**
 
@@ -439,8 +440,9 @@ agentsctl は native session record や transcript を複製せず、agentsctl �
 
 - Pin
 - Claude Archive overlay
-- Claude Rename overlay
 - Codex managed run metadata
+
+Claude session の表示名 (`ClaudeNames`) は、native rename 導入以前の overlay が migration compatibility として残るのみで、新規 rename の保存先ではない。
 
 ##### Overlay
 
@@ -675,13 +677,13 @@ underlying PTY size に変化がない場合、CLI 側が redraw 不要と判断
 
 実際の PTY size を一度変更して元へ戻す方式を採用する。
 
-### Claude session を native state 上で Rename する
+### `claude --bg --resume <id> --name <name>` を Rename に使う
 
 **不採用。**
 
-既存 background session を in-place で改名する supported operation がない。
+resume 時に `--name` を指定する方式は、既存 background session を in-place で改名する操作ではなく、別 session (別 ID) を生成する。session state・active/stopped を問わず、また省略形でなく完全な session ID を指定しても同様に fork する。
 
-resume 時に name を指定する方式では別 session が生成されるため、agentsctl-local overlay を採用する。
+代わりに、transient な `claude attach <id>` client を起動して Claude 自身の `/rename` slash command を実行し、既存 session を in-place で改名する方式を採用する (session ID・sessionId・pid が変化しないことを実機で確認済み)。
 
 ### Claude transcript を直接編集する
 

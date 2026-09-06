@@ -54,7 +54,7 @@ func run() error {
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
-	providers := []session.Provider{&claude.Provider{Path: "claude", Runner: runner, Store: store}, &codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch}}
+	providers := []session.Provider{&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer()}, &codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch}}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err

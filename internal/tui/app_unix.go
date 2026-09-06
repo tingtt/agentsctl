@@ -89,7 +89,14 @@ func (a *App) Run(ctx context.Context) error {
 		// depends on takes low-single-digit milliseconds. act() already
 		// applies the toggled Pinned state (and re-sorts/reselects)
 		// directly on the Model's existing rows via Model.ApplyPin.
-		if action.Kind != ActionNone && action.Kind != ActionPin {
+		//
+		// A successful rename does touch provider (remote/native) state,
+		// but act() has already confirmed the new name against Claude's
+		// own catalog (Provider.Rename's contract) and applied that exact
+		// confirmed value to the Model via Model.ApplyRename, so a full
+		// refresh here would only re-fetch every provider's List() to
+		// learn back a value already known to be current.
+		if action.Kind != ActionNone && action.Kind != ActionPin && action.Kind != ActionRename {
 			a.refresh(ctx)
 		}
 	}
@@ -171,6 +178,12 @@ func (a *App) act(ctx context.Context, x Action) error {
 		if err := p.Rename(ctx, *x.SessionKey, x.Name); err != nil {
 			return err
 		}
+		// Rename only just returned successfully because Provider.Rename
+		// already confirmed x.Name against Claude's own native catalog
+		// (see its doc comment) -- ApplyRename reflects that
+		// already-confirmed value directly, so the caller (Run's loop)
+		// does not need a full provider List refresh just to learn it back.
+		a.Model.ApplyRename(*x.SessionKey, x.Name)
 		a.Model.clearRename()
 	case ActionPin:
 		if x.Session == nil {

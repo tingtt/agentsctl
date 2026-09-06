@@ -197,6 +197,25 @@ func (m *Model) ApplyPin(key session.Key, pinned bool) {
 		}
 	}
 }
+
+// ApplyRename updates the display name of the row identified by key within
+// the Model's current rows. Rename is a confirmed-native-state operation
+// (Provider.Rename only returns success once Claude's own catalog reflects
+// the new name -- see internal/provider/claude), not a local-only one like
+// Pin/unpin, but it still must not require a full provider List refresh to
+// show up: the name passed here is that already-confirmed value, so
+// callers apply it directly to whatever rows the Model already holds
+// rather than re-fetching every provider's catalog just to learn back the
+// one value this call already knows. Name never affects ordering
+// (session.SortOverview does not sort on it), so rows are not re-sorted.
+func (m *Model) ApplyRename(key session.Key, name string) {
+	for i := range m.Rows {
+		if m.Rows[i].Key == key {
+			m.Rows[i].Name = name
+			return
+		}
+	}
+}
 func (m *Model) Update(key string) Action {
 	if m.Renaming {
 		return m.updateRename(key)
