@@ -279,6 +279,38 @@ func TestShiftTabPreservesPrompt(t *testing.T) {
 	}
 }
 
+// TestShiftTabPreservesMultilinePrompt fixes the Issue #10 retention
+// criterion for Shift+Tab: switching providers must not rewrite or
+// flatten an embedded newline in the composer, and must not move the
+// cursor.
+func TestShiftTabPreservesMultilinePrompt(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "line 1\nline 2"
+	m.PromptCursor = 4
+	m.Update("shift+tab")
+	if m.Provider != session.ProviderCodex || m.Prompt != "line 1\nline 2" || m.PromptCursor != 4 {
+		t.Fatalf("model=%+v", m)
+	}
+}
+
+// TestStashRoundTripsMultilinePrompt fixes the Issue #10 retention
+// criterion for Ctrl+S: a multiline prompt stashed and then restored must
+// come back with its embedded newlines intact, not rewritten/flattened.
+// The stash's existing "shared in-memory slot" contract (see Model.Stash)
+// is unchanged -- only that the text it carries may now contain "\n".
+func TestStashRoundTripsMultilinePrompt(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "a\nb"
+	m.Update("stash") // store: Prompt -> Stash
+	if m.Stash != "a\nb" || m.Prompt != "" {
+		t.Fatalf("after store: model=%+v", m)
+	}
+	m.Update("stash") // restore: Stash -> Prompt
+	if m.Prompt != "a\nb" || m.PromptCursor != len([]rune("a\nb")) {
+		t.Fatalf("after restore: model=%+v", m)
+	}
+}
+
 func TestComposerCursorEditingUsesRunes(t *testing.T) {
 	m := NewModel()
 	for _, key := range []string{"A", "界", "B", "left", "left", "X", "right", "delete", "home", "delete", "end", "backspace"} {
@@ -289,6 +321,72 @@ func TestComposerCursorEditingUsesRunes(t *testing.T) {
 	}
 	if view := m.View(40, 8); !strings.Contains(view, composerPrefix(session.ProviderClaude, "")+"X"+cursorStyle(" ")) {
 		t.Fatalf("composer cursor is not visible:\n%s", view)
+	}
+}
+
+// TestMultilineComposerEditing fixes the model-level newline contract from
+// Issue #10: "newline" (the terminal-parser-normalized semantic key for
+// Option+Enter/Shift+Enter -- see TestReadKeyNormalizesEnterVariants)
+// inserts "\n" at the rune-index cursor, exactly like any other inserted
+// text, and the existing rune-index insert/backspace/delete/left/right
+// contract keeps working across an embedded newline without special-casing
+// it.
+func TestMultilineComposerEditing(t *testing.T) {
+	cases := []struct {
+		name       string
+		keys       []string
+		wantPrompt string
+		wantCursor int
+	}{
+		{name: "newline on empty prompt", keys: []string{"newline"}, wantPrompt: "\n", wantCursor: 1},
+		{name: "newline in the middle", keys: []string{"h", "e", "l", "l", "o", "left", "left", "newline"}, wantPrompt: "hel\nlo", wantCursor: 4},
+		{name: "newline at the beginning", keys: []string{"h", "i", "home", "newline"}, wantPrompt: "\nhi", wantCursor: 1},
+		{name: "newline at the end", keys: []string{"h", "i", "newline"}, wantPrompt: "hi\n", wantCursor: 3},
+		{name: "backspace immediately after newline removes it", keys: []string{"a", "newline", "b", "backspace", "backspace"}, wantPrompt: "a", wantCursor: 1},
+		{name: "delete immediately before newline removes it", keys: []string{"a", "newline", "b", "home", "right", "delete"}, wantPrompt: "ab", wantCursor: 1},
+		{name: "left crosses newline", keys: []string{"a", "newline", "b", "left", "left", "X"}, wantPrompt: "aX\nb", wantCursor: 2},
+		{name: "right crosses newline", keys: []string{"a", "newline", "b", "home", "right", "right", "X"}, wantPrompt: "a\nXb", wantCursor: 3},
+		{name: "unicode surrounding newline", keys: []string{"界", "newline", "う", "left", "left", "X"}, wantPrompt: "界X\nう", wantCursor: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewModel()
+			for _, key := range tc.keys {
+				m.Update(key)
+			}
+			if m.Prompt != tc.wantPrompt || m.PromptCursor != tc.wantCursor {
+				t.Fatalf("prompt=%q cursor=%d, want prompt=%q cursor=%d", m.Prompt, m.PromptCursor, tc.wantPrompt, tc.wantCursor)
+			}
+		})
+	}
+}
+
+func TestNewlineActionNeverDispatches(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "hello"
+	m.PromptCursor = len([]rune(m.Prompt))
+	if a := m.Update("newline"); a.Kind != ActionNone {
+		t.Fatalf("action=%+v, want ActionNone", a)
+	}
+	if m.Prompt != "hello\n" || m.PromptCursor != 6 {
+		t.Fatalf("prompt=%q cursor=%d", m.Prompt, m.PromptCursor)
+	}
+}
+
+// TestEnterDispatchesMultilinePromptVerbatim fixes the dispatch-boundary
+// half of the contract: a composer prompt built up with embedded "\n"
+// (via repeated "newline" actions) reaches the ActionDispatch payload
+// exactly as typed -- no flattening to spaces, no trimming of internal
+// newlines. See also TestDispatchReceivesEmbeddedNewlinesVerbatim in
+// blackbox_test.go for the same contract through the fake-provider seam.
+func TestEnterDispatchesMultilinePromptVerbatim(t *testing.T) {
+	m := NewModel()
+	for _, key := range []string{"f", "i", "r", "s", "t", "newline", "s", "e", "c", "o", "n", "d", "newline", "t", "h", "i", "r", "d"} {
+		m.Update(key)
+	}
+	a := m.Update("enter")
+	if a.Kind != ActionDispatch || a.Prompt != "first\nsecond\nthird" {
+		t.Fatalf("action=%+v", a)
 	}
 }
 
@@ -647,6 +745,48 @@ func TestReadKeyConsumesLegacyAndUnknownSequencesAtomically(t *testing.T) {
 	}
 }
 
+// TestReadKeyNormalizesEnterVariants fixes the Issue #10 terminal-parser
+// contract: Enter, Option+Enter, and Shift+Enter must decode to distinct
+// semantic keys ("enter" vs "newline") based on the real byte sequences
+// confirmed via a raw-byte probe against the installed macOS terminal --
+// plain Enter sends CR (\r), Shift+Enter sends a bare LF (\n), and
+// Option+Enter sends ESC followed by CR (the "meta sends escape"
+// convention also used for e.g. Option+b/Option+f in readline). Option+
+// Enter and Shift+Enter don't need distinct semantic keys from each other
+// -- both normalize to "newline" (see Model.Update's "newline" case)
+// since the composer only ever needs to tell "insert a line break" apart
+// from "dispatch/open".
+func TestReadKeyNormalizesEnterVariants(t *testing.T) {
+	cases := []struct{ name, input, want string }{
+		{name: "plain Enter (CR)", input: "\r", want: "enter"},
+		{name: "Shift+Enter (bare LF)", input: "\n", want: "newline"},
+		{name: "Option+Enter (ESC CR)", input: "\x1b\r", want: "newline"},
+		{name: "ESC LF is also normalized", input: "\x1b\n", want: "newline"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := bufio.NewReader(strings.NewReader(tc.input))
+			got, err := readKey(r)
+			if err != nil || got != tc.want {
+				t.Fatalf("input=%q got=%q want=%q err=%v", tc.input, got, tc.want, err)
+			}
+		})
+	}
+}
+
+// TestEscQuitStillWorksAfterEnterVariantNormalization guards the boundary
+// TestReadKeyNormalizesEnterVariants' Option+Enter case touches: a lone
+// ESC with nothing else buffered (and, via readKey's nil wait func, no
+// chance to wait for more) must still decode to "quit", not fall through
+// to the new ESC-CR/ESC-LF handling.
+func TestEscQuitStillWorksAfterEnterVariantNormalization(t *testing.T) {
+	r := bufio.NewReader(strings.NewReader("\x1b"))
+	got, err := readKey(r)
+	if err != nil || got != "quit" {
+		t.Fatalf("got=%q err=%v", got, err)
+	}
+}
+
 // TestReadKeySupportsSS3ArrowAndHomeEndSequences covers the ESC O <letter>
 // (SS3) key encoding, not just the ESC [ <letter> (CSI) form covered by
 // TestReadKeyConsumesLegacyAndUnknownSequencesAtomically. This form is not
@@ -801,5 +941,110 @@ func TestViewKeepsFooterComposerSelectionAndErrorWithinNarrowViewport(t *testing
 		if count > 0 && !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)) {
 			t.Fatalf("count=%d selected row not visible\n%s", count, view)
 		}
+	}
+}
+
+// TestMultilineComposerRendersOneRowPerLogicalLine fixes the Issue #10
+// rendering contract: an embedded "\n" in Prompt becomes a real extra
+// terminal row, with continuation rows indented to align under the
+// "<provider> > " prefix rather than folded into one horizontally-
+// scrolled line.
+func TestMultilineComposerRendersOneRowPerLogicalLine(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "first\nsecond"
+	m.PromptCursor = len([]rune(m.Prompt))
+	view := m.View(40, 10)
+	prefix := composerPrefix(session.ProviderClaude, "")
+	indent := strings.Repeat(" ", lineCells(prefix))
+	if !strings.Contains(view, prefix+"first") {
+		t.Fatalf("first logical line missing its prefix:\n%s", view)
+	}
+	if !strings.Contains(view, indent+"second"+cursorStyle(" ")) {
+		t.Fatalf("continuation line is not indented to the prefix column:\n%s", view)
+	}
+	if strings.Contains(view, "first\\nsecond") || strings.Contains(view, "first\nsecond") {
+		t.Fatalf("embedded newline was rendered as a literal escape/inline break instead of a real row:\n%s", view)
+	}
+}
+
+// TestMultilineComposerCursorTracksLogicalLine fixes cursor placement: the
+// cursor glyph must appear on the logical line promptCursorPosition says
+// it's on, at the right in-line offset -- not recomputed against the
+// flattened Prompt string.
+func TestMultilineComposerCursorTracksLogicalLine(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "ab\ncd"
+	m.PromptCursor = 1 // between 'a' and 'b', on the first logical line
+	view := m.View(40, 10)
+	prefix := composerPrefix(session.ProviderClaude, "")
+	if !strings.Contains(view, prefix+"a"+cursorStyle("b")) {
+		t.Fatalf("cursor did not render on the first logical line:\n%s", view)
+	}
+	indent := strings.Repeat(" ", lineCells(prefix))
+	if !strings.Contains(view, indent+"cd") {
+		t.Fatalf("second logical line missing or corrupted:\n%s", view)
+	}
+	if strings.Contains(view, "c"+cursorStyle("d")) || strings.Contains(view, cursorStyle("c")+"d") {
+		t.Fatalf("cursor glyph leaked onto the second logical line:\n%s", view)
+	}
+
+	m.PromptCursor = 4 // between 'c' and 'd', on the second logical line
+	view = m.View(40, 10)
+	if !strings.Contains(view, indent+"c"+cursorStyle("d")) {
+		t.Fatalf("cursor did not move to the second logical line:\n%s", view)
+	}
+}
+
+// TestNarrowShortTerminalWithMultilinePromptDoesNotPanic fixes the Issue
+// #10 acceptance criterion that a narrow/short terminal must not panic or
+// corrupt layout once the composer can span multiple rows. The composer
+// alone (5 logical lines) already exceeds the tiny height budgets
+// exercised here, which is exactly the layout-pressure case that must
+// degrade safely (see View's header/footer-dropping logic) rather than
+// slice out of range.
+func TestNarrowShortTerminalWithMultilinePromptDoesNotPanic(t *testing.T) {
+	m := NewModel()
+	m.Prompt = "line one\nline two\nline three\nline four\nline five"
+	m.PromptCursor = len([]rune(m.Prompt))
+	m.Rows = []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "x"}, Name: "session", Activity: session.ActivityIdle}}
+	for _, dims := range [][2]int{{1, 1}, {0, 0}, {5, 3}, {1, 24}, {80, 1}, {2, 2}} {
+		width, height := dims[0], dims[1]
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("View(%d,%d) panicked: %v", width, height, r)
+				}
+			}()
+			view := m.View(width, height)
+			if lines := strings.Count(view, "\n"); height > 0 && lines != height {
+				t.Fatalf("View(%d,%d) produced %d lines, want %d", width, height, lines, height)
+			}
+		}()
+	}
+}
+
+// TestMultilineComposerReservesFooterSpaceForEveryRow fixes the footer/
+// viewport reservation criterion: each extra composer row must count
+// against the reserved footer height (so listHeight shrinks accordingly)
+// exactly like the existing single-line composer already does -- the
+// total line count must always equal the requested height.
+func TestMultilineComposerReservesFooterSpaceForEveryRow(t *testing.T) {
+	m := NewModel()
+	for i := 0; i < 20; i++ {
+		m.Rows = append(m.Rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: fmt.Sprint(i)}, Name: fmt.Sprintf("session-%03d", i), Activity: session.ActivityIdle})
+	}
+	m.Selected = 19
+	m.Prompt = "a\nb\nc"
+	m.PromptCursor = len([]rune(m.Prompt))
+	view := m.View(48, 16)
+	if lines := strings.Count(view, "\n"); lines != 16 {
+		t.Fatalf("lines=%d, want 16\n%s", lines, view)
+	}
+	if !strings.Contains(view, rowPrefix(">", session.ActivityIdle, true, false)+"session-019") {
+		t.Fatalf("selected row not visible once the composer grew to 3 rows:\n%s", view)
+	}
+	prefix := composerPrefix(session.ProviderClaude, "")
+	if !strings.Contains(view, prefix+"a") {
+		t.Fatalf("multiline composer not rendered:\n%s", view)
 	}
 }
