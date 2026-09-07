@@ -1,0 +1,99 @@
+package agentview
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/tingtt/agentsctl/internal/session"
+)
+
+// TestArchiveConfirmationRendersRedOnTargetRowNotFooter fixes the row-
+// notice placement contract: a pending confirmation must render in red on
+// the target session's own row, immediately before the provider/cwd
+// block, and nowhere in the footer.
+func TestArchiveConfirmationRendersRedOnTargetRowNotFooter(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("c"), Name: "old", CWD: "/work", Activity: session.ActivityCompleted, Actions: session.Actions{session.ActionArchive: {Available: true}}}})
+	s.Handle(KeyEvent{Key: KeyCtrlX})
+	view := s.View(80, 12)
+	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
+	confirmStyled := styleText("Press Ctrl+X again to archive", colorRed)
+	found := false
+	for _, line := range lines[:len(lines)-3] { // exclude the 3 footer lines
+		if strings.Contains(line, "old") && strings.Contains(line, confirmStyled) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("archive confirmation not found styled red on the target row:\n%s", view)
+	}
+	for _, line := range lines[len(lines)-3:] {
+		if strings.Contains(line, "Press Ctrl+X again to archive") {
+			t.Fatalf("archive confirmation leaked into the footer: %q", line)
+		}
+	}
+}
+
+// TestFullwidthTitleWithNoticeKeepsCWDAlignment fixes that the provider/
+// cwd block's start column stays identical whether or not a row carries a
+// notice, and regardless of full-width glyphs in the title.
+func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
+	cwd := "/work/project"
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "short", Activity: session.ActivityIdle, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "日本語のタイトル", Activity: session.ActivityWorking, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
+	})
+	s.selectIndex(1)
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms the confirmation on row "b"
+	view := s.View(80, 12)
+	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
+	var offsets []int
+	for _, line := range lines {
+		if idx := strings.Index(line, "project"); idx >= 0 {
+			offsets = append(offsets, lineCells(line[:idx]))
+		}
+	}
+	if len(offsets) < 2 {
+		t.Fatalf("expected both rows' cwd in view:\n%s", view)
+	}
+	for i := 1; i < len(offsets); i++ {
+		if offsets[i] != offsets[0] {
+			t.Fatalf("cwd column shifted by the notice: offsets=%v\n%s", offsets, view)
+		}
+	}
+}
+
+// TestSelectedRowRendersCursorMarker is a representative rendering test:
+// the selected row must carry the ">" cursor and no other row does.
+func TestSelectedRowRendersCursorMarker(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: "first"}, {Key: key("b"), Name: "second"}})
+	s.selectIndex(1)
+	view := s.View(80, 12)
+	lines := strings.Split(view, "\n")
+	cursorLines := 0
+	for _, line := range lines {
+		if strings.HasPrefix(line, "> ") {
+			cursorLines++
+			if !strings.Contains(line, "second") {
+				t.Fatalf("cursor marker on the wrong row: %q", line)
+			}
+		}
+	}
+	if cursorLines != 1 {
+		t.Fatalf("expected exactly one cursor-marked row, got %d", cursorLines)
+	}
+}
+
+// TestNarrowTerminalNeverPanics is a representative narrow-terminal
+// rendering guarantee: View must degrade gracefully (never panic, never
+// produce negative-width slicing) at pathologically small dimensions.
+func TestNarrowTerminalNeverPanics(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: "a very long session title indeed", CWD: "/some/long/path/here", Actions: session.Actions{session.ActionArchive: {Available: true}}}})
+	s.Handle(KeyEvent{Key: KeyCtrlX})
+	for _, dims := range [][2]int{{0, 0}, {1, 1}, {5, 3}, {80, 0}} {
+		_ = s.View(dims[0], dims[1])
+	}
+}

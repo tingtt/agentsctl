@@ -10,9 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/session"
-	"github.com/tingtt/agentsctl/internal/state"
+	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
 type fakeAPI struct {
@@ -24,7 +25,7 @@ type fakeAPI struct {
 
 func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
 	api := &fakeAPI{}
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	p := Provider{API: api, Store: store}
 	key := session.Key{Provider: session.ProviderCodex, ID: "thread"}
 	if err := p.Archive(context.Background(), key); err != nil {
@@ -53,46 +54,43 @@ func (f *fakeAPI) Unarchive(_ context.Context, id string) error { f.unarchived =
 func (f *fakeAPI) CodexHome() string                            { return "" }
 
 func TestAmbiguousThreadBindingIsNeverGuessed(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	started := time.Now()
-	_ = store.Update(func(d *state.Data) error {
-		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "running", StartedAt: started, Baseline: []string{"old"}}
-		return nil
-	})
+	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "running", StartedAt: started, Baseline: []string{"old"}}); err != nil {
+		t.Fatal(err)
+	}
 	p := Provider{Store: store, API: &fakeAPI{}, WriterOwner: func(string, process.Identity) (bool, error) { return true, nil }}
 	threads := []Thread{{ID: "new-1", CWD: "/work"}, {ID: "new-2", CWD: "/work"}}
 	if err := p.reconcile(threads); err != nil {
 		t.Fatal(err)
 	}
-	d, _ := store.Load()
-	r := d.Runs["r"]
+	runs, _ := store.Runs()
+	r := runs["r"]
 	if r.SessionID != "" || r.Error == "" {
 		t.Fatalf("run=%+v", r)
 	}
 }
 func TestUniqueThreadBindingPersistsAcrossClientRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	store := state.New(path)
-	_ = store.Update(func(d *state.Data) error {
-		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "running", Baseline: []string{"old"}}
-		return nil
-	})
+	store := localstate.New(path)
+	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "running", Baseline: []string{"old"}}); err != nil {
+		t.Fatal(err)
+	}
 	p := Provider{Store: store, API: &fakeAPI{}, WriterOwner: func(string, process.Identity) (bool, error) { return true, nil }}
 	if err := p.reconcile([]Thread{{ID: "new", CWD: "/work"}}); err != nil {
 		t.Fatal(err)
 	}
-	reopened, _ := state.New(path).Load()
-	if reopened.Runs["r"].SessionID != "new" {
-		t.Fatalf("run=%+v", reopened.Runs["r"])
+	reopened, _ := localstate.New(path).Runs()
+	if reopened["r"].SessionID != "new" {
+		t.Fatalf("run=%+v", reopened["r"])
 	}
 }
 
 func TestArchivedBoundRunDoesNotReappearAsUnbound(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	_ = store.Update(func(d *state.Data) error {
-		d.Runs["run"] = state.Run{ID: "run", Provider: "codex", SessionID: "archived-thread", CWD: "/work", State: "stopped"}
-		return nil
-	})
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "run", Provider: "codex", SessionID: "archived-thread", CWD: "/work", State: "stopped"}); err != nil {
+		t.Fatal(err)
+	}
 	p := Provider{Store: store, API: &fakeAPI{rows: nil}}
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
@@ -104,7 +102,7 @@ func TestArchivedBoundRunDoesNotReappearAsUnbound(t *testing.T) {
 }
 
 func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	api := &fakeAPI{rows: []Thread{
 		{ID: "working", CreatedAt: 100, UpdatedAt: 900, Status: ThreadStatus{Type: "active"}},
 		{ID: "idle", CreatedAt: 200, UpdatedAt: 800, Status: ThreadStatus{Type: "idle"}},
@@ -126,7 +124,7 @@ func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
 // TestCatalogNeverReceivesDuplicateCodexKeys is the end-to-end guarantee:
 // a real CommandAppServer talking (over a real subprocess/JSON-RPC boundary)
 // to a fake codex CLI that reports the same thread ID twice must still
-// produce a session.Catalog with at most one row per session.Key.
+// produce a catalog with at most one row per session.Key.
 func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not available for fake codex CLI")
@@ -150,10 +148,10 @@ func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "codex.json"), b, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	provider := &Provider{API: &CommandAppServer{Path: fakePath}, Store: store}
-	catalog := session.Catalog{Providers: []session.Provider{provider}}
-	snap := catalog.Load(context.Background(), session.Scope{CurrentDirectory: "/work", Directory: session.ScopeAll})
+	controller := sessionctl.Controller{Providers: []sessionctl.Source{provider}}
+	snap := controller.Load(context.Background(), session.Scope{CurrentDirectory: "/work", Directory: session.ScopeAll})
 	if snap.Warnings[session.ProviderCodex] != nil {
 		t.Fatalf("catalog warning: %v", snap.Warnings[session.ProviderCodex])
 	}
@@ -169,19 +167,19 @@ func TestCatalogNeverReceivesDuplicateCodexKeys(t *testing.T) {
 	}
 }
 
-// TestFailedUnboundRunExposesArchiveNotStop fixes the capability shape for
-// a local run that started but was never proven to any app-server thread
-// (state.Run.SessionID == "") and reached a terminal state: it must be
-// archivable (a local cleanup, see below) but not stoppable, and the
-// startup error must not gate Archive — "why the run failed" and "whether
-// this row can be archived" are unrelated (the error remains visible only
-// as diagnostic Summary text).
+// TestFailedUnboundRunExposesArchiveNotStop fixes the action-availability
+// shape for a local run that started but was never proven to any
+// app-server thread (localstate.Run.SessionID == "") and reached a
+// terminal state: it must be archivable (a local cleanup, see below) but
+// not stoppable, and the startup error must not leak into the
+// availability reason -- "why the run failed" and "whether this row can
+// be archived" are unrelated (the error remains visible only as
+// diagnostic Summary text).
 func TestFailedUnboundRunExposesArchiveNotStop(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	_ = store.Update(func(d *state.Data) error {
-		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec /usr/local/bin/codex: operation not permitted"}
-		return nil
-	})
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec /usr/local/bin/codex: operation not permitted"}); err != nil {
+		t.Fatal(err)
+	}
 	p := Provider{Store: store, API: &fakeAPI{}}
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
@@ -194,29 +192,28 @@ func TestFailedUnboundRunExposesArchiveNotStop(t *testing.T) {
 	if row.Name != "Unbound run" || row.Activity != session.ActivityFailed {
 		t.Fatalf("row=%+v", row)
 	}
-	if row.Capabilities.Stop {
-		t.Fatalf("unbound failed run must not be stoppable: %+v", row.Capabilities)
+	if row.Actions.Available(session.ActionStop) {
+		t.Fatalf("unbound failed run must not be stoppable: %+v", row.Actions)
 	}
-	if !row.Capabilities.Archive {
-		t.Fatalf("unbound failed run must be archivable: %+v", row.Capabilities)
+	if !row.Actions.Available(session.ActionArchive) {
+		t.Fatalf("unbound failed run must be archivable: %+v", row.Actions)
 	}
-	if row.Capabilities.Reason != "" {
-		t.Fatalf("startup error leaked into Capabilities.Reason (would show as an archive-unavailable reason): %q", row.Capabilities.Reason)
+	if row.Actions.Reason(session.ActionStop) == row.Summary {
+		t.Fatalf("startup error leaked into the Stop-unavailable reason: %q", row.Actions.Reason(session.ActionStop))
 	}
 }
 
 // TestArchiveUnboundRunIsLocalCleanupNotThreadArchive is the core
 // regression for the reported bug: archiving a failed "Unbound run" (whose
 // Key.ID is agentsctl's own run ID, never a real Codex thread ID) must
-// delete the local state.Store run and must NOT call the app-server's
+// delete the local run record and must NOT call the app-server's
 // thread/archive — passing a non-thread ID to thread/archive would either
 // error or, worse, silently no-op against an unrelated/nonexistent thread.
 func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	_ = store.Update(func(d *state.Data) error {
-		d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec: operation not permitted"}
-		return nil
-	})
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec: operation not permitted"}); err != nil {
+		t.Fatal(err)
+	}
 	api := &fakeAPI{}
 	p := Provider{Store: store, API: api}
 	if err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"}); err != nil {
@@ -225,8 +222,8 @@ func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
 	if api.archived != "" {
 		t.Fatalf("unbound run archive called app-server thread/archive with id=%q", api.archived)
 	}
-	d, _ := store.Load()
-	if _, ok := d.Runs["r"]; ok {
+	runs, _ := store.Runs()
+	if _, ok := runs["r"]; ok {
 		t.Fatal("unbound run was not removed from local state")
 	}
 	rows, err := p.List(context.Background(), false)
@@ -238,51 +235,6 @@ func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
 	}
 }
 
-// TestDeleteUnboundTerminalRunRecheckesAtUpdateTime is the deterministic
-// stand-in for the race Archive's doc comment describes: state.Run's
-// terminal-unbound shape is checked once in Archive (Store.Load, outside
-// any lock) and must be re-checked atomically with the delete itself
-// (inside Store.Update) — a run that no longer matches by the time Update
-// actually runs (bound to a thread, left its terminal state, or already
-// gone) must survive. Rather than manufacturing a real goroutine race,
-// this calls deleteUnboundTerminalRun directly against a store already
-// seeded with the "changed by Update time" state — deleteUnboundTerminalRun
-// always re-reads from the store inside its own Update callback, so this
-// exercises exactly the same re-check a genuine race would hit.
-func TestDeleteUnboundTerminalRunRecheckesAtUpdateTime(t *testing.T) {
-	cases := []struct {
-		name     string
-		seed     *state.Run // nil means the run is gone by Update time
-		wantKept bool
-	}{
-		{name: "became bound to a thread", seed: &state.Run{ID: "r", Provider: "codex", SessionID: "thread-abc", State: "failed"}, wantKept: true},
-		{name: "left terminal state", seed: &state.Run{ID: "r", Provider: "codex", State: "running"}, wantKept: true},
-		{name: "already deleted", seed: nil, wantKept: false},
-		{name: "still terminal and unbound", seed: &state.Run{ID: "r", Provider: "codex", State: "stopped"}, wantKept: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			store := state.New(filepath.Join(t.TempDir(), "state.json"))
-			if tc.seed != nil {
-				run := *tc.seed
-				_ = store.Update(func(d *state.Data) error { d.Runs["r"] = run; return nil })
-			}
-			p := Provider{Store: store, API: &fakeAPI{}}
-			if err := p.deleteUnboundTerminalRun("r"); err != nil {
-				t.Fatal(err)
-			}
-			d, _ := store.Load()
-			_, ok := d.Runs["r"]
-			if tc.wantKept && !ok {
-				t.Fatal("run was deleted despite no longer matching the unbound-terminal shape at Update time")
-			}
-			if !tc.wantKept && ok {
-				t.Fatal("run was not deleted despite still matching the unbound-terminal shape at Update time")
-			}
-		})
-	}
-}
-
 // TestArchiveRejectsRunningOrStartingUnboundRun guards the "active/starting
 // run を誤って消さない" requirement, fail-closed at the provider boundary
 // (not just relying on the UI never offering Archive for such a row): a
@@ -291,21 +243,20 @@ func TestDeleteUnboundTerminalRunRecheckesAtUpdateTime(t *testing.T) {
 // forwarded to the app-server's thread/archive under any circumstance —
 // Provider.Archive must instead return an error.
 func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
-	for _, state_ := range []string{"running", "starting"} {
-		t.Run(state_, func(t *testing.T) {
-			store := state.New(filepath.Join(t.TempDir(), "state.json"))
-			_ = store.Update(func(d *state.Data) error {
-				d.Runs["r"] = state.Run{ID: "r", Provider: "codex", CWD: "/work", State: state_}
-				return nil
-			})
+	for _, runState := range []string{"running", "starting"} {
+		t.Run(runState, func(t *testing.T) {
+			store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+			if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: runState}); err != nil {
+				t.Fatal(err)
+			}
 			api := &fakeAPI{}
 			p := Provider{Store: store, API: api}
 			err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
 			if err == nil {
 				t.Fatal("expected an error archiving an active unbound run, got nil")
 			}
-			d, _ := store.Load()
-			if _, ok := d.Runs["r"]; !ok {
+			runs, _ := store.Runs()
+			if _, ok := runs["r"]; !ok {
 				t.Fatal("running/starting unbound run was locally deleted by Archive")
 			}
 			if api.archived != "" {

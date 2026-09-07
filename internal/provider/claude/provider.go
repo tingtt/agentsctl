@@ -12,17 +12,17 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/tingtt/agentsctl/internal/localstate"
 	base "github.com/tingtt/agentsctl/internal/provider"
 	"github.com/tingtt/agentsctl/internal/session"
-	"github.com/tingtt/agentsctl/internal/state"
 )
 
 // NativeRenamer performs Claude's native, in-place session rename (see
 // Provider.Rename). It is an interface -- rather than Provider calling
-// straight into internal/pty -- so this package stays buildable on every
-// platform even though the only real implementation
-// (NewNativeRenamer/internal/pty's transient-attach transport, in
-// rename_unix.go) is darwin/linux only.
+// straight into rename_transport_unix.go -- so this package stays
+// buildable on every platform even though the only real implementation
+// (NewNativeRenamer/sendClaudeRename, in rename_unix.go/
+// rename_transport_unix.go) is darwin/linux only.
 //
 // Send is split from cleanup (its own return value) rather than being one
 // blocking call, specifically so Provider.Rename can run native-catalog
@@ -30,8 +30,8 @@ import (
 // serially: cleanup ending the transient attach client has nothing to do
 // with whether the rename itself succeeded (see Provider.Rename), and
 // serializing them was the single largest source of avoidable rename
-// latency (see internal/pty.SendClaudeRename's doc comment for the
-// real-CLI measurements behind this).
+// latency (see sendClaudeRename's doc comment for the real-CLI
+// measurements behind this).
 type NativeRenamer interface {
 	// Send starts a transient attach client and submits the rename
 	// command, returning once that submission is durable. cleanup is nil
@@ -39,9 +39,9 @@ type NativeRenamer interface {
 	Send(ctx context.Context, path, id, name string) (cleanup func(context.Context, time.Duration) error, err error)
 }
 
-// renameCleanupTimeout is looser than AttachClaude's interactive detach
-// timeout (app_unix.go passes 2s there, where a slow detach is directly
-// visible to a waiting user): rename's cleanup has no one watching it in
+// renameCleanupTimeout is looser than Open's interactive detach timeout
+// (openDetachTimeout, where a slow detach is directly visible to a
+// waiting user): rename's cleanup has no one watching it in
 // real time, and was observed, under heavy concurrent-claude-process load,
 // to occasionally take noticeably longer than 5s for the attach client to
 // actually exit after SIGTERM even though it reliably did exit. Unlike the
@@ -52,7 +52,7 @@ const renameCleanupTimeout = 8 * time.Second
 type Provider struct {
 	Path   string
 	Runner base.Runner
-	Store  *state.Store
+	Store  *localstate.Store
 	// Renamer is the native rename transport Rename delegates to. Required
 	// for Rename to work; production wires it from NewNativeRenamer(). A nil
 	// Renamer makes Rename fail closed rather than silently falling back to
@@ -98,14 +98,14 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	if err := json.Unmarshal(res.Stdout, &raw); err != nil {
 		return nil, fmt.Errorf("decode claude agents JSON: %w", err)
 	}
-	d, _ := p.Store.Load()
+	claudeArchived, legacyNames, _ := p.Store.ClaudeState()
 	rows := make([]session.Session, 0, len(raw))
 	for _, v := range raw {
 		id := text(v, "id", "sessionId")
 		if id == "" {
 			continue
 		}
-		isArchived := d.ClaudeArchived[id]
+		isArchived := claudeArchived[id]
 		if isArchived != archived {
 			continue
 		}
@@ -124,20 +124,37 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		}
 		attachable := runtime == session.RuntimeDetached || activity == session.ActivityCompleted
 		// Claude's own native `name` is canonical (see Provider.Rename):
-		// state.Data.ClaudeNames is only consulted when the native catalog
-		// has no name at all, which is legacy migration compatibility for
-		// overrides written before native rename existed (see
-		// state.Data.ClaudeNames' doc comment) -- it never hides a name
-		// Claude itself now reports.
+		// the legacy overlay is only consulted when the native catalog has
+		// no name at all, which is migration compatibility for overrides
+		// written before native rename existed (see
+		// localstate.Store.ClaudeState's doc comment) -- it never hides a
+		// name Claude itself now reports.
 		name := text(v, "name", "displayName")
 		if name == "" {
-			name = d.ClaudeNames[id]
+			name = legacyNames[id]
+		}
+		actions := session.Actions{}
+		if attachable {
+			actions[session.ActionOpen] = session.Availability{Available: true}
+		} else {
+			actions[session.ActionOpen] = session.Availability{Reason: "session is not attachable in its current state"}
+		}
+		if runtime == session.RuntimeDetached {
+			actions[session.ActionStop] = session.Availability{Available: true}
+		} else {
+			actions[session.ActionStop] = session.Availability{Reason: "session is not running"}
 		}
 		// Rename never stops or otherwise touches the session (it is a
 		// rename-only session action -- see Provider.Rename), so — unlike
 		// Stop/Archive — it is available for any non-archived row
 		// regardless of Activity/Runtime, active sessions included.
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: session.Capabilities{Attach: attachable, Stop: runtime == session.RuntimeDetached, Rename: !isArchived, Archive: runtime == session.RuntimeStopped, Unarchive: isArchived, Respawn: runtime == session.RuntimeStopped}})
+		actions[session.ActionRename] = session.Availability{Available: true}
+		if runtime == session.RuntimeStopped {
+			actions[session.ActionArchive] = session.Availability{Available: true}
+		} else {
+			actions[session.ActionArchive] = session.Availability{Reason: "stop the session before archiving"}
+		}
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Actions: actions})
 	}
 	return rows, nil
 }
@@ -161,7 +178,8 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	}
 	id = fields[0]
 	createdAt := time.Now()
-	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Capabilities: session.Capabilities{Attach: true, Stop: true}}, nil
+	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
+	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Actions: actions}, nil
 }
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	res, err := p.Runner.Run(ctx, p.path(), []string{"stop", k.ID}, "")
@@ -171,21 +189,21 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	return nil
 }
 func (p *Provider) Archive(_ context.Context, k session.Key) error {
-	return p.Store.Update(func(d *state.Data) error { d.ClaudeArchived[k.ID] = true; return nil })
+	return p.Store.SetClaudeArchived(k.ID)
 }
 func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
-	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeArchived, k.ID); return nil })
+	return p.Store.ClearClaudeArchived(k.ID)
 }
 
 // Rename performs Claude's own native, in-place session rename via a
-// Claude-specific transport (NativeRenamer/internal/pty.RenameClaude on
+// Claude-specific transport (NativeRenamer/sendClaudeRename on
 // darwin/linux): it drives a transient, headless `claude attach <id>`
 // client that sends the CLI's own `/rename <name>` slash command, then
 // detaches only that client — the native session, its lifetime, and its
 // identity (id/sessionId/pid) are all left untouched. See the doc comment
-// on internal/pty.RenameClaude for what was verified against the installed
-// CLI, and NativeRenamer's for why this is an interface rather than a
-// direct call into internal/pty.
+// on sendClaudeRename for what was verified against the installed CLI, and
+// NativeRenamer's for why this is an interface rather than a direct call
+// into rename_transport_unix.go.
 //
 // `claude --bg --resume <id> --name <name>` is deliberately not used here:
 // verified (against `claude` 2.1.260/2.1.263) to always fork a new session
@@ -194,12 +212,12 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 //
 // Rename is rename-only: on failure, no state changes at all — in
 // particular, it never falls back to writing a local-only override, and it
-// never touches state.Data.ClaudeArchived or any other session-lifecycle
-// field. On confirmed success it deletes any stale
-// state.Data.ClaudeNames[k.ID] left over from before native rename existed
-// (see that field's doc comment), since List() now treats it purely as a
-// legacy fallback and a stale entry must not go on hiding the new native
-// name.
+// never touches the Claude archive overlay or any other session-lifecycle
+// field. On confirmed success it deletes any stale legacy name for k.ID
+// left over from before native rename existed (see
+// localstate.Store.ClaudeState's doc comment), since List() now treats it
+// purely as a legacy fallback and a stale entry must not go on hiding the
+// new native name.
 //
 // The native catalog check (confirmRenamed) always runs and is what
 // actually decides success/failure here, even when Send itself returned an
@@ -215,8 +233,8 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 // sequentially: cleanup is unrelated to whether the rename succeeded (see
 // NativeRenamer), and serializing "wait for the client to exit" before
 // "check whether the rename landed" was the single largest source of
-// avoidable rename latency (see internal/pty.SendClaudeRename's doc
-// comment). Rename still waits for cleanup to finish (bounded by
+// avoidable rename latency (see sendClaudeRename's doc comment). Rename
+// still waits for cleanup to finish (bounded by
 // renameCleanupTimeout) before returning, the same as before -- only the
 // order changed from serial to parallel -- so a transient attach client is
 // never left to outlive this call.
@@ -256,7 +274,7 @@ func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error
 		}
 		return confirmErr
 	}
-	return p.Store.Update(func(d *state.Data) error { delete(d.ClaudeNames, k.ID); return nil })
+	return p.Store.ClearLegacyClaudeName(k.ID)
 }
 
 // confirmPollInterval and confirmMaxWait bound confirmRenamed's polling of
