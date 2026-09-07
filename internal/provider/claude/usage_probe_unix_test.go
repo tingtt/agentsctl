@@ -328,6 +328,223 @@ func TestProbeRefreshDetectsBothLimitsExhausted(t *testing.T) {
 	}
 }
 
+// TestProbeRecoversFromExhaustedAfterFreshSnapshot fixes Issue #19's
+// recovery contract: once a later refresh obtains a genuine fresh
+// snapshot, a previously exhausted window returns to Available with the
+// new percentage/reset, rather than staying stuck at 100%.
+func TestProbeRecoversFromExhaustedAfterFreshSnapshot(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": 4102444800},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// First: the limit hits, FiveHour becomes exhausted.
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
+	exhausted, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.FiveHour.State != session.UsageExhausted {
+		t.Fatalf("FiveHour=%+v, want Exhausted before recovery", exhausted.FiveHour)
+	}
+
+	// Then: the limit clears (a real window reset) and a normal refresh
+	// obtains a genuine new snapshot.
+	if err := os.Remove(filepath.Join(fakeDir, "limit_banner.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 3, "resets_at": 4102444900},
+	})
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+
+	recovered, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.FiveHour.State != session.UsageAvailable || recovered.FiveHour.Percent != 3 {
+		t.Fatalf("FiveHour=%+v, want Available/3%% after recovery, not stuck exhausted", recovered.FiveHour)
+	}
+}
+
+// TestProbeNonLimitTimeoutDoesNotFabricateExhausted fixes Issue #19's
+// "limit 以外の timeout...では、#14 で定義した既存 stale/unknown handling を維持する":
+// a refresh that times out with no fresh snapshot AND no usage-limit
+// wording in its output must behave exactly like #14's pre-existing
+// generic-failure policy (return the stale cache without erroring), never
+// invent an exhausted state from silence alone.
+func TestProbeNonLimitTimeoutDoesNotFabricateExhausted(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 60, "resets_at": 4102444800},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+	pr.SendTimeout = 500 * time.Millisecond
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a new refresh where the generated statusLine command itself
+	// fails to run (an unusable ExePath), so the fake CLI's statusLine
+	// invocation never writes a snapshot at all -- matching a real parse/
+	// process failure -- and no limit banner exists, so
+	// waitForProbeOutcome must time out plainly.
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	pr.ExePath = filepath.Join(t.TempDir(), "no-such-agentsctl-exe")
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("a plain timeout with a prior cache must fail over to the stale snapshot, not error: %v", err)
+	}
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 60 {
+		t.Fatalf("got=%+v, want the stale cached 60%% preserved, not a fabricated exhausted state", got.FiveHour)
+	}
+}
+
+// TestProbeExhaustedStateCachedWithoutRerefresh fixes Issue #19's "limit
+// 到達状態も cache へ反映し、次回 refresh まで古い utilization に戻らないようにする":
+// once a limit has been detected and cached, a second Usage() call within
+// usageProbeTTL must return the exact same exhausted result without
+// spawning another probe process at all (proven, as in
+// TestProbeUsageServesFreshCacheWithoutRefreshing, by making the claude
+// path unusable afterward and expecting no error).
+func TestProbeExhaustedStateCachedWithoutRerefresh(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": 4102444800},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
+
+	first, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.FiveHour.State != session.UsageExhausted {
+		t.Fatalf("first=%+v, want Exhausted", first.FiveHour)
+	}
+
+	pr.Path = filepath.Join(t.TempDir(), "no-such-claude-binary")
+	second, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("second Usage() with an unusable claude path errored -- the cached exhausted state should have been used: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second=%+v, want identical to cached first=%+v", second, first)
+	}
+}
+
+// TestProbeRecoversToAvailableAfterResetBoundaryThenFreshRefresh fixes
+// Issue #19's "reset 後に新しい snapshot を取得したら unknown/stale -> available":
+// a window that read as UsageUnknown purely from reset-boundary crossing
+// (not a detected limit) returns to Available once a real refresh
+// produces a new in-period snapshot.
+func TestProbeRecoversToAvailableAfterResetBoundaryThenFreshRefresh(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	reset := time.Now().Add(1 * time.Hour)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": reset.Unix()},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pr.Clock = func() time.Time { return reset.Add(1 * time.Minute) }
+	crossed, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if crossed.FiveHour.State != session.UsageUnknown {
+		t.Fatalf("crossed=%+v, want Unknown once the reset boundary has passed", crossed.FiveHour)
+	}
+
+	// A real refresh (TTL-forced) now produces a genuinely new in-period
+	// snapshot.
+	newReset := reset.Add(5 * time.Hour)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 7, "resets_at": newReset.Unix()},
+	})
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	pr.Clock = nil
+
+	recovered, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.FiveHour.State != session.UsageAvailable || recovered.FiveHour.Percent != 7 {
+		t.Fatalf("recovered=%+v, want Available/7%% after a fresh in-period refresh", recovered.FiveHour)
+	}
+}
+
+// TestProbeUsageAppliesResetBoundaryThroughClock fixes Issue #19's
+// worked example end to end through Probe.Usage (not just the pure
+// toSessionUsageWindow unit tests): a fresh-within-TTL cache whose own
+// Reset has nonetheless already passed (per Probe.Clock) is not shown as
+// current -- TTL freshness and reset-boundary validity are independent
+// checks, and reset-boundary wins.
+func TestProbeUsageAppliesResetBoundaryThroughClock(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	reset := time.Now().Add(1 * time.Hour)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": reset.Unix()},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Still within usageProbeTTL of the fetch, but Clock now reports a
+	// time past the cached window's own Reset.
+	pr.Clock = func() time.Time { return reset.Add(1 * time.Minute) }
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.State != session.UsageUnknown {
+		t.Fatalf("FiveHour=%+v, want Unknown once Clock reports past the cached Reset, even though the TTL cache is still fresh", got.FiveHour)
+	}
+}
+
 // TestProbeUsageFailsClosedWithNoCacheAtAll fixes the cold-start failure
 // case: with no cached snapshot ever obtained, a refresh failure must
 // surface as an error (which sessionctl.Controller.Usage already treats as

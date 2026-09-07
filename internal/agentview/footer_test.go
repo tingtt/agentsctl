@@ -242,6 +242,27 @@ func TestUsageLineTextKeepsFreshProviderWhileOtherIsUnknown(t *testing.T) {
 	}
 }
 
+// TestUsageLineTextRendersExhaustedWindowEndToEnd fixes Issue #19's
+// rendering contract exercised through the full pipeline a real refresh
+// uses (ApplyUsageUpdate -> usageLineText -> usageWindowText), not just
+// usageWindowText in isolation: a provider whose 5h window came back
+// UsageExhausted renders 100% for that window while its still-available
+// weekly window renders its own real percentage.
+func TestUsageLineTextRendersExhaustedWindowEndToEnd(t *testing.T) {
+	s := freshUsageState(session.Usage{
+		Provider: session.ProviderClaude,
+		FiveHour: session.UsageWindow{State: session.UsageExhausted, Percent: 100, Reset: time.Now().Add(2 * time.Hour)},
+		Weekly:   session.UsageWindow{State: session.UsageAvailable, Percent: 84, Reset: time.Now().Add(5 * 24 * time.Hour)},
+	})
+	line := usageLineText(s)
+	if !strings.Contains(line, "100%") {
+		t.Fatalf("usage line=%q, want the exhausted 5h window rendered as 100%%", line)
+	}
+	if !strings.Contains(line, "84%") {
+		t.Fatalf("usage line=%q, want the still-available weekly window's real 84%% preserved", line)
+	}
+}
+
 // TestHelpLinesDeriveKeysFromBindings fixes the single-source-of-truth
 // requirement: help text must reference the same Binding.Label values
 // State.Handle and the contextual footer key off of, not an independently

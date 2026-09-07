@@ -113,6 +113,14 @@ type Probe struct {
 	SettleDelay       time.Duration
 	TrustSettleDelay  time.Duration
 	DetachSettleDelay time.Duration
+	// SendTimeout overrides usageProbeSendTimeout, the bound
+	// waitForProbeOutcome waits for either a genuine fresh snapshot or a
+	// classified usage-limit indication before giving up with a plain
+	// (non-limit) failure; zero uses the production default. Exposed so a
+	// test exercising that plain-failure path (see Issue #19's "limit 以外
+	// の timeout" regression test) isn't forced to wait out the real
+	// production timeout.
+	SendTimeout time.Duration
 	// Clock overrides "now" for cache-freshness and reset-boundary
 	// decisions (see now, toSessionUsage, exhaustedSnapshot); nil uses
 	// time.Now. Exposed so a test can deterministically cross a cached
@@ -157,6 +165,12 @@ func (pr *Probe) detachSettleDelay() time.Duration {
 		return pr.DetachSettleDelay
 	}
 	return usageProbeDetachSettleDelay
+}
+func (pr *Probe) sendTimeout() time.Duration {
+	if pr.SendTimeout > 0 {
+		return pr.SendTimeout
+	}
+	return usageProbeSendTimeout
 }
 func (pr *Probe) now() time.Time {
 	if pr.Clock != nil {
@@ -375,7 +389,7 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 		return usageSnapshot{}, fmt.Errorf("send claude usage probe prompt: %w", err)
 	}
 
-	snap, sig, waitErr := waitForProbeOutcome(ctx, pr.snapshotPath(), capture, sentAt, usageProbeSendTimeout)
+	snap, sig, waitErr := waitForProbeOutcome(ctx, pr.snapshotPath(), capture, sentAt, pr.sendTimeout())
 
 	pr.detachProbeSession(ctx, cmd, wait)
 
