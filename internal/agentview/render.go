@@ -80,8 +80,8 @@ func (s State) View(width, height int) string {
 	}
 	promptPrefix := composerPrefix(s.Provider, unavailable)
 	footer := append(composerLines(s.Composer.Prompt, s.Composer.Cursor, promptPrefix, width),
-		clipLine("Shift+Tab / Enter send/open / Option+Enter/Shift+Enter newline / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth", width),
-		clipLine("↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit", width),
+		clipLine(footerText(footerLine1), width),
+		clipLine(footerText(footerLine2), width),
 	)
 	// The composer-top notification area is reserved for Error
 	// exclusively -- there is no generic non-error notice here.
