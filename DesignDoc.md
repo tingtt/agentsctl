@@ -170,6 +170,7 @@ Claude/Codex の 5h・weekly 利用率は、`sessionctl` 側の任意 capability
 - 取得は provider ごとに並行して行い、一部 provider の失敗が他方の結果を握りつぶさない (Session catalog の "provider catalog の partial failure" と同じ方針)。
 - 0% (実際に利用率 0 と報告された) と unavailable (そもそも報告されない) を区別する。unavailable を 0% として描画することはない。
 - 巨大な単一 `Provider` interface へ `Usage` を必須 method として追加することはしない。
+- usage 取得は Agent View の rendering critical path に置かない。catalog は usage の成功/失敗/速度に関係なく即座に render 可能とし、usage は background で provider ごとに独立して取得・反映する (遅い/hung provider が他 provider の表示や画面の再描画を妨げない)。reload のたびに既知の usage を消すことはせず、新しい結果が届くまで直前の値を表示し続ける。
 
 **Codex**
 
@@ -181,6 +182,7 @@ Claude Code には Codex app-server のような on-demand usage 読み取り RP
 
 - probe session は agentsctl が生成・所有する session であり、既存のユーザー session を attach/hijack することはない。
 - probe session の identity (native session ID) は agentsctl local state に保持し、以後の起動でも同じ session を再利用する。名前や CWD だけを identity の根拠にはしない。
+- probe 専用 directory は Claude Code にとって未知の directory であるため、初回起動時のみ workspace trust 確認への応答を行う。以後は Claude Code 自身がその directory を trusted として記憶するため、同じ応答を繰り返さない。
 - probe session は通常の session catalog (Agent View 上の一覧、pin/rename/attach/stop/archive の対象) には現れない。除外は agentsctl が記録している exact な session identity によって provider 境界で行い、CWD だけを条件にはしない。
 - 取得結果は TTL 付きでキャッシュし、Agent View の reload のたびに probe session へ request を送ることはない。cache が stale な場合のみ refresh を行い、複数の呼び出しが同時に発生しても refresh は高々1回に集約する。
 - refresh が失敗しても、直前に取得できていた snapshot があればそれを返し、Session catalog や Codex 側の usage を道連れにしない。snapshot が一度も取得できていない場合のみ、この provider の usage を省略する (0% として偽装しない)。
