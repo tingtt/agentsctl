@@ -1,6 +1,9 @@
 package agentview
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestSplitRowWidthPrioritizesProviderCWDOverNoticeOverTitle fixes the
 // narrow-terminal width-allocation priority order required by the
@@ -50,6 +53,29 @@ func TestSplitRowWidthPrioritizesProviderCWDOverNoticeOverTitle(t *testing.T) {
 	}
 	if notice != 0 || title != 0 {
 		t.Fatalf("ultra-narrow: notice=%d title=%d, want 0/0", notice, title)
+	}
+}
+
+// TestClipLineTruncationClosesDanglingStyle fixes a narrow-terminal
+// corruption risk: clipping a styled line off before its own style closes
+// (e.g. #14's topRule, whose colored cwd can be longer than the terminal
+// is wide) must append a reset, or the color would bleed into whatever
+// this line's caller writes next.
+func TestClipLineTruncationClosesDanglingStyle(t *testing.T) {
+	styled := styleText("a very long colored value that will not fit", colorGreen)
+	got := clipLine(styled, 5)
+	if !strings.HasSuffix(got, "\x1b[0m") {
+		t.Fatalf("clipLine truncated a styled value without closing it: %q", got)
+	}
+}
+
+// TestClipLineUnclippedStyleIsUnchanged fixes that clipLine doesn't add a
+// redundant reset when the whole value already fit (styleText already
+// closes its own style).
+func TestClipLineUnclippedStyleIsUnchanged(t *testing.T) {
+	styled := styleText("short", colorGreen)
+	if got := clipLine(styled, 80); got != styled {
+		t.Fatalf("clipLine(%q, 80) = %q, want unchanged", styled, got)
 	}
 }
 

@@ -264,27 +264,40 @@ func viewportStart(lines []displayLine, selected, height int) int {
 	return start
 }
 
+// clipLine clips value to width visible cells, tolerating embedded ANSI
+// SGR sequences (zero-width, always copied whole). If clipping cuts value
+// off before an ANSI sequence it contains ever closes its own style (e.g.
+// a styleText-colored cwd/rule too long for a narrow terminal), a trailing
+// reset is appended -- otherwise that dangling color would bleed into
+// whatever this line's caller writes after it (see the DesignDoc's Width
+// priority section: degrading gracefully under narrow width must not also
+// corrupt unrelated later output).
 func clipLine(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	used := 0
+	used, sawANSI, truncated := 0, false, false
 	var b strings.Builder
 	for i := 0; i < len(value); {
 		if value[i] == 0x1b {
 			j := skipANSI(value, i)
 			b.WriteString(value[i:j])
+			sawANSI = true
 			i = j
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(value[i:])
 		cells := runeCells(r)
 		if used+cells > width {
+			truncated = true
 			break
 		}
 		b.WriteRune(r)
 		used += cells
 		i += size
+	}
+	if truncated && sawANSI && !strings.HasSuffix(b.String(), "\x1b[0m") {
+		b.WriteString("\x1b[0m")
 	}
 	return b.String()
 }
