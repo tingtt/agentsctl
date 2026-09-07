@@ -314,3 +314,101 @@ func TestEscQuitsOnlyOutsideRenameAndConfirmation(t *testing.T) {
 		t.Fatalf("plain Esc must quit: %+v", intent)
 	}
 }
+
+// TestHelpVisibleEscWithEmptyPromptOnlyHidesHelp fixes #14's fixed Esc
+// priority: help visible always wins first, so Esc must only hide help --
+// never fall through to the "empty prompt -> quit" behavior it would
+// otherwise trigger.
+func TestHelpVisibleEscWithEmptyPromptOnlyHidesHelp(t *testing.T) {
+	s := NewState()
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none (help-hiding Esc must not quit)", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+}
+
+// TestHelpVisibleEscWithNonEmptyPromptPreservesPrompt fixes that a
+// help-hiding Esc must not also clear the prompt, even though a non-empty
+// prompt would normally be Esc's next priority once help is out of the way.
+func TestHelpVisibleEscWithNonEmptyPromptPreservesPrompt(t *testing.T) {
+	s := NewState()
+	s.HelpVisible = true
+	s.Composer.Prompt = "hoge"
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if s.Composer.Prompt != "hoge" {
+		t.Fatalf("prompt=%q, want unchanged (help-hiding Esc must not clear it)", s.Composer.Prompt)
+	}
+	// The next Esc, with help now hidden, falls through to normal priority:
+	// a non-empty prompt gets cleared, not quit.
+	intent = s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none (clearing the prompt, not quitting)", intent)
+	}
+	if s.Composer.Prompt != "" {
+		t.Fatalf("prompt=%q, want cleared by the next Esc now that help is hidden", s.Composer.Prompt)
+	}
+}
+
+// TestHelpVisibleEscWithPendingConfirmationPreservesConfirmation fixes that
+// a help-hiding Esc must not also cancel a pending archive confirmation,
+// even though Confirmation != nil would otherwise route Esc to
+// handleConfirmationKey ahead of the normal-state Esc priority.
+func TestHelpVisibleEscWithPendingConfirmationPreservesConfirmation(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionArchive: {Available: true}})})
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arm the confirmation on "a"
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if _, ok := s.rowNotice(key("a")); !ok {
+		t.Fatal("pending confirmation must survive a help-hiding Esc")
+	}
+	// The next Esc, with help now hidden, falls through to normal priority
+	// and cancels the confirmation as usual.
+	s.Handle(KeyEvent{Key: KeyEsc})
+	if _, ok := s.rowNotice(key("a")); ok {
+		t.Fatal("the following Esc (help already hidden) must cancel the confirmation as usual")
+	}
+}
+
+// TestHelpVisibleEscWithActiveRenamePreservesRename fixes that a
+// help-hiding Esc must not also cancel an in-progress rename, even though
+// Rename.Active would otherwise route Esc to handleRenameKey ahead of the
+// normal-state Esc priority.
+func TestHelpVisibleEscWithActiveRenamePreservesRename(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionRename: {Available: true}})})
+	s.Handle(KeyEvent{Key: KeyCtrlR}) // start renaming "a"
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if !s.Rename.Active || s.Rename.Target != key("a") {
+		t.Fatalf("rename must survive a help-hiding Esc: %+v", s.Rename)
+	}
+	// The next Esc, with help now hidden, falls through to normal priority
+	// and cancels the rename as usual.
+	s.Handle(KeyEvent{Key: KeyEsc})
+	if s.Rename.Active {
+		t.Fatal("the following Esc (help already hidden) must cancel the rename as usual")
+	}
+}

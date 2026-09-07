@@ -159,7 +159,7 @@ Composer 下部には、常時固定の shortcut 一覧ではなく、現在の�
 - `Ctrl+X` の表示 (`stop` / `archive`) は、選択中 session が実際に持つ Action availability から決める。provider ID による再判定は行わない。
 - `?` と `Esc` の意味は prompt の空/非空、および help view の表示状態によって変わる。
 - Help view は `State` の明示的な UI state (`HelpVisible`) として持つ。terminal decoder は `?` を単なる rune として渡すのみで、"help を開く" という意味付けは `State.Handle` 側で行う。
-- Esc の優先順位は次の順で固定する: help visible なら help を閉じる、次に prompt が非空ならそれを消す、いずれでもなければ (rename/confirmation を除く通常状態で) 終了する。rename・confirmation 中の Esc は従来どおりそれぞれの state を優先する。
+- Esc の優先順位は次の順で固定する: help visible なら (rename・confirmation の有無に関わらず) help を閉じるだけで prompt/rename/confirmation のいずれにも触れない、help が非表示かつ prompt が非空ならそれを消す、help が非表示かつ prompt が空なら (rename 中ならその rename をキャンセル、confirmation 中ならそれを解除、どちらでもなければ) 終了する。
 - footer/help が参照する shortcut の物理 key と label は `keymap.go` の named `Binding` を単一の source of truth とする。footer 表示用に別途 key を持たない。
 
 ##### Usage capability

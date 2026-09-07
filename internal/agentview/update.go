@@ -43,7 +43,19 @@ type Intent struct {
 // same KeyEsc means "cancel rename" while renaming, "cancel confirmation"
 // while one is pending, and "quit" otherwise; input_unix.go's decoder
 // knows none of this.
+//
+// Esc while HelpVisible is intercepted here, ahead of Rename/Confirmation
+// routing, per #14's fixed priority: help visible always hides help first
+// -- regardless of a pending rename or archive confirmation -- touching
+// neither the prompt nor that rename/confirmation state. Only once help is
+// hidden does a later Esc reach handleRenameKey/handleConfirmationKey/
+// handleNormalKey to cancel rename, cancel confirmation, clear the prompt,
+// or quit.
 func (s *State) Handle(ev KeyEvent) Intent {
+	if s.HelpVisible && bindingEscape.Matches(ev.Key) {
+		s.HelpVisible = false
+		return Intent{}
+	}
 	if s.Rename.Active {
 		return s.handleRenameKey(ev)
 	}
@@ -150,13 +162,10 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	case bindingRefresh.Matches(ev.Key):
 		return Intent{Kind: IntentRefresh}
 	case bindingEscape.Matches(ev.Key):
-		// #14's Esc priority: hide help first (never touching the prompt),
-		// then clear a non-empty prompt, and only quit once both are
-		// already empty/hidden.
-		if s.HelpVisible {
-			s.HelpVisible = false
-			return Intent{}
-		}
+		// Help-visible Esc is intercepted by Handle before routing here
+		// (see Handle's doc comment) -- HelpVisible is always false by the
+		// time execution reaches this branch. What remains is #14's next
+		// priority: clear a non-empty prompt, or quit once it's empty too.
 		if s.Composer.Prompt != "" {
 			s.Composer.Clear()
 			return Intent{}
