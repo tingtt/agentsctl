@@ -2,6 +2,7 @@ package agentview
 
 import (
 	"sort"
+	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
@@ -70,6 +71,15 @@ type State struct {
 	// reload -- either way it is simply omitted, never rendered as 0%.
 	Usage []session.Usage
 
+	// UsageUpdatedAt tracks, per provider, the wall-clock time of its most
+	// recent successful entry in Usage (see ApplyUsageUpdate) -- how the
+	// composer usage line tells a provider it just heard from apart from
+	// one whose last known reading has gone stale, rendering the latter as
+	// unknown ("?%") rather than a possibly-misleading old percentage (see
+	// usageStaleAfter in footer.go). A provider absent here has never
+	// reported successfully at all.
+	UsageUpdatedAt map[session.ProviderID]time.Time
+
 	// LastAttachedKey/HasLastAttached identify the session most recently
 	// Opened from the overview, regardless of how that Open ended (an
 	// explicit detach, or the session/process exiting on its own): title
@@ -84,7 +94,7 @@ type State struct {
 // NewState returns a freshly-initialized State: Claude as the initial
 // composer provider target, matching the pre-refactor default.
 func NewState() State {
-	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}}
+	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, UsageUpdatedAt: map[session.ProviderID]time.Time{}}
 }
 
 // SetRows installs rows as the current catalog snapshot, preserving
@@ -210,13 +220,16 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 
 // ApplyUsageUpdate incorporates one provider's incremental usage result
 // (see sessionctl.Controller.UsageStream) into Usage: a successful reading
-// upserts that provider's entry, an error removes it -- matching
-// Controller.Usage's own "omit on failure, never a fake 0%" contract, just
-// applied per provider instead of only at the end of one batch call. Usage
-// is never reset wholesale here: a provider not yet updated in the current
+// upserts that provider's entry and records its arrival time in
+// UsageUpdatedAt, an error removes the entry (leaving UsageUpdatedAt
+// untouched, so a still-recent prior success doesn't immediately look
+// unknown just because this one refresh failed) -- matching Controller.
+// Usage's own "omit on failure, never a fake 0%" contract, just applied
+// per provider instead of only at the end of one batch call. Usage is
+// never reset wholesale here: a provider not yet updated in the current
 // refresh cycle keeps showing its last known reading (see Runtime.reload's
 // doc comment) rather than flickering to blank while a slower provider is
-// still in flight.
+// still in flight -- until it goes stale on its own (usageStaleAfter).
 func (s *State) ApplyUsageUpdate(provider session.ProviderID, usage session.Usage, err error) {
 	next := make([]session.Usage, 0, len(s.Usage)+1)
 	for _, u := range s.Usage {
@@ -226,6 +239,10 @@ func (s *State) ApplyUsageUpdate(provider session.ProviderID, usage session.Usag
 	}
 	if err == nil {
 		next = append(next, usage)
+		if s.UsageUpdatedAt == nil {
+			s.UsageUpdatedAt = map[session.ProviderID]time.Time{}
+		}
+		s.UsageUpdatedAt[provider] = time.Now()
 	}
 	sort.Slice(next, func(i, j int) bool { return next[i].Provider < next[j].Provider })
 	s.Usage = next

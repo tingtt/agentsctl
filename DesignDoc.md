@@ -171,6 +171,7 @@ Claude/Codex の 5h・weekly 利用率は、`sessionctl` 側の任意 capability
 - 0% (実際に利用率 0 と報告された) と unavailable (そもそも報告されない) を区別する。unavailable を 0% として描画することはない。
 - 巨大な単一 `Provider` interface へ `Usage` を必須 method として追加することはしない。
 - usage 取得は Agent View の rendering critical path に置かない。catalog は usage の成功/失敗/速度に関係なく即座に render 可能とし、usage は background で provider ごとに独立して取得・反映する (遅い/hung provider が他 provider の表示や画面の再描画を妨げない)。reload のたびに既知の usage を消すことはせず、新しい結果が届くまで直前の値を表示し続ける。
+- ただし直前の値を無期限に表示し続けることはしない。各 provider の usage 行は、直近の成功した取得から一定時間 (5分) 以上経過している場合、または一度も取得できていない場合、percentage を `?%` の unknown placeholder として表示する — 古くなった値をあたかも現在値であるかのように見せない。claude/codex の行自体は常に表示し、取得未完了/stale を理由に行ごと非表示にはしない。
 
 **Codex**
 

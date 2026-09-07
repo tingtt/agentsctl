@@ -115,17 +115,25 @@ func TestFormatResetTimeSameDayVsOtherDay(t *testing.T) {
 	}
 }
 
+// freshUsageState builds a State with usages applied as fresh (just-now)
+// successful updates -- the common setup for usage-line tests that don't
+// care about staleness itself.
+func freshUsageState(usages ...session.Usage) State {
+	s := NewState()
+	for _, u := range usages {
+		s.ApplyUsageUpdate(u.Provider, u, nil)
+	}
+	return s
+}
+
 // TestUsageLineTextRendersClaudeBeforeCodexInOrder fixes #14's usage
 // render order: "claude <5h>/<weekly> · codex <5h>/<weekly>".
 func TestUsageLineTextRendersClaudeBeforeCodexInOrder(t *testing.T) {
-	usages := []session.Usage{
-		{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}},
-		{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 100, Reset: time.Now()}},
-	}
-	line, ok := usageLineText(usages)
-	if !ok {
-		t.Fatal("usageLineText must report ok=true with usages present")
-	}
+	s := freshUsageState(
+		session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}},
+		session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 100, Reset: time.Now()}},
+	)
+	line := usageLineText(s)
 	claudeIdx := strings.Index(line, "claude")
 	codexIdx := strings.Index(line, "codex")
 	if claudeIdx < 0 || codexIdx < 0 || claudeIdx > codexIdx {
@@ -133,9 +141,59 @@ func TestUsageLineTextRendersClaudeBeforeCodexInOrder(t *testing.T) {
 	}
 }
 
-func TestUsageLineTextEmptyWhenNoUsage(t *testing.T) {
-	if _, ok := usageLineText(nil); ok {
-		t.Fatal("usageLineText must report ok=false with no usage rows")
+// TestUsageLineTextShowsUnknownPlaceholderWhenNeverFetched fixes that the
+// usage line is never omitted entirely: a fresh State with no usage ever
+// applied still renders both known providers, each as the "?%" unknown
+// placeholder rather than a real percentage.
+func TestUsageLineTextShowsUnknownPlaceholderWhenNeverFetched(t *testing.T) {
+	s := NewState()
+	line := usageLineText(s)
+	if !strings.Contains(line, "claude") || !strings.Contains(line, "codex") {
+		t.Fatalf("usage line=%q, want both known providers present even before any fetch", line)
+	}
+	if strings.Contains(line, "n/a") {
+		t.Fatalf("usage line=%q, want the unknown placeholder, not n/a, before any fetch", line)
+	}
+	if got := strings.Count(line, "?%"); got != 4 {
+		t.Fatalf("usage line=%q, want 4 unknown placeholders (2 windows x 2 providers), got %d", line, got)
+	}
+}
+
+// TestUsageLineTextShowsUnknownPlaceholderWhenStale fixes the freshness
+// (not just presence) requirement: a provider whose last successful
+// update is older than usageStaleAfter falls back to the unknown
+// placeholder even though Usage still holds its last real reading.
+func TestUsageLineTextShowsUnknownPlaceholderWhenStale(t *testing.T) {
+	s := freshUsageState(session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}})
+	s.UsageUpdatedAt[session.ProviderClaude] = time.Now().Add(-(usageStaleAfter + time.Minute))
+	line := usageLineText(s)
+	if strings.Contains(line, "70%") || strings.Contains(line, "20%") {
+		t.Fatalf("usage line=%q, want the stale claude reading replaced by the unknown placeholder", line)
+	}
+	claudeIdx := strings.Index(line, "claude")
+	if claudeIdx < 0 || !strings.Contains(line[claudeIdx:], "?%") {
+		t.Fatalf("usage line=%q, want claude's segment to show the unknown placeholder once stale", line)
+	}
+}
+
+// TestUsageLineTextKeepsFreshProviderWhileOtherIsUnknown fixes that
+// staleness/absence is judged per provider, independently: one provider
+// showing the unknown placeholder must not affect a different, freshly-
+// updated provider's real reading.
+func TestUsageLineTextKeepsFreshProviderWhileOtherIsUnknown(t *testing.T) {
+	s := freshUsageState(session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 42, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 5, Reset: time.Now()}})
+	// Claude was never applied at all -- still unknown.
+	line := usageLineText(s)
+	if !strings.Contains(line, "42%") {
+		t.Fatalf("usage line=%q, want codex's fresh 42%% preserved", line)
+	}
+	claudeIdx := strings.Index(line, "claude")
+	codexIdx := strings.Index(line, "codex")
+	if claudeIdx < 0 || codexIdx < 0 {
+		t.Fatalf("usage line=%q, want both providers present", line)
+	}
+	if !strings.Contains(line[claudeIdx:codexIdx], "?%") {
+		t.Fatalf("usage line=%q, want claude's own segment to show the unknown placeholder", line)
 	}
 }
 

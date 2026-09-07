@@ -123,8 +123,6 @@ func (s State) composerLines(width int) []string {
 		return append(lines, helpLines(width)...)
 	}
 	lines = append(lines, clipLine("  "+contextualFooterText(s), width))
-	if usage, ok := usageLineText(s.Usage); ok {
-		lines = append(lines, clipLine("  "+usage, width))
-	}
+	lines = append(lines, clipLine("  "+usageLineText(s), width))
 	return lines
 }
