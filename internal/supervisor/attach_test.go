@@ -136,10 +136,10 @@ func TestClientAttachForwardsBurstOutputWhileInputIsBlocked(t *testing.T) {
 	defer inputWriter.Close()
 
 	inputStarted := make(chan struct{})
-	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) error {
+	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) inputOutcome {
 		close(inputStarted)
 		<-ctx.Done()
-		return ctx.Err()
+		return inputOutcome{err: ctx.Err()}
 	}
 	var output bytes.Buffer
 	done := make(chan error, 1)
@@ -177,11 +177,11 @@ func TestClientAttachWaitsForInputPumpBeforeReturn(t *testing.T) {
 
 	inputCanceled := make(chan struct{})
 	allowInputStop := make(chan struct{})
-	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) error {
+	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) inputOutcome {
 		<-ctx.Done()
 		close(inputCanceled)
 		<-allowInputStop
-		return ctx.Err()
+		return inputOutcome{err: ctx.Err()}
 	}
 	done := make(chan error, 1)
 	go func() {

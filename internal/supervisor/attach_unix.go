@@ -28,7 +28,20 @@ func (f *lockedFrames) write(kind byte, b []byte) error {
 	return protocol.Write(f.w, kind, b)
 }
 
-type attachInputPump func(context.Context, *os.File, *lockedFrames) error
+// inputOutcome is how the attach input pump ended. detached is the only
+// signal the attach loop trusts to tell a locally requested Ctrl+] detach
+// (after which the supervisor closing the attach connection is expected,
+// not a failure) apart from every other way the pump can stop -- an input
+// error, or the pump's context (derived from the caller's ctx) being
+// canceled. It is set only once pumpInput has itself confirmed
+// protocol.Detach was sent successfully, so "detached" here always means
+// the real thing, never merely "the pump returned with no error".
+type inputOutcome struct {
+	detached bool
+	err      error
+}
+
+type attachInputPump func(context.Context, *os.File, *lockedFrames) inputOutcome
 
 // Attach implements the Codex half of the DesignDoc's common Agent View
 // "Open selected session" intent: it connects to the supervisor's Unix
@@ -86,10 +99,10 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 	})
 	inputCtx, cancelInput := context.WithCancel(ctx)
 	inputDone := make(chan struct{})
-	var inputErr error
+	var inputResult inputOutcome
 	go func() {
 		defer close(inputDone)
-		inputErr = pumpInput(inputCtx, in, frames)
+		inputResult = pumpInput(inputCtx, in, frames)
 	}()
 	type incoming struct {
 		kind byte
@@ -124,9 +137,27 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-inputDone:
-			return inputErr
+			if inputResult.detached {
+				return nil
+			}
+			return inputResult.err
 		case msg := <-incomingFrames:
 			if msg.err != nil {
+				// The connection just closed or failed. If a local Ctrl+]
+				// detach already won this race by writing protocol.Detach
+				// first, this is the supervisor closing the socket in
+				// response -- expected, not a failure. cancelInput unblocks
+				// a pump that is instead genuinely still waiting on
+				// terminal input (so this join can't hang), and joining it
+				// makes pumpInput -- the only place that knows whether
+				// protocol.Detach was actually sent -- the sole authority
+				// on that distinction, regardless of which of these two
+				// goroutines this select happened to observe first.
+				cancelInput()
+				<-inputDone
+				if inputResult.detached {
+					return nil
+				}
 				return msg.err
 			}
 			switch msg.kind {
@@ -143,16 +174,16 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 	}
 }
 
-func pumpAttachInput(ctx context.Context, in *os.File, frames *lockedFrames) error {
+func pumpAttachInput(ctx context.Context, in *os.File, frames *lockedFrames) inputOutcome {
 	var scanner terminal.DetachScanner
 	buf := make([]byte, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return inputOutcome{err: err}
 		}
 		ready, err := terminal.PollInput(in, 50*time.Millisecond)
 		if err != nil {
-			return err
+			return inputOutcome{err: err}
 		}
 		if !ready {
 			continue
@@ -162,15 +193,18 @@ func pumpAttachInput(ctx context.Context, in *os.File, frames *lockedFrames) err
 			before, detach := scanner.Feed(buf[:n])
 			if len(before) > 0 {
 				if writeErr := frames.write(protocol.Input, before); writeErr != nil {
-					return writeErr
+					return inputOutcome{err: writeErr}
 				}
 			}
 			if detach {
-				return frames.write(protocol.Detach, nil)
+				if writeErr := frames.write(protocol.Detach, nil); writeErr != nil {
+					return inputOutcome{err: writeErr}
+				}
+				return inputOutcome{detached: true}
 			}
 		}
 		if err != nil {
-			return err
+			return inputOutcome{err: err}
 		}
 	}
 }
