@@ -1,6 +1,8 @@
 package agentview
 
 import (
+	"sort"
+
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -204,6 +206,29 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 			}
 		}
 	}
+}
+
+// ApplyUsageUpdate incorporates one provider's incremental usage result
+// (see sessionctl.Controller.UsageStream) into Usage: a successful reading
+// upserts that provider's entry, an error removes it -- matching
+// Controller.Usage's own "omit on failure, never a fake 0%" contract, just
+// applied per provider instead of only at the end of one batch call. Usage
+// is never reset wholesale here: a provider not yet updated in the current
+// refresh cycle keeps showing its last known reading (see Runtime.reload's
+// doc comment) rather than flickering to blank while a slower provider is
+// still in flight.
+func (s *State) ApplyUsageUpdate(provider session.ProviderID, usage session.Usage, err error) {
+	next := make([]session.Usage, 0, len(s.Usage)+1)
+	for _, u := range s.Usage {
+		if u.Provider != provider {
+			next = append(next, u)
+		}
+	}
+	if err == nil {
+		next = append(next, usage)
+	}
+	sort.Slice(next, func(i, j int) bool { return next[i].Provider < next[j].Provider })
+	s.Usage = next
 }
 
 // nextScope cycles the session-list directory scope: same directory ->
