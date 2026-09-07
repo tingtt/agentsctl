@@ -49,20 +49,28 @@ func readUsageSnapshot(path string) (snap usageSnapshot, ok bool, err error) {
 	return snap, true, nil
 }
 
-// writeUsageSnapshotAtomic persists snap to path via a temp-file-plus-
-// rename swap, so a concurrent reader (this same probe's Usage() call
-// running in another process, or a future collector invocation) never
-// observes a partially-written file -- the same pattern localstate.Store
-// uses for state.json.
+// writeUsageSnapshotAtomic persists snap to path via writeFileAtomic, so a
+// concurrent reader (this same probe's Usage() call running in another
+// process, or a future collector invocation) never observes a partially-
+// written file.
 func writeUsageSnapshotAtomic(path string, snap usageSnapshot) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
 	b, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".usage-*")
+	return writeFileAtomic(path, b)
+}
+
+// writeFileAtomic writes data to path via a temp-file-plus-rename swap --
+// the same pattern localstate.Store uses for state.json -- shared by every
+// file this package's usage probe owns (the snapshot, the dedicated
+// settings.json, and the probe identity file), so none of them can ever be
+// observed half-written by a concurrent reader.
+func writeFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -72,7 +80,7 @@ func writeUsageSnapshotAtomic(path string, snap usageSnapshot) error {
 		tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(b); err != nil {
+	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return err
 	}
