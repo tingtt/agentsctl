@@ -343,6 +343,133 @@ func TestSupervisorPTYSignalHelper(t *testing.T) {
 	}
 }
 
+func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
+	disconnected := make(chan struct{})
+	sub := &subscriber{
+		output:     make(chan []byte, subscriberBuffer),
+		disconnect: func() { close(disconnected) },
+	}
+	p := &process{
+		subscribers: map[*subscriber]struct{}{sub: {}},
+		done:        make(chan struct{}),
+	}
+	for i := range subscriberBuffer {
+		p.broadcast([]byte{byte(i)})
+	}
+	select {
+	case <-disconnected:
+		t.Fatal("subscriber disconnected before its bounded queue filled")
+	default:
+	}
+	p.broadcast([]byte("overflow"))
+	select {
+	case <-disconnected:
+	default:
+		t.Fatal("full subscriber remained attached after output could not be queued")
+	}
+	p.mu.Lock()
+	remaining := len(p.subscribers)
+	p.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("subscribers=%d, want 0 after overflow", remaining)
+	}
+	for i := range subscriberBuffer {
+		chunk, ok := <-sub.output
+		if !ok {
+			t.Fatalf("subscriber queue closed after %d chunks, want %d", i, subscriberBuffer)
+		}
+		if len(chunk) != 1 || chunk[0] != byte(i) {
+			t.Fatalf("chunk %d=%v, want ordered byte %d", i, chunk, i)
+		}
+	}
+	if _, ok := <-sub.output; ok {
+		t.Fatal("subscriber queue remained open after disconnect")
+	}
+}
+
+func TestManagedProcessExitEndsAttachAfterQueuedOutput(t *testing.T) {
+	p := &process{
+		run:         localstate.Run{ID: "r"},
+		subscribers: map[*subscriber]struct{}{},
+		done:        make(chan struct{}),
+	}
+	srv := &Server{runs: map[string]*process{"r": p}}
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer server.Close()
+		srv.attach(server, "r")
+	}()
+	kind, _, err := protocol.Read(client)
+	if err != nil || kind != protocol.Response {
+		t.Fatalf("attach response kind=%q err=%v", kind, err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		attached := len(p.subscribers) == 1
+		p.mu.Unlock()
+		if attached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not register attach subscriber")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	p.broadcast([]byte("last output"))
+	p.finishSubscribers()
+	kind, data, err := protocol.Read(client)
+	if err != nil || kind != protocol.Output || string(data) != "last output" {
+		t.Fatalf("last output kind=%q data=%q err=%v", kind, data, err)
+	}
+	kind, _, err = protocol.Read(client)
+	if err != nil || kind != protocol.Exit {
+		t.Fatalf("exit kind=%q err=%v", kind, err)
+	}
+	_ = client.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server attach did not return after process exit")
+	}
+}
+
+func TestAttachRaceWithProcessExitReturnsExit(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	p := &process{
+		run:         localstate.Run{ID: "r"},
+		subscribers: map[*subscriber]struct{}{},
+		done:        done,
+	}
+	srv := &Server{runs: map[string]*process{"r": p}}
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer server.Close()
+		srv.attach(server, "r")
+	}()
+	kind, _, err := protocol.Read(client)
+	if err != nil || kind != protocol.Response {
+		t.Fatalf("attach response kind=%q err=%v", kind, err)
+	}
+	kind, _, err = protocol.Read(client)
+	if err != nil || kind != protocol.Exit {
+		t.Fatalf("exit kind=%q err=%v", kind, err)
+	}
+	_ = client.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server attach did not return for an already-ended process")
+	}
+}
+
 // TestReattachForcesRedrawEvenWhenSizeIsUnchanged fixes the root cause of the
 // Codex reattach redraw bug: a manually raised SIGWINCH with no underlying
 // PTY size change was verified against the installed Codex CLI to not
@@ -377,20 +504,20 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	// The production drain() goroutine is the only reader of p.ptmx (a second
 	// direct reader would race it for bytes), so observe output the same way
 	// a real attach does: through a subscriber channel fed by that broadcast.
-	sub := make(chan []byte, 64)
-	p.mu.Lock()
-	p.subscribers[sub] = struct{}{}
-	p.mu.Unlock()
-	defer func() { p.mu.Lock(); delete(p.subscribers, sub); p.mu.Unlock() }()
+	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	if !p.addSubscriber(sub) {
+		t.Fatal("live process rejected subscriber")
+	}
+	defer p.removeSubscriber(sub)
 
 	// Establish a known starting size (mirrors the real attach flow, which
 	// sends a Resize frame on connect) before exercising the same-size
 	// reattach path below, and let the helper's signal.Notify land.
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	drainSubscriberFor(sub, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
+	drainSubscriberFor(sub.output, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
-	requireSubscriberContains(t, sub, "WINCH", 2*time.Second)
+	requireSubscriberContains(t, sub.output, "WINCH", 2*time.Second)
 }
 
 func drainSubscriberFor(sub <-chan []byte, d time.Duration) {

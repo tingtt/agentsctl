@@ -59,8 +59,15 @@ type process struct {
 	cmd         *exec.Cmd
 	ptmx        *os.File
 	mu          sync.Mutex
-	subscribers map[chan []byte]struct{}
+	subscribers map[*subscriber]struct{}
 	done        chan struct{}
+}
+
+const subscriberBuffer = 64
+
+type subscriber struct {
+	output     chan []byte
+	disconnect func()
 }
 type Server struct {
 	Socket            string
@@ -234,7 +241,7 @@ func (s *Server) start(c net.Conn, req Request) {
 	} else {
 		r.Error = "process identity unavailable: " + observeErr.Error()
 	}
-	p := &process{run: r, cmd: cmd, ptmx: ptmx, subscribers: map[chan []byte]struct{}{}, done: make(chan struct{})}
+	p := &process{run: r, cmd: cmd, ptmx: ptmx, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
 	s.mu.Lock()
 	s.runs[r.ID] = p
 	s.mu.Unlock()
@@ -249,14 +256,7 @@ func (s *Server) drain(p *process) {
 		n, err := p.ptmx.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
-			p.mu.Lock()
-			for ch := range p.subscribers {
-				select {
-				case ch <- chunk:
-				default:
-				}
-			}
-			p.mu.Unlock()
+			p.broadcast(chunk)
 		}
 		if err != nil {
 			break
@@ -264,13 +264,7 @@ func (s *Server) drain(p *process) {
 	}
 	_ = p.cmd.Wait()
 	_ = p.ptmx.Close()
-	p.mu.Lock()
-	close(p.done)
-	for ch := range p.subscribers {
-		close(ch)
-	}
-	p.subscribers = map[chan []byte]struct{}{}
-	p.mu.Unlock()
+	p.finishSubscribers()
 	stopped, _ := s.Store.MarkRunStopped(runID)
 	p.mu.Lock()
 	p.run = stopped
@@ -291,18 +285,27 @@ func (s *Server) attach(c net.Conn, id string) {
 	run := p.run
 	p.mu.Unlock()
 	respond(c, Response{OK: true, Run: &run})
-	out := make(chan []byte, 64)
-	p.mu.Lock()
-	p.subscribers[out] = struct{}{}
-	p.mu.Unlock()
-	defer func() { p.mu.Lock(); delete(p.subscribers, out); p.mu.Unlock() }()
+	sub := &subscriber{
+		output:     make(chan []byte, subscriberBuffer),
+		disconnect: func() { _ = c.Close() },
+	}
+	if !p.addSubscriber(sub) {
+		_ = protocol.Write(c, protocol.Exit, nil)
+		return
+	}
+	defer p.removeSubscriber(sub)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for b := range out {
+		for b := range sub.output {
 			if protocol.Write(c, protocol.Output, b) != nil {
 				return
 			}
+		}
+		select {
+		case <-p.done:
+			_ = protocol.Write(c, protocol.Exit, nil)
+		default:
 		}
 	}()
 	for {
@@ -327,6 +330,58 @@ func (s *Server) attach(c net.Conn, id string) {
 		default:
 		}
 	}
+}
+
+func (p *process) broadcast(chunk []byte) {
+	var disconnect []func()
+	p.mu.Lock()
+	for sub := range p.subscribers {
+		select {
+		case sub.output <- chunk:
+		default:
+			delete(p.subscribers, sub)
+			close(sub.output)
+			disconnect = append(disconnect, sub.disconnect)
+		}
+	}
+	p.mu.Unlock()
+	for _, closeConnection := range disconnect {
+		if closeConnection != nil {
+			closeConnection()
+		}
+	}
+}
+
+func (p *process) addSubscriber(sub *subscriber) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.done:
+		return false
+	default:
+		p.subscribers[sub] = struct{}{}
+		return true
+	}
+}
+
+func (p *process) removeSubscriber(sub *subscriber) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.subscribers[sub]; !ok {
+		return
+	}
+	delete(p.subscribers, sub)
+	close(sub.output)
+}
+
+func (p *process) finishSubscribers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	close(p.done)
+	for sub := range p.subscribers {
+		close(sub.output)
+	}
+	p.subscribers = map[*subscriber]struct{}{}
 }
 
 // syncPTYSize applies the client's terminal size to the managed PTY and, on
