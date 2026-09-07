@@ -1,6 +1,7 @@
 package agentview
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -89,17 +90,61 @@ func TestUsageColorThresholds(t *testing.T) {
 }
 
 // TestUsageWindowUnavailableIsNotZeroPercent fixes that "not reported" and
-// "reported 0%" render distinctly -- an unavailable window must never look
-// like a 0% utilization.
+// "reported 0%" render distinctly -- a window whose normalized State is
+// UsageUnknown must never look like a 0% utilization; it renders the same
+// "?%" unknown placeholder as a whole stale/never-fetched provider, not a
+// real percentage.
 func TestUsageWindowUnavailableIsNotZeroPercent(t *testing.T) {
 	now := time.Now()
-	unavailable := usageWindowText(session.UsageWindow{Available: false}, now)
-	if strings.Contains(unavailable, "%") {
-		t.Fatalf("unavailable window must not render a percentage: %q", unavailable)
+	unavailable := usageWindowText(session.UsageWindow{State: session.UsageUnknown}, now)
+	if !strings.Contains(unavailable, "?%") {
+		t.Fatalf("unknown window must render the unknown placeholder: %q", unavailable)
 	}
-	zero := usageWindowText(session.UsageWindow{Available: true, Percent: 0, Reset: now}, now)
+	if strings.Contains(unavailable, "0%") {
+		t.Fatalf("unknown window must not render a real percentage: %q", unavailable)
+	}
+	zero := usageWindowText(session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: now}, now)
 	if !strings.Contains(zero, "0%") {
 		t.Fatalf("available 0%% window must render 0%%: %q", zero)
+	}
+}
+
+// TestUsageWindowExhaustedRendersOneHundredPercentRegardlessOfPercent fixes
+// Issue #19's rendering contract: a window whose normalized State is
+// UsageExhausted always renders 100%, in red (usageColor's top threshold),
+// even if Percent carries some other value -- 100% is the display
+// convention for exhausted, never something usageWindowText itself derives
+// from Percent as a state judgment.
+func TestUsageWindowExhaustedRendersOneHundredPercentRegardlessOfPercent(t *testing.T) {
+	now := time.Now()
+	reset := now.Add(2 * time.Hour)
+	got := usageWindowText(session.UsageWindow{State: session.UsageExhausted, Percent: 37, Reset: reset}, now)
+	if !strings.Contains(got, "100%") {
+		t.Fatalf("exhausted window=%q, want 100%% regardless of Percent", got)
+	}
+	if strings.Contains(got, "37%") {
+		t.Fatalf("exhausted window=%q, must not render the raw Percent value", got)
+	}
+	if !strings.Contains(got, styleText(fmt.Sprintf("%3d%%", 100), colorRed)) {
+		t.Fatalf("exhausted window=%q, want the 100%% rendered in red", got)
+	}
+	if !strings.Contains(got, formatResetTime(reset, now)) {
+		t.Fatalf("exhausted window=%q, want the known reset time rendered", got)
+	}
+}
+
+// TestUsageWindowExhaustedWithoutKnownResetOmitsResetClause fixes that an
+// exhausted window with no known Reset time (a limit detected without a
+// carried-forward reset -- see the Claude provider) still renders cleanly,
+// without a bogus/zero-value reset clause.
+func TestUsageWindowExhaustedWithoutKnownResetOmitsResetClause(t *testing.T) {
+	now := time.Now()
+	got := usageWindowText(session.UsageWindow{State: session.UsageExhausted}, now)
+	if !strings.Contains(got, "100%") {
+		t.Fatalf("exhausted window=%q, want 100%%", got)
+	}
+	if strings.Contains(got, "reset at") {
+		t.Fatalf("exhausted window=%q, must not render a reset clause with no known reset time", got)
 	}
 }
 
@@ -130,8 +175,8 @@ func freshUsageState(usages ...session.Usage) State {
 // render order: "claude <5h>/<weekly> · codex <5h>/<weekly>".
 func TestUsageLineTextRendersClaudeBeforeCodexInOrder(t *testing.T) {
 	s := freshUsageState(
-		session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}},
-		session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 100, Reset: time.Now()}},
+		session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now()}},
+		session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 100, Reset: time.Now()}},
 	)
 	line := usageLineText(s)
 	claudeIdx := strings.Index(line, "claude")
@@ -164,7 +209,7 @@ func TestUsageLineTextShowsUnknownPlaceholderWhenNeverFetched(t *testing.T) {
 // update is older than usageStaleAfter falls back to the unknown
 // placeholder even though Usage still holds its last real reading.
 func TestUsageLineTextShowsUnknownPlaceholderWhenStale(t *testing.T) {
-	s := freshUsageState(session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}})
+	s := freshUsageState(session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now()}})
 	s.UsageUpdatedAt[session.ProviderClaude] = time.Now().Add(-(usageStaleAfter + time.Minute))
 	line := usageLineText(s)
 	if strings.Contains(line, "70%") || strings.Contains(line, "20%") {
@@ -181,7 +226,7 @@ func TestUsageLineTextShowsUnknownPlaceholderWhenStale(t *testing.T) {
 // showing the unknown placeholder must not affect a different, freshly-
 // updated provider's real reading.
 func TestUsageLineTextKeepsFreshProviderWhileOtherIsUnknown(t *testing.T) {
-	s := freshUsageState(session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 42, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 5, Reset: time.Now()}})
+	s := freshUsageState(session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 5, Reset: time.Now()}})
 	// Claude was never applied at all -- still unknown.
 	line := usageLineText(s)
 	if !strings.Contains(line, "42%") {

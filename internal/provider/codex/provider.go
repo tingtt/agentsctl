@@ -223,14 +223,18 @@ func (p *Provider) Usage(ctx context.Context) (session.Usage, error) {
 
 // rateLimitWindow converts one app-server RateLimitWindow into the
 // provider-neutral session.UsageWindow. A window with no ResetsAt means the
-// backend didn't report a reset time for it -- reported as Available:
-// false so it renders as "not reported", never a false 0%; a 0%
-// UsedPercent with a real ResetsAt is a valid, Available reading.
+// backend didn't report a reset time for it -- reported as
+// session.UsageUnknown (the zero value) so it renders as "not reported",
+// never a false 0%; a 0% UsedPercent with a real ResetsAt is a valid,
+// session.UsageAvailable reading. Codex's own transport has no limit-
+// reached signal of its own (unlike Claude's usage probe -- see Issue #19
+// and the DesignDoc's Usage capability), so this never reports
+// session.UsageExhausted.
 func rateLimitWindow(w *RateLimitWindow) session.UsageWindow {
 	if w.ResetsAt == nil {
 		return session.UsageWindow{}
 	}
-	return session.UsageWindow{Available: true, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
+	return session.UsageWindow{State: session.UsageAvailable, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
 }
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {

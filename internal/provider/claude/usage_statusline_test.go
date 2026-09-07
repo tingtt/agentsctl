@@ -1,6 +1,10 @@
 package claude
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tingtt/agentsctl/internal/session"
+)
 
 // TestParseStatusLinePayloadMapsFiveHourAndSevenDay fixes the core mapping
 // confirmed against the installed CLI's own statusLine documentation:
@@ -11,10 +15,10 @@ func TestParseStatusLinePayloadMapsFiveHourAndSevenDay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available || snap.FiveHour.Percent != 24 || snap.FiveHour.ResetAt.Unix() != 1738425600 {
+	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 24 || snap.FiveHour.ResetAt.Unix() != 1738425600 {
 		t.Fatalf("FiveHour=%+v, want Available/24%%(rounded)/reset 1738425600", snap.FiveHour)
 	}
-	if !snap.Weekly.Available || snap.Weekly.Percent != 41 || snap.Weekly.ResetAt.Unix() != 1738857600 {
+	if snap.Weekly.State != session.UsageAvailable || snap.Weekly.Percent != 41 || snap.Weekly.ResetAt.Unix() != 1738857600 {
 		t.Fatalf("Weekly=%+v, want Available/41%%/reset 1738857600", snap.Weekly)
 	}
 }
@@ -28,7 +32,7 @@ func TestParseStatusLinePayloadMissingRateLimitsIsUnavailableNotZero(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.FiveHour.Available || snap.Weekly.Available {
+	if snap.FiveHour.State == session.UsageAvailable || snap.Weekly.State == session.UsageAvailable {
 		t.Fatalf("snap=%+v, want both windows unavailable when rate_limits is absent", snap)
 	}
 }
@@ -43,10 +47,10 @@ func TestParseStatusLinePayloadWindowIndependentlyAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available {
+	if snap.FiveHour.State != session.UsageAvailable {
 		t.Fatalf("FiveHour=%+v, want Available", snap.FiveHour)
 	}
-	if snap.Weekly.Available {
+	if snap.Weekly.State == session.UsageAvailable {
 		t.Fatalf("Weekly=%+v, want Available=false when seven_day is absent", snap.Weekly)
 	}
 }
@@ -60,7 +64,7 @@ func TestParseStatusLinePayloadZeroPercentIsAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available || snap.FiveHour.Percent != 0 {
+	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 0 {
 		t.Fatalf("FiveHour=%+v, want Available=true/Percent=0 for a genuinely reported 0%%", snap.FiveHour)
 	}
 }

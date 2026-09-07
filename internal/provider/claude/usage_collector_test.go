@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // TestRunUsageCollectorParsesStdinAndWritesSnapshot fixes the collector's
@@ -19,10 +21,10 @@ func TestRunUsageCollectorParsesStdinAndWritesSnapshot(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("readUsageSnapshot ok=%v err=%v", ok, err)
 	}
-	if !snap.FiveHour.Available || snap.FiveHour.Percent != 70 {
+	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 70 {
 		t.Fatalf("FiveHour=%+v, want Available/70%%", snap.FiveHour)
 	}
-	if !snap.Weekly.Available || snap.Weekly.Percent != 20 {
+	if snap.Weekly.State != session.UsageAvailable || snap.Weekly.Percent != 20 {
 		t.Fatalf("Weekly=%+v, want Available/20%%", snap.Weekly)
 	}
 }

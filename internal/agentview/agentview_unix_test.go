@@ -154,7 +154,7 @@ func TestEventLoopAppliesUsageUpdateAndRedrawsWithoutConsumingKeyRead(t *testing
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 42, Reset: time.Now()}}}
+	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now()}}}
 
 	waitFor(t, 2*time.Second, func() bool { return bytes.Contains([]byte(out.String()), []byte("42%")) })
 
@@ -186,13 +186,13 @@ func TestEventLoopIgnoresStaleGenerationUsageUpdate(t *testing.T) {
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 42}}} // stale gen
+	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42}}} // stale gen
 
 	// Give the stale update a bounded window to (wrongly) apply, then
 	// prove a fresh gen-2 update still works -- ruling out "usageCh
 	// itself is broken" as an alternative explanation for an absent 42%.
 	time.Sleep(50 * time.Millisecond)
-	rt.usageCh <- usageEvent{gen: 2, provider: session.ProviderCodex, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 7}}}
+	rt.usageCh <- usageEvent{gen: 2, provider: session.ProviderCodex, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 7}}}
 	waitFor(t, 2*time.Second, func() bool { return bytes.Contains([]byte(out.String()), []byte("7%")) })
 
 	if bytes.Contains([]byte(out.String()), []byte("42%")) {
@@ -352,11 +352,11 @@ func TestEventLoopCodexUsageVisibleBeforeSlowClaudeCompletes(t *testing.T) {
 		fakeProvider: &fakeProvider{id: session.ProviderClaude},
 		entered:      entered,
 		release:      release,
-		usage:        session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 88}},
+		usage:        session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 88}},
 	}
 	codex := &fastUsageProvider{
 		fakeProvider: &fakeProvider{id: session.ProviderCodex},
-		usage:        session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 3}},
+		usage:        session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 3}},
 	}
 	out := &syncBuffer{}
 	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{claude, codex}, Pins: &fakePins{}}, State: NewState(), Input: inR, Output: out, CWD: "/work"}

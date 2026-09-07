@@ -113,6 +113,14 @@ type Probe struct {
 	SettleDelay       time.Duration
 	TrustSettleDelay  time.Duration
 	DetachSettleDelay time.Duration
+	// Clock overrides "now" for cache-freshness and reset-boundary
+	// decisions (see now, toSessionUsage, exhaustedSnapshot); nil uses
+	// time.Now. Exposed so a test can deterministically cross a cached
+	// window's own Reset time without sleeping (see Issue #19's reset-
+	// boundary regression tests) -- time.Now is never called directly
+	// anywhere else in this file for that purpose (see the DesignDoc's
+	// usage contract).
+	Clock func() time.Time
 
 	mu          sync.Mutex
 	snapshot    usageSnapshot
@@ -149,6 +157,12 @@ func (pr *Probe) detachSettleDelay() time.Duration {
 		return pr.DetachSettleDelay
 	}
 	return usageProbeDetachSettleDelay
+}
+func (pr *Probe) now() time.Time {
+	if pr.Clock != nil {
+		return pr.Clock()
+	}
+	return time.Now()
 }
 func (pr *Probe) settingsPath() string { return filepath.Join(pr.Dir, "settings.json") }
 func (pr *Probe) snapshotPath() string { return filepath.Join(pr.Dir, "usage.json") }
@@ -187,17 +201,26 @@ func (pr *Probe) KnownSessionID() (string, bool) {
 // cache/failure policy). Only a refresh failure with no prior snapshot at
 // all surfaces as an error, which sessionctl.Controller.Usage already
 // treats as "omit this provider from the usage line" -- never a fake 0%.
+//
+// Every returned snapshot passes through toSessionUsage with the same
+// "now" (see pr.now()), which independently normalizes each window
+// against its own cached Reset time (see toSessionUsageWindow) -- a
+// window whose reset boundary has passed since it was cached renders as
+// session.UsageUnknown here regardless of which of the three paths below
+// produced the underlying snapshot (see Issue #19's reset-boundary
+// handling).
 func (pr *Probe) Usage(ctx context.Context) (session.Usage, error) {
 	pr.loadPersistedSnapshotOnce()
+	now := pr.now()
 	if snap, ok := pr.cachedFresh(); ok {
-		return toSessionUsage(snap), nil
+		return toSessionUsage(snap, now), nil
 	}
 	snap, err := pr.refreshShared(ctx)
 	if err == nil {
-		return toSessionUsage(snap), nil
+		return toSessionUsage(snap, now), nil
 	}
 	if stale, ok := pr.cachedAny(); ok {
-		return toSessionUsage(stale), nil
+		return toSessionUsage(stale, now), nil
 	}
 	return session.Usage{}, err
 }
@@ -415,16 +438,38 @@ func (pr *Probe) detachProbeSession(ctx context.Context, cmd *exec.Cmd, wait <-c
 // toSessionUsage converts this package's own Claude-specific snapshot into
 // the provider-neutral session.Usage -- the boundary past which no
 // statusLine-shaped detail leaks (see UsageProbeSource's doc comment).
-func toSessionUsage(snap usageSnapshot) session.Usage {
+// now is compared against each window's own cached Reset independently
+// (see toSessionUsageWindow), so a 5h window whose reset boundary has
+// passed renders as unknown even while weekly's still-valid snapshot
+// renders normally, and vice versa (see Issue #19's "5h と weekly は独立
+// して評価してください").
+func toSessionUsage(snap usageSnapshot, now time.Time) session.Usage {
 	return session.Usage{
 		Provider: session.ProviderClaude,
-		FiveHour: toSessionUsageWindow(snap.FiveHour),
-		Weekly:   toSessionUsageWindow(snap.Weekly),
+		FiveHour: toSessionUsageWindow(snap.FiveHour, now),
+		Weekly:   toSessionUsageWindow(snap.Weekly, now),
 	}
 }
-func toSessionUsageWindow(w usageWindowSnapshot) session.UsageWindow {
-	if !w.Available {
+
+// toSessionUsageWindow converts one cached window, applying Issue #19's
+// reset-boundary rule: a cached reading (State != UsageUnknown) is only
+// used as-is while now is still before its own ResetAt. Once now reaches
+// or passes ResetAt, that reading belonged to a window period that has
+// since ended -- it is no longer a valid reading for the *current* period
+// (a new one may not have been fetched yet), so this reports
+// session.UsageUnknown (the zero value) rather than carrying the old
+// Percent/State forward as if it still described "now" (see the
+// DesignDoc's "cached snapshot の percentage は、その snapshot が属していた usage
+// window に対してのみ有効"). A window with no ResetAt at all (State ==
+// UsageUnknown, or -- see exhaustedWindowSnapshot -- an exhausted window
+// detected with no prior reset ever cached) has nothing to compare
+// against and is never boundary-invalidated on that basis alone.
+func toSessionUsageWindow(w usageWindowSnapshot, now time.Time) session.UsageWindow {
+	if w.State == session.UsageUnknown {
 		return session.UsageWindow{}
 	}
-	return session.UsageWindow{Available: true, Percent: w.Percent, Reset: w.ResetAt}
+	if !w.ResetAt.IsZero() && !now.Before(w.ResetAt) {
+		return session.UsageWindow{}
+	}
+	return session.UsageWindow{State: w.State, Percent: w.Percent, Reset: w.ResetAt}
 }

@@ -6,18 +6,23 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // usageWindowSnapshot is one rate-limit window (5h or weekly) as persisted
-// to agentsctl-owned storage -- Available distinguishes "the statusLine
-// payload reported 0% used" from "this window was absent from the
-// payload", the same distinction session.UsageWindow makes at the
-// provider-neutral boundary (see toSessionUsage in usage.go, the only
-// place this Claude-specific shape is converted to session.Usage).
+// to agentsctl-owned storage. State reuses the provider-neutral
+// session.UsageLimitState vocabulary directly (available/exhausted/unknown
+// -- see Issue #19's "Normalized state") rather than a redundant parallel
+// Claude-internal enum: the three-state distinction itself is not
+// Claude-specific (see this package's reset-boundary handling in
+// toSessionUsageWindow). UsageUnknown covers "the statusLine payload
+// didn't report this window at all" -- never conflated with a genuinely
+// reported 0% (UsageAvailable, Percent 0).
 type usageWindowSnapshot struct {
-	Available bool      `json:"available"`
-	Percent   int       `json:"percent"`
-	ResetAt   time.Time `json:"resetAt"`
+	State   session.UsageLimitState `json:"state"`
+	Percent int                     `json:"percent"`
+	ResetAt time.Time               `json:"resetAt"`
 }
 
 // usageSnapshot is the whole persisted usage.json document: the last

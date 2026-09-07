@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // TestUsageSnapshotRoundTripsAtomically fixes the write/read contract:
@@ -14,8 +16,8 @@ import (
 func TestUsageSnapshotRoundTripsAtomically(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "usage.json")
 	want := usageSnapshot{
-		FiveHour:   usageWindowSnapshot{Available: true, Percent: 42, ResetAt: time.Unix(1000, 0)},
-		Weekly:     usageWindowSnapshot{Available: false},
+		FiveHour:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Unix(1000, 0)},
+		Weekly:     usageWindowSnapshot{State: session.UsageUnknown},
 		ObservedAt: time.Unix(2000, 0),
 	}
 	if err := writeUsageSnapshotAtomic(path, want); err != nil {
@@ -31,8 +33,8 @@ func TestUsageSnapshotRoundTripsAtomically(t *testing.T) {
 	if got.FiveHour != want.FiveHour {
 		t.Fatalf("FiveHour=%+v, want %+v", got.FiveHour, want.FiveHour)
 	}
-	if got.Weekly.Available {
-		t.Fatalf("Weekly=%+v, want Available=false preserved across the round trip", got.Weekly)
+	if got.Weekly.State == session.UsageAvailable {
+		t.Fatalf("Weekly=%+v, want State=UsageUnknown preserved across the round trip", got.Weekly)
 	}
 	if !got.ObservedAt.Equal(want.ObservedAt) {
 		t.Fatalf("ObservedAt=%v, want %v", got.ObservedAt, want.ObservedAt)

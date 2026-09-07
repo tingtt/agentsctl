@@ -86,10 +86,10 @@ func TestUsageClassifiesWindowsByDurationNotSlotPosition(t *testing.T) {
 			if got.Provider != session.ProviderCodex {
 				t.Fatalf("Provider=%v, want codex", got.Provider)
 			}
-			if !got.FiveHour.Available || got.FiveHour.Percent != 42 || got.FiveHour.Reset.Unix() != resets5h {
+			if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 42 || got.FiveHour.Reset.Unix() != resets5h {
 				t.Fatalf("FiveHour=%+v, want Available/42%%/reset %d regardless of slot", got.FiveHour, resets5h)
 			}
-			if !got.Weekly.Available || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
+			if got.Weekly.State != session.UsageAvailable || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
 				t.Fatalf("Weekly=%+v, want Available/7%%/reset %d regardless of slot", got.Weekly, resetsWeek)
 			}
 		})
@@ -111,10 +111,10 @@ func TestUsageWeeklyOnlyAccountLeavesFiveHourUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.FiveHour.Available {
+	if got.FiveHour.State == session.UsageAvailable {
 		t.Fatalf("FiveHour=%+v, want Available=false when only a weekly window was reported", got.FiveHour)
 	}
-	if !got.Weekly.Available || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
+	if got.Weekly.State != session.UsageAvailable || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
 		t.Fatalf("Weekly=%+v, want Available/7%%/reset %d", got.Weekly, resetsWeek)
 	}
 }
@@ -134,7 +134,7 @@ func TestUsageUnknownWindowDurationIsIgnoredNotGuessed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.FiveHour.Available || got.Weekly.Available {
+	if got.FiveHour.State == session.UsageAvailable || got.Weekly.State == session.UsageAvailable {
 		t.Fatalf("got=%+v, want both windows unavailable for an unrecognized 60-minute duration", got)
 	}
 }
@@ -154,7 +154,7 @@ func TestUsageNilWindowDurationIsIgnoredNotGuessed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.FiveHour.Available || got.Weekly.Available {
+	if got.FiveHour.State == session.UsageAvailable || got.Weekly.State == session.UsageAvailable {
 		t.Fatalf("got=%+v, want both windows unavailable for a nil WindowDurationMins", got)
 	}
 }
@@ -174,7 +174,7 @@ func TestUsageZeroPercentIsAvailableNotUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.FiveHour.Available || got.FiveHour.Percent != 0 {
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 0 {
 		t.Fatalf("FiveHour=%+v, want Available=true/Percent=0 for a genuinely reported 0%%", got.FiveHour)
 	}
 }
@@ -192,10 +192,10 @@ func TestUsageMissingResetIsUnavailableNotZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.FiveHour.Available {
+	if got.FiveHour.State == session.UsageAvailable {
 		t.Fatalf("FiveHour=%+v, want Available=false for a nil Primary window", got.FiveHour)
 	}
-	if got.Weekly.Available {
+	if got.Weekly.State == session.UsageAvailable {
 		t.Fatalf("Weekly=%+v, want Available=false for a window with no resetsAt", got.Weekly)
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	base "github.com/tingtt/agentsctl/internal/provider"
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 var (
@@ -119,8 +120,8 @@ func TestProbeRefreshWritesSnapshotFromFakeStatusLine(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 70, "resets_at": 1000},
-		"seven_day": map[string]any{"used_percentage": 20, "resets_at": 2000},
+		"five_hour": map[string]any{"used_percentage": 70, "resets_at": 4102444800},
+		"seven_day": map[string]any{"used_percentage": 20, "resets_at": 4102444801},
 	})
 
 	probeDir := t.TempDir()
@@ -131,10 +132,10 @@ func TestProbeRefreshWritesSnapshotFromFakeStatusLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !usage.FiveHour.Available || usage.FiveHour.Percent != 70 {
+	if usage.FiveHour.State != session.UsageAvailable || usage.FiveHour.Percent != 70 {
 		t.Fatalf("FiveHour=%+v, want Available/70%%", usage.FiveHour)
 	}
-	if !usage.Weekly.Available || usage.Weekly.Percent != 20 {
+	if usage.Weekly.State != session.UsageAvailable || usage.Weekly.Percent != 20 {
 		t.Fatalf("Weekly=%+v, want Available/20%%", usage.Weekly)
 	}
 }
@@ -148,7 +149,7 @@ func TestProbeUsageServesFreshCacheWithoutRefreshing(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 55, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 55, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -158,7 +159,7 @@ func TestProbeUsageServesFreshCacheWithoutRefreshing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !first.FiveHour.Available || first.FiveHour.Percent != 55 {
+	if first.FiveHour.State != session.UsageAvailable || first.FiveHour.Percent != 55 {
 		t.Fatalf("first=%+v", first)
 	}
 
@@ -181,7 +182,7 @@ func TestProbeUsageStaleCacheFailsOverWithoutError(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 33, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 33, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -200,7 +201,7 @@ func TestProbeUsageStaleCacheFailsOverWithoutError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stale-cache Usage() errored instead of returning the stale snapshot: %v", err)
 	}
-	if !got.FiveHour.Available || got.FiveHour.Percent != 33 {
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 33 {
 		t.Fatalf("got=%+v, want the stale cached 33%%", got)
 	}
 }
@@ -230,7 +231,7 @@ func TestProbeConcurrentUsageSingleFlightsRefresh(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 12, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 12, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -278,7 +279,7 @@ func TestProbeKnownSessionIDExcludesCatalogRowNotJustCWD(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 5, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 5, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -349,7 +350,7 @@ func TestFakeCLIRejectsPromptWithoutTrustDialogAccept(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 70, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 70, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	settingsPath := filepath.Join(probeDir, "settings.json")
@@ -392,7 +393,7 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -411,7 +412,7 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
 	pr.mu.Unlock()
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 2, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 2, "resets_at": 4102444800},
 	})
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
@@ -434,7 +435,7 @@ func TestProbeTrustAcceptedPersistsAfterFirstRefresh(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -469,7 +470,7 @@ func TestProbeSnapshotWithoutRateLimitsIsUnavailableNotError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.FiveHour.Available || usage.Weekly.Available {
+	if usage.FiveHour.State == session.UsageAvailable || usage.Weekly.State == session.UsageAvailable {
 		t.Fatalf("usage=%+v, want both windows unavailable when no rate_limits was ever reported", usage)
 	}
 }
@@ -482,7 +483,7 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 1, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
@@ -531,7 +532,7 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 func TestProbePersistedFreshSnapshotSkipsRefreshOnNewInstance(t *testing.T) {
 	probeDir := t.TempDir()
 	want := usageSnapshot{
-		FiveHour:   usageWindowSnapshot{Available: true, Percent: 42, ResetAt: time.Unix(1000, 0)},
+		FiveHour:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Unix(4102444800, 0)},
 		ObservedAt: time.Now(),
 	}
 	if err := writeUsageSnapshotAtomic(filepath.Join(probeDir, "usage.json"), want); err != nil {
@@ -543,7 +544,7 @@ func TestProbePersistedFreshSnapshotSkipsRefreshOnNewInstance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Usage() tried to refresh instead of reusing the fresh persisted snapshot: %v", err)
 	}
-	if !got.FiveHour.Available || got.FiveHour.Percent != 42 {
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 42 {
 		t.Fatalf("got=%+v, want the persisted 42%% snapshot", got)
 	}
 }
@@ -557,11 +558,11 @@ func TestProbePersistedStaleSnapshotOnNewInstanceStillRefreshes(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
-		"five_hour": map[string]any{"used_percentage": 99, "resets_at": 1000},
+		"five_hour": map[string]any{"used_percentage": 99, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
 	stale := usageSnapshot{
-		FiveHour:   usageWindowSnapshot{Available: true, Percent: 1, ResetAt: time.Unix(1000, 0)},
+		FiveHour:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 1, ResetAt: time.Unix(4102444800, 0)},
 		ObservedAt: time.Now().Add(-2 * usageProbeTTL),
 	}
 	if err := writeUsageSnapshotAtomic(filepath.Join(probeDir, "usage.json"), stale); err != nil {

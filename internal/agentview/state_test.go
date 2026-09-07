@@ -142,8 +142,8 @@ func TestComposerCWDFollowsSelectedSession(t *testing.T) {
 // sessionctl.Controller.Usage's own partial-failure guarantee.
 func TestApplyUsageUpdateUpsertsSuccessfulProviderWithoutTouchingOthers(t *testing.T) {
 	s := NewState()
-	s.Usage = []session.Usage{{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 10}}}
-	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70}}, nil)
+	s.Usage = []session.Usage{{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 10}}}
+	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70}}, nil)
 	if len(s.Usage) != 2 {
 		t.Fatalf("Usage=%+v, want both providers present", s.Usage)
 	}
@@ -160,8 +160,8 @@ func TestApplyUsageUpdateUpsertsSuccessfulProviderWithoutTouchingOthers(t *testi
 // rather than appending a duplicate.
 func TestApplyUsageUpdateReplacesStalePreviousValueForSameProvider(t *testing.T) {
 	s := NewState()
-	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 10}}, nil)
-	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 90}}, nil)
+	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 10}}, nil)
+	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 90}}, nil)
 	if len(s.Usage) != 1 || s.Usage[0].FiveHour.Percent != 90 {
 		t.Fatalf("Usage=%+v, want a single, updated claude entry", s.Usage)
 	}
@@ -174,8 +174,8 @@ func TestApplyUsageUpdateReplacesStalePreviousValueForSameProvider(t *testing.T)
 func TestApplyUsageUpdateErrorRemovesThatProviderOnly(t *testing.T) {
 	s := NewState()
 	s.Usage = []session.Usage{
-		{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70}},
-		{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 10}},
+		{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70}},
+		{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 10}},
 	}
 	s.ApplyUsageUpdate(session.ProviderClaude, session.Usage{}, errBoomState)
 	if len(s.Usage) != 1 || s.Usage[0].Provider != session.ProviderCodex {

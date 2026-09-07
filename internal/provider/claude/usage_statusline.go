@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"math"
 	"time"
+
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // statusLinePayload is the slice of Claude Code's statusLine stdin JSON
@@ -59,17 +61,17 @@ func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
 
 // toUsageWindowSnapshot converts one statusLine rate-limit window into the
 // local snapshot shape. A nil window (the field was absent from the
-// payload) is Available: false, never a guessed 0% -- matching Codex's own
-// rateLimitWindow contract (see provider/codex.rateLimitWindow) so both
-// providers draw the same distinction between "reported 0%" and "not
-// reported".
+// payload) is session.UsageUnknown (the zero value), never a guessed 0% --
+// matching Codex's own rateLimitWindow contract (see
+// provider/codex.rateLimitWindow) so both providers draw the same
+// distinction between "reported 0%" and "not reported".
 func toUsageWindowSnapshot(w *statusLineWindow) usageWindowSnapshot {
 	if w == nil {
 		return usageWindowSnapshot{}
 	}
 	return usageWindowSnapshot{
-		Available: true,
-		Percent:   int(math.Round(w.UsedPercentage)),
-		ResetAt:   time.Unix(w.ResetsAt, 0),
+		State:   session.UsageAvailable,
+		Percent: int(math.Round(w.UsedPercentage)),
+		ResetAt: time.Unix(w.ResetsAt, 0),
 	}
 }
