@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,11 +17,16 @@ import (
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
+var errBoom = errors.New("boom")
+
 type fakeAPI struct {
 	rows       []Thread
 	archived   string
 	unarchived string
 	renamed    string
+
+	rateLimits    AccountRateLimits
+	rateLimitsErr error
 }
 
 func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
@@ -42,6 +48,168 @@ func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
 	}
 }
 
+func durationMins(m int) *int { return &m }
+
+// TestUsageClassifiesWindowsByDurationNotSlotPosition fixes the core
+// review finding: which of FiveHour/Weekly a RateLimitWindow becomes must
+// depend only on its own WindowDurationMins, never on whether it arrived
+// as Primary or Secondary. Each subtest places the 300/10080-minute
+// windows in a different Primary/Secondary arrangement and expects the
+// same FiveHour/Weekly classification regardless.
+func TestUsageClassifiesWindowsByDurationNotSlotPosition(t *testing.T) {
+	resets5h := int64(1000)
+	resetsWeek := int64(2000)
+	cases := []struct {
+		name      string
+		primary   *RateLimitWindow
+		secondary *RateLimitWindow
+	}{
+		{
+			name:      "primary 300 / secondary 10080",
+			primary:   &RateLimitWindow{UsedPercent: 42, ResetsAt: &resets5h, WindowDurationMins: durationMins(300)},
+			secondary: &RateLimitWindow{UsedPercent: 7, ResetsAt: &resetsWeek, WindowDurationMins: durationMins(10080)},
+		},
+		{
+			name:      "primary 10080 / secondary 300",
+			primary:   &RateLimitWindow{UsedPercent: 7, ResetsAt: &resetsWeek, WindowDurationMins: durationMins(10080)},
+			secondary: &RateLimitWindow{UsedPercent: 42, ResetsAt: &resets5h, WindowDurationMins: durationMins(300)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{Primary: tc.primary, Secondary: tc.secondary}}}
+			p := Provider{API: api}
+			got, err := p.Usage(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Provider != session.ProviderCodex {
+				t.Fatalf("Provider=%v, want codex", got.Provider)
+			}
+			if !got.FiveHour.Available || got.FiveHour.Percent != 42 || got.FiveHour.Reset.Unix() != resets5h {
+				t.Fatalf("FiveHour=%+v, want Available/42%%/reset %d regardless of slot", got.FiveHour, resets5h)
+			}
+			if !got.Weekly.Available || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
+				t.Fatalf("Weekly=%+v, want Available/7%%/reset %d regardless of slot", got.Weekly, resetsWeek)
+			}
+		})
+	}
+}
+
+// TestUsageWeeklyOnlyAccountLeavesFiveHourUnavailable fixes an account that
+// only has a weekly window active (Primary=10080, Secondary=nil): FiveHour
+// must be unavailable, not guessed from the weekly reading or from
+// Secondary's absence.
+func TestUsageWeeklyOnlyAccountLeavesFiveHourUnavailable(t *testing.T) {
+	resetsWeek := int64(2000)
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   &RateLimitWindow{UsedPercent: 7, ResetsAt: &resetsWeek, WindowDurationMins: durationMins(10080)},
+		Secondary: nil,
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.Available {
+		t.Fatalf("FiveHour=%+v, want Available=false when only a weekly window was reported", got.FiveHour)
+	}
+	if !got.Weekly.Available || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsWeek {
+		t.Fatalf("Weekly=%+v, want Available/7%%/reset %d", got.Weekly, resetsWeek)
+	}
+}
+
+// TestUsageUnknownWindowDurationIsIgnoredNotGuessed fixes fail-closed
+// handling of a window whose WindowDurationMins doesn't match either known
+// duration: it must not be guessed into FiveHour or Weekly, it must simply
+// not classify.
+func TestUsageUnknownWindowDurationIsIgnoredNotGuessed(t *testing.T) {
+	resetsAt := int64(1000)
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   &RateLimitWindow{UsedPercent: 42, ResetsAt: &resetsAt, WindowDurationMins: durationMins(60)},
+		Secondary: nil,
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.Available || got.Weekly.Available {
+		t.Fatalf("got=%+v, want both windows unavailable for an unrecognized 60-minute duration", got)
+	}
+}
+
+// TestUsageNilWindowDurationIsIgnoredNotGuessed fixes fail-closed handling
+// of a window with no WindowDurationMins at all (nil) -- it must not be
+// assumed to be the 5h window (or any other), matching the "primary is not
+// always 5h" contract.
+func TestUsageNilWindowDurationIsIgnoredNotGuessed(t *testing.T) {
+	resetsAt := int64(1000)
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   &RateLimitWindow{UsedPercent: 42, ResetsAt: &resetsAt, WindowDurationMins: nil},
+		Secondary: nil,
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.Available || got.Weekly.Available {
+		t.Fatalf("got=%+v, want both windows unavailable for a nil WindowDurationMins", got)
+	}
+}
+
+// TestUsageZeroPercentIsAvailableNotUnavailable fixes that a genuinely
+// reported 0% utilization (ResetsAt present) renders as an available 0%
+// reading, not as "unavailable" -- Available and Percent==0 are
+// independent, never conflated.
+func TestUsageZeroPercentIsAvailableNotUnavailable(t *testing.T) {
+	resetsAt := int64(1000)
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   &RateLimitWindow{UsedPercent: 0, ResetsAt: &resetsAt, WindowDurationMins: durationMins(300)},
+		Secondary: nil,
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.FiveHour.Available || got.FiveHour.Percent != 0 {
+		t.Fatalf("FiveHour=%+v, want Available=true/Percent=0 for a genuinely reported 0%%", got.FiveHour)
+	}
+}
+
+// TestUsageMissingResetIsUnavailableNotZero fixes that a window the
+// backend reported without a reset time renders as unavailable rather than
+// a false 0%, even though its duration is recognized.
+func TestUsageMissingResetIsUnavailableNotZero(t *testing.T) {
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   nil,
+		Secondary: &RateLimitWindow{UsedPercent: 0, ResetsAt: nil, WindowDurationMins: durationMins(10080)},
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.Available {
+		t.Fatalf("FiveHour=%+v, want Available=false for a nil Primary window", got.FiveHour)
+	}
+	if got.Weekly.Available {
+		t.Fatalf("Weekly=%+v, want Available=false for a window with no resetsAt", got.Weekly)
+	}
+}
+
+// TestUsagePropagatesAPIError fixes that a failed account/rateLimits/read
+// call is surfaced as an error, not silently reported as empty usage.
+func TestUsagePropagatesAPIError(t *testing.T) {
+	api := &fakeAPI{rateLimitsErr: errBoom}
+	p := Provider{API: api}
+	if _, err := p.Usage(context.Background()); err == nil {
+		t.Fatal("want an error when the app-server call fails")
+	}
+}
+
 func (f *fakeAPI) List(context.Context, bool) ([]Thread, error) {
 	return append([]Thread(nil), f.rows...), nil
 }
@@ -52,6 +220,9 @@ func (f *fakeAPI) Rename(_ context.Context, id, name string) error {
 func (f *fakeAPI) Archive(_ context.Context, id string) error   { f.archived = id; return nil }
 func (f *fakeAPI) Unarchive(_ context.Context, id string) error { f.unarchived = id; return nil }
 func (f *fakeAPI) CodexHome() string                            { return "" }
+func (f *fakeAPI) RateLimits(context.Context) (AccountRateLimits, error) {
+	return f.rateLimits, f.rateLimitsErr
+}
 
 func TestAmbiguousThreadBindingIsNeverGuessed(t *testing.T) {
 	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))

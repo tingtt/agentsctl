@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, sys, termios, tty
+import json, os, signal, subprocess, sys, termios, tty
 from pathlib import Path
 
 root = Path(os.environ["AGENTSCTL_FAKE_DIR"])
@@ -13,7 +13,125 @@ def load():
 def save(rows):
     path.write_text(json.dumps(rows))
 
+def arg_value(args, flag):
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+# TRUST_DIALOG_ACCEPT mirrors usageProbeTrustDialogAccept
+# (usage_probe_unix.go): Down arrow then Enter, the exact bytes real
+# Claude Code's workspace-trust dialog needs to select "Yes, I trust this
+# folder" over its own default-selected "No, exit".
+TRUST_DIALOG_ACCEPT = b"\x1b[B\r"
+
+def probe_session(session_id, settings_flag):
+    # Stands in for a real, actively-rendering interactive `claude`
+    # session for usage_probe_unix.go's Probe: it goes raw, and once it
+    # sees a full line (terminated by '\r', matching Probe.refresh's own
+    # prompt submission), it invokes the statusLine command named in
+    # --settings with a canned rate_limits payload piped to its stdin --
+    # the same shape Claude Code itself invokes a statusLine command with
+    # after a session's first API response. A ratelimits.json fixture under
+    # AGENTSCTL_FAKE_DIR controls the payload; its absence means "no
+    # rate_limits yet" (payload has none), matching a pre-first-response
+    # session.
+    #
+    # tty.setraw(0) must run before ANY other I/O in this process
+    # (matching the "attach" branch below), not just before this
+    # function's own load()/save() calls: Python's tty.setraw uses
+    # termios' TCSAFLUSH, which discards any input the kernel already
+    # queued before it runs. Go's startClaudeAttachRaw puts the pty's
+    # slave into raw mode before this process even starts specifically so
+    # a caller's write is never lost regardless of this process's own
+    # startup delay (see its doc comment) -- but that guarantee is only
+    # real if this script's own redundant setraw call (a harmless no-op
+    # the way startClaudeAttachRaw intends it) doesn't itself flush away
+    # input that arrived during slower startup work, including Python's
+    # own interpreter/import startup and any file I/O performed before
+    # this call. This is why settings_flag's copy (below) waits until
+    # after setraw, unlike the other, non-interactive branches' dispatch.
+    old = termios.tcgetattr(0)
+    tty.setraw(0)
+
+    # Real Claude Code (verified against the installed CLI): a plain
+    # interactive session ignores SIGTERM (does not exit), and treats a
+    # literal Ctrl+Z byte on stdin as an ordinary job-control suspend
+    # request rather than an exit -- only SIGINT actually ends the
+    # process. Modeled here so a test exercising detachProbeSession's
+    # SIGINT-then-SIGKILL escalation against this fake actually proves
+    # something, instead of trivially "working" against a fake that exits
+    # on anything.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+    if settings_flag:
+        # The real settings path passed on argv can vary per test run;
+        # record it once so run_statusline (which has no argv of its own)
+        # can find it regardless of the actual --settings path used.
+        (root / "probe-settings.json").write_text(Path(settings_flag).read_text())
+    rows = load()
+    rows = [r for r in rows if r["id"] != session_id]
+    rows.append({"id": session_id, "name": "agentsctl usage probe", "summary": "", "cwd": os.getcwd(), "updatedAt": 1, "status": "idle", "state": "done"})
+    save(rows)
+
+    # Real Claude Code (verified against the installed CLI): a brand-new,
+    # never-before-seen directory shows a workspace-trust confirmation
+    # dialog before any chat input is accepted, defaulting to "No, exit"
+    # -- so any input that isn't exactly TRUST_DIALOG_ACCEPT (e.g. a
+    # prompt sent without first answering it, reproducing this package's
+    # original bug) selects that default and exits immediately, never
+    # reaching chat input or invoking statusLine at all. Once accepted,
+    # trust is remembered per-directory by Claude Code itself (not
+    # anything this process's caller writes) -- modeled here with a marker
+    # file scoped to this cwd, so a later probe_session invocation in the
+    # same directory (e.g. this same test's own second refresh) skips
+    # straight to chat mode exactly like a real already-trusted directory
+    # would.
+    trust_marker = Path(os.getcwd()) / ".fake-claude-trust-accepted"
+    buf = b""
+    try:
+        if not trust_marker.exists():
+            got = b""
+            while len(got) < len(TRUST_DIALOG_ACCEPT):
+                b = os.read(0, 1)
+                if not b:
+                    return
+                got += b
+            if got != TRUST_DIALOG_ACCEPT:
+                return  # the default "No, exit" was effectively selected
+            trust_marker.write_text("trusted")
+
+        os.write(1, b"FAKE CLAUDE PROBE ATTACHED\r\n")
+        while True:
+            b = os.read(0, 1)
+            if not b:
+                break
+            if b == b"\x1a":
+                continue  # suspend request, not an exit -- see above
+            buf += b
+            if b in (b"\r", b"\n"):
+                run_statusline()
+                buf = b""
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+
+def run_statusline():
+    settings_path = root / "probe-settings.json"
+    if not settings_path.exists():
+        return
+    settings = json.loads(settings_path.read_text())
+    command = settings.get("statusLine", {}).get("command")
+    if not command:
+        return
+    ratelimits_path = root / "ratelimits.json"
+    payload = {"session_id": "probe"}
+    if ratelimits_path.exists():
+        payload["rate_limits"] = json.loads(ratelimits_path.read_text())
+    subprocess.run(command, shell=True, input=json.dumps(payload).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
 args = sys.argv[1:]
+
 if args[:1] == ["agents"]:
     print(json.dumps(load()))
 elif args[:1] == ["--bg"]:
@@ -36,5 +154,8 @@ elif args[:1] == ["attach"]:
             os.write(1, b)
     finally:
         termios.tcsetattr(0, termios.TCSADRAIN, old)
+elif "--session-id" in args or "--resume" in args:
+    session_id = arg_value(args, "--session-id") or arg_value(args, "--resume")
+    probe_session(session_id, arg_value(args, "--settings"))
 else:
     sys.exit(2)

@@ -16,6 +16,7 @@ import (
 	"github.com/tingtt/agentsctl/internal/provider/codex"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 	"github.com/tingtt/agentsctl/internal/supervisor"
+	"github.com/tingtt/agentsctl/internal/workspace"
 )
 
 func main() {
@@ -36,6 +37,13 @@ func run() error {
 		}
 		return (&supervisor.Server{Socket: *socket, Store: localstate.New(*statePath)}).Serve(ctx)
 	}
+	// claude.UsageCollectorCommand is the Claude usage probe's own
+	// statusLine command target (see claude.NewProbe/writeUsageSettings):
+	// this same executable, re-invoked as a hidden subcommand, the same
+	// pattern "daemon" above uses for the Codex supervisor's own re-exec.
+	if len(os.Args) > 1 && os.Args[1] == claude.UsageCollectorCommand {
+		return claude.RunUsageCollector(os.Args[2:], os.Stdin)
+	}
 	dir, err := configDir()
 	if err != nil {
 		return err
@@ -54,9 +62,10 @@ func run() error {
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
+	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
 	controller := sessionctl.Controller{
 		Providers: []sessionctl.Source{
-			&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer()},
+			&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
 			&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
 		},
 		Pins: store,
@@ -65,7 +74,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd}
+	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd, Worktrees: workspace.Worktrees}
 	return rt.Run(ctx)
 }
 func configDir() (string, error) {

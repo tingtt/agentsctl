@@ -92,16 +92,30 @@ func promptCursorPosition(lines []string, cursor int) (line, col int) {
 const rowLeftFixed = 4
 
 // rowRightFixed is the terminal-cell width of the right block's fixed
-// portion, before the CWD: the provider field plus the single separator
-// space between it and the CWD.
+// portion, on top of the CWD: the provider field plus the single separator
+// space between the CWD and it (the row renders title/notice -> CWD ->
+// provider; see the DesignDoc's Pinned row layout).
 const rowRightFixed = providerFieldWidth + 1
 
 // splitRowWidth lays out a session row in strict priority order --
 // provider field + CWD first, then an optional row notice, then the title
 // gets whatever cells remain -- so the row fills the terminal width
-// exactly. A notice never takes width from CWD/provider.
+// exactly. This priority order is a width *budget*, independent of the
+// row's actual left-to-right text order (title/notice -> CWD -> provider,
+// see render.go): the provider field is always reserved in full and never
+// shrinks, and CWD is reserved next out of what's left, so both keep their
+// full width under pressure before the title or notice give up any of
+// theirs. A notice never takes width from CWD/provider. cwdCells == 0
+// means the row carries no CWD column at all (see groupRows'
+// showCWD -- most rows since #14 don't, their group heading says the
+// directory instead), in which case no width is reserved for the
+// separator space a CWD column would otherwise need either.
 func splitRowWidth(width, cwdCells, noticeCells int) (title, notice, cwd int) {
-	available := width - rowLeftFixed - rowRightFixed
+	rightFixed := providerFieldWidth
+	if cwdCells > 0 {
+		rightFixed = rowRightFixed
+	}
+	available := width - rowLeftFixed - rightFixed
 	if available < 0 {
 		available = 0
 	}
@@ -137,50 +151,13 @@ func padCells(value string, width int) string {
 	return value
 }
 
-// displayCWD renders row's working directory per the active
-// directory-depth mode: depth 1-3 show that many trailing path components
-// (HOME is never counted as a component); CWDDepthAll shows the
-// shortHome-abbreviated full path.
-func displayCWD(path string, depth int) string {
-	if depth == CWDDepthAll {
-		return shortHome(path)
-	}
-	home, _ := os.UserHomeDir()
-	return trailingComponents(path, home, depth)
-}
-
-// withTrailingSlash appends a directory separator "/" to a displayed CWD,
-// unless value already ends in one.
-func withTrailingSlash(value string) string {
-	if strings.HasSuffix(value, "/") {
-		return value
-	}
-	return value + "/"
-}
-
-// trailingComponents returns the last n path components of path (HOME
-// stripped and not counted as a component).
-func trailingComponents(path, home string, n int) string {
-	rel := filepath.Clean(path)
-	if home != "" {
-		home = filepath.Clean(home)
-		if rel == home {
-			return "~"
-		}
-		if strings.HasPrefix(rel, home+string(filepath.Separator)) {
-			rel = rel[len(home)+1:]
-		}
-	}
-	var parts []string
-	for _, p := range strings.Split(rel, string(filepath.Separator)) {
-		if p != "" {
-			parts = append(parts, p)
-		}
-	}
-	if len(parts) > n {
-		parts = parts[len(parts)-n:]
-	}
-	return strings.Join(parts, "/")
+// displayCWD renders row's working directory as the shortHome-abbreviated
+// full path (see Slice B / #14: the previous depth-limited display and its
+// Ctrl+/ toggle are gone -- a session row shows either no CWD at all in a
+// same-directory scope, or its full abbreviated path in a multi-directory
+// scope).
+func displayCWD(path string) string {
+	return shortHome(path)
 }
 
 // shortHome renders path with the user's home directory abbreviated to
@@ -293,27 +270,40 @@ func viewportStart(lines []displayLine, selected, height int) int {
 	return start
 }
 
+// clipLine clips value to width visible cells, tolerating embedded ANSI
+// SGR sequences (zero-width, always copied whole). If clipping cuts value
+// off before an ANSI sequence it contains ever closes its own style (e.g.
+// a styleText-colored cwd/rule too long for a narrow terminal), a trailing
+// reset is appended -- otherwise that dangling color would bleed into
+// whatever this line's caller writes after it (see the DesignDoc's Width
+// priority section: degrading gracefully under narrow width must not also
+// corrupt unrelated later output).
 func clipLine(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	used := 0
+	used, sawANSI, truncated := 0, false, false
 	var b strings.Builder
 	for i := 0; i < len(value); {
 		if value[i] == 0x1b {
 			j := skipANSI(value, i)
 			b.WriteString(value[i:j])
+			sawANSI = true
 			i = j
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(value[i:])
 		cells := runeCells(r)
 		if used+cells > width {
+			truncated = true
 			break
 		}
 		b.WriteRune(r)
 		used += cells
 		i += size
+	}
+	if truncated && sawANSI && !strings.HasSuffix(b.String(), "\x1b[0m") {
+		b.WriteString("\x1b[0m")
 	}
 	return b.String()
 }

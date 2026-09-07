@@ -43,7 +43,19 @@ type Intent struct {
 // same KeyEsc means "cancel rename" while renaming, "cancel confirmation"
 // while one is pending, and "quit" otherwise; input_unix.go's decoder
 // knows none of this.
+//
+// Esc while HelpVisible is intercepted here, ahead of Rename/Confirmation
+// routing, per #14's fixed priority: help visible always hides help first
+// -- regardless of a pending rename or archive confirmation -- touching
+// neither the prompt nor that rename/confirmation state. Only once help is
+// hidden does a later Esc reach handleRenameKey/handleConfirmationKey/
+// handleNormalKey to cancel rename, cancel confirmation, clear the prompt,
+// or quit.
 func (s *State) Handle(ev KeyEvent) Intent {
+	if s.HelpVisible && bindingEscape.Matches(ev.Key) {
+		s.HelpVisible = false
+		return Intent{}
+	}
 	if s.Rename.Active {
 		return s.handleRenameKey(ev)
 	}
@@ -63,15 +75,26 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		}
 		return Intent{}
 	case bindingNavigate.Matches(ev.Key):
+		// #14: a multiline prompt gives Up/Down to in-prompt cursor
+		// movement instead of session-list navigation -- resolved here in
+		// State.Handle, not the terminal decoder (which only ever emits
+		// physical KeyUp/KeyDown regardless of prompt content).
+		if s.Composer.IsMultiline() {
+			switch ev.Key {
+			case KeyUp:
+				s.Composer.CursorUp()
+			case KeyDown:
+				s.Composer.CursorDown()
+			}
+			return Intent{}
+		}
 		switch ev.Key {
 		case KeyUp:
-			if i := s.SelectedIndex(); i > 0 {
-				s.selectIndex(i - 1)
+			if s.moveSelection(-1) {
 				s.Confirmation = nil
 			}
 		case KeyDown:
-			if i := s.SelectedIndex(); i >= 0 && i+1 < len(s.Rows) {
-				s.selectIndex(i + 1)
+			if s.moveSelection(1) {
 				s.Confirmation = nil
 			}
 		}
@@ -134,20 +157,60 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 			return Intent{}
 		}
 		return Intent{Kind: IntentPin, Key: row.Key}
-	case bindingDepth.Matches(ev.Key):
-		// The CWD column itself changing for every row is the feedback;
-		// no notification (see State.Error's doc comment).
-		s.CWDDepth = nextCWDDepth(s.CWDDepth)
-		return Intent{}
 	case bindingRefresh.Matches(ev.Key):
 		return Intent{Kind: IntentRefresh}
 	case bindingEscape.Matches(ev.Key):
+		// Help-visible Esc is intercepted by Handle before routing here
+		// (see Handle's doc comment) -- HelpVisible is always false by the
+		// time execution reaches this branch. What remains is #14's next
+		// priority: clear a non-empty prompt, or quit once it's empty too.
+		if s.Composer.Prompt != "" {
+			s.Composer.Clear()
+			return Intent{}
+		}
 		return Intent{Kind: IntentQuit}
+	case ev.Key == KeyRune && ev.Rune == '?' && s.Composer.Prompt == "" && !s.HelpVisible:
+		// "?" opens help only on an empty prompt with help not already
+		// shown; otherwise (prompt non-empty, or help already visible) it
+		// is a plain prompt rune -- see the generic KeyRune case below.
+		s.HelpVisible = true
+		return Intent{}
 	case ev.Key == KeyRune:
 		s.Composer.InsertAtCursor(string(ev.Rune))
 		return Intent{}
 	}
 	return Intent{}
+}
+
+// moveSelection steps selection by delta (+1/-1) through the visual row
+// order groupRows/View actually renders top-to-bottom (see
+// visualRowIndices), rather than State.Rows' raw catalog order -- so
+// Up/Down always lands on the row immediately above/below the current one
+// on screen, even when a group heading, a blank separator, or another
+// group's rows sit between them in Rows. It reports whether selection
+// actually moved (false at either end of the visual list, or if the
+// current selection isn't a visible row), mirroring the in-range guard
+// this replaces; selection identity itself is still stored as a
+// session.Key via selectIndex, never as a raw or visual index.
+func (s *State) moveSelection(delta int) bool {
+	indices := visualRowIndices(s.Rows)
+	current := s.SelectedIndex()
+	pos := -1
+	for i, idx := range indices {
+		if idx == current {
+			pos = i
+			break
+		}
+	}
+	if pos == -1 {
+		return false
+	}
+	next := pos + delta
+	if next < 0 || next >= len(indices) {
+		return false
+	}
+	s.selectIndex(indices[next])
+	return true
 }
 
 func (s *State) handleConfirmationKey(ev KeyEvent) Intent {

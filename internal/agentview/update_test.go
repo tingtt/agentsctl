@@ -37,6 +37,213 @@ func TestNavigationMovesSelectionByKeyNotIndex(t *testing.T) {
 	}
 }
 
+// interleavedDirectoryRows fixes the raw creation-time order that exposes
+// the grouped-navigation bug: two directories' sessions interleaved in
+// Rows (A1, B1, A2, B2), which groupRows regroups for display into
+// contiguous per-directory runs (A1, A2, B1, B2). Raw-index navigation
+// from A1 lands on B1 (Rows' next raw entry); visual-order navigation
+// must land on A2 (the row immediately below A1 on screen).
+func interleavedDirectoryRows() []session.Session {
+	return []session.Session{
+		rowAt(key("A1"), "/work/repo-a", false),
+		rowAt(key("B1"), "/work/repo-b", false),
+		rowAt(key("A2"), "/work/repo-a", false),
+		rowAt(key("B2"), "/work/repo-b", false),
+	}
+}
+
+// selectedName returns the DisplayName of the current selection, or "" if
+// none, for compact assertions against the visual order fixtures above
+// (whose sessions carry no Name/Summary, so DisplayName falls back to
+// their Key.ID -- "A1", "B1", etc).
+func selectedName(t *testing.T, s *State) string {
+	t.Helper()
+	row, ok := s.SelectedRow()
+	if !ok {
+		return ""
+	}
+	return row.DisplayName()
+}
+
+// TestGroupedNavigationFollowsVisualOrderDown is the primary regression for
+// the directory-grouping bug: Down must walk the on-screen (grouped) order
+// -- A1, A2, B1, B2 -- not Rows' raw interleaved order, which would skip
+// A2 and jump straight from A1 to B1. Also covers the "last row" boundary
+// (see the DesignDoc's selection guarantees / #14): a further Down at the
+// last visual row must not move selection.
+func TestGroupedNavigationFollowsVisualOrderDown(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	s.selectIndex(0) // A1
+	for _, want := range []string{"A2", "B1", "B2"} {
+		s.Handle(KeyEvent{Key: KeyDown})
+		if got := selectedName(t, &s); got != want {
+			t.Fatalf("selected=%q, want %q", got, want)
+		}
+	}
+	s.Handle(KeyEvent{Key: KeyDown})
+	if got := selectedName(t, &s); got != "B2" {
+		t.Fatalf("Down at the last visual row must not move selection: got %q", got)
+	}
+}
+
+// TestGroupedNavigationFollowsVisualOrderUp is Down's mirror: Up from B2
+// must walk B1, A2, A1 -- crossing back over the directory-group boundary
+// -- and a further Up at the first visual row must not move selection.
+func TestGroupedNavigationFollowsVisualOrderUp(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	s.selectIndex(3) // B2
+	for _, want := range []string{"B1", "A2", "A1"} {
+		s.Handle(KeyEvent{Key: KeyUp})
+		if got := selectedName(t, &s); got != want {
+			t.Fatalf("selected=%q, want %q", got, want)
+		}
+	}
+	s.Handle(KeyEvent{Key: KeyUp})
+	if got := selectedName(t, &s); got != "A1" {
+		t.Fatalf("Up at the first visual row must not move selection: got %q", got)
+	}
+}
+
+// TestGroupedNavigationPinnedToDirectoryGroup fixes that Pinned sessions
+// (a single group spanning every directory) and the per-directory groups
+// beneath it form one continuous visual order: Down off the last Pinned
+// row must land on the first row of the first directory group, and Up
+// must return.
+func TestGroupedNavigationPinnedToDirectoryGroup(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		rowAt(key("P1"), "/work/repo-a", true),
+		rowAt(key("P2"), "/work/repo-b", true),
+		rowAt(key("A1"), "/work/repo-a", false),
+		rowAt(key("B1"), "/work/repo-b", false),
+	})
+	s.selectIndex(1) // P2
+	s.Handle(KeyEvent{Key: KeyDown})
+	if got := selectedName(t, &s); got != "A1" {
+		t.Fatalf("selected=%q, want A1 (visual next after Pinned)", got)
+	}
+	s.Handle(KeyEvent{Key: KeyUp})
+	if got := selectedName(t, &s); got != "P2" {
+		t.Fatalf("selected=%q, want P2 (visual previous, back into Pinned)", got)
+	}
+}
+
+// TestConfirmationCancelsOnGroupedSelectionMove is
+// TestConfirmationCancelsOnSelectionMove's multi-directory counterpart:
+// moving off a row with an armed confirmation must cancel it and land on
+// the visual-next row (A2), not Rows' raw-next row (B1) -- the same bug
+// TestGroupedNavigationFollowsVisualOrderDown fixes, exercised through the
+// confirmation path.
+func TestConfirmationCancelsOnGroupedSelectionMove(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("A1"), CWD: "/work/repo-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("B1"), CWD: "/work/repo-b"},
+		{Key: key("A2"), CWD: "/work/repo-a"},
+	})
+	s.selectIndex(0) // A1
+	s.Handle(KeyEvent{Key: KeyCtrlX})
+	s.Handle(KeyEvent{Key: KeyDown})
+	if _, ok := s.rowNotice(key("A1")); ok {
+		t.Fatal("moving selection must cancel a pending confirmation")
+	}
+	if got := selectedName(t, &s); got != "A2" {
+		t.Fatalf("selected=%q, want visual-next A2 (not raw-next B1)", got)
+	}
+}
+
+// TestGroupedRenderAndNavigationAgreeOnSessionOrder is the end-to-end
+// guarantee: the session order View() actually renders top-to-bottom and
+// the order repeated Down presses visit must be identical. This is the
+// user-facing contract the bug broke (a visible row being skipped);
+// asserting it directly, rather than only against the visualRowIndices
+// helper, catches any future regression where render and navigation drift
+// apart again regardless of how either is implemented internally.
+func TestGroupedRenderAndNavigationAgreeOnSessionOrder(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	want := []string{"A1", "A2", "B1", "B2"}
+
+	view := s.View(80, 20)
+	var rendered []string
+	for _, line := range strings.Split(view, "\n") {
+		for _, id := range want {
+			if strings.Contains(line, id) {
+				rendered = append(rendered, id)
+				break
+			}
+		}
+	}
+	if strings.Join(rendered, ",") != strings.Join(want, ",") {
+		t.Fatalf("rendered session order=%v, want %v\n%s", rendered, want, view)
+	}
+
+	s.selectIndex(0)
+	navigated := []string{selectedName(t, &s)}
+	for range want[1:] {
+		s.Handle(KeyEvent{Key: KeyDown})
+		navigated = append(navigated, selectedName(t, &s))
+	}
+	if strings.Join(navigated, ",") != strings.Join(want, ",") {
+		t.Fatalf("navigated session order=%v, want %v", navigated, want)
+	}
+}
+
+// TestMultilineUpDownMovesCursorNotSelection fixes #14's input-priority
+// requirement: with a multiline prompt, Up/Down move the in-prompt cursor
+// and must never move session selection, resolved in State.Handle (not
+// the terminal decoder, which emits the same physical KeyUp/KeyDown either
+// way).
+func TestMultilineUpDownMovesCursorNotSelection(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
+	s.selectIndex(0)
+	s.Composer.Prompt = "first\nsecond"
+	s.Composer.Cursor = len([]rune(s.Composer.Prompt)) // end of "second" (col 6)
+
+	intent := s.Handle(KeyEvent{Key: KeyUp})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.SelectedIndex() != 0 {
+		t.Fatalf("SelectedIndex=%d, want unchanged 0 (multiline Up must not move selection)", s.SelectedIndex())
+	}
+	if want := len([]rune("first")); s.Composer.Cursor != want { // clamped onto "first"'s own EOL (col 5)
+		t.Fatalf("Cursor=%d, want %d (moved onto \"first\", clamped to its EOL)", s.Composer.Cursor, want)
+	}
+
+	s.Handle(KeyEvent{Key: KeyDown})
+	if s.SelectedIndex() != 0 {
+		t.Fatalf("SelectedIndex=%d, want still unchanged 0", s.SelectedIndex())
+	}
+	if want := len([]rune("first\nsecond")); s.Composer.Cursor != want {
+		t.Fatalf("Cursor=%d, want %d (back onto \"second\")", s.Composer.Cursor, want)
+	}
+}
+
+// TestSingleLineUpDownStillMovesSessionSelectionEvenWithText fixes that
+// the multiline-priority carve-out is scoped to an actual embedded
+// newline: a non-empty but single-line prompt must still let Up/Down
+// drive session-list navigation exactly like an empty one (see
+// TestNavigationMovesSelectionByKeyNotIndex for the empty-composer case).
+func TestSingleLineUpDownStillMovesSessionSelectionEvenWithText(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
+	s.selectIndex(0)
+	s.Composer.Prompt = "no newline here"
+	s.Composer.Cursor = 5
+
+	s.Handle(KeyEvent{Key: KeyDown})
+	if s.SelectedIndex() != 1 {
+		t.Fatalf("SelectedIndex=%d, want 1 (single-line prompt must not block selection)", s.SelectedIndex())
+	}
+	if s.Composer.Cursor != 5 {
+		t.Fatalf("Cursor=%d, want unchanged 5 (single-line Up/Down must not touch the composer)", s.Composer.Cursor)
+	}
+}
+
 func TestComposerEditingInsertsAndDeletes(t *testing.T) {
 	s := NewState()
 	for _, r := range "hi" {
@@ -207,20 +414,20 @@ func TestRenameEscCancelsWithoutIntent(t *testing.T) {
 
 func TestCtrlGCyclesScopeAndRequestsRefresh(t *testing.T) {
 	s := NewState()
-	if s.Scope != session.ScopeCWD {
-		t.Fatalf("initial scope=%v, want ScopeCWD", s.Scope)
+	if s.Scope != session.ScopeSame {
+		t.Fatalf("initial scope=%v, want ScopeSame", s.Scope)
 	}
 	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
-	if intent.Kind != IntentRefresh || s.Scope != session.ScopeSubtree {
-		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeSubtree", intent, s.Scope)
+	if intent.Kind != IntentRefresh || s.Scope != session.ScopeDescendants {
+		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeDescendants", intent, s.Scope)
 	}
 	s.Handle(KeyEvent{Key: KeyCtrlG})
 	if s.Scope != session.ScopeAll {
 		t.Fatalf("scope=%v, want ScopeAll", s.Scope)
 	}
 	s.Handle(KeyEvent{Key: KeyCtrlG})
-	if s.Scope != session.ScopeCWD {
-		t.Fatalf("scope=%v, want wrap back to ScopeCWD", s.Scope)
+	if s.Scope != session.ScopeSame {
+		t.Fatalf("scope=%v, want wrap back to ScopeSame", s.Scope)
 	}
 }
 
@@ -237,18 +444,6 @@ func TestCtrlLRequestsRefresh(t *testing.T) {
 	s := NewState()
 	if intent := s.Handle(KeyEvent{Key: KeyCtrlL}); intent.Kind != IntentRefresh {
 		t.Fatalf("intent=%+v", intent)
-	}
-}
-
-func TestCtrlSlashCyclesCWDDepthWithoutAnIntent(t *testing.T) {
-	s := NewState()
-	start := s.CWDDepth
-	intent := s.Handle(KeyEvent{Key: KeyCtrlSlash})
-	if intent.Kind != IntentNone {
-		t.Fatalf("intent=%+v, want none (depth change is its own feedback)", intent)
-	}
-	if s.CWDDepth == start {
-		t.Fatal("CWDDepth did not change")
 	}
 }
 
@@ -271,5 +466,103 @@ func TestEscQuitsOnlyOutsideRenameAndConfirmation(t *testing.T) {
 	s := NewState()
 	if intent := s.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {
 		t.Fatalf("plain Esc must quit: %+v", intent)
+	}
+}
+
+// TestHelpVisibleEscWithEmptyPromptOnlyHidesHelp fixes #14's fixed Esc
+// priority: help visible always wins first, so Esc must only hide help --
+// never fall through to the "empty prompt -> quit" behavior it would
+// otherwise trigger.
+func TestHelpVisibleEscWithEmptyPromptOnlyHidesHelp(t *testing.T) {
+	s := NewState()
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none (help-hiding Esc must not quit)", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+}
+
+// TestHelpVisibleEscWithNonEmptyPromptPreservesPrompt fixes that a
+// help-hiding Esc must not also clear the prompt, even though a non-empty
+// prompt would normally be Esc's next priority once help is out of the way.
+func TestHelpVisibleEscWithNonEmptyPromptPreservesPrompt(t *testing.T) {
+	s := NewState()
+	s.HelpVisible = true
+	s.Composer.Prompt = "hoge"
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if s.Composer.Prompt != "hoge" {
+		t.Fatalf("prompt=%q, want unchanged (help-hiding Esc must not clear it)", s.Composer.Prompt)
+	}
+	// The next Esc, with help now hidden, falls through to normal priority:
+	// a non-empty prompt gets cleared, not quit.
+	intent = s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none (clearing the prompt, not quitting)", intent)
+	}
+	if s.Composer.Prompt != "" {
+		t.Fatalf("prompt=%q, want cleared by the next Esc now that help is hidden", s.Composer.Prompt)
+	}
+}
+
+// TestHelpVisibleEscWithPendingConfirmationPreservesConfirmation fixes that
+// a help-hiding Esc must not also cancel a pending archive confirmation,
+// even though Confirmation != nil would otherwise route Esc to
+// handleConfirmationKey ahead of the normal-state Esc priority.
+func TestHelpVisibleEscWithPendingConfirmationPreservesConfirmation(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionArchive: {Available: true}})})
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arm the confirmation on "a"
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if _, ok := s.rowNotice(key("a")); !ok {
+		t.Fatal("pending confirmation must survive a help-hiding Esc")
+	}
+	// The next Esc, with help now hidden, falls through to normal priority
+	// and cancels the confirmation as usual.
+	s.Handle(KeyEvent{Key: KeyEsc})
+	if _, ok := s.rowNotice(key("a")); ok {
+		t.Fatal("the following Esc (help already hidden) must cancel the confirmation as usual")
+	}
+}
+
+// TestHelpVisibleEscWithActiveRenamePreservesRename fixes that a
+// help-hiding Esc must not also cancel an in-progress rename, even though
+// Rename.Active would otherwise route Esc to handleRenameKey ahead of the
+// normal-state Esc priority.
+func TestHelpVisibleEscWithActiveRenamePreservesRename(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionRename: {Available: true}})})
+	s.Handle(KeyEvent{Key: KeyCtrlR}) // start renaming "a"
+	s.HelpVisible = true
+	intent := s.Handle(KeyEvent{Key: KeyEsc})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.HelpVisible {
+		t.Fatal("help must be hidden after Esc")
+	}
+	if !s.Rename.Active || s.Rename.Target != key("a") {
+		t.Fatalf("rename must survive a help-hiding Esc: %+v", s.Rename)
+	}
+	// The next Esc, with help now hidden, falls through to normal priority
+	// and cancels the rename as usual.
+	s.Handle(KeyEvent{Key: KeyEsc})
+	if s.Rename.Active {
+		t.Fatal("the following Esc (help already hidden) must cancel the rename as usual")
 	}
 }

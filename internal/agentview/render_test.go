@@ -18,8 +18,20 @@ func TestArchiveConfirmationRendersRedOnTargetRowNotFooter(t *testing.T) {
 	view := s.View(80, 12)
 	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
 	confirmStyled := styleText("Press Ctrl+X again to archive", colorRed)
-	found := false
-	for _, line := range lines[:len(lines)-3] { // exclude the 3 footer lines
+	found, inComposer := false, false
+	for _, line := range lines {
+		// The composer block starts at the top rule (identifiable by its
+		// "─" fill, unlike any session-list line); everything at or after
+		// it is the footer, which must never carry the row notice.
+		if strings.Contains(line, "─") {
+			inComposer = true
+		}
+		if inComposer {
+			if strings.Contains(line, "Press Ctrl+X again to archive") {
+				t.Fatalf("archive confirmation leaked into the composer/footer: %q", line)
+			}
+			continue
+		}
 		if strings.Contains(line, "old") && strings.Contains(line, confirmStyled) {
 			found = true
 		}
@@ -27,22 +39,19 @@ func TestArchiveConfirmationRendersRedOnTargetRowNotFooter(t *testing.T) {
 	if !found {
 		t.Fatalf("archive confirmation not found styled red on the target row:\n%s", view)
 	}
-	for _, line := range lines[len(lines)-3:] {
-		if strings.Contains(line, "Press Ctrl+X again to archive") {
-			t.Fatalf("archive confirmation leaked into the footer: %q", line)
-		}
-	}
 }
 
 // TestFullwidthTitleWithNoticeKeepsCWDAlignment fixes that the provider/
 // cwd block's start column stays identical whether or not a row carries a
-// notice, and regardless of full-width glyphs in the title.
+// notice, and regardless of full-width glyphs in the title. Only Pinned
+// rows across more than one directory carry an inline CWD column (see
+// groupRows), so both rows here are pinned and given distinct directories
+// under a shared "/work/project..." prefix.
 func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
-	cwd := "/work/project"
 	s := NewState()
 	s.SetRows([]session.Session{
-		{Key: key("a"), Name: "short", Activity: session.ActivityIdle, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
-		{Key: key("b"), Name: "日本語のタイトル", Activity: session.ActivityWorking, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("a"), Name: "short", Pinned: true, Activity: session.ActivityIdle, CWD: "/work/project-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "日本語のタイトル", Pinned: true, Activity: session.ActivityWorking, CWD: "/work/project-b", Actions: session.Actions{session.ActionArchive: {Available: true}}},
 	})
 	s.selectIndex(1)
 	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms the confirmation on row "b"
@@ -50,7 +59,13 @@ func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
 	var offsets []int
 	for _, line := range lines {
-		if idx := strings.Index(line, "project"); idx >= 0 {
+		// Restrict to session rows: the composer's own top rule also
+		// renders "/work/project-b" (the selected row's ComposerCWD), which
+		// would otherwise be miscounted as a third row here.
+		if !strings.Contains(line, "short") && !strings.Contains(line, "日本語のタイトル") {
+			continue
+		}
+		if idx := strings.Index(line, "/work/project"); idx >= 0 {
 			offsets = append(offsets, lineCells(line[:idx]))
 		}
 	}
@@ -95,5 +110,128 @@ func TestNarrowTerminalNeverPanics(t *testing.T) {
 	s.Handle(KeyEvent{Key: KeyCtrlX})
 	for _, dims := range [][2]int{{0, 0}, {1, 1}, {5, 3}, {80, 0}} {
 		_ = s.View(dims[0], dims[1])
+	}
+}
+
+// TestMultiDirectoryPinnedRowOrdersCWDBeforeProvider fixes #14's Desired UI
+// for a multi-directory Pinned row: the row's right-hand block renders
+// `cwd -> provider`, not the reviewed-away `provider -> cwd` order.
+func TestMultiDirectoryPinnedRowOrdersCWDBeforeProvider(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", Pinned: true, CWD: "/work/repo-a"},
+		{Key: key("b"), Name: "second", Pinned: true, CWD: "/work/repo-b"},
+	})
+	view := s.View(120, 12)
+	lines := strings.Split(view, "\n")
+	var row string
+	for _, line := range lines {
+		if strings.Contains(line, "first") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("row for \"first\" not found:\n%s", view)
+	}
+	cwdIdx := strings.Index(row, displayCWD("/work/repo-a"))
+	providerIdx := strings.Index(row, "claude")
+	if cwdIdx < 0 || providerIdx < 0 {
+		t.Fatalf("row missing cwd or provider: %q", row)
+	}
+	if cwdIdx >= providerIdx {
+		t.Fatalf("row=%q, want cwd (idx %d) before provider (idx %d)", row, cwdIdx, providerIdx)
+	}
+}
+
+// TestSameDirectoryRowRendersNoCWD fixes that a same-directory scope's rows
+// never render an inline CWD, at the full View level (not just groupRows'
+// showCWD flag).
+func TestSameDirectoryRowRendersNoCWD(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", CWD: "/work/only-directory"},
+		{Key: key("b"), Name: "second", CWD: "/work/only-directory"},
+	})
+	view := s.View(120, 12)
+	for _, line := range strings.Split(view, "\n") {
+		if (strings.Contains(line, "first") || strings.Contains(line, "second")) && strings.Contains(line, displayCWD("/work/only-directory")) {
+			t.Fatalf("same-directory row must not render its cwd inline: %q", line)
+		}
+	}
+}
+
+// TestUnpinnedDirectoryGroupRowDoesNotRepeatCWD fixes that an unpinned
+// row's own line never repeats the directory already stated by its group
+// heading, at the full View level.
+func TestUnpinnedDirectoryGroupRowDoesNotRepeatCWD(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", CWD: "/work/repo-a"},
+		{Key: key("b"), Name: "second", CWD: "/work/repo-b"},
+	})
+	view := s.View(120, 12)
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "first") && strings.Contains(line, displayCWD("/work/repo-a")) {
+			t.Fatalf("unpinned directory-group row must not repeat its heading's cwd: %q", line)
+		}
+	}
+}
+
+// TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI is the
+// integration-level counterpart to TestClipLineTruncationClosesDanglingStyle:
+// rendering a real multi-directory Pinned row (title -> cwd -> provider,
+// each individually styled) across a sweep of narrow widths must never
+// leave a line with an unclosed SGR sequence that would bleed color into
+// whatever renders next.
+func TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "日本語のセッションタイトルとても長い", Pinned: true, CWD: "/workspace/github.com/tingtt/agentsctl", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "second", Pinned: true, CWD: "/workspace/github.com/tingtt-dojo/third-score"},
+	})
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms a row notice on row "a"
+	for width := 1; width <= 60; width++ {
+		view := s.View(width, 12)
+		for _, line := range strings.Split(view, "\n") {
+			if open := ansiOpenAtLineEnd(line); open {
+				t.Fatalf("width=%d: line leaves an unclosed ANSI style: %q", width, line)
+			}
+		}
+	}
+}
+
+// ansiOpenAtLineEnd reports whether line ends with an SGR style still
+// active -- i.e. its last SGR escape sequence isn't a reset ("\x1b[0m").
+func ansiOpenAtLineEnd(line string) bool {
+	open := false
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b {
+			j := skipANSI(line, i)
+			open = line[i:j] != "\x1b[0m"
+			i = j
+			continue
+		}
+		i++
+	}
+	return open
+}
+
+// TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth is a
+// representative narrow-terminal guarantee for #14's new list rendering:
+// a Pinned row's directory column, a directory group heading, the
+// provider field, the title, a row notice, and full-width Japanese glyphs
+// must all degrade gracefully together (never panic) at a narrow width.
+func TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "日本語のセッションタイトルとても長い", Pinned: true, CWD: "/workspace/github.com/tingtt/agentsctl", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "second", CWD: "/workspace/github.com/tingtt-dojo/third-score", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+	})
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms a row notice on row "a"
+	for width := 1; width <= 40; width++ {
+		_ = s.View(width, 12)
 	}
 }

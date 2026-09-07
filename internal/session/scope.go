@@ -6,45 +6,60 @@ import (
 )
 
 // DirectoryScope selects which sessions' CWDs Agent View shows, relative to
-// the directory agentsctl was started in. Cycled cwd -> cwd/** -> all ->
-// cwd (see the DesignDoc's Directory scope section).
+// the directory agentsctl was started in. Cycled same directory ->
+// descendants + worktree directories -> all -> same directory (see the
+// DesignDoc's Directory scope section).
 type DirectoryScope int
 
 const (
-	// ScopeCWD shows only sessions whose CWD is exactly the directory
+	// ScopeSame shows only sessions whose CWD is exactly the directory
 	// agentsctl was started in.
-	ScopeCWD DirectoryScope = iota
-	// ScopeSubtree shows sessions whose CWD is the starting directory
-	// itself or any descendant of it (an inclusive recursive subtree).
-	ScopeSubtree
+	ScopeSame DirectoryScope = iota
+	// ScopeDescendants shows sessions whose CWD is the starting directory
+	// itself, a descendant of it (an inclusive recursive subtree), or
+	// itself/a descendant of one of Scope.WorktreeDirectories -- the
+	// working directories of git worktrees belonging to the same
+	// repository as the starting directory.
+	ScopeDescendants
 	// ScopeAll shows every session regardless of CWD.
 	ScopeAll
 )
 
-// Scope is a Filter input: the directory-scope mode plus the starting
-// directory it is relative to.
+// Scope is a Filter input: the directory-scope mode, the starting directory
+// it is relative to, and (for ScopeDescendants) any additional worktree
+// roots to include alongside it.
 type Scope struct {
 	CurrentDirectory string
 	Directory        DirectoryScope
+	// WorktreeDirectories are extra ScopeDescendants roots -- each included
+	// together with its own descendants, exactly like CurrentDirectory --
+	// discovered outside this package (see internal/workspace) since
+	// finding them requires git/filesystem I/O. Filter never discovers
+	// these itself; it only ever compares the paths it is given. Ignored
+	// for ScopeSame and ScopeAll.
+	WorktreeDirectories []string
 }
 
 // Filter returns the subset of sessions visible under scope, preserving
 // input order (callers apply SortOverview separately). It performs no I/O:
-// CurrentDirectory and each Session's CWD are compared as given.
+// CurrentDirectory, WorktreeDirectories, and each Session's CWD are
+// compared as given.
 func Filter(sessions []Session, scope Scope) []Session {
 	switch scope.Directory {
 	case ScopeAll:
 		return sessions
-	case ScopeSubtree:
-		current := normalizeDirectory(scope.CurrentDirectory)
+	case ScopeDescendants:
+		roots := make([]string, 0, 1+len(scope.WorktreeDirectories))
+		roots = append(roots, scope.CurrentDirectory)
+		roots = append(roots, scope.WorktreeDirectories...)
 		filtered := make([]Session, 0, len(sessions))
 		for _, row := range sessions {
-			if isWithinSubtree(current, row.CWD) {
+			if isWithinAnySubtree(roots, row.CWD) {
 				filtered = append(filtered, row)
 			}
 		}
 		return filtered
-	default: // ScopeCWD
+	default: // ScopeSame
 		current := normalizeDirectory(scope.CurrentDirectory)
 		filtered := make([]Session, 0, len(sessions))
 		for _, row := range sessions {
@@ -60,6 +75,17 @@ func Filter(sessions []Session, scope Scope) []Session {
 // compare filepath-cleaned logical paths and agentsctl keeps that UX
 // contract (see the DesignDoc's Symlink section).
 func normalizeDirectory(path string) string { return filepath.Clean(path) }
+
+// isWithinAnySubtree reports whether candidate is within (or is) any of
+// roots.
+func isWithinAnySubtree(roots []string, candidate string) bool {
+	for _, root := range roots {
+		if isWithinSubtree(root, candidate) {
+			return true
+		}
+	}
+	return false
+}
 
 // isWithinSubtree reports whether candidate is root itself or a descendant
 // of root, using filepath.Rel on cleaned logical paths (no symlink

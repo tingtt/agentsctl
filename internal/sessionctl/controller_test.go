@@ -81,7 +81,7 @@ func TestLoadAppliesScopeAndOrder(t *testing.T) {
 		}}},
 		Pins: &fakePinStore{pinned: map[string]bool{"claude:pinned": true}},
 	}
-	got := c.Load(context.Background(), session.Scope{CurrentDirectory: "/proj", Directory: session.ScopeCWD})
+	got := c.Load(context.Background(), session.Scope{CurrentDirectory: "/proj", Directory: session.ScopeSame})
 	if len(got.Sessions) != 2 {
 		t.Fatalf("scope must exclude /other: %+v", got.Sessions)
 	}

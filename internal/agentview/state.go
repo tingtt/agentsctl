@@ -1,6 +1,9 @@
 package agentview
 
 import (
+	"sort"
+	"time"
+
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -23,14 +26,20 @@ type State struct {
 
 	Composer Composer
 
-	// Scope selects which sessions' CWDs are shown (cwd -> cwd/** -> all
-	// -> cwd, cycled by Ctrl+G). session.ScopeCWD is the zero value, so a
-	// fresh State starts scoped to the current directory without an
-	// explicit default here.
+	// Scope selects which sessions' CWDs are shown (same directory ->
+	// descendants + worktree directories -> all -> same directory, cycled
+	// by Ctrl+G). session.ScopeSame is the zero value, so a fresh State
+	// starts scoped to the current directory without an explicit default
+	// here.
 	Scope session.DirectoryScope
-	// CWDDepth is the directory-path display depth (1-3 trailing
-	// components, or CWDDepthAll), cycled by Ctrl+/.
-	CWDDepth int
+
+	// StartupCWD is the directory agentsctl was started in -- the listing
+	// scope anchor (see session.Scope.CurrentDirectory) -- and, per #14,
+	// only ComposerCWD's fallback for when no session is selectable at
+	// all. It never changes for the life of a Runtime; see
+	// Runtime.reload, the single place that keeps it in sync with
+	// Runtime.CWD.
+	StartupCWD string
 
 	// Error holds the most recent action failure. It is the only thing
 	// ever rendered in the composer-top notification area, reserved for
@@ -48,6 +57,29 @@ type State struct {
 	// (see PendingConfirmation).
 	Confirmation *PendingConfirmation
 
+	// HelpVisible toggles #14's help view in place of the contextual
+	// footer/usage lines. Only "?" on an empty composer prompt sets it
+	// (see State.Handle); Esc's meaning is entirely governed by it while
+	// true (hide help, never touching the prompt -- see the DesignDoc's
+	// Esc priority order).
+	HelpVisible bool
+
+	// Usage holds the most recently loaded provider usage rows (see
+	// sessionctl.Controller.Usage), rendered as #14's composer usage line.
+	// A provider absent here either doesn't implement
+	// sessionctl.UsageSource or failed to report usage on the last
+	// reload -- either way it is simply omitted, never rendered as 0%.
+	Usage []session.Usage
+
+	// UsageUpdatedAt tracks, per provider, the wall-clock time of its most
+	// recent successful entry in Usage (see ApplyUsageUpdate) -- how the
+	// composer usage line tells a provider it just heard from apart from
+	// one whose last known reading has gone stale, rendering the latter as
+	// unknown ("?%") rather than a possibly-misleading old percentage (see
+	// usageStaleAfter in footer.go). A provider absent here has never
+	// reported successfully at all.
+	UsageUpdatedAt map[session.ProviderID]time.Time
+
 	// LastAttachedKey/HasLastAttached identify the session most recently
 	// Opened from the overview, regardless of how that Open ended (an
 	// explicit detach, or the session/process exiting on its own): title
@@ -59,15 +91,10 @@ type State struct {
 	HasLastAttached bool
 }
 
-// CWDDepthAll is the sentinel State.CWDDepth value selecting the "all"
-// directory-depth display mode.
-const CWDDepthAll = 0
-
 // NewState returns a freshly-initialized State: Claude as the initial
-// composer provider target and a 2-component CWD display depth, matching
-// the pre-refactor default.
+// composer provider target, matching the pre-refactor default.
 func NewState() State {
-	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, CWDDepth: 2}
+	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, UsageUpdatedAt: map[session.ProviderID]time.Time{}}
 }
 
 // SetRows installs rows as the current catalog snapshot, preserving
@@ -115,6 +142,20 @@ func (s State) SelectedRow() (session.Session, bool) {
 		}
 	}
 	return session.Session{}, false
+}
+
+// ComposerCWD is the directory context the composer displays and any new
+// prompt dispatches into (see the DesignDoc's composer cwd section /
+// #14): the selected session's own CWD, so both display and dispatch
+// follow selection as it moves across directories. StartupCWD is only a
+// safe fallback for when no session is selectable at all (an empty
+// catalog) -- it never overrides an actual selection, even one outside
+// the current listing scope's own anchor directory.
+func (s State) ComposerCWD() string {
+	if row, ok := s.SelectedRow(); ok {
+		return row.CWD
+	}
+	return s.StartupCWD
 }
 
 // SelectedIndex returns the row index of the current selection for
@@ -177,42 +218,58 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 	}
 }
 
-// nextCWDDepth cycles the directory-depth display mode: 1 -> 2 -> 3 ->
-// all -> 1.
-func nextCWDDepth(depth int) int {
-	switch depth {
-	case 1:
-		return 2
-	case 2:
-		return 3
-	case 3:
-		return CWDDepthAll
-	default:
-		return 1
+// ApplyUsageUpdate incorporates one provider's incremental usage result
+// (see sessionctl.Controller.UsageStream) into Usage: a successful reading
+// upserts that provider's entry and records its arrival time in
+// UsageUpdatedAt, an error removes the entry (leaving UsageUpdatedAt
+// untouched, so a still-recent prior success doesn't immediately look
+// unknown just because this one refresh failed) -- matching Controller.
+// Usage's own "omit on failure, never a fake 0%" contract, just applied
+// per provider instead of only at the end of one batch call. Usage is
+// never reset wholesale here: a provider not yet updated in the current
+// refresh cycle keeps showing its last known reading (see Runtime.reload's
+// doc comment) rather than flickering to blank while a slower provider is
+// still in flight -- until it goes stale on its own (usageStaleAfter).
+func (s *State) ApplyUsageUpdate(provider session.ProviderID, usage session.Usage, err error) {
+	next := make([]session.Usage, 0, len(s.Usage)+1)
+	for _, u := range s.Usage {
+		if u.Provider != provider {
+			next = append(next, u)
+		}
 	}
+	if err == nil {
+		next = append(next, usage)
+		if s.UsageUpdatedAt == nil {
+			s.UsageUpdatedAt = map[session.ProviderID]time.Time{}
+		}
+		s.UsageUpdatedAt[provider] = time.Now()
+	}
+	sort.Slice(next, func(i, j int) bool { return next[i].Provider < next[j].Provider })
+	s.Usage = next
 }
 
-// nextScope cycles the session-list directory scope: cwd -> cwd/** -> all
-// -> cwd, bound to Ctrl+G.
+// nextScope cycles the session-list directory scope: same directory ->
+// descendants + worktree directories -> all -> same directory, bound to
+// Ctrl+G.
 func nextScope(scope session.DirectoryScope) session.DirectoryScope {
 	switch scope {
-	case session.ScopeCWD:
-		return session.ScopeSubtree
-	case session.ScopeSubtree:
+	case session.ScopeSame:
+		return session.ScopeDescendants
+	case session.ScopeDescendants:
 		return session.ScopeAll
 	default:
-		return session.ScopeCWD
+		return session.ScopeSame
 	}
 }
 
 // scopeLabel is the short header text for scope.
 func scopeLabel(scope session.DirectoryScope) string {
 	switch scope {
-	case session.ScopeSubtree:
-		return "cwd/**"
+	case session.ScopeDescendants:
+		return "descendants"
 	case session.ScopeAll:
 		return "all"
 	default:
-		return "cwd"
+		return "same"
 	}
 }

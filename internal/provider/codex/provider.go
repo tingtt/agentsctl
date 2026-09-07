@@ -181,6 +181,57 @@ func isTerminalRunState(state string) bool {
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
 	return p.API.Unarchive(ctx, k.ID)
 }
+
+// fiveHourWindowDurationMins and weeklyWindowDurationMins are the
+// windowDurationMins values the installed Codex CLI reports for its
+// rolling 5-hour and weekly rate-limit windows, respectively. Usage
+// classifies each RateLimitWindow by this duration rather than by its
+// Primary/Secondary position -- the app-server has been observed to place
+// either window in either slot (see RateLimitSnapshot's doc comment).
+const (
+	fiveHourWindowDurationMins = 300
+	weeklyWindowDurationMins   = 10080
+)
+
+// Usage implements sessionctl.UsageSource via the app-server's
+// account/rateLimits/read method (see AppServer.RateLimits) -- the same
+// native, machine-readable transport List/Rename/Archive already use. Each
+// of Primary/Secondary is classified into FiveHour/Weekly by its own
+// WindowDurationMins, never by which slot it arrived in. A window with an
+// unrecognized or absent WindowDurationMins is left unclassified (fail
+// closed: never guessed into either bucket), so it simply doesn't
+// contribute a FiveHour/Weekly reading.
+func (p *Provider) Usage(ctx context.Context) (session.Usage, error) {
+	limits, err := p.API.RateLimits(ctx)
+	if err != nil {
+		return session.Usage{}, err
+	}
+	usage := session.Usage{Provider: session.ProviderCodex}
+	for _, w := range []*RateLimitWindow{limits.RateLimits.Primary, limits.RateLimits.Secondary} {
+		if w == nil || w.WindowDurationMins == nil {
+			continue
+		}
+		switch *w.WindowDurationMins {
+		case fiveHourWindowDurationMins:
+			usage.FiveHour = rateLimitWindow(w)
+		case weeklyWindowDurationMins:
+			usage.Weekly = rateLimitWindow(w)
+		}
+	}
+	return usage, nil
+}
+
+// rateLimitWindow converts one app-server RateLimitWindow into the
+// provider-neutral session.UsageWindow. A window with no ResetsAt means the
+// backend didn't report a reset time for it -- reported as Available:
+// false so it renders as "not reported", never a false 0%; a 0%
+// UsedPercent with a real ResetsAt is a valid, Available reading.
+func rateLimitWindow(w *RateLimitWindow) session.UsageWindow {
+	if w.ResetsAt == nil {
+		return session.UsageWindow{}
+	}
+	return session.UsageWindow{Available: true, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
+}
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")

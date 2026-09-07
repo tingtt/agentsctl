@@ -49,6 +49,34 @@ type NativeRenamer interface {
 // to see the rename succeed -- see Provider.Rename.
 const renameCleanupTimeout = 8 * time.Second
 
+// UsageProbeSource is the Claude usage probe's own capability surface
+// Provider depends on for sessionctl.UsageSource (#14's composer usage
+// line) -- an interface, not a direct call into usage_probe_unix.go's
+// *Probe (its only real implementation, unix-only), for exactly the reason
+// NativeRenamer is an interface: this package stays buildable even where
+// the PTY-based implementation isn't (see NativeRenamer's doc comment).
+//
+// `claude` has no on-demand usage/limits/quota subcommand or flag (checked
+// `claude --help` and `claude auth status --json`, which reports
+// login/plan identity only), and no local cache file under `~/.claude`
+// carries a rate-limit snapshot either. The only interface that does carry
+// it is Claude Code's own `statusLine` hook JSON payload
+// (`rate_limits.five_hour`/`seven_day`, each with
+// `used_percentage`/`resets_at` -- see
+// https://code.claude.com/docs/en/statusline), but that is only invoked
+// from a live, actively-rendering interactive TUI loop after that
+// session's first API response (`claude -p`/`--bg` never invoke it at
+// all). Usage therefore reads it via a dedicated, agentsctl-owned
+// interactive Claude session (see usage_probe_unix.go's Probe) rather than
+// hijacking a real user session or terminal.
+type UsageProbeSource interface {
+	Usage(ctx context.Context) (session.Usage, error)
+	// KnownSessionID reports the probe's own Claude session identity, if
+	// one has ever been created, so List can exclude that exact row from
+	// the normal catalog (see Provider.List) -- identity, never CWD alone.
+	KnownSessionID() (string, bool)
+}
+
 type Provider struct {
 	Path   string
 	Runner base.Runner
@@ -58,6 +86,12 @@ type Provider struct {
 	// Renamer makes Rename fail closed rather than silently falling back to
 	// a local-only rename.
 	Renamer NativeRenamer
+	// UsageProbe backs Usage (sessionctl.UsageSource) and List's catalog
+	// exclusion of the probe's own row. Production wires it from
+	// usage_probe_unix.NewProbe(); nil makes Usage fail closed (Claude
+	// simply omitted from the usage line, per UsageSource's optional-
+	// capability contract) and List skip no rows at all.
+	UsageProbe UsageProbeSource
 	// ConfirmPollInterval and ConfirmMaxWait override confirmRenamed's
 	// native-catalog poll cadence and ceiling; zero uses the documented
 	// defaults (confirmPollInterval/confirmMaxWait). Exposed so a test that
@@ -99,10 +133,24 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		return nil, fmt.Errorf("decode claude agents JSON: %w", err)
 	}
 	claudeArchived, legacyNames, _ := p.Store.ClaudeState()
+	var probeID string
+	if p.UsageProbe != nil {
+		probeID, _ = p.UsageProbe.KnownSessionID()
+	}
 	rows := make([]session.Session, 0, len(raw))
 	for _, v := range raw {
 		id := text(v, "id", "sessionId")
 		if id == "" {
+			continue
+		}
+		// The usage probe's own session must never appear in the normal
+		// catalog (pin/rename/attach/stop/archive/grouping all operate on
+		// session.Session rows) -- excluded by its exact recorded identity,
+		// never by CWD alone, so a real user session that happens to share
+		// the probe's dedicated app-data directory (which nothing else
+		// should ever use, but fail-closed matters more than convenience
+		// here) is never hidden by mistake. See UsageProbeSource.KnownSessionID.
+		if probeID != "" && id == probeID {
 			continue
 		}
 		isArchived := claudeArchived[id]
@@ -181,6 +229,20 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
 	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Actions: actions}, nil
 }
+
+// Usage implements sessionctl.UsageSource by delegating to the owned
+// probe session (see UsageProbeSource). A nil UsageProbe (this platform's
+// PTY-based implementation isn't wired, or a test constructed Provider
+// without one) fails closed: Claude is simply omitted from the usage line,
+// matching UsageSource's optional-per-provider contract -- never a fake
+// 0%.
+func (p *Provider) Usage(ctx context.Context) (session.Usage, error) {
+	if p.UsageProbe == nil {
+		return session.Usage{}, errors.New("claude usage probe is not configured")
+	}
+	return p.UsageProbe.Usage(ctx)
+}
+
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	res, err := p.Runner.Run(ctx, p.path(), []string{"stop", k.ID}, "")
 	if err != nil {
