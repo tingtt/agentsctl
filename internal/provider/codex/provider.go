@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -221,14 +222,27 @@ func (p *Provider) Open(ctx context.Context, s session.Session, in *os.File, out
 // most one Codex app-server thread, per the DesignDoc's run-to-thread
 // binding rule: a candidate thread must be new since the run's own
 // pre-dispatch baseline, share its CWD, and be owned (writer lock) by the
-// run's own process identity. Zero or multiple candidates never bind —
-// see localstate.Store.ReconcileRuns, which applies this atomically
-// against the live locked run record rather than a stale pre-lock
-// snapshot.
+// run's own process identity. Zero or multiple candidates never bind.
+//
+// The writer-lock ownership probe (owner below) is filesystem/process I/O,
+// so it runs entirely against an unlocked Runs() snapshot, never inside
+// localstate's exclusive lock -- Codex-specific observation like this must
+// not become something every other localstate caller (a concurrent TUI
+// reading pins, the supervisor saving an unrelated run) blocks on. Once a
+// run's binding decision is computed, UpdateRunIf re-verifies -- atomically,
+// under the lock, and without I/O -- that the record still matches this
+// snapshot before applying it, so a run that changed since (bound,
+// deleted, or otherwise mutated by a concurrent writer) is never
+// clobbered by a now-stale decision; reconcile simply leaves it for the
+// next List to reconsider.
 func (p *Provider) reconcile(threads []Thread) error {
-	return p.Store.ReconcileRuns(func(_ string, r localstate.Run) (localstate.Run, bool) {
+	runs, err := p.Store.Runs()
+	if err != nil {
+		return err
+	}
+	for id, r := range runs {
 		if r.Provider != "codex" || r.SessionID != "" || r.State == "failed" || r.State == "stale" {
-			return r, false
+			continue
 		}
 		base := map[string]bool{}
 		for _, x := range r.Baseline {
@@ -245,18 +259,25 @@ func (p *Provider) reconcile(threads []Thread) error {
 				candidates = append(candidates, t.ID)
 			}
 		}
+		next := r
 		switch len(candidates) {
 		case 1:
-			r.SessionID = candidates[0]
-			r.Error = ""
-			return r, true
+			next.SessionID = candidates[0]
+			next.Error = ""
 		case 0:
-			return r, false
+			continue
 		default:
-			r.Error = "ambiguous Codex thread binding; candidates were not guessed"
-			return r, true
+			next.Error = "ambiguous Codex thread binding; candidates were not guessed"
 		}
-	})
+		snapshot, decided := r, next
+		if _, err := p.Store.UpdateRunIf(id,
+			func(current localstate.Run) bool { return reflect.DeepEqual(current, snapshot) },
+			func(localstate.Run) localstate.Run { return decided },
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (p *Provider) writerAbsent(id string) bool {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -159,19 +160,26 @@ func TestDeleteTerminalUnboundRunRechecksAtDeleteTime(t *testing.T) {
 	}
 }
 
-func TestReconcileRunsPersistsOnlyChangedRuns(t *testing.T) {
+// TestUpdateRunIfAppliesWhenPredicateMatchesCurrent fixes the ordinary
+// compare-and-apply path: predicate seeing exactly what is currently
+// persisted applies mutate's result and reports applied.
+func TestUpdateRunIfAppliesWhenPredicateMatchesCurrent(t *testing.T) {
 	s := New(filepath.Join(t.TempDir(), "state.json"))
 	_ = s.StartRun(Run{ID: "bind-me", State: "running"})
 	_ = s.StartRun(Run{ID: "leave-me", State: "running"})
-	err := s.ReconcileRuns(func(id string, r Run) (Run, bool) {
-		if id != "bind-me" {
-			return r, false
-		}
-		r.SessionID = "thread-1"
-		return r, true
-	})
+	snapshot, err := s.Runs()
 	if err != nil {
 		t.Fatal(err)
+	}
+	applied, err := s.UpdateRunIf("bind-me",
+		func(current Run) bool { return reflect.DeepEqual(current, snapshot["bind-me"]) },
+		func(current Run) Run { current.SessionID = "thread-1"; return current },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("applied = false, want true")
 	}
 	runs, err := s.Runs()
 	if err != nil {
@@ -182,6 +190,138 @@ func TestReconcileRunsPersistsOnlyChangedRuns(t *testing.T) {
 	}
 	if runs["leave-me"].SessionID != "" {
 		t.Fatalf("leave-me must be untouched: %+v", runs["leave-me"])
+	}
+}
+
+// TestUpdateRunIfSkipsStaleDecision is the core stale-safety guarantee:
+// predicate is re-evaluated against the record as it exists at update
+// time, not as it existed when a caller made its (possibly slow,
+// possibly I/O-derived) decision -- so a decision computed against an
+// earlier snapshot, handed to UpdateRunIf after the record changed
+// underneath it, must lose rather than clobber the concurrent change.
+func TestUpdateRunIfSkipsStaleDecision(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "state.json"))
+	_ = s.StartRun(Run{ID: "r", State: "running", CWD: "/work"})
+	staleSnapshot, err := s.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Someone else -- a concurrent writer, e.g. the supervisor observing
+	// the process exited -- mutates the run after the snapshot above was
+	// taken but before the caller's own (deliberately stale) predicate
+	// runs.
+	if _, err := s.MarkRunStopped("r"); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.UpdateRunIf("r",
+		func(current Run) bool { return reflect.DeepEqual(current, staleSnapshot["r"]) },
+		func(current Run) Run { current.SessionID = "thread-1"; return current },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("applied = true for a stale predicate, want false")
+	}
+	runs, err := s.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs["r"].SessionID != "" {
+		t.Fatalf("stale decision was applied despite the concurrent change: %+v", runs["r"])
+	}
+	if runs["r"].State != "stopped" {
+		t.Fatalf("concurrent MarkRunStopped was overwritten: %+v", runs["r"])
+	}
+}
+
+// TestUpdateRunIfSkipsWhenRunGone fixes the other half of "the record
+// changed underneath the caller": a run deleted between the caller's
+// snapshot and its UpdateRunIf call must not be recreated.
+func TestUpdateRunIfSkipsWhenRunGone(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "state.json"))
+	_ = s.StartRun(Run{ID: "r", State: "failed"})
+	snapshot, err := s.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteRun("r"); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.UpdateRunIf("r",
+		func(current Run) bool { return reflect.DeepEqual(current, snapshot["r"]) },
+		func(current Run) Run { current.SessionID = "thread-1"; return current },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("applied = true for a deleted run, want false")
+	}
+	runs, err := s.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := runs["r"]; ok {
+		t.Fatal("UpdateRunIf recreated a deleted run")
+	}
+}
+
+// TestUpdateRunIfSerializesConcurrentPredicatedWrites is a race test: many
+// goroutines race to bind the same run from the same initial snapshot
+// (simulating provider/codex.Provider.reconcile's writer-lock-ownership
+// decision racing a concurrent List/reconcile in another process). Exactly
+// one must win -- predicate re-evaluated under the lock means every writer
+// after the first sees a record that no longer matches its stale
+// snapshot -- and the run must never end up clobbered back to a stale
+// value.
+func TestUpdateRunIfSerializesConcurrentPredicatedWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	a, b := New(path), New(path)
+	_ = a.StartRun(Run{ID: "r", State: "running"})
+	snapshot, err := a.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := snapshot["r"]
+	const n = 20
+	applied := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s := a
+			if i%2 == 1 {
+				s = b
+			}
+			ok, err := s.UpdateRunIf("r",
+				func(current Run) bool { return reflect.DeepEqual(current, initial) },
+				func(current Run) Run { current.SessionID = fmt.Sprintf("thread-%d", i); return current },
+			)
+			if err != nil {
+				t.Errorf("UpdateRunIf(%d): %v", i, err)
+				return
+			}
+			applied[i] = ok
+		}(i)
+	}
+	wg.Wait()
+	wins := 0
+	for _, ok := range applied {
+		if ok {
+			wins++
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("wins=%d, want exactly 1 (every writer raced from the same stale snapshot)", wins)
+	}
+	runs, err := a.Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runs["r"].SessionID == "" {
+		t.Fatal("no SessionID was persisted despite exactly one writer reporting applied")
 	}
 }
 

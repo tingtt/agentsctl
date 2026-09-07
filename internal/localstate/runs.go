@@ -96,23 +96,35 @@ func (s *Store) DeleteTerminalUnboundRun(id string, isTerminal func(state string
 	})
 }
 
-// ReconcileRuns applies bind to every currently-tracked run: bind decides,
-// from its own domain logic (Codex thread candidates, writer ownership,
-// ...), whether/how to update one run, returning the possibly-changed
-// record and whether to persist it. This is the one place outside
-// provider/codex that a Codex-specific matching rule would leak into
-// localstate if it lived here instead -- so localstate only owns the
-// atomic "read every run, let the caller decide, persist what changed"
-// transaction, never the matching rule itself (see provider/codex's
-// reconcile, the only caller).
-func (s *Store) ReconcileRuns(bind func(id string, r Run) (next Run, changed bool)) error {
-	return s.update(func(d *data) error {
-		for id, r := range d.Runs {
-			next, changed := bind(id, toRun(r))
-			if changed {
-				d.Runs[id] = fromRun(next)
-			}
+// UpdateRunIf conditionally applies mutate to run id: predicate is
+// re-evaluated here, under the exclusive lock, against whatever is
+// currently persisted -- never against a caller's own earlier read -- and
+// the update is applied only if it still returns true. If id is not
+// currently tracked, or predicate returns false, nothing is persisted and
+// applied reports false; this is not an error, just a caller's decision
+// losing to whatever changed (or removed) the record first.
+//
+// predicate and mutate must be pure functions of the Run they are given --
+// no filesystem/process I/O, no capturing external state that could
+// change between calls. This is the compare-and-apply half of a
+// stale-safe update: a caller with an expensive or I/O-bound decision
+// (e.g. provider/codex.Provider.reconcile's Codex writer-lock ownership
+// probes) computes that decision against an earlier, unlocked Runs()
+// snapshot, entirely outside any localstate lock, then hands the
+// already-computed result to mutate and a snapshot-equality check to
+// predicate -- so the potentially-slow external observation never runs
+// while localstate holds its cross-process exclusive lock, and a run that
+// changed in between (bound, deleted, or otherwise mutated by a
+// concurrent writer) is never clobbered by a now-stale decision.
+func (s *Store) UpdateRunIf(id string, predicate func(current Run) bool, mutate func(current Run) Run) (applied bool, err error) {
+	err = s.update(func(d *data) error {
+		r, ok := d.Runs[id]
+		if !ok || !predicate(toRun(r)) {
+			return nil
 		}
+		d.Runs[id] = fromRun(mutate(toRun(r)))
+		applied = true
 		return nil
 	})
+	return applied, err
 }
