@@ -94,3 +94,18 @@ func multiDirectory(rows []session.Session) bool {
 }
 
 func directoryKey(path string) string { return filepath.Clean(path) }
+
+// visualRowIndices flattens groupRows' output into the single ordered list
+// of selectable row indices the list actually renders top-to-bottom --
+// group headings and blank separators contribute nothing, since groupRows
+// never puts them in a group's own indices. This is the one source render
+// (View) and selection navigation (update.go's moveSelection) share for
+// "row order as seen on screen", so a raw State.Rows index and its on-
+// screen neighbor can never disagree.
+func visualRowIndices(rows []session.Session) []int {
+	var indices []int
+	for _, g := range groupRows(rows) {
+		indices = append(indices, g.indices...)
+	}
+	return indices
+}

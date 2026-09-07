@@ -37,6 +37,160 @@ func TestNavigationMovesSelectionByKeyNotIndex(t *testing.T) {
 	}
 }
 
+// interleavedDirectoryRows fixes the raw creation-time order that exposes
+// the grouped-navigation bug: two directories' sessions interleaved in
+// Rows (A1, B1, A2, B2), which groupRows regroups for display into
+// contiguous per-directory runs (A1, A2, B1, B2). Raw-index navigation
+// from A1 lands on B1 (Rows' next raw entry); visual-order navigation
+// must land on A2 (the row immediately below A1 on screen).
+func interleavedDirectoryRows() []session.Session {
+	return []session.Session{
+		rowAt(key("A1"), "/work/repo-a", false),
+		rowAt(key("B1"), "/work/repo-b", false),
+		rowAt(key("A2"), "/work/repo-a", false),
+		rowAt(key("B2"), "/work/repo-b", false),
+	}
+}
+
+// selectedName returns the DisplayName of the current selection, or "" if
+// none, for compact assertions against the visual order fixtures above
+// (whose sessions carry no Name/Summary, so DisplayName falls back to
+// their Key.ID -- "A1", "B1", etc).
+func selectedName(t *testing.T, s *State) string {
+	t.Helper()
+	row, ok := s.SelectedRow()
+	if !ok {
+		return ""
+	}
+	return row.DisplayName()
+}
+
+// TestGroupedNavigationFollowsVisualOrderDown is the primary regression for
+// the directory-grouping bug: Down must walk the on-screen (grouped) order
+// -- A1, A2, B1, B2 -- not Rows' raw interleaved order, which would skip
+// A2 and jump straight from A1 to B1. Also covers the "last row" boundary
+// (see the DesignDoc's selection guarantees / #14): a further Down at the
+// last visual row must not move selection.
+func TestGroupedNavigationFollowsVisualOrderDown(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	s.selectIndex(0) // A1
+	for _, want := range []string{"A2", "B1", "B2"} {
+		s.Handle(KeyEvent{Key: KeyDown})
+		if got := selectedName(t, &s); got != want {
+			t.Fatalf("selected=%q, want %q", got, want)
+		}
+	}
+	s.Handle(KeyEvent{Key: KeyDown})
+	if got := selectedName(t, &s); got != "B2" {
+		t.Fatalf("Down at the last visual row must not move selection: got %q", got)
+	}
+}
+
+// TestGroupedNavigationFollowsVisualOrderUp is Down's mirror: Up from B2
+// must walk B1, A2, A1 -- crossing back over the directory-group boundary
+// -- and a further Up at the first visual row must not move selection.
+func TestGroupedNavigationFollowsVisualOrderUp(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	s.selectIndex(3) // B2
+	for _, want := range []string{"B1", "A2", "A1"} {
+		s.Handle(KeyEvent{Key: KeyUp})
+		if got := selectedName(t, &s); got != want {
+			t.Fatalf("selected=%q, want %q", got, want)
+		}
+	}
+	s.Handle(KeyEvent{Key: KeyUp})
+	if got := selectedName(t, &s); got != "A1" {
+		t.Fatalf("Up at the first visual row must not move selection: got %q", got)
+	}
+}
+
+// TestGroupedNavigationPinnedToDirectoryGroup fixes that Pinned sessions
+// (a single group spanning every directory) and the per-directory groups
+// beneath it form one continuous visual order: Down off the last Pinned
+// row must land on the first row of the first directory group, and Up
+// must return.
+func TestGroupedNavigationPinnedToDirectoryGroup(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		rowAt(key("P1"), "/work/repo-a", true),
+		rowAt(key("P2"), "/work/repo-b", true),
+		rowAt(key("A1"), "/work/repo-a", false),
+		rowAt(key("B1"), "/work/repo-b", false),
+	})
+	s.selectIndex(1) // P2
+	s.Handle(KeyEvent{Key: KeyDown})
+	if got := selectedName(t, &s); got != "A1" {
+		t.Fatalf("selected=%q, want A1 (visual next after Pinned)", got)
+	}
+	s.Handle(KeyEvent{Key: KeyUp})
+	if got := selectedName(t, &s); got != "P2" {
+		t.Fatalf("selected=%q, want P2 (visual previous, back into Pinned)", got)
+	}
+}
+
+// TestConfirmationCancelsOnGroupedSelectionMove is
+// TestConfirmationCancelsOnSelectionMove's multi-directory counterpart:
+// moving off a row with an armed confirmation must cancel it and land on
+// the visual-next row (A2), not Rows' raw-next row (B1) -- the same bug
+// TestGroupedNavigationFollowsVisualOrderDown fixes, exercised through the
+// confirmation path.
+func TestConfirmationCancelsOnGroupedSelectionMove(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("A1"), CWD: "/work/repo-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("B1"), CWD: "/work/repo-b"},
+		{Key: key("A2"), CWD: "/work/repo-a"},
+	})
+	s.selectIndex(0) // A1
+	s.Handle(KeyEvent{Key: KeyCtrlX})
+	s.Handle(KeyEvent{Key: KeyDown})
+	if _, ok := s.rowNotice(key("A1")); ok {
+		t.Fatal("moving selection must cancel a pending confirmation")
+	}
+	if got := selectedName(t, &s); got != "A2" {
+		t.Fatalf("selected=%q, want visual-next A2 (not raw-next B1)", got)
+	}
+}
+
+// TestGroupedRenderAndNavigationAgreeOnSessionOrder is the end-to-end
+// guarantee: the session order View() actually renders top-to-bottom and
+// the order repeated Down presses visit must be identical. This is the
+// user-facing contract the bug broke (a visible row being skipped);
+// asserting it directly, rather than only against the visualRowIndices
+// helper, catches any future regression where render and navigation drift
+// apart again regardless of how either is implemented internally.
+func TestGroupedRenderAndNavigationAgreeOnSessionOrder(t *testing.T) {
+	s := NewState()
+	s.SetRows(interleavedDirectoryRows())
+	want := []string{"A1", "A2", "B1", "B2"}
+
+	view := s.View(80, 20)
+	var rendered []string
+	for _, line := range strings.Split(view, "\n") {
+		for _, id := range want {
+			if strings.Contains(line, id) {
+				rendered = append(rendered, id)
+				break
+			}
+		}
+	}
+	if strings.Join(rendered, ",") != strings.Join(want, ",") {
+		t.Fatalf("rendered session order=%v, want %v\n%s", rendered, want, view)
+	}
+
+	s.selectIndex(0)
+	navigated := []string{selectedName(t, &s)}
+	for range want[1:] {
+		s.Handle(KeyEvent{Key: KeyDown})
+		navigated = append(navigated, selectedName(t, &s))
+	}
+	if strings.Join(navigated, ",") != strings.Join(want, ",") {
+		t.Fatalf("navigated session order=%v, want %v", navigated, want)
+	}
+}
+
 // TestMultilineUpDownMovesCursorNotSelection fixes #14's input-priority
 // requirement: with a multiline prompt, Up/Down move the in-prompt cursor
 // and must never move session selection, resolved in State.Handle (not

@@ -90,13 +90,11 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		}
 		switch ev.Key {
 		case KeyUp:
-			if i := s.SelectedIndex(); i > 0 {
-				s.selectIndex(i - 1)
+			if s.moveSelection(-1) {
 				s.Confirmation = nil
 			}
 		case KeyDown:
-			if i := s.SelectedIndex(); i >= 0 && i+1 < len(s.Rows) {
-				s.selectIndex(i + 1)
+			if s.moveSelection(1) {
 				s.Confirmation = nil
 			}
 		}
@@ -182,6 +180,37 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		return Intent{}
 	}
 	return Intent{}
+}
+
+// moveSelection steps selection by delta (+1/-1) through the visual row
+// order groupRows/View actually renders top-to-bottom (see
+// visualRowIndices), rather than State.Rows' raw catalog order -- so
+// Up/Down always lands on the row immediately above/below the current one
+// on screen, even when a group heading, a blank separator, or another
+// group's rows sit between them in Rows. It reports whether selection
+// actually moved (false at either end of the visual list, or if the
+// current selection isn't a visible row), mirroring the in-range guard
+// this replaces; selection identity itself is still stored as a
+// session.Key via selectIndex, never as a raw or visual index.
+func (s *State) moveSelection(delta int) bool {
+	indices := visualRowIndices(s.Rows)
+	current := s.SelectedIndex()
+	pos := -1
+	for i, idx := range indices {
+		if idx == current {
+			pos = i
+			break
+		}
+	}
+	if pos == -1 {
+		return false
+	}
+	next := pos + delta
+	if next < 0 || next >= len(indices) {
+		return false
+	}
+	s.selectIndex(indices[next])
+	return true
 }
 
 func (s *State) handleConfirmationKey(ev KeyEvent) Intent {
