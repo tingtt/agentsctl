@@ -137,7 +137,24 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	case bindingRefresh.Matches(ev.Key):
 		return Intent{Kind: IntentRefresh}
 	case bindingEscape.Matches(ev.Key):
+		// #14's Esc priority: hide help first (never touching the prompt),
+		// then clear a non-empty prompt, and only quit once both are
+		// already empty/hidden.
+		if s.HelpVisible {
+			s.HelpVisible = false
+			return Intent{}
+		}
+		if s.Composer.Prompt != "" {
+			s.Composer.Clear()
+			return Intent{}
+		}
 		return Intent{Kind: IntentQuit}
+	case ev.Key == KeyRune && ev.Rune == '?' && s.Composer.Prompt == "" && !s.HelpVisible:
+		// "?" opens help only on an empty prompt with help not already
+		// shown; otherwise (prompt non-empty, or help already visible) it
+		// is a plain prompt rune -- see the generic KeyRune case below.
+		s.HelpVisible = true
+		return Intent{}
 	case ev.Key == KeyRune:
 		s.Composer.InsertAtCursor(string(ev.Rune))
 		return Intent{}

@@ -18,19 +18,26 @@ func TestArchiveConfirmationRendersRedOnTargetRowNotFooter(t *testing.T) {
 	view := s.View(80, 12)
 	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
 	confirmStyled := styleText("Press Ctrl+X again to archive", colorRed)
-	found := false
-	for _, line := range lines[:len(lines)-3] { // exclude the 3 footer lines
+	found, inComposer := false, false
+	for _, line := range lines {
+		// The composer block starts at the top rule (identifiable by its
+		// "─" fill, unlike any session-list line); everything at or after
+		// it is the footer, which must never carry the row notice.
+		if strings.Contains(line, "─") {
+			inComposer = true
+		}
+		if inComposer {
+			if strings.Contains(line, "Press Ctrl+X again to archive") {
+				t.Fatalf("archive confirmation leaked into the composer/footer: %q", line)
+			}
+			continue
+		}
 		if strings.Contains(line, "old") && strings.Contains(line, confirmStyled) {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatalf("archive confirmation not found styled red on the target row:\n%s", view)
-	}
-	for _, line := range lines[len(lines)-3:] {
-		if strings.Contains(line, "Press Ctrl+X again to archive") {
-			t.Fatalf("archive confirmation leaked into the footer: %q", line)
-		}
 	}
 }
 
@@ -52,6 +59,12 @@ func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
 	var offsets []int
 	for _, line := range lines {
+		// Restrict to session rows: the composer's own top rule also
+		// renders "/work/project-b" (the selected row's ComposerCWD), which
+		// would otherwise be miscounted as a third row here.
+		if !strings.Contains(line, "short") && !strings.Contains(line, "日本語のタイトル") {
+			continue
+		}
 		if idx := strings.Index(line, "/work/project"); idx >= 0 {
 			offsets = append(offsets, lineCells(line[:idx]))
 		}

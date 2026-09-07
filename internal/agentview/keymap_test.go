@@ -1,35 +1,10 @@
 package agentview
 
 import (
-	"slices"
-	"strings"
 	"testing"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
-
-// equalBinding reports whether got and want are the same Binding, physical
-// Keys included -- Label/Desc alone can't catch a Keys-only drift (e.g.
-// footerLine1 losing sync with a named binding's Keys while keeping its
-// Label/Desc).
-func equalBinding(got, want Binding) bool {
-	return got.Label == want.Label &&
-		got.Desc == want.Desc &&
-		slices.Equal(got.Keys, want.Keys)
-}
-
-// TestFooterLinesMatchCentralizedBindings fixes the exact footer text
-// against the Binding definitions it is built from, so a label/description
-// typo shows up as a Binding change, not a silently-diverged literal
-// string in render.go.
-func TestFooterLinesMatchCentralizedBindings(t *testing.T) {
-	if got, want := footerText(footerLine1), "Shift+Tab / Enter send/open / Option+Enter/Shift+Enter newline / Ctrl+S stash / Ctrl+O / Ctrl+T pin"; got != want {
-		t.Fatalf("footerLine1 = %q, want %q", got, want)
-	}
-	if got, want := footerText(footerLine2), "↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit"; got != want {
-		t.Fatalf("footerLine2 = %q, want %q", got, want)
-	}
-}
 
 // TestBindingMatchesOwnsPhysicalKeyMembership fixes that Matches is the
 // membership test for a shortcut's physical Key(s): true for every Key the
@@ -60,44 +35,44 @@ func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
 	}
 }
 
-// TestFooterComposedFromNamedBindings fixes that footerLine1/footerLine2
-// are built only from the named binding variables -- not a second,
-// independently-hardcoded physical-key list -- by checking each footer
-// slot is == (same Label/Desc/Keys) to its named counterpart.
-func TestFooterComposedFromNamedBindings(t *testing.T) {
-	want1 := []Binding{
-		bindingProviderCycle, bindingSubmit, bindingNewline, bindingStash,
-		bindingOpen, bindingPin,
+// TestEscPriorityOrder fixes #14's Esc priority order end to end: help
+// visible always wins (hiding help without touching the prompt), then a
+// non-empty prompt is cleared, and only once both are already empty/hidden
+// does Esc quit. Also covers the pre-existing rename/confirmation-modal
+// cases, which Esc must still resolve before ever reaching normal-mode
+// logic.
+func TestEscPriorityOrder(t *testing.T) {
+	// Help visible, with a non-empty prompt: Esc hides help only, leaving
+	// the prompt untouched.
+	help := NewState()
+	help.Composer.Prompt = "hello"
+	help.HelpVisible = true
+	if intent := help.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentNone || help.HelpVisible {
+		t.Fatalf("help+Esc: intent=%+v HelpVisible=%v, want hidden with no Intent", intent, help.HelpVisible)
 	}
-	if len(footerLine1) != len(want1) {
-		t.Fatalf("footerLine1 has %d entries, want %d", len(footerLine1), len(want1))
+	if help.Composer.Prompt != "hello" {
+		t.Fatalf("help+Esc must not touch the prompt: %q", help.Composer.Prompt)
 	}
-	for i, b := range want1 {
-		if !equalBinding(footerLine1[i], b) {
-			t.Fatalf("footerLine1[%d] = %+v, want %+v", i, footerLine1[i], b)
-		}
-	}
-	want2 := []Binding{
-		bindingNavigate, bindingScope, bindingRename, bindingStopArchive,
-		bindingRefresh, bindingEscape,
-	}
-	if len(footerLine2) != len(want2) {
-		t.Fatalf("footerLine2 has %d entries, want %d", len(footerLine2), len(want2))
-	}
-	for i, b := range want2 {
-		if !equalBinding(footerLine2[i], b) {
-			t.Fatalf("footerLine2[%d] = %+v, want %+v", i, footerLine2[i], b)
-		}
-	}
-}
 
-// TestEscBindingMeaningIsStateDependent is the state-dependent-semantics
-// guard: bindingEscape's physical Key (KeyEsc) is the same in all three
-// cases below, yet State.Handle resolves it to a different Intent (or
-// none) depending purely on State -- proof that Binding owns only "this is
-// the Esc key", never "Esc means quit".
-func TestEscBindingMeaningIsStateDependent(t *testing.T) {
-	// Rename active: Esc cancels the rename, no Intent.
+	// Help hidden, non-empty prompt: Esc clears the prompt, no Intent.
+	clear := NewState()
+	clear.Composer.Prompt = "hello"
+	if intent := clear.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentNone {
+		t.Fatalf("prompt+Esc: intent=%+v, want none", intent)
+	}
+	if clear.Composer.Prompt != "" {
+		t.Fatalf("prompt+Esc must clear the prompt: %q", clear.Composer.Prompt)
+	}
+
+	// Help hidden, empty prompt: Esc quits.
+	quit := NewState()
+	if intent := quit.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {
+		t.Fatalf("empty+Esc: intent=%+v, want IntentQuit", intent)
+	}
+
+	// Rename active: Esc cancels the rename, no Intent (unaffected by help
+	// priority -- Handle dispatches to rename handling before ever
+	// consulting HelpVisible).
 	rename := NewState()
 	rename.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionRename: {Available: true}})})
 	rename.Handle(KeyEvent{Key: KeyCtrlR})
@@ -112,80 +87,64 @@ func TestEscBindingMeaningIsStateDependent(t *testing.T) {
 	if intent := confirm.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentNone || confirm.Confirmation != nil {
 		t.Fatalf("confirmation+Esc: intent=%+v Confirmation=%+v, want cancelled confirmation with no Intent", intent, confirm.Confirmation)
 	}
+}
 
-	// Normal mode: Esc quits.
-	normal := NewState()
-	if intent := normal.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {
-		t.Fatalf("normal+Esc: intent=%+v, want IntentQuit", intent)
+// TestQuestionMarkTogglesHelpOnlyOnEmptyPrompt fixes #14's "?" behavior:
+// it opens help only when the prompt is empty and help isn't already
+// shown; otherwise it's a plain prompt rune.
+func TestQuestionMarkTogglesHelpOnlyOnEmptyPrompt(t *testing.T) {
+	empty := NewState()
+	if intent := empty.Handle(KeyEvent{Key: KeyRune, Rune: '?'}); intent.Kind != IntentNone || !empty.HelpVisible {
+		t.Fatalf("empty prompt+?: intent=%+v HelpVisible=%v, want help shown", intent, empty.HelpVisible)
+	}
+	if empty.Composer.Prompt != "" {
+		t.Fatalf("? must not be inserted into the prompt when it opens help: %q", empty.Composer.Prompt)
+	}
+
+	nonEmpty := NewState()
+	nonEmpty.Composer.Prompt = "hi"
+	nonEmpty.Composer.Cursor = 2
+	nonEmpty.Handle(KeyEvent{Key: KeyRune, Rune: '?'})
+	if nonEmpty.HelpVisible {
+		t.Fatal("? on a non-empty prompt must not open help")
+	}
+	if nonEmpty.Composer.Prompt != "hi?" {
+		t.Fatalf("? on a non-empty prompt must be inserted as a plain rune: %q", nonEmpty.Composer.Prompt)
+	}
+
+	alreadyOpen := NewState()
+	alreadyOpen.HelpVisible = true
+	alreadyOpen.Handle(KeyEvent{Key: KeyRune, Rune: '?'})
+	if alreadyOpen.Composer.Prompt != "?" {
+		t.Fatalf("? while help is already visible must be a plain prompt rune: %q", alreadyOpen.Composer.Prompt)
 	}
 }
 
-// TestKnownBindingLabels fixes a representative sample's exact Label/Desc,
-// including a bare binding (no Desc) and a multi-key binding (↑↓), so a
-// future edit to keymap.go can't silently change what the footer shows for
-// these without a test failing.
-func TestKnownBindingLabels(t *testing.T) {
-	cases := []struct {
-		bindings []Binding
-		label    string
-		want     Binding
-	}{
-		{footerLine1, "Ctrl+O", Binding{Label: "Ctrl+O", Keys: []Key{KeyCtrlO}}},
-		{footerLine1, "Ctrl+T", Binding{Label: "Ctrl+T", Desc: "pin", Keys: []Key{KeyCtrlT}}},
-		{footerLine2, "↑↓", Binding{Label: "↑↓", Keys: []Key{KeyUp, KeyDown}}},
-		{footerLine2, "Esc", Binding{Label: "Esc", Desc: "quit", Keys: []Key{KeyEsc}}},
-	}
-	for _, c := range cases {
-		var found *Binding
-		for i := range c.bindings {
-			if c.bindings[i].Label == c.label {
-				found = &c.bindings[i]
-				break
-			}
-		}
-		if found == nil {
-			t.Fatalf("no binding labeled %q", c.label)
-		}
-		if found.Desc != c.want.Desc || len(found.Keys) != len(c.want.Keys) {
-			t.Fatalf("binding %q = %+v, want %+v", c.label, *found, c.want)
-		}
-		for i, k := range found.Keys {
-			if k != c.want.Keys[i] {
-				t.Fatalf("binding %q Keys = %v, want %v", c.label, found.Keys, c.want.Keys)
-			}
-		}
-	}
-}
-
-// TestFooterUsesCentralizedDefinitions fixes that View's rendered footer
-// rows are exactly footerText(footerLine1)/footerText(footerLine2) --
-// render.go must read the shared Binding definitions, not its own copy of
-// the text.
-func TestFooterUsesCentralizedDefinitions(t *testing.T) {
+// TestTypingWhileHelpVisibleDoesNotCloseIt fixes that help stays open
+// while the user keeps typing -- only Esc closes it.
+func TestTypingWhileHelpVisibleDoesNotCloseIt(t *testing.T) {
 	s := NewState()
-	view := s.View(200, 12)
-	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
-	if len(lines) < 2 {
-		t.Fatalf("view has too few lines: %q", view)
+	s.HelpVisible = true
+	for _, r := range "hello" {
+		s.Handle(KeyEvent{Key: KeyRune, Rune: r})
 	}
-	last2 := lines[len(lines)-2:]
-	if last2[0] != footerText(footerLine1) {
-		t.Fatalf("footer line 1 = %q, want %q", last2[0], footerText(footerLine1))
+	if !s.HelpVisible {
+		t.Fatal("typing must not close help")
 	}
-	if last2[1] != footerText(footerLine2) {
-		t.Fatalf("footer line 2 = %q, want %q", last2[1], footerText(footerLine2))
+	if s.Composer.Prompt != "hello" {
+		t.Fatalf("prompt=%q, want typed text to still land in the composer", s.Composer.Prompt)
 	}
 }
 
 // TestBindingsCoverEveryShortcutKey is the drift guard: every physical Key
 // input_unix.go can decode is either a documented shortcut (present in
-// footerLine1/footerLine2, and reachable from State.Handle's normal-mode
-// switch) or an explicitly-listed non-shortcut key (raw composer/rename
-// text editing, or a key with no assigned meaning at all). A newly-added
-// Key that is neither listed here nor added to a footer line fails this
-// test, so State.Handle and the footer cannot silently drift apart the way
-// two independently-hardcoded copies of "what does Ctrl+X do" could (see
-// the DesignDoc's shortcut source-of-truth requirement).
+// allBindings, and reachable from State.Handle's normal-mode switch) or an
+// explicitly-listed non-shortcut key (raw composer/rename text editing, or
+// a key with no assigned meaning at all). A newly-added Key that is
+// neither listed here nor added to allBindings fails this test, so
+// State.Handle and the displayed shortcuts cannot silently drift apart the
+// way two independently-hardcoded copies of "what does Ctrl+X do" could
+// (see the DesignDoc's shortcut source-of-truth requirement).
 func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// The complete Key enum (input_unix.go). Keep in sync by construction:
 	// a Key added there and omitted here is still caught, just as
@@ -204,18 +163,16 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyUnknown: true,
 	}
 	documented := map[Key]bool{}
-	for _, bindings := range [][]Binding{footerLine1, footerLine2} {
-		for _, b := range bindings {
-			for _, k := range b.Keys {
-				documented[k] = true
-			}
+	for _, b := range allBindings {
+		for _, k := range b.Keys {
+			documented[k] = true
 		}
 	}
 	for _, k := range all {
 		if nonShortcut[k] || documented[k] {
 			continue
 		}
-		t.Errorf("Key %d is neither a documented shortcut (footerLine1/footerLine2) nor listed as a non-shortcut key -- update keymap.go or this test's nonShortcut set", k)
+		t.Errorf("Key %d is neither a documented shortcut (allBindings) nor listed as a non-shortcut key -- update keymap.go or this test's nonShortcut set", k)
 	}
 	// And the reverse: every documented shortcut must be one of the
 	// recognized Key values above (catches a stale/typo'd Key in a

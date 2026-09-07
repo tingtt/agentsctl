@@ -3,8 +3,6 @@ package agentview
 import (
 	"fmt"
 	"strings"
-
-	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // displayLine is one rendered terminal row: rowIndex is the Rows index it
@@ -68,15 +66,8 @@ func (s State) View(width, height int) string {
 		}
 		list = append(list, displayLine{text: "", rowIndex: -1})
 	}
-	unavailable := ""
-	if err := s.Warnings[s.Provider]; err != nil {
-		unavailable = " (unavailable: " + err.Error() + ")"
-	}
-	promptPrefix := composerPrefix(s.Provider, unavailable)
-	footer := append(composerLines(s.Composer.Prompt, s.Composer.Cursor, promptPrefix, width),
-		clipLine(footerText(footerLine1), width),
-		clipLine(footerText(footerLine2), width),
-	)
+
+	footer := s.composerLines(width)
 	// The composer-top notification area is reserved for Error
 	// exclusively -- there is no generic non-error notice here.
 	if s.Error != "" {
@@ -116,10 +107,23 @@ func (s State) View(width, height int) string {
 	return b.String()
 }
 
-// composerPrefix builds the prompt composer's "<provider> > " prefix. The
-// provider label is fixed to providerFieldWidth visible cells so
-// Shift+Tab switching providers never moves the column the prompt body
-// starts at.
-func composerPrefix(provider session.ProviderID, unavailable string) string {
-	return styleText(providerLabel(provider), providerColor(provider)) + unavailable + " > "
+// composerLines renders #14's composer block: a top rule carrying the
+// composer's directory context, the prompt itself, a bottom rule, and
+// then either the help view or the contextual footer + usage lines --
+// never both (see State.HelpVisible).
+func (s State) composerLines(width int) []string {
+	lines := make([]string, 0, 8)
+	lines = append(lines, topRule(s.ComposerCWD(), width))
+	for _, line := range composerLines(s.Composer.Prompt, s.Composer.Cursor, "❯ ", width) {
+		lines = append(lines, styleText(line, colorWhite))
+	}
+	lines = append(lines, bottomRule(width))
+	if s.HelpVisible {
+		return append(lines, helpLines(width)...)
+	}
+	lines = append(lines, clipLine("  "+contextualFooterText(s), width))
+	if usage, ok := usageLineText(s.Usage); ok {
+		lines = append(lines, clipLine("  "+usage, width))
+	}
+	return lines
 }

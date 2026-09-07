@@ -52,18 +52,24 @@ func providerColor(provider session.ProviderID) string {
 // from it never shifts whatever follows it when the provider changes.
 const providerFieldWidth = 6
 
+// providerName is the plain-text, unpadded provider identity -- e.g. for
+// the composer footer/usage lines, which (unlike a session row's provider
+// field) don't need column alignment across providers.
+func providerName(provider session.ProviderID) string {
+	switch provider {
+	case session.ProviderClaude:
+		return "claude"
+	case session.ProviderCodex:
+		return "codex"
+	default:
+		return string(provider)
+	}
+}
+
 // providerLabel is the plain-text (uncolored) provider identity,
 // right-aligned/padded to exactly providerFieldWidth visible cells.
 func providerLabel(provider session.ProviderID) string {
-	var name string
-	switch provider {
-	case session.ProviderClaude:
-		name = "claude"
-	case session.ProviderCodex:
-		name = "codex"
-	default:
-		name = string(provider)
-	}
+	name := providerName(provider)
 	if pad := providerFieldWidth - lineCells(name); pad > 0 {
 		return strings.Repeat(" ", pad) + name
 	}

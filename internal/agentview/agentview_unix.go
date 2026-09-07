@@ -114,6 +114,7 @@ func (r *Runtime) reload(ctx context.Context) {
 	snap := r.Controller.Load(ctx, scope)
 	r.State.SetRows(snap.Sessions)
 	r.State.Warnings = snap.Warnings
+	r.State.Usage = r.Controller.Usage(ctx)
 }
 
 // act carries out intent via the Controller and applies its Result to

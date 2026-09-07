@@ -54,6 +54,20 @@ type State struct {
 	// (see PendingConfirmation).
 	Confirmation *PendingConfirmation
 
+	// HelpVisible toggles #14's help view in place of the contextual
+	// footer/usage lines. Only "?" on an empty composer prompt sets it
+	// (see State.Handle); Esc's meaning is entirely governed by it while
+	// true (hide help, never touching the prompt -- see the DesignDoc's
+	// Esc priority order).
+	HelpVisible bool
+
+	// Usage holds the most recently loaded provider usage rows (see
+	// sessionctl.Controller.Usage), rendered as #14's composer usage line.
+	// A provider absent here either doesn't implement
+	// sessionctl.UsageSource or failed to report usage on the last
+	// reload -- either way it is simply omitted, never rendered as 0%.
+	Usage []sessionctl.Usage
+
 	// LastAttachedKey/HasLastAttached identify the session most recently
 	// Opened from the overview, regardless of how that Open ended (an
 	// explicit detach, or the session/process exiting on its own): title
