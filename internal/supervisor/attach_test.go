@@ -3,12 +3,14 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,18 @@ import (
 	"github.com/tingtt/agentsctl/internal/supervisor/protocol"
 	"github.com/tingtt/agentsctl/internal/terminal"
 )
+
+type blockingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriter) Write(b []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(b), nil
+}
 
 // fakeSupervisorSocket starts a minimal fake supervisor: it accepts one
 // connection, reads the attach Request frame, always answers with an OK
@@ -101,6 +115,212 @@ func TestClientAttachExplicitDetachReturnsCleanly(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Attach did not return after sending Detach")
+	}
+}
+
+func TestClientAttachForwardsBurstOutputWhileInputIsBlocked(t *testing.T) {
+	const frameCount = 128
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		for range frameCount {
+			if err := protocol.Write(conn, protocol.Output, []byte("x")); err != nil {
+				return
+			}
+		}
+		_ = protocol.Write(conn, protocol.Exit, nil)
+	})
+	in, inputWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer inputWriter.Close()
+
+	inputStarted := make(chan struct{})
+	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) error {
+		close(inputStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	var output bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- (Client{Socket: sock}).attach(context.Background(), "run1", in, &output, pump)
+	}()
+	select {
+	case <-inputStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("input pump did not start")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Attach err=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("burst output remained gated by blocked terminal input")
+	}
+	if output.Len() != frameCount {
+		t.Fatalf("wrote %d output bytes, want %d", output.Len(), frameCount)
+	}
+}
+
+func TestClientAttachWaitsForInputPumpBeforeReturn(t *testing.T) {
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		_ = protocol.Write(conn, protocol.Exit, nil)
+	})
+	in, inputWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer inputWriter.Close()
+
+	inputCanceled := make(chan struct{})
+	allowInputStop := make(chan struct{})
+	pump := func(ctx context.Context, _ *os.File, _ *lockedFrames) error {
+		<-ctx.Done()
+		close(inputCanceled)
+		<-allowInputStop
+		return ctx.Err()
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- (Client{Socket: sock}).attach(context.Background(), "run1", in, io.Discard, pump)
+	}()
+	select {
+	case <-inputCanceled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("input pump was not canceled after remote exit")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Attach returned before its input pump stopped: %v", err)
+	default:
+	}
+	close(allowInputStop)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Attach err=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Attach did not return after its input pump stopped")
+	}
+}
+
+func TestClientAttachForwardsInputWhileOutputWriteIsBlocked(t *testing.T) {
+	input := make(chan []byte, 1)
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		if err := protocol.Write(conn, protocol.Output, []byte("blocked output")); err != nil {
+			return
+		}
+		for {
+			kind, data, err := protocol.Read(conn)
+			if err != nil {
+				return
+			}
+			if kind == protocol.Input {
+				input <- data
+				_ = protocol.Write(conn, protocol.Exit, nil)
+				return
+			}
+		}
+	})
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	out := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- (Client{Socket: sock}).Attach(context.Background(), "run1", slave, out)
+	}()
+	select {
+	case <-out.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal output write did not start")
+	}
+	if _, err := master.Write([]byte("prompt")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-input:
+		if string(got) != "prompt" {
+			t.Fatalf("input=%q, want prompt", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal input waited for the blocked output write")
+	}
+	close(out.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Attach err=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Attach did not return after remote exit")
+	}
+}
+
+func TestClientAttachDetachesWhileOutputWriteIsBlocked(t *testing.T) {
+	detached := make(chan bool, 1)
+	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
+		if err := protocol.Write(conn, protocol.Output, []byte("blocked output")); err != nil {
+			return
+		}
+		detachForwardedAsInput := false
+		for {
+			kind, data, err := protocol.Read(conn)
+			if err != nil {
+				return
+			}
+			switch kind {
+			case protocol.Input:
+				detachForwardedAsInput = detachForwardedAsInput || bytes.Contains(data, []byte{terminal.DetachKey})
+			case protocol.Detach:
+				detached <- detachForwardedAsInput
+				_ = protocol.Write(conn, protocol.Exit, nil)
+				return
+			}
+		}
+	})
+	master, slave, err := creackpty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	out := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- (Client{Socket: sock}).Attach(context.Background(), "run1", slave, out)
+	}()
+	select {
+	case <-out.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal output write did not start")
+	}
+	if _, err := master.Write([]byte{terminal.DetachKey}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case forwarded := <-detached:
+		if forwarded {
+			t.Fatal("detach key was forwarded as PTY input")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("detach waited for the blocked output write")
+	}
+	close(out.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Attach err=%v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Attach did not return after detach")
 	}
 }
 

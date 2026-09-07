@@ -28,6 +28,8 @@ func (f *lockedFrames) write(kind byte, b []byte) error {
 	return protocol.Write(f.w, kind, b)
 }
 
+type attachInputPump func(context.Context, *os.File, *lockedFrames) error
+
 // Attach implements the Codex half of the DesignDoc's common Agent View
 // "Open selected session" intent: it connects to the supervisor's Unix
 // socket, requests the managed PTY for runID, and forwards the real
@@ -37,6 +39,10 @@ func (f *lockedFrames) write(kind byte, b []byte) error {
 // client; detaching (or this process exiting) never stops them -- see the
 // DesignDoc's Codex supervisor Lifetime section.
 func (c Client) Attach(ctx context.Context, runID string, in *os.File, out io.Writer) error {
+	return c.attach(ctx, runID, in, out, pumpAttachInput)
+}
+
+func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Writer, pumpInput attachInputPump) error {
 	conn, err := net.Dial("unix", c.Socket)
 	if err != nil {
 		return err
@@ -78,27 +84,47 @@ func (c Client) Attach(ctx context.Context, runID string, in *os.File, out io.Wr
 		sendSize(first)
 		first = false
 	})
-	defer stopResize()
+	inputCtx, cancelInput := context.WithCancel(ctx)
+	inputDone := make(chan struct{})
+	var inputErr error
+	go func() {
+		defer close(inputDone)
+		inputErr = pumpInput(inputCtx, in, frames)
+	}()
 	type incoming struct {
 		kind byte
 		data []byte
 		err  error
 	}
 	incomingFrames := make(chan incoming, 1)
+	incomingDone := make(chan struct{})
 	go func() {
+		defer close(incomingDone)
 		for {
 			kind, data, err := protocol.Read(conn)
-			incomingFrames <- incoming{kind, data, err}
+			select {
+			case incomingFrames <- incoming{kind, data, err}:
+			case <-inputCtx.Done():
+				return
+			}
 			if err != nil {
 				return
 			}
 		}
 	}()
-	var scanner terminal.DetachScanner
+	defer func() {
+		cancelInput()
+		stopResize()
+		_ = conn.Close()
+		<-inputDone
+		<-incomingDone
+	}()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-inputDone:
+			return inputErr
 		case msg := <-incomingFrames:
 			if msg.err != nil {
 				return msg.err
@@ -113,7 +139,16 @@ func (c Client) Attach(ctx context.Context, runID string, in *os.File, out io.Wr
 			case protocol.Failure:
 				return errors.New(string(msg.data))
 			}
-		default:
+		}
+	}
+}
+
+func pumpAttachInput(ctx context.Context, in *os.File, frames *lockedFrames) error {
+	var scanner terminal.DetachScanner
+	buf := make([]byte, 4096)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		ready, err := terminal.PollInput(in, 50*time.Millisecond)
 		if err != nil {
@@ -122,20 +157,16 @@ func (c Client) Attach(ctx context.Context, runID string, in *os.File, out io.Wr
 		if !ready {
 			continue
 		}
-		buf := make([]byte, 4096)
 		n, err := in.Read(buf)
 		if n > 0 {
 			before, detach := scanner.Feed(buf[:n])
 			if len(before) > 0 {
-				if err := frames.write(protocol.Input, before); err != nil {
-					return err
+				if writeErr := frames.write(protocol.Input, before); writeErr != nil {
+					return writeErr
 				}
 			}
 			if detach {
-				if err := frames.write(protocol.Detach, nil); err != nil {
-					return err
-				}
-				return nil
+				return frames.write(protocol.Detach, nil)
 			}
 		}
 		if err != nil {
