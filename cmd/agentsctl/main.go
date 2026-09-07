@@ -62,7 +62,7 @@ func run() error {
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
-	usageProbe := claude.NewProbe("claude", runner, filepath.Join(dir, "claude-usage"))
+	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
 	controller := sessionctl.Controller{
 		Providers: []sessionctl.Source{
 			&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},

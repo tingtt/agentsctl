@@ -14,7 +14,15 @@ import (
 // writing a fresh prompt into the session does that (see
 // usage_probe_unix.go) -- so this is cheap local bookkeeping, not an
 // additional quota cost.
-const usageProbeRefreshIntervalSeconds = 60
+//
+// Kept short (rather than e.g. 60s) based on real-CLI measurement:
+// waitForFreshSnapshot needs the collector to actually run again after the
+// probe's own prompt gets its API response, and relying solely on Claude
+// Code's event-driven triggers to do that promptly was not reliably
+// observed within a bounded window in testing -- a short timer interval is
+// what actually got the post-response snapshot collected quickly and
+// consistently.
+const usageProbeRefreshIntervalSeconds = 5
 
 // usageSettings is the shape of the dedicated settings.json this package
 // writes for its own probe session -- a small, explicit subset of Claude

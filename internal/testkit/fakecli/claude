@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, subprocess, sys, termios, tty
+import json, os, signal, subprocess, sys, termios, tty
 from pathlib import Path
 
 root = Path(os.environ["AGENTSCTL_FAKE_DIR"])
@@ -19,6 +19,12 @@ def arg_value(args, flag):
         if i + 1 < len(args):
             return args[i + 1]
     return None
+
+# TRUST_DIALOG_ACCEPT mirrors usageProbeTrustDialogAccept
+# (usage_probe_unix.go): Down arrow then Enter, the exact bytes real
+# Claude Code's workspace-trust dialog needs to select "Yes, I trust this
+# folder" over its own default-selected "No, exit".
+TRUST_DIALOG_ACCEPT = b"\x1b[B\r"
 
 def probe_session(session_id, settings_flag):
     # Stands in for a real, actively-rendering interactive `claude`
@@ -49,6 +55,16 @@ def probe_session(session_id, settings_flag):
     old = termios.tcgetattr(0)
     tty.setraw(0)
 
+    # Real Claude Code (verified against the installed CLI): a plain
+    # interactive session ignores SIGTERM (does not exit), and treats a
+    # literal Ctrl+Z byte on stdin as an ordinary job-control suspend
+    # request rather than an exit -- only SIGINT actually ends the
+    # process. Modeled here so a test exercising detachProbeSession's
+    # SIGINT-then-SIGKILL escalation against this fake actually proves
+    # something, instead of trivially "working" against a fake that exits
+    # on anything.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
     if settings_flag:
         # The real settings path passed on argv can vary per test run;
         # record it once so run_statusline (which has no argv of its own)
@@ -59,13 +75,40 @@ def probe_session(session_id, settings_flag):
     rows.append({"id": session_id, "name": "agentsctl usage probe", "summary": "", "cwd": os.getcwd(), "updatedAt": 1, "status": "idle", "state": "done"})
     save(rows)
 
+    # Real Claude Code (verified against the installed CLI): a brand-new,
+    # never-before-seen directory shows a workspace-trust confirmation
+    # dialog before any chat input is accepted, defaulting to "No, exit"
+    # -- so any input that isn't exactly TRUST_DIALOG_ACCEPT (e.g. a
+    # prompt sent without first answering it, reproducing this package's
+    # original bug) selects that default and exits immediately, never
+    # reaching chat input or invoking statusLine at all. Once accepted,
+    # trust is remembered per-directory by Claude Code itself (not
+    # anything this process's caller writes) -- modeled here with a marker
+    # file scoped to this cwd, so a later probe_session invocation in the
+    # same directory (e.g. this same test's own second refresh) skips
+    # straight to chat mode exactly like a real already-trusted directory
+    # would.
+    trust_marker = Path(os.getcwd()) / ".fake-claude-trust-accepted"
     buf = b""
     try:
+        if not trust_marker.exists():
+            got = b""
+            while len(got) < len(TRUST_DIALOG_ACCEPT):
+                b = os.read(0, 1)
+                if not b:
+                    return
+                got += b
+            if got != TRUST_DIALOG_ACCEPT:
+                return  # the default "No, exit" was effectively selected
+            trust_marker.write_text("trusted")
+
         os.write(1, b"FAKE CLAUDE PROBE ATTACHED\r\n")
         while True:
             b = os.read(0, 1)
-            if not b or b == b"\x1a":
+            if not b:
                 break
+            if b == b"\x1a":
+                continue  # suspend request, not an exit -- see above
             buf += b
             if b in (b"\r", b"\n"):
                 run_statusline()

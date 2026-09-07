@@ -18,8 +18,8 @@ func TestLoadOrCreateProbeIdentityCreatesOnceThenReuses(t *testing.T) {
 	if first.SessionID == "" {
 		t.Fatal("created identity has no SessionID")
 	}
-	if first.Confirmed {
-		t.Fatal("a freshly created identity must not already be Confirmed")
+	if first.TrustAccepted {
+		t.Fatal("a freshly created identity must not already be TrustAccepted")
 	}
 	second, err := loadOrCreateProbeIdentity(path)
 	if err != nil {
@@ -30,27 +30,27 @@ func TestLoadOrCreateProbeIdentityCreatesOnceThenReuses(t *testing.T) {
 	}
 }
 
-// TestMarkProbeConfirmedPersistsAcrossLoads fixes that Confirmed, once
+// TestMarkTrustAcceptedPersistsAcrossLoads fixes that TrustAccepted, once
 // set, survives a reload -- the signal usage_probe_unix.go's refresh uses
-// to decide --session-id (first ever run) vs --resume (every run after).
-func TestMarkProbeConfirmedPersistsAcrossLoads(t *testing.T) {
+// to skip the workspace-trust dialog answer on every run after the first.
+func TestMarkTrustAcceptedPersistsAcrossLoads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "probe.json")
 	id, err := loadOrCreateProbeIdentity(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := markProbeConfirmed(path, id); err != nil {
+	if err := markTrustAccepted(path, id); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := loadOrCreateProbeIdentity(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reloaded.Confirmed {
-		t.Fatal("Confirmed did not survive a reload")
+	if !reloaded.TrustAccepted {
+		t.Fatal("TrustAccepted did not survive a reload")
 	}
 	if reloaded.SessionID != id.SessionID {
-		t.Fatalf("SessionID changed after confirming: %q -> %q", id.SessionID, reloaded.SessionID)
+		t.Fatalf("SessionID changed after marking trust accepted: %q -> %q", id.SessionID, reloaded.SessionID)
 	}
 }
 

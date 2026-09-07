@@ -10,21 +10,37 @@ import (
 
 // probeIdentity is agentsctl's local record of its one owned Claude usage
 // probe session -- the source of truth Provider.List uses to exclude the
-// probe from the normal session catalog (see excludeProbe in usage.go) and
-// the probe orchestration (usage_probe_unix.go) uses to decide whether to
-// start a brand-new Claude conversation (--session-id) or continue the
-// existing one (--resume). SessionID is the identity; DisplayName is
-// decorative only (see the DesignDoc's Claude usage probe section --
-// identity is never derived from a display name or CWD).
+// probe from the normal session catalog (see UsageProbeSource's
+// KnownSessionID) and the probe orchestration (usage_probe_unix.go)
+// addresses on every refresh via --session-id. SessionID is the identity;
+// DisplayName is decorative only (see the DesignDoc's Claude usage probe
+// section -- identity is never derived from a display name or CWD).
+//
+// Every refresh uses --session-id (never --resume): verified against the
+// installed CLI that re-addressing an existing session ID via
+// --session-id never errors, whether or not that ID has any resumable
+// history (a session ID Claude has no saved transcript for -- e.g. one
+// whose process had to be force-killed -- behaves exactly like a brand
+// new one). The probe never depends on conversation continuity for its
+// own purpose (one trivial round trip per refresh), so there is nothing
+// to lose either way; this sidesteps needing to track or verify whether a
+// given refresh's session survives to be resumable, and the earlier
+// "confirm this session appeared in the native catalog, then switch to
+// --resume" design this replaced never actually needed to run.
 type probeIdentity struct {
 	SessionID   string `json:"sessionId"`
 	DisplayName string `json:"displayName"`
-	// Confirmed is set once Provider has observed SessionID actually
-	// appear in Claude's own native catalog (`claude agents --json --all`)
-	// -- only then is it safe to address the session with --resume;
-	// before that, the process that will *create* it must be started with
-	// --session-id instead (see refresh in usage_probe_unix.go).
-	Confirmed bool `json:"confirmed"`
+	// TrustAccepted is set once this probe has answered Claude Code's
+	// workspace-trust confirmation dialog for its dedicated directory
+	// (see Probe.refresh in usage_probe_unix.go) -- shown only the
+	// very first time any interactive session runs in a directory Claude
+	// hasn't seen before, and, once accepted, remembered by Claude Code
+	// itself (in its own local state, not anything agentsctl writes) for
+	// every later session in that same directory. Refresh only attempts
+	// to answer it while this is false, so a later refresh's real prompt
+	// is never preceded by a blind, unnecessary keystroke into a live
+	// chat composer.
+	TrustAccepted bool `json:"trustAccepted"`
 }
 
 // probeDisplayName is the fixed, human-readable name given to the probe
@@ -60,7 +76,7 @@ func readProbeIdentityIfExists(path string) (probeIdentity, bool, error) {
 
 // loadOrCreateProbeIdentity reads path's persisted probe identity, or
 // creates and persists a brand-new one (a fresh random session ID,
-// Confirmed: false) if none exists yet. This is the only place a new
+// TrustAccepted: false) if none exists yet. This is the only place a new
 // probe session ID is ever minted -- called at most once per app-data
 // directory's lifetime, after which every refresh reuses the same
 // identity (see the DesignDoc's "probe session は最大1つだけ存在する").
@@ -81,12 +97,13 @@ func loadOrCreateProbeIdentity(path string) (probeIdentity, error) {
 	return id, nil
 }
 
-// markProbeConfirmed persists id with Confirmed set to true -- called once
-// Provider has verified id.SessionID actually appears in Claude's own
-// native catalog, so every subsequent refresh addresses it with --resume
-// instead of re-attempting --session-id creation.
-func markProbeConfirmed(path string, id probeIdentity) error {
-	id.Confirmed = true
+// markTrustAccepted persists id with TrustAccepted set to true -- called
+// once refresh (usage_probe_unix.go) has attempted to answer the
+// workspace-trust dialog, regardless of whether a dialog actually needed
+// answering, so no later refresh ever repeats that blind keystroke
+// sequence into what might by then be a live chat composer instead.
+func markTrustAccepted(path string, id probeIdentity) error {
+	id.TrustAccepted = true
 	return writeProbeIdentity(path, id)
 }
 
