@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tingtt/agentsctl/internal/state"
+	"github.com/tingtt/agentsctl/internal/localstate"
 )
 
 func TestRealCodexDaemonPreflight(t *testing.T) {
@@ -73,12 +73,12 @@ func TestRealCodexDaemonPreflight(t *testing.T) {
 
 func waitLivePreflightStopped(t *testing.T, path, id string) {
 	t.Helper()
-	store := state.New(path)
+	store := localstate.New(path)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		data, err := store.Load()
+		runs, err := store.Runs()
 		if err == nil {
-			if run, ok := data.Runs[id]; ok && run.State == "stopped" && run.PID == 0 {
+			if run, ok := runs[id]; ok && run.State == "stopped" && run.PID == 0 {
 				return
 			}
 		}

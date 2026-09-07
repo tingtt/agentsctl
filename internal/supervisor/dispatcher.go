@@ -6,38 +6,38 @@ import (
 	"encoding/hex"
 	"errors"
 
-	"github.com/tingtt/agentsctl/internal/state"
+	"github.com/tingtt/agentsctl/internal/localstate"
 )
 
 type Dispatcher struct {
 	Client Client
 }
 
-func (d Dispatcher) Dispatch(ctx context.Context, prompt, cwd string, baseline []string) (state.Run, error) {
+func (d Dispatcher) Dispatch(ctx context.Context, prompt, cwd string, baseline []string) (localstate.Run, error) {
 	id, err := newID()
 	if err != nil {
-		return state.Run{}, err
+		return localstate.Run{}, err
 	}
 	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: id, Args: []string{prompt}, CWD: cwd, Provider: "codex", Baseline: baseline})
 	if err != nil {
-		return state.Run{}, err
+		return localstate.Run{}, err
 	}
 	if res.Run == nil {
-		return state.Run{}, errors.New("supervisor returned no run")
+		return localstate.Run{}, errors.New("supervisor returned no run")
 	}
 	return *res.Run, nil
 }
-func (d Dispatcher) Resume(ctx context.Context, runID, threadID, cwd string) (state.Run, error) {
+func (d Dispatcher) Resume(ctx context.Context, runID, threadID, cwd string) (localstate.Run, error) {
 	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: runID, SessionID: threadID, Args: []string{"resume", threadID}, CWD: cwd, Provider: "codex"})
 	if err != nil {
-		return state.Run{}, err
+		return localstate.Run{}, err
 	}
 	return *res.Run, nil
 }
-func (d Dispatcher) ResumeExisting(ctx context.Context, threadID, cwd string) (state.Run, error) {
+func (d Dispatcher) ResumeExisting(ctx context.Context, threadID, cwd string) (localstate.Run, error) {
 	id, err := newID()
 	if err != nil {
-		return state.Run{}, err
+		return localstate.Run{}, err
 	}
 	return d.Resume(ctx, id, threadID, cwd)
 }

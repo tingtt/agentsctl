@@ -14,7 +14,6 @@ import (
 	"github.com/tingtt/agentsctl/internal/provider/claude"
 	"github.com/tingtt/agentsctl/internal/provider/codex"
 	"github.com/tingtt/agentsctl/internal/session"
-	"github.com/tingtt/agentsctl/internal/state"
 	"github.com/tingtt/agentsctl/internal/supervisor"
 	"github.com/tingtt/agentsctl/internal/tui"
 )
@@ -35,7 +34,7 @@ func run() error {
 		if err := fs.Parse(os.Args[2:]); err != nil {
 			return err
 		}
-		return (&supervisor.Server{Socket: *socket, Store: state.New(*statePath)}).Serve(ctx)
+		return (&supervisor.Server{Socket: *socket, Store: localstate.New(*statePath)}).Serve(ctx)
 	}
 	dir, err := configDir()
 	if err != nil {
@@ -51,18 +50,11 @@ func run() error {
 	if err := client.Ensure(ctx); err != nil {
 		return err
 	}
-	store := state.New(statePath)
-	// claudeStore is a second, transitional handle on the same state file:
-	// provider/claude has migrated to localstate's domain operations while
-	// provider/codex and the supervisor still read/write through the old
-	// state.Store (both types take/release an flock per operation against
-	// the same path, so the two handles interleave safely). This goes away
-	// once the supervisor/codex side migrates too.
-	claudeStore := localstate.New(statePath)
+	store := localstate.New(statePath)
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
-	providers := []session.Provider{&claude.Provider{Path: "claude", Runner: runner, Store: claudeStore, Renamer: claude.NewNativeRenamer()}, &codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch}}
+	providers := []session.Provider{&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer()}, &codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch}}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err

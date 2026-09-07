@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/tingtt/agentsctl/internal/localstate"
 	processinfo "github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/protocol"
-	"github.com/tingtt/agentsctl/internal/state"
 	"golang.org/x/sys/unix"
 )
 
@@ -35,27 +35,27 @@ type Request struct {
 	Baseline  []string `json:"baseline,omitempty"`
 }
 type Response struct {
-	OK               bool       `json:"ok"`
-	Error            string     `json:"error,omitempty"`
-	Run              *state.Run `json:"run,omitempty"`
-	ProtocolVersion  int        `json:"protocolVersion,omitempty"`
-	BuildVersion     string     `json:"buildVersion,omitempty"`
-	DaemonPID        int        `json:"daemonPid,omitempty"`
-	DaemonStartTime  uint64     `json:"daemonStartTime,omitempty"`
-	DaemonUID        uint32     `json:"daemonUid,omitempty"`
-	DaemonExecutable string     `json:"daemonExecutable,omitempty"`
-	DaemonParentPID  int        `json:"daemonParentPid,omitempty"`
-	DaemonCWD        string     `json:"daemonCwd,omitempty"`
-	DaemonPATH       string     `json:"daemonPath,omitempty"`
-	ResolvedPath     string     `json:"resolvedPath,omitempty"`
-	Output           string     `json:"output,omitempty"`
+	OK               bool            `json:"ok"`
+	Error            string          `json:"error,omitempty"`
+	Run              *localstate.Run `json:"run,omitempty"`
+	ProtocolVersion  int             `json:"protocolVersion,omitempty"`
+	BuildVersion     string          `json:"buildVersion,omitempty"`
+	DaemonPID        int             `json:"daemonPid,omitempty"`
+	DaemonStartTime  uint64          `json:"daemonStartTime,omitempty"`
+	DaemonUID        uint32          `json:"daemonUid,omitempty"`
+	DaemonExecutable string          `json:"daemonExecutable,omitempty"`
+	DaemonParentPID  int             `json:"daemonParentPid,omitempty"`
+	DaemonCWD        string          `json:"daemonCwd,omitempty"`
+	DaemonPATH       string          `json:"daemonPath,omitempty"`
+	ResolvedPath     string          `json:"resolvedPath,omitempty"`
+	Output           string          `json:"output,omitempty"`
 }
 
 const ProtocolVersion = 2
 const BuildVersion = "session-lifecycle-2026-09-03"
 
 type process struct {
-	run         state.Run
+	run         localstate.Run
 	cmd         *exec.Cmd
 	ptmx        *os.File
 	mu          sync.Mutex
@@ -64,7 +64,7 @@ type process struct {
 }
 type Server struct {
 	Socket            string
-	Store             *state.Store
+	Store             *localstate.Store
 	ResolveExecutable func(string) (string, error)
 	mu                sync.RWMutex
 	runs              map[string]*process
@@ -121,16 +121,7 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) markStale() error {
-	return s.Store.Update(func(d *state.Data) error {
-		for id, r := range d.Runs {
-			if r.State == "running" || r.State == "starting" {
-				r.State = "stale"
-				r.Error = "supervisor restarted; PTY cannot be recovered"
-				d.Runs[id] = r
-			}
-		}
-		return nil
-	})
+	return s.Store.MarkAllRunningStale("supervisor restarted; PTY cannot be recovered")
 }
 
 func (s *Server) handle(c net.Conn) {
@@ -206,14 +197,8 @@ func (s *Server) preflight(c net.Conn, req Request) {
 }
 
 func (s *Server) start(c net.Conn, req Request) {
-	r := state.Run{ID: req.RunID, Provider: req.Provider, SessionID: req.SessionID, CWD: req.CWD, State: "starting", StartedAt: time.Now(), Baseline: append([]string(nil), req.Baseline...)}
-	if err := s.Store.Update(func(d *state.Data) error {
-		if _, ok := d.Runs[r.ID]; ok {
-			return errors.New("run already exists")
-		}
-		d.Runs[r.ID] = r
-		return nil
-	}); err != nil {
+	r := localstate.Run{ID: req.RunID, Provider: req.Provider, SessionID: req.SessionID, CWD: req.CWD, State: "starting", StartedAt: time.Now(), Baseline: append([]string(nil), req.Baseline...)}
+	if err := s.Store.StartRun(r); err != nil {
 		respond(c, Response{Error: err.Error()})
 		return
 	}
@@ -286,15 +271,7 @@ func (s *Server) drain(p *process) {
 	}
 	p.subscribers = map[chan []byte]struct{}{}
 	p.mu.Unlock()
-	var stopped state.Run
-	_ = s.Store.Update(func(d *state.Data) error {
-		run := d.Runs[runID]
-		run.State = "stopped"
-		run.PID = 0
-		d.Runs[runID] = run
-		stopped = run
-		return nil
-	})
+	stopped, _ := s.Store.MarkRunStopped(runID)
 	p.mu.Lock()
 	p.run = stopped
 	p.mu.Unlock()
@@ -420,12 +397,8 @@ func (s *Server) stop(c net.Conn, id string) {
 		respond(c, Response{Error: "SIGTERM timed out; process was not force-killed"})
 	}
 }
-func (s *Server) saveRun(r state.Run) error {
-	return s.Store.Update(func(d *state.Data) error { d.Runs[r.ID] = r; return nil })
-}
-func (s *Server) deleteRun(id string) error {
-	return s.Store.Update(func(d *state.Data) error { delete(d.Runs, id); return nil })
-}
+func (s *Server) saveRun(r localstate.Run) error { return s.Store.SaveRun(r) }
+func (s *Server) deleteRun(id string) error      { return s.Store.DeleteRun(id) }
 func respond(w io.Writer, r Response) {
 	b, _ := json.Marshal(r)
 	_ = protocol.Write(w, protocol.Response, b)
@@ -538,11 +511,11 @@ func (c Client) restartLegacyOwned(ctx context.Context, identity processinfo.Ide
 	if !processNameMatches(name, filepath.Base(c.DaemonPath)) {
 		return fmt.Errorf("legacy daemon process %q does not match %q", name, filepath.Base(c.DaemonPath))
 	}
-	data, err := state.New(c.StatePath).Load()
+	runs, err := localstate.New(c.StatePath).Runs()
 	if err != nil {
 		return fmt.Errorf("inspect legacy daemon state: %w", err)
 	}
-	for _, run := range data.Runs {
+	for _, run := range runs {
 		if run.State == "running" || run.State == "starting" {
 			return errors.New("legacy daemon still owns an active run; refusing automatic restart")
 		}

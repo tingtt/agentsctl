@@ -16,15 +16,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/localstate"
 	processinfo "github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/protocol"
-	"github.com/tingtt/agentsctl/internal/state"
 	"golang.org/x/term"
 )
 
 func TestDetachDoesNotStopManagedChild(t *testing.T) {
 	dir := t.TempDir()
-	st := state.New(filepath.Join(dir, "state.json"))
+	st := localstate.New(filepath.Join(dir, "state.json"))
 	srv := &Server{Store: st, runs: map[string]*process{}}
 	exe, err := os.Executable()
 	if err != nil {
@@ -49,17 +49,17 @@ func TestDetachDoesNotStopManagedChild(t *testing.T) {
 	_ = protocol.Write(client, protocol.Detach, nil)
 	_ = client.Close()
 	time.Sleep(20 * time.Millisecond)
-	d, _ := st.Load()
-	if d.Runs["r"].State != "running" {
-		t.Fatalf("state=%s", d.Runs["r"].State)
+	runs, _ := st.Runs()
+	if runs["r"].State != "running" {
+		t.Fatalf("state=%s", runs["r"].State)
 	}
 	stop := callServer(t, srv, Request{Action: "stop", RunID: "r"})
 	if !stop.OK {
 		t.Fatal(stop.Error)
 	}
-	d, err = st.Load()
-	if err != nil || d.Runs["r"].SessionID != "thread" {
-		t.Fatalf("stopped run lost session binding: run=%+v err=%v", d.Runs["r"], err)
+	runs, err = st.Runs()
+	if err != nil || runs["r"].SessionID != "thread" {
+		t.Fatalf("stopped run lost session binding: run=%+v err=%v", runs["r"], err)
 	}
 }
 
@@ -86,7 +86,7 @@ func TestClientDaemonLauncherResolvesExecutableFromDaemonPATH(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	socket := filepath.Join(root, "supervisor.sock")
-	store := state.New(filepath.Join(root, "state.json"))
+	store := localstate.New(filepath.Join(root, "state.json"))
 	server := &Server{Socket: socket, Store: store}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx) }()
@@ -116,7 +116,7 @@ func TestClientDaemonLauncherResolvesExecutableFromDaemonPATH(t *testing.T) {
 
 func TestSpawnFailureDoesNotLeaveStartedRun(t *testing.T) {
 	dir := t.TempDir()
-	store := state.New(filepath.Join(dir, "state.json"))
+	store := localstate.New(filepath.Join(dir, "state.json"))
 	server := &Server{Store: store, runs: map[string]*process{}, ResolveExecutable: func(string) (string, error) {
 		return filepath.Join(dir, "missing"), nil
 	}}
@@ -124,17 +124,17 @@ func TestSpawnFailureDoesNotLeaveStartedRun(t *testing.T) {
 	if response.OK || !strings.Contains(response.Error, "PTY process spawn") {
 		t.Fatalf("response=%+v", response)
 	}
-	data, err := store.Load()
+	runs, err := store.Runs()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := data.Runs["failed"]; exists {
+	if _, exists := runs["failed"]; exists {
 		t.Fatal("failed executable remained as a started run")
 	}
 }
 
 func TestHandshakeReportsProtocolBuildAndDaemonIdentity(t *testing.T) {
-	server := &Server{Store: state.New(filepath.Join(t.TempDir(), "state.json"))}
+	server := &Server{Store: localstate.New(filepath.Join(t.TempDir(), "state.json"))}
 	response := callServer(t, server, Request{Action: "ping"})
 	if !response.OK || response.ProtocolVersion != ProtocolVersion || response.BuildVersion != BuildVersion || response.DaemonPID != os.Getpid() || response.DaemonStartTime == 0 {
 		t.Fatalf("handshake=%+v", response)
@@ -182,11 +182,8 @@ func TestLegacyRestartRefusesActiveManagedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	statePath := filepath.Join(dir, "state.json")
-	store := state.New(statePath)
-	if err := store.Update(func(data *state.Data) error {
-		data.Runs["active"] = state.Run{ID: "active", State: "running"}
-		return nil
-	}); err != nil {
+	store := localstate.New(statePath)
+	if err := store.StartRun(localstate.Run{ID: "active", State: "running"}); err != nil {
 		t.Fatal(err)
 	}
 	executable, err := os.Executable()
@@ -358,7 +355,7 @@ func TestSupervisorPTYSignalHelper(t *testing.T) {
 // receives a SIGWINCH.
 func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
-	st := state.New(filepath.Join(dir, "state.json"))
+	st := localstate.New(filepath.Join(dir, "state.json"))
 	srv := &Server{Store: st, runs: map[string]*process{}}
 	exe, err := os.Executable()
 	if err != nil {
@@ -428,15 +425,15 @@ func requireSubscriberContains(t *testing.T, sub <-chan []byte, want string, tim
 }
 
 func TestSupervisorRestartMarksUnrecoverableRecordStale(t *testing.T) {
-	store := state.New(filepath.Join(t.TempDir(), "state.json"))
-	_ = store.Update(func(d *state.Data) error { d.Runs["r"] = state.Run{ID: "r", State: "running", PID: 999}; return nil })
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	_ = store.StartRun(localstate.Run{ID: "r", State: "running", PID: 999})
 	srv := Server{Store: store}
 	if err := srv.markStale(); err != nil {
 		t.Fatal(err)
 	}
-	d, _ := store.Load()
-	if d.Runs["r"].State != "stale" || d.Runs["r"].Error == "" {
-		t.Fatalf("run=%+v", d.Runs["r"])
+	runs, _ := store.Runs()
+	if runs["r"].State != "stale" || runs["r"].Error == "" {
+		t.Fatalf("run=%+v", runs["r"])
 	}
 }
 
