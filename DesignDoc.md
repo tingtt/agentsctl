@@ -171,6 +171,20 @@ Claude/Codex の 5h・weekly 利用率は、`sessionctl` 側の任意 capability
 - 0% (実際に利用率 0 と報告された) と unavailable (そもそも報告されない) を区別する。unavailable を 0% として描画することはない。
 - 巨大な単一 `Provider` interface へ `Usage` を必須 method として追加することはしない。
 
+**Codex**
+
+app-server の `account/rateLimits/read` が返す window (`primary`/`secondary`) は position (どちらのフィールドに入っているか) では 5h/weekly を区別しない。各 window 自身が持つ `windowDurationMins` の値によって分類する。未知/欠落した duration は 5h/weekly のどちらへも推測せず、その window を unavailable として扱う (fail closed)。
+
+**Claude**
+
+Claude Code には Codex app-server のような on-demand usage 読み取り RPC がないため、agentsctl が所有する専用の interactive Claude session (usage probe) を1つだけ持ち、その session 向け専用設定の `statusLine` から usage snapshot を収集する。
+
+- probe session は agentsctl が生成・所有する session であり、既存のユーザー session を attach/hijack することはない。
+- probe session の identity (native session ID) は agentsctl local state に保持し、以後の起動でも同じ session を再利用する。名前や CWD だけを identity の根拠にはしない。
+- probe session は通常の session catalog (Agent View 上の一覧、pin/rename/attach/stop/archive の対象) には現れない。除外は agentsctl が記録している exact な session identity によって provider 境界で行い、CWD だけを条件にはしない。
+- 取得結果は TTL 付きでキャッシュし、Agent View の reload のたびに probe session へ request を送ることはない。cache が stale な場合のみ refresh を行い、複数の呼び出しが同時に発生しても refresh は高々1回に集約する。
+- refresh が失敗しても、直前に取得できていた snapshot があればそれを返し、Session catalog や Codex 側の usage を道連れにしない。snapshot が一度も取得できていない場合のみ、この provider の usage を省略する (0% として偽装しない)。
+
 ##### Prompt stash
 
 Composer は、1つの共有 prompt stash を持つ。
