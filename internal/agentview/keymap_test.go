@@ -1,11 +1,22 @@
 package agentview
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
+
+// equalBinding reports whether got and want are the same Binding, physical
+// Keys included -- Label/Desc alone can't catch a Keys-only drift (e.g.
+// footerLine1 losing sync with a named binding's Keys while keeping its
+// Label/Desc).
+func equalBinding(got, want Binding) bool {
+	return got.Label == want.Label &&
+		got.Desc == want.Desc &&
+		slices.Equal(got.Keys, want.Keys)
+}
 
 // TestFooterLinesMatchCentralizedBindings fixes the exact footer text
 // against the Binding definitions it is built from, so a label/description
@@ -62,7 +73,7 @@ func TestFooterComposedFromNamedBindings(t *testing.T) {
 		t.Fatalf("footerLine1 has %d entries, want %d", len(footerLine1), len(want1))
 	}
 	for i, b := range want1 {
-		if footerLine1[i].Label != b.Label || footerLine1[i].Desc != b.Desc {
+		if !equalBinding(footerLine1[i], b) {
 			t.Fatalf("footerLine1[%d] = %+v, want %+v", i, footerLine1[i], b)
 		}
 	}
@@ -74,7 +85,7 @@ func TestFooterComposedFromNamedBindings(t *testing.T) {
 		t.Fatalf("footerLine2 has %d entries, want %d", len(footerLine2), len(want2))
 	}
 	for i, b := range want2 {
-		if footerLine2[i].Label != b.Label || footerLine2[i].Desc != b.Desc {
+		if !equalBinding(footerLine2[i], b) {
 			t.Fatalf("footerLine2[%d] = %+v, want %+v", i, footerLine2[i], b)
 		}
 	}
