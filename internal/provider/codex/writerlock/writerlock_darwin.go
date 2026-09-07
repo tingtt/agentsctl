@@ -1,6 +1,6 @@
 //go:build darwin
 
-package process
+package writerlock
 
 import (
 	"errors"
@@ -8,9 +8,11 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/tingtt/agentsctl/internal/process"
 )
 
-func OwnsWriterLock(path string, want Identity) (bool, error) {
+func OwnsWriterLock(path string, want process.Identity) (bool, error) {
 	info, contended, err := lockContended(path)
 	if err != nil || !contended {
 		return false, err
@@ -32,7 +34,7 @@ func OwnsWriterLock(path string, want Identity) (bool, error) {
 	if len(pids) != 1 || !pids[want.PID] {
 		return false, nil
 	}
-	if err := Match(want); err != nil {
+	if err := process.Match(want); err != nil {
 		return false, err
 	}
 	after, err := os.Stat(path)

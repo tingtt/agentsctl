@@ -1,4 +1,12 @@
-package process
+// Package writerlock checks whether a specific process holds the exclusive
+// flock on a Codex app-server thread's writer-lock file -- Codex's own
+// on-disk convention for which process may currently write to a thread
+// (see the DesignDoc's Codex run-to-thread binding). This is Codex-
+// specific: nothing outside internal/provider/codex uses it, so it stays
+// out of the generic internal/process package (identity/ownership
+// concerns any provider could need), depending on it rather than the
+// reverse.
+package writerlock
 
 import (
 	"errors"

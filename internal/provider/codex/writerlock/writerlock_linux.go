@@ -1,6 +1,6 @@
 //go:build linux
 
-package process
+package writerlock
 
 import (
 	"errors"
@@ -10,9 +10,11 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/tingtt/agentsctl/internal/process"
 )
 
-func OwnsWriterLock(path string, want Identity) (bool, error) {
+func OwnsWriterLock(path string, want process.Identity) (bool, error) {
 	info, contended, err := lockContended(path)
 	if err != nil || !contended {
 		return false, err
@@ -47,7 +49,7 @@ func OwnsWriterLock(path string, want Identity) (bool, error) {
 	if len(owners) != 1 || !owners[want.PID] {
 		return false, nil
 	}
-	if err := Match(want); err != nil {
+	if err := process.Match(want); err != nil {
 		return false, err
 	}
 	return true, nil

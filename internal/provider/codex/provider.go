@@ -15,6 +15,7 @@ import (
 	"github.com/tingtt/agentsctl/internal/localstate"
 	processinfo "github.com/tingtt/agentsctl/internal/process"
 	base "github.com/tingtt/agentsctl/internal/provider"
+	"github.com/tingtt/agentsctl/internal/provider/codex/writerlock"
 	"github.com/tingtt/agentsctl/internal/session"
 	"golang.org/x/sys/unix"
 )
@@ -252,7 +253,7 @@ func (p *Provider) reconcile(threads []Thread) error {
 		for _, t := range threads {
 			owner := p.WriterOwner
 			if owner == nil {
-				owner = processinfo.OwnsWriterLock
+				owner = writerlock.OwnsWriterLock
 			}
 			owned, _ := owner(filepath.Join(p.API.CodexHome(), "thread-writer-locks", t.ID+".lock"), processinfo.Identity{PID: r.PID, StartTime: r.StartTime, UID: r.UID})
 			if !base[t.ID] && filepath.Clean(t.CWD) == filepath.Clean(r.CWD) && owned {
