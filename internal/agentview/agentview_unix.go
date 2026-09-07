@@ -106,6 +106,7 @@ func beginTerminal(w io.Writer) { _, _ = io.WriteString(w, "\x1b[?1049h\x1b[?25l
 func endTerminal(w io.Writer)   { _, _ = io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l") }
 
 func (r *Runtime) reload(ctx context.Context) {
+	r.State.StartupCWD = r.CWD
 	scope := session.Scope{CurrentDirectory: r.CWD, Directory: r.State.Scope}
 	if r.State.Scope == session.ScopeDescendants && r.Worktrees != nil {
 		scope.WorktreeDirectories = r.Worktrees(ctx, r.CWD)
@@ -131,7 +132,7 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 	}
 	switch x.Kind {
 	case IntentDispatch:
-		_, result, err := r.Controller.Dispatch(ctx, x.Provider, x.Prompt, r.CWD)
+		_, result, err := r.Controller.Dispatch(ctx, x.Provider, x.Prompt, r.State.ComposerCWD())
 		if err != nil {
 			return err
 		}

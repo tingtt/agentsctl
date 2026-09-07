@@ -121,6 +121,72 @@ func TestRuntimeDispatchReloadsAndShowsNewSession(t *testing.T) {
 	}
 }
 
+// TestRuntimeDispatchUsesSelectedSessionCWDNotStartupCWD fixes #14's
+// runtime-context guarantee: dispatching a new prompt must target the
+// selected session's own CWD, not Runtime.CWD (the directory agentsctl
+// started in) -- display and dispatch context must never disagree (see
+// the DesignDoc's composer cwd section).
+func TestRuntimeDispatchUsesSelectedSessionCWDNotStartupCWD(t *testing.T) {
+	p := &fakeProvider{id: session.ProviderClaude, rows: []session.Session{
+		{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, CWD: "/work/repo-a"},
+	}}
+	rt := newTestRuntime(p)
+	if rt.CWD != "/work" {
+		t.Fatalf("test runtime CWD=%q, want /work (see newTestRuntime)", rt.CWD)
+	}
+	// The session's CWD ("/work/repo-a") differs from Runtime.CWD
+	// ("/work"), so widen scope past ScopeSame's exact-match filter to
+	// keep it selectable.
+	rt.State.Scope = session.ScopeAll
+	rt.reload(context.Background())
+	rt.State.selectIndex(0)
+	if got := rt.State.ComposerCWD(); got != "/work/repo-a" {
+		t.Fatalf("ComposerCWD()=%q, want the selected row's own CWD", got)
+	}
+	rt.State.Composer.Prompt = "hello"
+	intent := rt.State.Handle(KeyEvent{Key: KeyEnter})
+	if intent.Kind != IntentDispatch {
+		t.Fatalf("intent=%+v", intent)
+	}
+	if err := rt.act(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	var dispatched session.Session
+	for _, row := range p.rows {
+		if row.Key.ID == "new" {
+			dispatched = row
+		}
+	}
+	if dispatched.CWD != "/work/repo-a" {
+		t.Fatalf("dispatched session CWD=%q, want the selected session's CWD /work/repo-a, not Runtime.CWD", dispatched.CWD)
+	}
+}
+
+// TestRuntimeDispatchFallsBackToStartupCWDWithEmptyCatalog fixes the safe-
+// fallback rule: with nothing to select, a new prompt must still dispatch
+// using Runtime.CWD (StartupCWD) rather than an empty directory.
+func TestRuntimeDispatchFallsBackToStartupCWDWithEmptyCatalog(t *testing.T) {
+	p := &fakeProvider{id: session.ProviderClaude}
+	rt := newTestRuntime(p)
+	rt.State.Composer.Prompt = "hello"
+	intent := rt.State.Handle(KeyEvent{Key: KeyEnter})
+	if intent.Kind != IntentDispatch {
+		t.Fatalf("intent=%+v", intent)
+	}
+	if err := rt.act(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+	var dispatched session.Session
+	for _, row := range p.rows {
+		if row.Key.ID == "new" {
+			dispatched = row
+		}
+	}
+	if dispatched.CWD != rt.CWD {
+		t.Fatalf("dispatched session CWD=%q, want fallback to Runtime.CWD %q", dispatched.CWD, rt.CWD)
+	}
+}
+
 // TestRuntimeOpenMarksLastAttachedAndReloads covers the common Open
 // intent end to end: it must reach the provider's Open, mark the session
 // last-attached, and reload.

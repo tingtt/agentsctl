@@ -30,6 +30,14 @@ type State struct {
 	// here.
 	Scope session.DirectoryScope
 
+	// StartupCWD is the directory agentsctl was started in -- the listing
+	// scope anchor (see session.Scope.CurrentDirectory) -- and, per #14,
+	// only ComposerCWD's fallback for when no session is selectable at
+	// all. It never changes for the life of a Runtime; see
+	// Runtime.reload, the single place that keeps it in sync with
+	// Runtime.CWD.
+	StartupCWD string
+
 	// Error holds the most recent action failure. It is the only thing
 	// ever rendered in the composer-top notification area, reserved for
 	// errors exclusively -- an operation whose result is already visible
@@ -108,6 +116,20 @@ func (s State) SelectedRow() (session.Session, bool) {
 		}
 	}
 	return session.Session{}, false
+}
+
+// ComposerCWD is the directory context the composer displays and any new
+// prompt dispatches into (see the DesignDoc's composer cwd section /
+// #14): the selected session's own CWD, so both display and dispatch
+// follow selection as it moves across directories. StartupCWD is only a
+// safe fallback for when no session is selectable at all (an empty
+// catalog) -- it never overrides an actual selection, even one outside
+// the current listing scope's own anchor directory.
+func (s State) ComposerCWD() string {
+	if row, ok := s.SelectedRow(); ok {
+		return row.CWD
+	}
+	return s.StartupCWD
 }
 
 // SelectedIndex returns the row index of the current selection for

@@ -110,3 +110,35 @@ func TestApplyPatchRenameUpdatesNameWithoutReordering(t *testing.T) {
 		t.Fatal("row a missing")
 	}
 }
+
+// TestComposerCWDFollowsSelectedSession fixes #14's composer cwd tracking:
+// the composer's directory context is the selected session's own CWD, not
+// StartupCWD (the listing scope anchor), and it must follow selection
+// moving to a session in a different directory.
+func TestComposerCWDFollowsSelectedSession(t *testing.T) {
+	s := NewState()
+	s.StartupCWD = "/start"
+	s.SetRows([]session.Session{
+		{Key: key("a"), CWD: "/work/repo-a"},
+		{Key: key("b"), CWD: "/work/repo-b"},
+	})
+	s.selectIndex(0)
+	if got := s.ComposerCWD(); got != "/work/repo-a" {
+		t.Fatalf("ComposerCWD()=%q, want the selected session's own CWD", got)
+	}
+	s.selectIndex(1)
+	if got := s.ComposerCWD(); got != "/work/repo-b" {
+		t.Fatalf("ComposerCWD()=%q, want it to follow selection to repo-b", got)
+	}
+}
+
+// TestComposerCWDFallsBackToStartupWhenNoSessionSelectable fixes the #14
+// safe-fallback rule: an empty catalog (nothing to select) must still let
+// a new prompt dispatch, using StartupCWD rather than an empty string.
+func TestComposerCWDFallsBackToStartupWhenNoSessionSelectable(t *testing.T) {
+	s := NewState()
+	s.StartupCWD = "/start"
+	if got := s.ComposerCWD(); got != "/start" {
+		t.Fatalf("ComposerCWD()=%q, want StartupCWD fallback %q", got, "/start")
+	}
+}
