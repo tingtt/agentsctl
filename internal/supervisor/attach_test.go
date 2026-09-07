@@ -13,7 +13,7 @@ import (
 	"time"
 
 	creackpty "github.com/creack/pty"
-	"github.com/tingtt/agentsctl/internal/protocol"
+	"github.com/tingtt/agentsctl/internal/supervisor/protocol"
 	"github.com/tingtt/agentsctl/internal/terminal"
 )
 

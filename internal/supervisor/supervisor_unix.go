@@ -21,7 +21,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/localstate"
 	processinfo "github.com/tingtt/agentsctl/internal/process"
-	"github.com/tingtt/agentsctl/internal/protocol"
+	"github.com/tingtt/agentsctl/internal/supervisor/protocol"
 	"golang.org/x/sys/unix"
 )
 

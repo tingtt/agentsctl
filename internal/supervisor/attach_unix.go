@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tingtt/agentsctl/internal/protocol"
+	"github.com/tingtt/agentsctl/internal/supervisor/protocol"
 	"github.com/tingtt/agentsctl/internal/terminal"
 	"golang.org/x/term"
 )

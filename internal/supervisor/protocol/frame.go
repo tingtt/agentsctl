@@ -1,3 +1,9 @@
+// Package protocol is internal/supervisor's own Unix-socket wire framing:
+// a length-prefixed frame kind + payload, and the frame kinds the
+// supervisor daemon/client exchange (Request/Response/Input/Output/
+// Resize/Detach/Exit/Failure). It is not a generic application protocol --
+// nothing outside internal/supervisor speaks it -- so it is nested under
+// internal/supervisor rather than kept as a top-level package.
 package protocol
 
 import (
