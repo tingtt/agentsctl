@@ -218,6 +218,18 @@ func writeFakeLimitBanner(t *testing.T, dir, banner string) {
 	}
 }
 
+// writeFakeSessionConflict seeds AGENTSCTL_FAKE_DIR/session_conflict.txt,
+// the fixture the fake CLI writes to its own pty output (then exits)
+// instead of proceeding at all, standing in for Claude Code rejecting a
+// probe's --session-id as already in use (see probeSessionConflict and
+// the fake CLI's own doc comment on this fixture).
+func writeFakeSessionConflict(t *testing.T, dir, banner string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "session_conflict.txt"), []byte(banner), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestProbeRefreshDetectsFiveHourLimitAndPreservesWeekly fixes the core
 // limit-detection contract: a probe refresh that observes a 5-hour-
 // qualified usage-limit banner (instead of a fresh statusLine snapshot)
@@ -590,6 +602,66 @@ func TestProbeUsageAppliesResetBoundaryThroughClock(t *testing.T) {
 	}
 	if got.FiveHour.State != session.UsageUnknown {
 		t.Fatalf("FiveHour=%+v, want Unknown once Clock reports past the cached Reset, even though the TTL cache is still fresh", got.FiveHour)
+	}
+}
+
+// TestProbeRecoversFromSessionIDConflictByMintingNewIdentity fixes Issue
+// #19's follow-up root cause: a probe whose persisted --session-id has
+// been permanently rejected by Claude Code ("Session ID ... is already in
+// use") must discard that identity and mint a fresh one, rather than
+// repeating the exact same doomed refresh forever -- reproduced live
+// against the installed CLI (2.1.263), where retrying with the same
+// rejected ID failed identically and indefinitely, but a freshly-minted
+// ID succeeded immediately (see probeSessionConflict's doc comment).
+func TestProbeRecoversFromSessionIDConflictByMintingNewIdentity(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	// Seed a persisted identity as a real probe dir would already have
+	// (from before its session id became permanently rejected), and a
+	// fixture simulating that rejection.
+	rejectedID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markTrustAccepted(pr.identityPath(), rejectedID); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeSessionConflict(t, fakeDir, "Error: Session ID "+rejectedID.SessionID+" is already in use.\r\n")
+
+	if _, err := pr.Usage(context.Background()); err == nil {
+		t.Fatal("want an error while the session id is still rejected")
+	}
+	if _, ok, _ := readProbeIdentityIfExists(pr.identityPath()); ok {
+		t.Fatal("the rejected identity must be discarded, not left in place for the next refresh to retry")
+	}
+
+	// The conflict no longer applies to whatever fresh identity gets
+	// minted next; seed normal usage data for that refresh to succeed
+	// with.
+	if err := os.Remove(filepath.Join(fakeDir, "session_conflict.txt")); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 10, "resets_at": 4102444800},
+	})
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("Usage() with a freshly-minted identity errored: %v", err)
+	}
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 10 {
+		t.Fatalf("got=%+v, want Available/10%% once a fresh identity is used", got.FiveHour)
+	}
+	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	if err != nil || !ok {
+		t.Fatalf("no identity after recovery: ok=%v err=%v", ok, err)
+	}
+	if newID.SessionID == rejectedID.SessionID {
+		t.Fatal("recovery must mint a new session id, not reuse the rejected one")
 	}
 }
 

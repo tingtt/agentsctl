@@ -70,6 +70,21 @@ def probe_session(session_id, settings_flag):
         # record it once so run_statusline (which has no argv of its own)
         # can find it regardless of the actual --settings path used.
         (root / "probe-settings.json").write_text(Path(settings_flag).read_text())
+
+    # session_conflict.txt (usage_probe_unix_test.go's session-conflict
+    # fixture) stands in for the real CLI rejecting this --session-id as
+    # already in use elsewhere: verified against the installed CLI
+    # (2.1.263) via a live reproduction of Issue #19's "?% never updates"
+    # symptom that a rejected session ID prints an error and exits
+    # immediately, well before any trust dialog or chat input -- see
+    # probeSessionConflict's doc comment. Checked before anything else in
+    # this function that would otherwise consume stdin.
+    conflict_path = root / "session_conflict.txt"
+    if conflict_path.exists():
+        os.write(1, conflict_path.read_bytes())
+        termios.tcsetattr(0, termios.TCSADRAIN, old)
+        sys.exit(1)
+
     rows = load()
     rows = [r for r in rows if r["id"] != session_id]
     rows.append({"id": session_id, "name": "agentsctl usage probe", "summary": "", "cwd": os.getcwd(), "updatedAt": 1, "status": "idle", "state": "done"})

@@ -393,8 +393,20 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 		return usageSnapshot{}, err
 	}
 
+	// A rejected --session-id shows up here, within the settle window,
+	// well before any prompt is sent (see probeSessionConflict's doc
+	// comment) -- checked before the trust-dialog logic below so the
+	// common case never misreports it as a confusing, unrelated pty write
+	// failure once the (already-dead) child's slave end is written to.
+	if err, ok := pr.checkSessionConflict(capture, id); ok {
+		return usageSnapshot{}, err
+	}
+
 	if !id.TrustAccepted {
 		if _, err := child.Write([]byte(usageProbeTrustDialogAccept)); err != nil {
+			if cerr, ok := pr.checkSessionConflict(capture, id); ok {
+				return usageSnapshot{}, cerr
+			}
 			return usageSnapshot{}, fmt.Errorf("accept claude workspace trust dialog: %w", err)
 		}
 		// Persisted before the prompt below, not after refresh succeeds:
@@ -409,6 +421,16 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 
 	sentAt := time.Now()
 	if _, err := child.Write([]byte(usageProbePrompt + "\r")); err != nil {
+		// A conflict that arrived just after the settle-time check above
+		// (a narrow race, not observed but not impossible under heavy
+		// system load) would otherwise surface here only as a generic,
+		// unhelpful pty write error with no recovery action taken -- this
+		// re-check is the same identity-discarding recovery as the
+		// settle-time one above, just as a fallback rather than the
+		// common path.
+		if cerr, ok := pr.checkSessionConflict(capture, id); ok {
+			return usageSnapshot{}, cerr
+		}
 		return usageSnapshot{}, fmt.Errorf("send claude usage probe prompt: %w", err)
 	}
 
@@ -423,6 +445,21 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 		return usageSnapshot{}, waitErr
 	}
 	return snap, nil
+}
+
+// checkSessionConflict reports (via ok) whether capture shows Claude Code
+// rejecting id.SessionID as already in use (see probeSessionConflict),
+// discarding this probe's persisted identity as a side effect so the next
+// refresh mints a fresh one -- see discardProbeIdentity. Called at more
+// than one point in refresh (see its own call sites) so a conflict is
+// caught promptly in the common case but never missed just because it
+// showed up a moment later than the first check ran.
+func (pr *Probe) checkSessionConflict(capture *probeOutputCapture, id probeIdentity) (err error, ok bool) {
+	if !probeSessionConflict(capture.String()) {
+		return nil, false
+	}
+	_ = discardProbeIdentity(pr.identityPath())
+	return fmt.Errorf("claude usage probe: session id %s rejected as already in use; a new identity will be used on the next refresh", id.SessionID), true
 }
 
 // probeSettle waits for d, or returns ctx's error if ctx is cancelled

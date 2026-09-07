@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // probeIdentity is agentsctl's local record of its one owned Claude usage
@@ -114,6 +115,46 @@ func writeProbeIdentity(path string, id probeIdentity) error {
 		return err
 	}
 	return writeFileAtomic(path, b)
+}
+
+// probeSessionConflictPhrase is the Claude CLI's own error text when a
+// --session-id is rejected as already connected elsewhere -- confirmed
+// against the installed CLI (2.1.263) via a live reproduction of Issue
+// #19's follow-up "claude ?% / ?% それ自体が全く更新されない" symptom: a real
+// installed agentsctl's persisted probe session ID had become permanently
+// rejected ("Error: Session ID <uuid> is already in use."), printed to
+// the probe's own terminal output immediately on startup (well within the
+// settle delay, before any prompt is ever sent), and every subsequent
+// refresh attempt using that same session ID failed identically and
+// indefinitely -- reproduced twice in a row with no change. Minting a
+// brand-new identity (see discardProbeIdentity) and retrying was
+// confirmed, against the same real installed CLI, to succeed immediately.
+const probeSessionConflictPhrase = "is already in use"
+
+// probeSessionConflict reports whether output shows Claude Code rejecting
+// this probe's --session-id as already in use elsewhere -- see
+// probeSessionConflictPhrase's doc comment. This is a process/session-
+// identity-level signal, unrelated to classifyProbeOutput's usage-limit
+// wording (a different failure mode entirely, checked separately in
+// Probe.refresh).
+func probeSessionConflict(output string) bool {
+	return strings.Contains(output, probeSessionConflictPhrase)
+}
+
+// discardProbeIdentity removes path's persisted identity so the next
+// loadOrCreateProbeIdentity call mints a fresh session ID -- the only
+// recovery available once Claude Code has permanently rejected the
+// current one (see probeSessionConflict): the probe's design of reusing
+// one persisted identity forever (see probeIdentity's own doc comment)
+// has no other way to recover from a rejection that never clears on its
+// own. A missing file is not an error: discarding an identity that's
+// already gone (e.g. a concurrent refresh already discarded it) is a
+// no-op.
+func discardProbeIdentity(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // newUUIDv4 generates a random RFC 4122 version-4 UUID -- sufficient for
