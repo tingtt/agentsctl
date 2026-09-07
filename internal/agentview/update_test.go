@@ -205,6 +205,68 @@ func TestRenameEscCancelsWithoutIntent(t *testing.T) {
 	}
 }
 
+func TestCtrlGCyclesScopeAndRequestsRefresh(t *testing.T) {
+	s := NewState()
+	if s.Scope != session.ScopeCWD {
+		t.Fatalf("initial scope=%v, want ScopeCWD", s.Scope)
+	}
+	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
+	if intent.Kind != IntentRefresh || s.Scope != session.ScopeSubtree {
+		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeSubtree", intent, s.Scope)
+	}
+	s.Handle(KeyEvent{Key: KeyCtrlG})
+	if s.Scope != session.ScopeAll {
+		t.Fatalf("scope=%v, want ScopeAll", s.Scope)
+	}
+	s.Handle(KeyEvent{Key: KeyCtrlG})
+	if s.Scope != session.ScopeCWD {
+		t.Fatalf("scope=%v, want wrap back to ScopeCWD", s.Scope)
+	}
+}
+
+func TestCtrlTRequestsPinForSelectedSession(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}})
+	intent := s.Handle(KeyEvent{Key: KeyCtrlT})
+	if intent.Kind != IntentPin || intent.Key != key("a") {
+		t.Fatalf("intent=%+v", intent)
+	}
+}
+
+func TestCtrlLRequestsRefresh(t *testing.T) {
+	s := NewState()
+	if intent := s.Handle(KeyEvent{Key: KeyCtrlL}); intent.Kind != IntentRefresh {
+		t.Fatalf("intent=%+v", intent)
+	}
+}
+
+func TestCtrlSlashCyclesCWDDepthWithoutAnIntent(t *testing.T) {
+	s := NewState()
+	start := s.CWDDepth
+	intent := s.Handle(KeyEvent{Key: KeyCtrlSlash})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none (depth change is its own feedback)", intent)
+	}
+	if s.CWDDepth == start {
+		t.Fatal("CWDDepth did not change")
+	}
+}
+
+func TestShiftTabTogglesComposerProvider(t *testing.T) {
+	s := NewState()
+	if s.Provider != session.ProviderClaude {
+		t.Fatalf("initial provider=%v, want claude", s.Provider)
+	}
+	s.Handle(KeyEvent{Key: KeyShiftTab})
+	if s.Provider != session.ProviderCodex {
+		t.Fatalf("provider=%v, want codex", s.Provider)
+	}
+	s.Handle(KeyEvent{Key: KeyShiftTab})
+	if s.Provider != session.ProviderClaude {
+		t.Fatalf("provider=%v, want claude", s.Provider)
+	}
+}
+
 func TestEscQuitsOnlyOutsideRenameAndConfirmation(t *testing.T) {
 	s := NewState()
 	if intent := s.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {
