@@ -26,6 +26,16 @@ import (
 // statusLineWindow.toUsageWindowSnapshot).
 type statusLinePayload struct {
 	RateLimits *statusLineRateLimits `json:"rate_limits"`
+	// Cost is confirmed (by driving the real installed CLI's statusLine
+	// through this package's own probe machinery) to carry
+	// total_api_duration_ms == 0 on a tick observed before this process's
+	// own first completed API response, and non-zero from then on -- see
+	// parseStatusLinePayload's doc comment.
+	Cost *statusLineCost `json:"cost"`
+}
+
+type statusLineCost struct {
+	TotalAPIDurationMs int64 `json:"total_api_duration_ms"`
 }
 
 type statusLineRateLimits struct {
@@ -45,12 +55,27 @@ type statusLineWindow struct {
 // plan account, or before the session's first API response) yields a
 // snapshot with both windows unavailable, not an error -- that is a valid,
 // expected shape, not a parse failure.
+//
+// ResponseObserved is set from cost.total_api_duration_ms: this package's
+// probe re-invokes the same statusLine command on a fixed timer regardless
+// of API activity (see usage_settings.go's refreshInterval), so a tick's
+// ObservedAt alone does not prove it reflects a completed response to
+// *this* refresh's own prompt -- verified against the installed CLI
+// (2.1.263): a brand-new probe process's very first ticks report
+// total_api_duration_ms: 0 (and no rate_limits at all) even for a
+// long-lived, previously-established --session-id, only becoming non-zero
+// once this process's own prompt actually gets an API response. Without
+// this, waitForProbeOutcome could otherwise accept an earlier, still-
+// pre-response tick as if it were this refresh's real answer.
 func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
 	var payload statusLinePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return usageSnapshot{}, err
 	}
-	snap := usageSnapshot{ObservedAt: time.Now()}
+	snap := usageSnapshot{
+		ObservedAt:       time.Now(),
+		ResponseObserved: payload.Cost != nil && payload.Cost.TotalAPIDurationMs > 0,
+	}
 	if payload.RateLimits == nil {
 		return snap, nil
 	}

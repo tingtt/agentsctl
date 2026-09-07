@@ -111,7 +111,23 @@ def probe_session(session_id, settings_flag):
                 continue  # suspend request, not an exit -- see above
             buf += b
             if b in (b"\r", b"\n"):
-                run_statusline()
+                # limit_banner.txt (usage_probe_unix_test.go's limit-
+                # detection fixtures) stands in for the real CLI hitting a
+                # 5h/weekly usage limit: verified against the installed
+                # CLI (2.1.263) that a probe process which never gets a
+                # completed API response for its own prompt keeps
+                # reporting total_api_duration_ms: 0 (no rate_limits
+                # update) on every statusLine tick -- modeled here by
+                # writing the fixture's banner text to the pty instead of
+                # invoking statusLine at all for this line, so
+                # classifyProbeOutput has real terminal output to work
+                # from and waitForProbeOutcome never sees a
+                # ResponseObserved snapshot for this refresh.
+                banner_path = root / "limit_banner.txt"
+                if banner_path.exists():
+                    os.write(1, banner_path.read_bytes())
+                else:
+                    run_statusline()
                 buf = b""
     finally:
         termios.tcsetattr(0, termios.TCSADRAIN, old)
@@ -125,7 +141,13 @@ def run_statusline():
     if not command:
         return
     ratelimits_path = root / "ratelimits.json"
-    payload = {"session_id": "probe"}
+    # A real completed API turn (verified against the installed CLI,
+    # 2.1.263): cost.total_api_duration_ms is non-zero once this process's
+    # own prompt has gotten a response -- see parseStatusLinePayload's doc
+    # comment and waitForProbeOutcome's ResponseObserved gate. This fake
+    # only ever calls run_statusline in response to a submitted line (see
+    # above), so it always represents a completed turn.
+    payload = {"session_id": "probe", "cost": {"total_api_duration_ms": 1234}}
     if ratelimits_path.exists():
         payload["rate_limits"] = json.loads(ratelimits_path.read_text())
     subprocess.run(command, shell=True, input=json.dumps(payload).encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

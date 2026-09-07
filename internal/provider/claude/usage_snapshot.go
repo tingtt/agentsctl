@@ -15,10 +15,11 @@ import (
 // session.UsageLimitState vocabulary directly (available/exhausted/unknown
 // -- see Issue #19's "Normalized state") rather than a redundant parallel
 // Claude-internal enum: the three-state distinction itself is not
-// Claude-specific (see this package's reset-boundary handling in
-// toSessionUsageWindow). UsageUnknown covers "the statusLine payload
-// didn't report this window at all" -- never conflated with a genuinely
-// reported 0% (UsageAvailable, Percent 0).
+// Claude-specific, only the mechanism that arrives at it is (see
+// usage_limit.go's classifyProbeOutput and this package's reset-boundary
+// handling in toSessionUsageWindow). UsageUnknown covers "the statusLine
+// payload didn't report this window at all" -- never conflated with a
+// genuinely reported 0% (UsageAvailable, Percent 0).
 type usageWindowSnapshot struct {
 	State   session.UsageLimitState `json:"state"`
 	Percent int                     `json:"percent"`
@@ -26,15 +27,22 @@ type usageWindowSnapshot struct {
 }
 
 // usageSnapshot is the whole persisted usage.json document: the last
-// statusLine reading the probe's collector observed, plus when it observed
-// it (ObservedAt) -- freshness bookkeeping lives in the in-memory Probe
-// (see usage_probe_unix.go), but ObservedAt is what lets a refresh tell a
-// newly-written snapshot apart from a stale one already on disk (see
-// waitForFreshSnapshot).
+// statusLine reading the probe's collector observed, when it observed it
+// (ObservedAt), and whether that observation actually reflects a
+// completed API response for this probe process's own lifetime
+// (ResponseObserved -- see parseStatusLinePayload's doc comment). Freshness
+// bookkeeping (the TTL) lives in the in-memory Probe (see
+// usage_probe_unix.go); ObservedAt is what lets a refresh tell a
+// newly-written snapshot apart from a stale one already on disk, and
+// ResponseObserved is what lets it tell a snapshot that actually reflects
+// this refresh's own prompt apart from a periodic statusLine re-tick of
+// unchanged pre-response (or stale prior-turn) data (see
+// waitForProbeOutcome).
 type usageSnapshot struct {
-	FiveHour   usageWindowSnapshot `json:"fiveHour"`
-	Weekly     usageWindowSnapshot `json:"weekly"`
-	ObservedAt time.Time           `json:"observedAt"`
+	FiveHour         usageWindowSnapshot `json:"fiveHour"`
+	Weekly           usageWindowSnapshot `json:"weekly"`
+	ObservedAt       time.Time           `json:"observedAt"`
+	ResponseObserved bool                `json:"responseObserved"`
 }
 
 // readUsageSnapshot reads path's persisted snapshot, if any. A missing

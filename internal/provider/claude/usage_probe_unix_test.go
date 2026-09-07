@@ -206,6 +206,128 @@ func TestProbeUsageStaleCacheFailsOverWithoutError(t *testing.T) {
 	}
 }
 
+// writeFakeLimitBanner seeds AGENTSCTL_FAKE_DIR/limit_banner.txt -- the
+// fixture the extended fake CLI writes to its own pty output instead of
+// invoking statusLine, standing in for Claude Code hitting a usage limit
+// (see the fake CLI's own doc comment on this fixture, and
+// classifyProbeOutput).
+func writeFakeLimitBanner(t *testing.T, dir, banner string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "limit_banner.txt"), []byte(banner), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProbeRefreshDetectsFiveHourLimitAndPreservesWeekly fixes the core
+// limit-detection contract: a probe refresh that observes a 5-hour-
+// qualified usage-limit banner (instead of a fresh statusLine snapshot)
+// reports FiveHour as exhausted/100%, while Weekly's still-valid prior
+// cached reading is preserved rather than wiped -- see Issue #19's "片方
+// だけ exhausted の場合、もう片方の有効な usage snapshot を不必要に失わない".
+func TestProbeRefreshDetectsFiveHourLimitAndPreservesWeekly(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": 4102444800},
+		"seven_day": map[string]any{"used_percentage": 84, "resets_at": 4102444801},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a new refresh, this time observing a 5-hour usage-limit banner
+	// instead of a fresh statusLine snapshot.
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("a detected limit must be a valid state transition, not a refresh error: %v", err)
+	}
+	if got.FiveHour.State != session.UsageExhausted || got.FiveHour.Percent != 100 {
+		t.Fatalf("FiveHour=%+v, want Exhausted/100%%", got.FiveHour)
+	}
+	if got.Weekly.State != session.UsageAvailable || got.Weekly.Percent != 84 {
+		t.Fatalf("Weekly=%+v, want the prior Available/84%% reading preserved", got.Weekly)
+	}
+}
+
+// TestProbeRefreshDetectsWeeklyLimitAndPreservesFiveHour is the symmetric
+// case: a weekly-qualified banner exhausts only Weekly, leaving FiveHour's
+// prior valid reading untouched.
+func TestProbeRefreshDetectsWeeklyLimitAndPreservesFiveHour(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 40, "resets_at": 4102444800},
+		"seven_day": map[string]any{"used_percentage": 95, "resets_at": 4102444801},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "You have reached your weekly usage limit.\r\n")
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("a detected limit must be a valid state transition, not a refresh error: %v", err)
+	}
+	if got.Weekly.State != session.UsageExhausted || got.Weekly.Percent != 100 {
+		t.Fatalf("Weekly=%+v, want Exhausted/100%%", got.Weekly)
+	}
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 40 {
+		t.Fatalf("FiveHour=%+v, want the prior Available/40%% reading preserved", got.FiveHour)
+	}
+}
+
+// TestProbeRefreshDetectsBothLimitsExhausted fixes that a banner
+// mentioning both windows exhausts both, each independently normalized to
+// Exhausted/100%.
+func TestProbeRefreshDetectsBothLimitsExhausted(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": 4102444800},
+		"seven_day": map[string]any{"used_percentage": 95, "resets_at": 4102444801},
+	})
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	if _, err := pr.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	pr.mu.Lock()
+	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "Usage limit reached: your 5-hour session limit and your weekly usage limit have both been reached.\r\n")
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("a detected limit must be a valid state transition, not a refresh error: %v", err)
+	}
+	if got.FiveHour.State != session.UsageExhausted || got.FiveHour.Percent != 100 {
+		t.Fatalf("FiveHour=%+v, want Exhausted/100%%", got.FiveHour)
+	}
+	if got.Weekly.State != session.UsageExhausted || got.Weekly.Percent != 100 {
+		t.Fatalf("Weekly=%+v, want Exhausted/100%%", got.Weekly)
+	}
+}
+
 // TestProbeUsageFailsClosedWithNoCacheAtAll fixes the cold-start failure
 // case: with no cached snapshot ever obtained, a refresh failure must
 // surface as an error (which sessionctl.Controller.Usage already treats as

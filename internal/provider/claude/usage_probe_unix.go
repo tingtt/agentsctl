@@ -301,11 +301,21 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 // answers the workspace-trust dialog if this is the very first launch
 // ever for this probe identity, sends usageProbePrompt to elicit a real
 // API response (consuming a small amount of quota -- see
-// usageProbePrompt's doc comment), waits for the collector to observe a
-// fresh statusLine snapshot, then detaches -- the process is never left
-// running across refreshes (see Probe's doc comment): each refresh is its
-// own short-lived attach, so Claude's own native catalog shows exactly
-// one probe session no matter how many refreshes have run.
+// usageProbePrompt's doc comment), waits for either the collector to
+// observe a snapshot that actually reflects a completed response to this
+// prompt or Claude Code's own terminal output to show a usage-limit
+// indication (see waitForProbeOutcome/classifyProbeOutput), then detaches
+// -- the process is never left running across refreshes (see Probe's doc
+// comment): each refresh is its own short-lived attach, so Claude's own
+// native catalog shows exactly one probe session no matter how many
+// refreshes have run.
+//
+// A detected limit is returned as a valid (err == nil) exhausted
+// usageSnapshot, not a failure -- see exhaustedSnapshot and Issue #19's
+// "limit 到達を...単なる refresh failure として扱わない". Only a genuine
+// non-limit failure (timeout, parse failure, process failure) still
+// returns an error, preserving #14's existing stale-cache fallback policy
+// for those cases (see Usage's own doc comment).
 func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 	if err := os.MkdirAll(pr.Dir, 0o700); err != nil {
 		return usageSnapshot{}, err
@@ -332,10 +342,13 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 	defer child.Close()
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
-	// No real terminal is watching this session's output; drain it for the
-	// same reason sendClaudeRename does (an unread pty buffer would
-	// otherwise make the child block on its own writes).
-	go drainUntilClosed(child)
+	// No real terminal is watching this session's output; capture it
+	// (rather than plain drainUntilClosed's discard, as sendClaudeRename
+	// uses) both to keep the pty buffer draining -- an unread buffer would
+	// otherwise make the child block on its own writes -- and so a usage-
+	// limit indication in that output can be classified below.
+	capture := &probeOutputCapture{}
+	go captureUntilClosed(child, capture)
 
 	// See usageProbeSettleDelay's doc comment for why this waits, unlike
 	// sendClaudeRename's immediate write.
@@ -362,10 +375,13 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 		return usageSnapshot{}, fmt.Errorf("send claude usage probe prompt: %w", err)
 	}
 
-	snap, waitErr := waitForFreshSnapshot(ctx, pr.snapshotPath(), sentAt, usageProbeSendTimeout)
+	snap, sig, waitErr := waitForProbeOutcome(ctx, pr.snapshotPath(), capture, sentAt, usageProbeSendTimeout)
 
 	pr.detachProbeSession(ctx, cmd, wait)
 
+	if sig.any() {
+		return pr.exhaustedSnapshot(sig, pr.now()), nil
+	}
 	if waitErr != nil {
 		return usageSnapshot{}, waitErr
 	}
@@ -383,25 +399,71 @@ func probeSettle(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// waitForFreshSnapshot polls path until it holds a snapshot whose
-// ObservedAt is after `after` (proving the collector wrote it in response
-// to this refresh's own prompt, not a leftover from an earlier one) or
-// timeout elapses.
-func waitForFreshSnapshot(ctx context.Context, path string, after time.Time, timeout time.Duration) (usageSnapshot, error) {
+// waitForProbeOutcome polls both path (the collector's persisted snapshot)
+// and capture (the probe session's own raw terminal output) until one of
+// three outcomes is reached: (1) path holds a snapshot whose ObservedAt is
+// after `after` AND whose ResponseObserved is true -- proving it reflects
+// a completed response to this refresh's own prompt, not a periodic
+// pre-response or stale-prior-turn re-tick (see parseStatusLinePayload's
+// doc comment) -- returned as a normal fresh snapshot; (2) capture's
+// accumulated output classifies as a usage-limit indication (see
+// classifyProbeOutput) -- returned as a limit signal, snapshot zero,
+// error nil, since this is itself a valid outcome, not a failure; or (3)
+// timeout elapses with neither -- a genuine non-limit failure (see
+// refresh's own doc comment for how each outcome is handled).
+func waitForProbeOutcome(ctx context.Context, path string, capture *probeOutputCapture, after time.Time, timeout time.Duration) (usageSnapshot, probeLimitSignal, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if snap, ok, err := readUsageSnapshot(path); err == nil && ok && snap.ObservedAt.After(after) {
-			return snap, nil
+		if snap, ok, err := readUsageSnapshot(path); err == nil && ok && snap.ObservedAt.After(after) && snap.ResponseObserved {
+			return snap, probeLimitSignal{}, nil
+		}
+		if sig := classifyProbeOutput(capture.String()); sig.any() {
+			return usageSnapshot{}, sig, nil
 		}
 		if !time.Now().Before(deadline) {
-			return usageSnapshot{}, fmt.Errorf("claude usage probe: no fresh statusLine snapshot within %s", timeout)
+			return usageSnapshot{}, probeLimitSignal{}, fmt.Errorf("claude usage probe: no fresh statusLine snapshot within %s", timeout)
 		}
 		select {
 		case <-ctx.Done():
-			return usageSnapshot{}, ctx.Err()
+			return usageSnapshot{}, probeLimitSignal{}, ctx.Err()
 		case <-time.After(usageProbePollInterval):
 		}
 	}
+}
+
+// exhaustedSnapshot builds the usageSnapshot for a refresh that detected a
+// Claude usage limit (see classifyProbeOutput) instead of obtaining a
+// trustworthy fresh statusLine snapshot. Each window sig marks exhausted
+// becomes session.UsageExhausted at 100%, carrying forward that same
+// window's own prior cached Reset time when one is known (the server-set
+// reset boundary doesn't change just because this refresh couldn't
+// re-confirm it) -- never inventing one. A window sig does NOT mark is
+// left exactly as it was previously cached, so a limit confirmed for one
+// window never destroys the other's still-valid snapshot (see Issue #19's
+// "片方だけ exhausted の場合...もう片方の有効な snapshot を不必要に失わない"); that
+// carried-forward window is still subject to the normal reset-boundary
+// normalization at toSessionUsageWindow's read boundary, same as any
+// other cached window.
+func (pr *Probe) exhaustedSnapshot(sig probeLimitSignal, now time.Time) usageSnapshot {
+	prev, _ := pr.cachedAny()
+	snap := usageSnapshot{ObservedAt: now, ResponseObserved: true, FiveHour: prev.FiveHour, Weekly: prev.Weekly}
+	if sig.FiveHour {
+		snap.FiveHour = exhaustedWindowSnapshot(prev.FiveHour)
+	}
+	if sig.Weekly {
+		snap.Weekly = exhaustedWindowSnapshot(prev.Weekly)
+	}
+	return snap
+}
+
+// exhaustedWindowSnapshot builds one exhausted window, carrying forward
+// prev's own Reset time when prev had one (see exhaustedSnapshot).
+func exhaustedWindowSnapshot(prev usageWindowSnapshot) usageWindowSnapshot {
+	reset := prev.ResetAt
+	if prev.State == session.UsageUnknown {
+		reset = time.Time{}
+	}
+	return usageWindowSnapshot{State: session.UsageExhausted, Percent: 100, ResetAt: reset}
 }
 
 // detachProbeSession ends a plain interactive probe session process.

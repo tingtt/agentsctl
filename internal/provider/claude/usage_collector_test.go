@@ -13,7 +13,7 @@ import (
 // payload on stdin, --out naming where the derived snapshot lands.
 func TestRunUsageCollectorParsesStdinAndWritesSnapshot(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "usage.json")
-	stdin := strings.NewReader(`{"rate_limits":{"five_hour":{"used_percentage":70,"resets_at":1000},"seven_day":{"used_percentage":20,"resets_at":2000}}}`)
+	stdin := strings.NewReader(`{"cost":{"total_api_duration_ms":1000},"rate_limits":{"five_hour":{"used_percentage":70,"resets_at":1000},"seven_day":{"used_percentage":20,"resets_at":2000}}}`)
 	if err := RunUsageCollector([]string{"--out", out}, stdin); err != nil {
 		t.Fatal(err)
 	}

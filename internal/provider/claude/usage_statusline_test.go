@@ -10,7 +10,7 @@ import (
 // confirmed against the installed CLI's own statusLine documentation:
 // rate_limits.five_hour -> FiveHour, rate_limits.seven_day -> Weekly.
 func TestParseStatusLinePayloadMapsFiveHourAndSevenDay(t *testing.T) {
-	raw := []byte(`{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}}`)
+	raw := []byte(`{"cost":{"total_api_duration_ms":1000},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}}`)
 	snap, err := parseStatusLinePayload(raw)
 	if err != nil {
 		t.Fatal(err)
@@ -74,5 +74,35 @@ func TestParseStatusLinePayloadZeroPercentIsAvailable(t *testing.T) {
 func TestParseStatusLinePayloadRejectsMalformedJSON(t *testing.T) {
 	if _, err := parseStatusLinePayload([]byte("not json")); err == nil {
 		t.Fatal("malformed payload was accepted")
+	}
+}
+
+// TestParseStatusLinePayloadResponseObservedFromCost fixes the freshness
+// signal waitForProbeOutcome depends on: total_api_duration_ms == 0 (or
+// cost absent entirely) means no completed API response yet, non-zero
+// means one occurred -- verified against the installed CLI (2.1.263) via
+// this package's own probe machinery (see parseStatusLinePayload's doc
+// comment).
+func TestParseStatusLinePayloadResponseObservedFromCost(t *testing.T) {
+	preResponse, err := parseStatusLinePayload([]byte(`{"cost":{"total_api_duration_ms":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preResponse.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=false for total_api_duration_ms=0", preResponse)
+	}
+	noCost, err := parseStatusLinePayload([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noCost.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=false with no cost field at all", noCost)
+	}
+	postResponse, err := parseStatusLinePayload([]byte(`{"cost":{"total_api_duration_ms":1979}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !postResponse.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=true for a positive total_api_duration_ms", postResponse)
 	}
 }
