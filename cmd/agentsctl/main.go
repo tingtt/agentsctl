@@ -9,13 +9,13 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/tingtt/agentsctl/internal/agentview"
 	"github.com/tingtt/agentsctl/internal/localstate"
 	base "github.com/tingtt/agentsctl/internal/provider"
 	"github.com/tingtt/agentsctl/internal/provider/claude"
 	"github.com/tingtt/agentsctl/internal/provider/codex"
-	"github.com/tingtt/agentsctl/internal/session"
+	"github.com/tingtt/agentsctl/internal/sessionctl"
 	"github.com/tingtt/agentsctl/internal/supervisor"
-	"github.com/tingtt/agentsctl/internal/tui"
 )
 
 func main() {
@@ -54,13 +54,19 @@ func run() error {
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
-	providers := []session.Provider{&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer()}, &codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch}}
+	controller := sessionctl.Controller{
+		Providers: []sessionctl.Source{
+			&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer()},
+			&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
+		},
+		Pins: store,
+	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
-	app := tui.App{Catalog: session.Catalog{Providers: providers, Pins: store}, Model: tui.NewModel(), Input: os.Stdin, Output: os.Stdout, CWD: cwd, ClaudePath: "claude", Socket: socket}
-	return app.Run(ctx)
+	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd}
+	return rt.Run(ctx)
 }
 func configDir() (string, error) {
 	if v := os.Getenv("AGENTSCTL_STATE_DIR"); v != "" {

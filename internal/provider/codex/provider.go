@@ -34,26 +34,6 @@ type Provider struct {
 	WriterOwner func(string, processinfo.Identity) (bool, error)
 }
 
-// capabilitiesFromActions derives the legacy session.Capabilities group
-// from actions, for internal/tui -- the only remaining Capabilities reader
-// -- until it is replaced (internal/agentview reads Actions directly).
-func capabilitiesFromActions(actions session.Actions) session.Capabilities {
-	reason := ""
-	for _, id := range []session.ActionID{session.ActionOpen, session.ActionStop, session.ActionRename, session.ActionArchive} {
-		if a, ok := actions[id]; ok && !a.Available && a.Reason != "" {
-			reason = a.Reason
-			break
-		}
-	}
-	return session.Capabilities{
-		Attach:  actions.Available(session.ActionOpen),
-		Stop:    actions.Available(session.ActionStop),
-		Rename:  actions.Available(session.ActionRename),
-		Archive: actions.Available(session.ActionArchive),
-		Reason:  reason,
-	}
-}
-
 func (p *Provider) ID() session.ProviderID { return session.ProviderCodex }
 func (p *Provider) Available() error {
 	path := p.Path
@@ -102,7 +82,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			actions[session.ActionOpen] = session.Availability{Reason: reason}
 			actions[session.ActionStop] = session.Availability{Reason: reason}
 		}
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, Capabilities: capabilitiesFromActions(actions), Actions: actions})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, Actions: actions})
 	}
 	if !archived {
 		for _, r := range runs {
@@ -124,7 +104,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 				activity, runtime, name = session.ActivityFailed, session.RuntimeStopped, "Unbound run"
 				actions = session.Actions{session.ActionArchive: {Available: true}}
 			}
-			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, CreatedAt: r.StartedAt, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Capabilities: capabilitiesFromActions(actions), Actions: actions})
+			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, CreatedAt: r.StartedAt, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Actions: actions})
 		}
 	}
 	return rows, nil
@@ -144,7 +124,7 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	}
 	createdAt := time.Now()
 	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
-	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Capabilities: capabilitiesFromActions(actions), Actions: actions}, nil
+	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
 }
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	runs, err := p.Store.Runs()

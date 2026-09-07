@@ -80,26 +80,6 @@ func (p *Provider) confirmMaxWait() time.Duration {
 	return confirmMaxWait
 }
 
-// capabilitiesFromActions derives the legacy session.Capabilities group
-// from actions, for internal/tui -- the only remaining Capabilities reader
-// -- until it is replaced (internal/agentview reads Actions directly).
-func capabilitiesFromActions(actions session.Actions) session.Capabilities {
-	reason := ""
-	for _, id := range []session.ActionID{session.ActionOpen, session.ActionStop, session.ActionRename, session.ActionArchive} {
-		if a, ok := actions[id]; ok && !a.Available && a.Reason != "" {
-			reason = a.Reason
-			break
-		}
-	}
-	return session.Capabilities{
-		Attach:  actions.Available(session.ActionOpen),
-		Stop:    actions.Available(session.ActionStop),
-		Rename:  actions.Available(session.ActionRename),
-		Archive: actions.Available(session.ActionArchive),
-		Reason:  reason,
-	}
-}
-
 func (p *Provider) ID() session.ProviderID { return session.ProviderClaude }
 func (p *Provider) path() string {
 	if p.Path != "" {
@@ -174,7 +154,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		} else {
 			actions[session.ActionArchive] = session.Availability{Reason: "stop the session before archiving"}
 		}
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Capabilities: capabilitiesFromActions(actions), Actions: actions})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Name: name, Summary: text(v, "summary", "description", "lastMessage"), CWD: text(v, "cwd", "workingDirectory"), CreatedAt: created, UpdatedAt: updated, Activity: activity, Runtime: runtime, Archived: isArchived, Actions: actions})
 	}
 	return rows, nil
 }
@@ -199,7 +179,7 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	id = fields[0]
 	createdAt := time.Now()
 	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
-	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Capabilities: capabilitiesFromActions(actions), Actions: actions}, nil
+	return session.Session{Key: session.Key{Provider: session.ProviderClaude, ID: id}, Summary: prompt, CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, Actions: actions}, nil
 }
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	res, err := p.Runner.Run(ctx, p.path(), []string{"stop", k.ID}, "")
