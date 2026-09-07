@@ -264,13 +264,7 @@ func (s *Server) drain(p *process) {
 	}
 	_ = p.cmd.Wait()
 	_ = p.ptmx.Close()
-	p.mu.Lock()
-	close(p.done)
-	for sub := range p.subscribers {
-		close(sub.output)
-	}
-	p.subscribers = map[*subscriber]struct{}{}
-	p.mu.Unlock()
+	p.finishSubscribers()
 	stopped, _ := s.Store.MarkRunStopped(runID)
 	p.mu.Lock()
 	p.run = stopped
@@ -295,9 +289,10 @@ func (s *Server) attach(c net.Conn, id string) {
 		output:     make(chan []byte, subscriberBuffer),
 		disconnect: func() { _ = c.Close() },
 	}
-	p.mu.Lock()
-	p.subscribers[sub] = struct{}{}
-	p.mu.Unlock()
+	if !p.addSubscriber(sub) {
+		_ = protocol.Write(c, protocol.Exit, nil)
+		return
+	}
 	defer p.removeSubscriber(sub)
 	done := make(chan struct{})
 	go func() {
@@ -306,6 +301,11 @@ func (s *Server) attach(c net.Conn, id string) {
 			if protocol.Write(c, protocol.Output, b) != nil {
 				return
 			}
+		}
+		select {
+		case <-p.done:
+			_ = protocol.Write(c, protocol.Exit, nil)
+		default:
 		}
 	}()
 	for {
@@ -352,6 +352,18 @@ func (p *process) broadcast(chunk []byte) {
 	}
 }
 
+func (p *process) addSubscriber(sub *subscriber) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.done:
+		return false
+	default:
+		p.subscribers[sub] = struct{}{}
+		return true
+	}
+}
+
 func (p *process) removeSubscriber(sub *subscriber) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -360,6 +372,16 @@ func (p *process) removeSubscriber(sub *subscriber) {
 	}
 	delete(p.subscribers, sub)
 	close(sub.output)
+}
+
+func (p *process) finishSubscribers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	close(p.done)
+	for sub := range p.subscribers {
+		close(sub.output)
+	}
+	p.subscribers = map[*subscriber]struct{}{}
 }
 
 // syncPTYSize applies the client's terminal size to the managed PTY and, on

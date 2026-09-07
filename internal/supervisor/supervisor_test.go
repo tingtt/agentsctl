@@ -387,6 +387,89 @@ func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
 	}
 }
 
+func TestManagedProcessExitEndsAttachAfterQueuedOutput(t *testing.T) {
+	p := &process{
+		run:         localstate.Run{ID: "r"},
+		subscribers: map[*subscriber]struct{}{},
+		done:        make(chan struct{}),
+	}
+	srv := &Server{runs: map[string]*process{"r": p}}
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer server.Close()
+		srv.attach(server, "r")
+	}()
+	kind, _, err := protocol.Read(client)
+	if err != nil || kind != protocol.Response {
+		t.Fatalf("attach response kind=%q err=%v", kind, err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		p.mu.Lock()
+		attached := len(p.subscribers) == 1
+		p.mu.Unlock()
+		if attached {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("server did not register attach subscriber")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	p.broadcast([]byte("last output"))
+	p.finishSubscribers()
+	kind, data, err := protocol.Read(client)
+	if err != nil || kind != protocol.Output || string(data) != "last output" {
+		t.Fatalf("last output kind=%q data=%q err=%v", kind, data, err)
+	}
+	kind, _, err = protocol.Read(client)
+	if err != nil || kind != protocol.Exit {
+		t.Fatalf("exit kind=%q err=%v", kind, err)
+	}
+	_ = client.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server attach did not return after process exit")
+	}
+}
+
+func TestAttachRaceWithProcessExitReturnsExit(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	p := &process{
+		run:         localstate.Run{ID: "r"},
+		subscribers: map[*subscriber]struct{}{},
+		done:        done,
+	}
+	srv := &Server{runs: map[string]*process{"r": p}}
+	client, server := net.Pipe()
+	defer client.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		defer server.Close()
+		srv.attach(server, "r")
+	}()
+	kind, _, err := protocol.Read(client)
+	if err != nil || kind != protocol.Response {
+		t.Fatalf("attach response kind=%q err=%v", kind, err)
+	}
+	kind, _, err = protocol.Read(client)
+	if err != nil || kind != protocol.Exit {
+		t.Fatalf("exit kind=%q err=%v", kind, err)
+	}
+	_ = client.Close()
+	select {
+	case <-serverDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("server attach did not return for an already-ended process")
+	}
+}
+
 // TestReattachForcesRedrawEvenWhenSizeIsUnchanged fixes the root cause of the
 // Codex reattach redraw bug: a manually raised SIGWINCH with no underlying
 // PTY size change was verified against the installed Codex CLI to not
@@ -422,9 +505,9 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	// direct reader would race it for bytes), so observe output the same way
 	// a real attach does: through a subscriber channel fed by that broadcast.
 	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
-	p.mu.Lock()
-	p.subscribers[sub] = struct{}{}
-	p.mu.Unlock()
+	if !p.addSubscriber(sub) {
+		t.Fatal("live process rejected subscriber")
+	}
 	defer p.removeSubscriber(sub)
 
 	// Establish a known starting size (mirrors the real attach flow, which
