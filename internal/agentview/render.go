@@ -57,11 +57,12 @@ func (s State) View(width, height int) string {
 				noticeSegment = styleText(clipLine(notice.Message, noticeWidth), noticeColor(notice.Severity)) + " "
 			}
 			provider := styleText(providerLabel(row.Key.Provider), providerColor(row.Key.Provider))
-			line := cursor + " " + statusIcon(row.Activity) + " " + name + noticeSegment + provider
+			line := cursor + " " + statusIcon(row.Activity) + " " + name + noticeSegment
 			if cwdWidth > 0 {
 				cwd := styleText(fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth), colorGray)
-				line += " " + cwd
+				line += cwd + " "
 			}
+			line += provider
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		list = append(list, displayLine{text: "", rowIndex: -1})

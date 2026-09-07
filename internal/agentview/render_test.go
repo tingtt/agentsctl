@@ -113,6 +113,111 @@ func TestNarrowTerminalNeverPanics(t *testing.T) {
 	}
 }
 
+// TestMultiDirectoryPinnedRowOrdersCWDBeforeProvider fixes #14's Desired UI
+// for a multi-directory Pinned row: the row's right-hand block renders
+// `cwd -> provider`, not the reviewed-away `provider -> cwd` order.
+func TestMultiDirectoryPinnedRowOrdersCWDBeforeProvider(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", Pinned: true, CWD: "/work/repo-a"},
+		{Key: key("b"), Name: "second", Pinned: true, CWD: "/work/repo-b"},
+	})
+	view := s.View(120, 12)
+	lines := strings.Split(view, "\n")
+	var row string
+	for _, line := range lines {
+		if strings.Contains(line, "first") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatalf("row for \"first\" not found:\n%s", view)
+	}
+	cwdIdx := strings.Index(row, displayCWD("/work/repo-a"))
+	providerIdx := strings.Index(row, "claude")
+	if cwdIdx < 0 || providerIdx < 0 {
+		t.Fatalf("row missing cwd or provider: %q", row)
+	}
+	if cwdIdx >= providerIdx {
+		t.Fatalf("row=%q, want cwd (idx %d) before provider (idx %d)", row, cwdIdx, providerIdx)
+	}
+}
+
+// TestSameDirectoryRowRendersNoCWD fixes that a same-directory scope's rows
+// never render an inline CWD, at the full View level (not just groupRows'
+// showCWD flag).
+func TestSameDirectoryRowRendersNoCWD(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", CWD: "/work/only-directory"},
+		{Key: key("b"), Name: "second", CWD: "/work/only-directory"},
+	})
+	view := s.View(120, 12)
+	for _, line := range strings.Split(view, "\n") {
+		if (strings.Contains(line, "first") || strings.Contains(line, "second")) && strings.Contains(line, displayCWD("/work/only-directory")) {
+			t.Fatalf("same-directory row must not render its cwd inline: %q", line)
+		}
+	}
+}
+
+// TestUnpinnedDirectoryGroupRowDoesNotRepeatCWD fixes that an unpinned
+// row's own line never repeats the directory already stated by its group
+// heading, at the full View level.
+func TestUnpinnedDirectoryGroupRowDoesNotRepeatCWD(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "first", CWD: "/work/repo-a"},
+		{Key: key("b"), Name: "second", CWD: "/work/repo-b"},
+	})
+	view := s.View(120, 12)
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, "first") && strings.Contains(line, displayCWD("/work/repo-a")) {
+			t.Fatalf("unpinned directory-group row must not repeat its heading's cwd: %q", line)
+		}
+	}
+}
+
+// TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI is the
+// integration-level counterpart to TestClipLineTruncationClosesDanglingStyle:
+// rendering a real multi-directory Pinned row (title -> cwd -> provider,
+// each individually styled) across a sweep of narrow widths must never
+// leave a line with an unclosed SGR sequence that would bleed color into
+// whatever renders next.
+func TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "日本語のセッションタイトルとても長い", Pinned: true, CWD: "/workspace/github.com/tingtt/agentsctl", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "second", Pinned: true, CWD: "/workspace/github.com/tingtt-dojo/third-score"},
+	})
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms a row notice on row "a"
+	for width := 1; width <= 60; width++ {
+		view := s.View(width, 12)
+		for _, line := range strings.Split(view, "\n") {
+			if open := ansiOpenAtLineEnd(line); open {
+				t.Fatalf("width=%d: line leaves an unclosed ANSI style: %q", width, line)
+			}
+		}
+	}
+}
+
+// ansiOpenAtLineEnd reports whether line ends with an SGR style still
+// active -- i.e. its last SGR escape sequence isn't a reset ("\x1b[0m").
+func ansiOpenAtLineEnd(line string) bool {
+	open := false
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b {
+			j := skipANSI(line, i)
+			open = line[i:j] != "\x1b[0m"
+			i = j
+			continue
+		}
+		i++
+	}
+	return open
+}
+
 // TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth is a
 // representative narrow-terminal guarantee for #14's new list rendering:
 // a Pinned row's directory column, a directory group heading, the

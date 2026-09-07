@@ -92,14 +92,20 @@ func promptCursorPosition(lines []string, cursor int) (line, col int) {
 const rowLeftFixed = 4
 
 // rowRightFixed is the terminal-cell width of the right block's fixed
-// portion, before the CWD: the provider field plus the single separator
-// space between it and the CWD.
+// portion, on top of the CWD: the provider field plus the single separator
+// space between the CWD and it (the row renders title/notice -> CWD ->
+// provider; see the DesignDoc's Pinned row layout).
 const rowRightFixed = providerFieldWidth + 1
 
 // splitRowWidth lays out a session row in strict priority order --
 // provider field + CWD first, then an optional row notice, then the title
 // gets whatever cells remain -- so the row fills the terminal width
-// exactly. A notice never takes width from CWD/provider. cwdCells == 0
+// exactly. This priority order is a width *budget*, independent of the
+// row's actual left-to-right text order (title/notice -> CWD -> provider,
+// see render.go): the provider field is always reserved in full and never
+// shrinks, and CWD is reserved next out of what's left, so both keep their
+// full width under pressure before the title or notice give up any of
+// theirs. A notice never takes width from CWD/provider. cwdCells == 0
 // means the row carries no CWD column at all (see groupRows'
 // showCWD -- most rows since #14 don't, their group heading says the
 // directory instead), in which case no width is reserved for the
