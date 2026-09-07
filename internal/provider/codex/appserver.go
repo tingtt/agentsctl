@@ -34,16 +34,24 @@ type Thread struct {
 // RateLimitSnapshot). ResetsAt is nil when the backend didn't report a
 // reset time for this window (observed, per the app-server's own generated
 // JSON Schema, to be legitimately absent -- callers must not treat this
-// the same as a 0% reading).
+// the same as a 0% reading). WindowDurationMins identifies which window
+// this is (300 for the rolling 5h window, 10080 for the weekly one, per
+// the installed CLI) -- it is the only reliable classifier: which JSON
+// field (Primary/Secondary) a window arrives in is not a stable indicator
+// of its duration (see RateLimitSnapshot).
 type RateLimitWindow struct {
-	UsedPercent int    `json:"usedPercent"`
-	ResetsAt    *int64 `json:"resetsAt"`
+	UsedPercent        int    `json:"usedPercent"`
+	ResetsAt           *int64 `json:"resetsAt"`
+	WindowDurationMins *int   `json:"windowDurationMins"`
 }
 
 // RateLimitSnapshot mirrors account/rateLimits/read's "backward-compatible
-// single-bucket view" (its own schema doc's wording): Primary is Codex's
-// rolling 5-hour window, Secondary its weekly window -- confirmed against
-// the installed CLI (windowDurationMins 300 and 10080 respectively).
+// single-bucket view" (its own schema doc's wording). Primary and Secondary
+// are positional slots, not a 5h/weekly designation: the installed CLI has
+// been observed to populate them in either order (and to leave Secondary
+// nil for an account with only one active window), so callers must
+// classify each window by its own WindowDurationMins rather than assuming
+// Primary is always the 5h window.
 type RateLimitSnapshot struct {
 	Primary   *RateLimitWindow `json:"primary"`
 	Secondary *RateLimitWindow `json:"secondary"`

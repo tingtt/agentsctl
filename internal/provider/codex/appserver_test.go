@@ -137,8 +137,8 @@ func TestCommandAppServerRateLimitsReadsAccountRateLimits(t *testing.T) {
 	t.Setenv("AGENTSCTL_FAKE_DIR", dir)
 	b, err := json.Marshal(map[string]any{
 		"rateLimits": map[string]any{
-			"primary":   map[string]any{"usedPercent": 70, "resetsAt": 1788776728},
-			"secondary": map[string]any{"usedPercent": 20, "resetsAt": 1789363528},
+			"primary":   map[string]any{"usedPercent": 70, "resetsAt": 1788776728, "windowDurationMins": 300},
+			"secondary": map[string]any{"usedPercent": 20, "resetsAt": 1789363528, "windowDurationMins": 10080},
 		},
 	})
 	if err != nil {
@@ -155,8 +155,14 @@ func TestCommandAppServerRateLimitsReadsAccountRateLimits(t *testing.T) {
 	if got.RateLimits.Primary == nil || got.RateLimits.Primary.UsedPercent != 70 || got.RateLimits.Primary.ResetsAt == nil || *got.RateLimits.Primary.ResetsAt != 1788776728 {
 		t.Fatalf("Primary=%+v, want 70%% resetting at 1788776728", got.RateLimits.Primary)
 	}
+	if got.RateLimits.Primary.WindowDurationMins == nil || *got.RateLimits.Primary.WindowDurationMins != 300 {
+		t.Fatalf("Primary.WindowDurationMins=%v, want 300", got.RateLimits.Primary.WindowDurationMins)
+	}
 	if got.RateLimits.Secondary == nil || got.RateLimits.Secondary.UsedPercent != 20 || got.RateLimits.Secondary.ResetsAt == nil || *got.RateLimits.Secondary.ResetsAt != 1789363528 {
 		t.Fatalf("Secondary=%+v, want 20%% resetting at 1789363528", got.RateLimits.Secondary)
+	}
+	if got.RateLimits.Secondary.WindowDurationMins == nil || *got.RateLimits.Secondary.WindowDurationMins != 10080 {
+		t.Fatalf("Secondary.WindowDurationMins=%v, want 10080", got.RateLimits.Secondary.WindowDurationMins)
 	}
 }
 
