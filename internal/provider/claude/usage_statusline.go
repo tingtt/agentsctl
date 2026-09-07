@@ -61,12 +61,24 @@ type statusLineWindow struct {
 // of API activity (see usage_settings.go's refreshInterval), so a tick's
 // ObservedAt alone does not prove it reflects a completed response to
 // *this* refresh's own prompt -- verified against the installed CLI
-// (2.1.263): a brand-new probe process's very first ticks report
-// total_api_duration_ms: 0 (and no rate_limits at all) even for a
-// long-lived, previously-established --session-id, only becoming non-zero
-// once this process's own prompt actually gets an API response. Without
+// (2.1.263, by capturing the raw statusLine payload end to end through
+// this package's own probe machinery): a brand-new probe process's very
+// first ticks report total_api_duration_ms: 0 (and no rate_limits at all)
+// even for a long-lived, previously-established --session-id, only
+// becoming non-zero once this process's own prompt actually gets an API
+// response, and staying at that same value across further idle re-ticks
+// of the same turn (proving it isn't simply "always non-zero once any
+// history exists" -- see waitForProbeOutcome's doc comment). Without
 // this, waitForProbeOutcome could otherwise accept an earlier, still-
 // pre-response tick as if it were this refresh's real answer.
+//
+// Whether this field is a per-turn value or a running total across every
+// turn in this process's own lifetime was not directly distinguished (no
+// second prompt was ever sent within one process to compare) -- but it
+// does not matter for this package's own usage: refresh sends exactly one
+// prompt per probe process, then detaches (see Probe's doc comment), so
+// there is never a second turn within the same process for a cumulative
+// count to conflate with the first.
 func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
 	var payload statusLinePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {

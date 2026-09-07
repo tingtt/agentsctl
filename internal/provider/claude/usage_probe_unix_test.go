@@ -329,6 +329,53 @@ func TestProbeRefreshDetectsBothLimitsExhausted(t *testing.T) {
 	}
 }
 
+// TestProbeExhaustedStateSurvivesRestart fixes Issue #19's review
+// follow-up: a detected limit must be persisted to this probe's own
+// on-disk usage.json (not just held in memory), so it survives an
+// agentsctl restart -- simulated here by discarding Probe A entirely and
+// constructing a brand-new Probe B pointed at the same probe dir, with no
+// usable claude binary at all (proving the restored state comes from the
+// persisted file, not a real refresh).
+func TestProbeExhaustedStateSurvivesRestart(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 92, "resets_at": 4102444800},
+	})
+	probeDir := t.TempDir()
+	probeA := newFastProbe(fakeClaudePath(t), probeDir)
+	probeA.ExePath = probeExePath(t)
+
+	if _, err := probeA.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	probeA.mu.Lock()
+	probeA.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
+	probeA.mu.Unlock()
+	writeFakeLimitBanner(t, fakeDir, "You've hit your session limit · resets 3pm\r\n")
+
+	exhausted, err := probeA.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.FiveHour.State != session.UsageExhausted {
+		t.Fatalf("FiveHour=%+v, want Exhausted before the simulated restart", exhausted.FiveHour)
+	}
+
+	// Simulate an agentsctl restart: a brand-new Probe instance (no
+	// in-memory state at all) pointed at the same probe dir, with no
+	// usable claude binary -- any Usage() result can only have come from
+	// the persisted usage.json, never a real refresh.
+	probeB := NewProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
+	restored, err := probeB.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("Usage() on the restarted probe errored instead of reusing the persisted exhausted state: %v", err)
+	}
+	if restored.FiveHour.State != session.UsageExhausted || restored.FiveHour.Percent != 100 {
+		t.Fatalf("restored=%+v, want the persisted Exhausted/100%% state restored after restart", restored.FiveHour)
+	}
+}
+
 // TestProbeRecoversFromExhaustedAfterFreshSnapshot fixes Issue #19's
 // recovery contract: once a later refresh obtains a genuine fresh
 // snapshot, a previously exhausted window returns to Available with the

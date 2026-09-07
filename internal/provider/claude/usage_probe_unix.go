@@ -281,6 +281,24 @@ func (pr *Probe) cachedAny() (usageSnapshot, bool) {
 // guaranteeing at most one probe-session creation and at most one stale
 // refresh request in flight at a time, regardless of how many goroutines
 // call Usage concurrently.
+//
+// A successful result -- including a synthesized exhausted snapshot (see
+// refresh/exhaustedSnapshot), which the statusLine collector never gets a
+// chance to write itself since no completed response ever arrives -- is
+// persisted to this probe's own usage.json via writeUsageSnapshotAtomic
+// (the same path loadPersistedSnapshotOnce reads on a fresh process,
+// never a second cache format) before the in-memory cache is updated, so
+// a limit detected now is still reflected after an agentsctl restart, not
+// just for the remainder of this process's own lifetime (see Issue #19's
+// "次回 refresh まで古い utilization に戻らない", which restart must not
+// undermine). A failed disk write does not revert this refresh's own
+// already-valid result (an exhausted state stays exhausted, a fresh
+// reading stays fresh) -- it is logged nowhere and simply means a later
+// restart, before any further successful refresh, could miss only this
+// one write; the in-memory cache this process holds is unaffected either
+// way (see the DesignDoc's Claude usage cache/failure policy, which
+// already tolerates persistence-layer hiccups without discarding an
+// otherwise-valid in-memory result).
 func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.mu.Lock()
 	if ch := pr.refreshCh; ch != nil {
@@ -300,6 +318,9 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.mu.Unlock()
 
 	snap, err := pr.refresh(ctx)
+	if err == nil {
+		_ = writeUsageSnapshotAtomic(pr.snapshotPath(), snap)
+	}
 
 	pr.mu.Lock()
 	if err == nil {
