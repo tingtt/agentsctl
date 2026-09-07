@@ -54,66 +54,68 @@ func (s *State) Handle(ev KeyEvent) Intent {
 }
 
 func (s *State) handleNormalKey(ev KeyEvent) Intent {
-	switch ev.Key {
-	case KeyShiftTab:
+	switch {
+	case bindingProviderCycle.Matches(ev.Key):
 		if s.Provider == session.ProviderClaude {
 			s.Provider = session.ProviderCodex
 		} else {
 			s.Provider = session.ProviderClaude
 		}
 		return Intent{}
-	case KeyUp:
-		if i := s.SelectedIndex(); i > 0 {
-			s.selectIndex(i - 1)
-			s.Confirmation = nil
+	case bindingNavigate.Matches(ev.Key):
+		switch ev.Key {
+		case KeyUp:
+			if i := s.SelectedIndex(); i > 0 {
+				s.selectIndex(i - 1)
+				s.Confirmation = nil
+			}
+		case KeyDown:
+			if i := s.SelectedIndex(); i >= 0 && i+1 < len(s.Rows) {
+				s.selectIndex(i + 1)
+				s.Confirmation = nil
+			}
 		}
 		return Intent{}
-	case KeyDown:
-		if i := s.SelectedIndex(); i >= 0 && i+1 < len(s.Rows) {
-			s.selectIndex(i + 1)
-			s.Confirmation = nil
-		}
-		return Intent{}
-	case KeyBackspace:
+	case ev.Key == KeyBackspace:
 		s.Composer.Backspace()
 		return Intent{}
-	case KeyDelete:
+	case ev.Key == KeyDelete:
 		s.Composer.Delete()
 		return Intent{}
-	case KeyHome:
+	case ev.Key == KeyHome:
 		s.Composer.Home()
 		return Intent{}
-	case KeyEnd:
+	case ev.Key == KeyEnd:
 		s.Composer.End()
 		return Intent{}
-	case KeyLeft:
+	case ev.Key == KeyLeft:
 		s.Composer.Left()
 		return Intent{}
-	case KeyRight:
+	case ev.Key == KeyRight:
 		s.Composer.Right()
 		return Intent{}
-	case KeyCtrlS:
+	case bindingStash.Matches(ev.Key):
 		s.Composer.ToggleStash()
 		return Intent{}
-	case KeyEnter:
+	case bindingSubmit.Matches(ev.Key):
 		if strings.TrimSpace(s.Composer.Prompt) != "" {
 			return Intent{Kind: IntentDispatch, Provider: s.Provider, Prompt: s.Composer.Prompt}
 		}
 		return s.openSelected()
-	case KeyNewline:
-		// Never dispatches (see the "enter" case above); the only way to
+	case bindingNewline.Matches(ev.Key):
+		// Never dispatches (see the "submit" case above); the only way to
 		// put an embedded newline into the composer.
 		s.Composer.InsertAtCursor("\n")
 		return Intent{}
-	case KeyCtrlO:
+	case bindingOpen.Matches(ev.Key):
 		return s.openSelected()
-	case KeyCtrlG:
+	case bindingScope.Matches(ev.Key):
 		s.Scope = nextScope(s.Scope)
 		s.Confirmation = nil
 		return Intent{Kind: IntentRefresh}
-	case KeyCtrlX:
+	case bindingStopArchive.Matches(ev.Key):
 		return s.stopOrArchive()
-	case KeyCtrlR:
+	case bindingRename.Matches(ev.Key):
 		row, ok := s.SelectedRow()
 		if !ok {
 			s.Error = "No session selected"
@@ -125,23 +127,23 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		}
 		s.startRename(row)
 		return Intent{}
-	case KeyCtrlT:
+	case bindingPin.Matches(ev.Key):
 		row, ok := s.SelectedRow()
 		if !ok {
 			s.Error = "No session selected"
 			return Intent{}
 		}
 		return Intent{Kind: IntentPin, Key: row.Key}
-	case KeyCtrlSlash:
+	case bindingDepth.Matches(ev.Key):
 		// The CWD column itself changing for every row is the feedback;
 		// no notification (see State.Error's doc comment).
 		s.CWDDepth = nextCWDDepth(s.CWDDepth)
 		return Intent{}
-	case KeyCtrlL:
+	case bindingRefresh.Matches(ev.Key):
 		return Intent{Kind: IntentRefresh}
-	case KeyEsc:
+	case bindingEscape.Matches(ev.Key):
 		return Intent{Kind: IntentQuit}
-	case KeyRune:
+	case ev.Key == KeyRune:
 		s.Composer.InsertAtCursor(string(ev.Rune))
 		return Intent{}
 	}
@@ -149,16 +151,16 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 }
 
 func (s *State) handleConfirmationKey(ev KeyEvent) Intent {
-	switch ev.Key {
-	case KeyCtrlX:
+	switch {
+	case bindingStopArchive.Matches(ev.Key):
 		return s.stopOrArchive()
-	case KeyEsc:
+	case bindingEscape.Matches(ev.Key):
 		// The row confirmation disappearing is the feedback; no
 		// notification (see State.Error's doc comment).
 		s.Confirmation = nil
 		s.Error = ""
 		return Intent{}
-	case KeyUp, KeyDown:
+	case bindingNavigate.Matches(ev.Key):
 		// Moving the selection cancels a pending confirmation (no
 		// "cancelled" notice -- it simply disappearing from its row as
 		// selection moves off it is enough), then falls through to the
@@ -170,31 +172,31 @@ func (s *State) handleConfirmationKey(ev KeyEvent) Intent {
 }
 
 func (s *State) handleRenameKey(ev KeyEvent) Intent {
-	switch ev.Key {
-	case KeyEsc:
+	switch {
+	case bindingEscape.Matches(ev.Key):
 		// The inline editor closing and the row reverting to its
 		// committed name is the feedback; no notification.
 		s.Rename.cancel()
 		s.Error = ""
-	case KeyHome:
+	case ev.Key == KeyHome:
 		s.Rename.home()
-	case KeyEnd:
+	case ev.Key == KeyEnd:
 		s.Rename.end()
-	case KeyLeft:
+	case ev.Key == KeyLeft:
 		s.Rename.left()
-	case KeyRight:
+	case ev.Key == KeyRight:
 		s.Rename.right()
-	case KeyBackspace:
+	case ev.Key == KeyBackspace:
 		s.Rename.backspace()
-	case KeyDelete:
+	case ev.Key == KeyDelete:
 		s.Rename.delete()
-	case KeyEnter:
+	case bindingSubmit.Matches(ev.Key):
 		if strings.TrimSpace(s.Rename.Draft) == "" {
 			s.Error = "Name must not be empty"
 			return Intent{}
 		}
 		return Intent{Kind: IntentRename, Key: s.Rename.Target, Name: s.Rename.Draft}
-	case KeyRune:
+	case ev.Key == KeyRune:
 		s.Rename.insert(string(ev.Rune))
 	}
 	return Intent{}

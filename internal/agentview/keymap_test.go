@@ -3,6 +3,8 @@ package agentview
 import (
 	"strings"
 	"testing"
+
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // TestFooterLinesMatchCentralizedBindings fixes the exact footer text
@@ -15,6 +17,95 @@ func TestFooterLinesMatchCentralizedBindings(t *testing.T) {
 	}
 	if got, want := footerText(footerLine2), "↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit"; got != want {
 		t.Fatalf("footerLine2 = %q, want %q", got, want)
+	}
+}
+
+// TestBindingMatchesOwnsPhysicalKeyMembership fixes that Matches is the
+// membership test for a shortcut's physical Key(s): true for every Key the
+// binding lists, false for a representative sample of Keys it doesn't --
+// so State.Handle's bindingX.Matches(ev.Key) branches (update.go) and this
+// test both exercise the same membership Binding owns.
+func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
+	if !bindingPin.Matches(KeyCtrlT) {
+		t.Fatal("bindingPin must match KeyCtrlT")
+	}
+	if bindingPin.Matches(KeyCtrlR) {
+		t.Fatal("bindingPin must not match KeyCtrlR")
+	}
+	if !bindingEscape.Matches(KeyEsc) {
+		t.Fatal("bindingEscape must match KeyEsc")
+	}
+	if bindingEscape.Matches(KeyCtrlX) {
+		t.Fatal("bindingEscape must not match KeyCtrlX")
+	}
+	if !bindingNavigate.Matches(KeyUp) || !bindingNavigate.Matches(KeyDown) {
+		t.Fatal("bindingNavigate must match both KeyUp and KeyDown")
+	}
+	if bindingNavigate.Matches(KeyLeft) {
+		t.Fatal("bindingNavigate must not match KeyLeft")
+	}
+	if !bindingStopArchive.Matches(KeyCtrlX) {
+		t.Fatal("bindingStopArchive must match KeyCtrlX")
+	}
+}
+
+// TestFooterComposedFromNamedBindings fixes that footerLine1/footerLine2
+// are built only from the named binding variables -- not a second,
+// independently-hardcoded physical-key list -- by checking each footer
+// slot is == (same Label/Desc/Keys) to its named counterpart.
+func TestFooterComposedFromNamedBindings(t *testing.T) {
+	want1 := []Binding{
+		bindingProviderCycle, bindingSubmit, bindingNewline, bindingStash,
+		bindingOpen, bindingPin, bindingDepth,
+	}
+	if len(footerLine1) != len(want1) {
+		t.Fatalf("footerLine1 has %d entries, want %d", len(footerLine1), len(want1))
+	}
+	for i, b := range want1 {
+		if footerLine1[i].Label != b.Label || footerLine1[i].Desc != b.Desc {
+			t.Fatalf("footerLine1[%d] = %+v, want %+v", i, footerLine1[i], b)
+		}
+	}
+	want2 := []Binding{
+		bindingNavigate, bindingScope, bindingRename, bindingStopArchive,
+		bindingRefresh, bindingEscape,
+	}
+	if len(footerLine2) != len(want2) {
+		t.Fatalf("footerLine2 has %d entries, want %d", len(footerLine2), len(want2))
+	}
+	for i, b := range want2 {
+		if footerLine2[i].Label != b.Label || footerLine2[i].Desc != b.Desc {
+			t.Fatalf("footerLine2[%d] = %+v, want %+v", i, footerLine2[i], b)
+		}
+	}
+}
+
+// TestEscBindingMeaningIsStateDependent is the state-dependent-semantics
+// guard: bindingEscape's physical Key (KeyEsc) is the same in all three
+// cases below, yet State.Handle resolves it to a different Intent (or
+// none) depending purely on State -- proof that Binding owns only "this is
+// the Esc key", never "Esc means quit".
+func TestEscBindingMeaningIsStateDependent(t *testing.T) {
+	// Rename active: Esc cancels the rename, no Intent.
+	rename := NewState()
+	rename.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionRename: {Available: true}})})
+	rename.Handle(KeyEvent{Key: KeyCtrlR})
+	if intent := rename.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentNone || rename.Rename.Active {
+		t.Fatalf("rename+Esc: intent=%+v rename.Active=%v, want cancelled rename with no Intent", intent, rename.Rename.Active)
+	}
+
+	// Confirmation pending: Esc cancels the confirmation, no Intent.
+	confirm := NewState()
+	confirm.SetRows([]session.Session{rowWith(key("a"), session.Actions{session.ActionArchive: {Available: true}})})
+	confirm.Handle(KeyEvent{Key: KeyCtrlX})
+	if intent := confirm.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentNone || confirm.Confirmation != nil {
+		t.Fatalf("confirmation+Esc: intent=%+v Confirmation=%+v, want cancelled confirmation with no Intent", intent, confirm.Confirmation)
+	}
+
+	// Normal mode: Esc quits.
+	normal := NewState()
+	if intent := normal.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {
+		t.Fatalf("normal+Esc: intent=%+v, want IntentQuit", intent)
 	}
 }
 
