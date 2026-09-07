@@ -343,6 +343,50 @@ func TestSupervisorPTYSignalHelper(t *testing.T) {
 	}
 }
 
+func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
+	disconnected := make(chan struct{})
+	sub := &subscriber{
+		output:     make(chan []byte, subscriberBuffer),
+		disconnect: func() { close(disconnected) },
+	}
+	p := &process{
+		subscribers: map[*subscriber]struct{}{sub: {}},
+		done:        make(chan struct{}),
+	}
+	for i := range subscriberBuffer {
+		p.broadcast([]byte{byte(i)})
+	}
+	select {
+	case <-disconnected:
+		t.Fatal("subscriber disconnected before its bounded queue filled")
+	default:
+	}
+	p.broadcast([]byte("overflow"))
+	select {
+	case <-disconnected:
+	default:
+		t.Fatal("full subscriber remained attached after output could not be queued")
+	}
+	p.mu.Lock()
+	remaining := len(p.subscribers)
+	p.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("subscribers=%d, want 0 after overflow", remaining)
+	}
+	for i := range subscriberBuffer {
+		chunk, ok := <-sub.output
+		if !ok {
+			t.Fatalf("subscriber queue closed after %d chunks, want %d", i, subscriberBuffer)
+		}
+		if len(chunk) != 1 || chunk[0] != byte(i) {
+			t.Fatalf("chunk %d=%v, want ordered byte %d", i, chunk, i)
+		}
+	}
+	if _, ok := <-sub.output; ok {
+		t.Fatal("subscriber queue remained open after disconnect")
+	}
+}
+
 // TestReattachForcesRedrawEvenWhenSizeIsUnchanged fixes the root cause of the
 // Codex reattach redraw bug: a manually raised SIGWINCH with no underlying
 // PTY size change was verified against the installed Codex CLI to not
@@ -377,20 +421,20 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	// The production drain() goroutine is the only reader of p.ptmx (a second
 	// direct reader would race it for bytes), so observe output the same way
 	// a real attach does: through a subscriber channel fed by that broadcast.
-	sub := make(chan []byte, 64)
+	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
 	p.mu.Lock()
 	p.subscribers[sub] = struct{}{}
 	p.mu.Unlock()
-	defer func() { p.mu.Lock(); delete(p.subscribers, sub); p.mu.Unlock() }()
+	defer p.removeSubscriber(sub)
 
 	// Establish a known starting size (mirrors the real attach flow, which
 	// sends a Resize frame on connect) before exercising the same-size
 	// reattach path below, and let the helper's signal.Notify land.
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	drainSubscriberFor(sub, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
+	drainSubscriberFor(sub.output, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
-	requireSubscriberContains(t, sub, "WINCH", 2*time.Second)
+	requireSubscriberContains(t, sub.output, "WINCH", 2*time.Second)
 }
 
 func drainSubscriberFor(sub <-chan []byte, d time.Duration) {
