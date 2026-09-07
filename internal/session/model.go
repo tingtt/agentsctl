@@ -16,6 +16,10 @@ type Key struct {
 
 func (k Key) String() string { return string(k.Provider) + ":" + k.ID }
 
+// IsZero reports whether k is the zero Key, i.e. does not identify any
+// session.
+func (k Key) IsZero() bool { return k == Key{} }
+
 type Activity string
 
 const (
@@ -28,6 +32,12 @@ const (
 	ActivityFailed       Activity = "failed"
 	ActivityUnknown      Activity = "unknown"
 )
+
+// Active reports whether a represents an in-progress agent turn. Normalize
+// (capability.go) uses this provider-independent invariant input.
+func (a Activity) Active() bool {
+	return a == ActivityWorking || a == ActivityNeedsInput || a == ActivityStarting
+}
 
 type Runtime string
 
@@ -62,7 +72,13 @@ type Session struct {
 	Runtime      Runtime      `json:"runtime"`
 	Archived     bool         `json:"archived"`
 	Capabilities Capabilities `json:"capabilities"`
-	RunID        string       `json:"runId,omitempty"`
+	// Actions is the action-specific availability a provider computes for
+	// this session (see action.go). It lands alongside the legacy
+	// Capabilities group while providers and their one remaining consumer
+	// (internal/tui, via Catalog) migrate off Capabilities; nothing reads
+	// Actions yet.
+	Actions Actions `json:"actions"`
+	RunID   string  `json:"runId,omitempty"`
 }
 
 func (s Session) DisplayName() string {
