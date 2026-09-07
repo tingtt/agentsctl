@@ -936,6 +936,53 @@ func TestProbePersistedFreshSnapshotSkipsRefreshOnNewInstance(t *testing.T) {
 	}
 }
 
+// TestProbeUpgradesLegacyPersistedSnapshotToAvailable fixes Issue #19's
+// real-world upgrade path end to end: a probe dir holding a usage.json in
+// the pre-#19 legacy schema (`available bool`, no `state` field -- what a
+// build from before PR #23 always wrote), with a still-in-period window,
+// must be read by a fresh PR #23 Probe as UsageAvailable at the real
+// persisted percentage, not UsageUnknown -- proven with an unusable
+// claude path (the fresh-within-TTL persisted snapshot must be served as
+// is, no refresh attempted).
+func TestProbeUpgradesLegacyPersistedSnapshotToAvailable(t *testing.T) {
+	probeDir := t.TempDir()
+	futureReset := time.Now().Add(2 * time.Hour).Format(time.RFC3339Nano)
+	writeRawSnapshot(t, filepath.Join(probeDir, "usage.json"), `{"fiveHour":{"available":true,"percent":60,"resetAt":"`+futureReset+`"},"weekly":{"available":true,"percent":36,"resetAt":"2099-01-01T00:00:00Z"},"observedAt":"`+time.Now().Format(time.RFC3339Nano)+`"}`)
+
+	pr := NewProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("Usage() errored instead of reusing the migrated legacy snapshot: %v", err)
+	}
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 60 {
+		t.Fatalf("FiveHour=%+v, want the legacy 60%% migrated to Available, not stuck at Unknown (\"?%%\")", got.FiveHour)
+	}
+	if got.Weekly.State != session.UsageAvailable || got.Weekly.Percent != 36 {
+		t.Fatalf("Weekly=%+v, want the legacy 36%% migrated to Available", got.Weekly)
+	}
+}
+
+// TestProbeUpgradesLegacyPersistedSnapshotExpiredWindowIsUnknown fixes
+// the companion case: a legacy snapshot whose window's own Reset has
+// already passed correctly still ends up UsageUnknown after migration --
+// via the ordinary reset-boundary rule (session.Usage.At), not because
+// the migration failed. This is expected, not a regression: the window
+// really is expired, and no refresh can happen (unusable claude path).
+func TestProbeUpgradesLegacyPersistedSnapshotExpiredWindowIsUnknown(t *testing.T) {
+	probeDir := t.TempDir()
+	pastReset := time.Now().Add(-time.Hour).Format(time.RFC3339Nano)
+	writeRawSnapshot(t, filepath.Join(probeDir, "usage.json"), `{"fiveHour":{"available":true,"percent":92,"resetAt":"`+pastReset+`"},"observedAt":"`+time.Now().Format(time.RFC3339Nano)+`"}`)
+
+	pr := NewProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("Usage() errored instead of reusing the migrated (then expired) legacy snapshot: %v", err)
+	}
+	if got.FiveHour.State != session.UsageUnknown {
+		t.Fatalf("FiveHour=%+v, want Unknown for a legacy window whose own Reset has already passed (migration succeeded, but the window is simply expired)", got.FiveHour)
+	}
+}
+
 // TestProbePersistedStaleSnapshotOnNewInstanceStillRefreshes fixes that
 // persisted-snapshot reuse only ever short-circuits a genuinely FRESH
 // (within TTL) snapshot: a new Probe instance finding a stale usage.json

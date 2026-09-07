@@ -45,9 +45,69 @@ type usageSnapshot struct {
 	ResponseObserved bool                `json:"responseObserved"`
 }
 
+// usageWindowSnapshotWire is the JSON decode shape for one persisted
+// window, covering both the current (`state`, since Issue #19/PR #23) and
+// legacy (`available`, everything persisted by an agentsctl build before
+// that) formats -- see readUsageSnapshot's doc comment for why this
+// exists. State and Available are pointers specifically so decoding can
+// tell "the field was present in the JSON" apart from "the field was
+// absent": the current schema's own zero value (session.UsageUnknown ==
+// 0) would otherwise be indistinguishable from "no state field was ever
+// written here at all" (a plain non-pointer session.UsageLimitState
+// always decodes to 0 either way), which is exactly the distinction that
+// must not be lost -- a persisted `"state": 0` (explicitly UsageUnknown,
+// written by this codebase) must never be treated as "legacy, fall back
+// to available".
+type usageWindowSnapshotWire struct {
+	State     *session.UsageLimitState `json:"state"`
+	Available *bool                    `json:"available"`
+	Percent   int                      `json:"percent"`
+	ResetAt   time.Time                `json:"resetAt"`
+}
+
+// resolve picks the current-schema `state` field when present
+// (authoritative for anything this codebase itself wrote from Issue #19
+// onward -- writeUsageSnapshotAtomic never omits it), and only falls back
+// to the legacy `available` boolean when `state` is entirely absent from
+// the JSON (a snapshot persisted by a pre-#19 build, which never wrote
+// `state` at all). Legacy `available: false` resolves to UsageUnknown,
+// never UsageExhausted -- the pre-#19 schema had no concept of exhausted,
+// so there is nothing to distinguish it from "not reported".
+func (w usageWindowSnapshotWire) resolve() usageWindowSnapshot {
+	if w.State != nil {
+		return usageWindowSnapshot{State: *w.State, Percent: w.Percent, ResetAt: w.ResetAt}
+	}
+	if w.Available != nil && *w.Available {
+		return usageWindowSnapshot{State: session.UsageAvailable, Percent: w.Percent, ResetAt: w.ResetAt}
+	}
+	return usageWindowSnapshot{State: session.UsageUnknown, Percent: w.Percent, ResetAt: w.ResetAt}
+}
+
+// usageSnapshotWire is usageSnapshot's own decode-only counterpart to
+// usageWindowSnapshotWire -- see readUsageSnapshot.
+type usageSnapshotWire struct {
+	FiveHour         usageWindowSnapshotWire `json:"fiveHour"`
+	Weekly           usageWindowSnapshotWire `json:"weekly"`
+	ObservedAt       time.Time               `json:"observedAt"`
+	ResponseObserved bool                    `json:"responseObserved"`
+}
+
 // readUsageSnapshot reads path's persisted snapshot, if any. A missing
 // file is reported via ok=false, not an error -- there is simply no
 // snapshot yet (e.g. the probe has never successfully refreshed).
+//
+// Decoding goes through usageSnapshotWire/usageWindowSnapshotWire.resolve
+// rather than a plain json.Unmarshal into usageSnapshot directly, so a
+// snapshot persisted by an agentsctl build from before Issue #19's PR #23
+// (whose usageWindowSnapshot had an `available bool` field, no `state` at
+// all) still decodes to a meaningful session.UsageLimitState instead of
+// silently dropping the unknown `available` field and defaulting State to
+// its zero value (UsageUnknown) regardless of what percentage was
+// actually persisted -- confirmed against a real installed agentsctl
+// exhibiting exactly this: a legacy usage.json with `"available":true,
+// "percent":60`, decoding State to UsageUnknown under a plain Unmarshal,
+// rendering as the reported "claude ?% / ?%" stuck symptom in Agent View
+// even though a real 60%/36% reading was sitting right there on disk.
 func readUsageSnapshot(path string) (snap usageSnapshot, ok bool, err error) {
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -56,8 +116,15 @@ func readUsageSnapshot(path string) (snap usageSnapshot, ok bool, err error) {
 	if err != nil {
 		return usageSnapshot{}, false, err
 	}
-	if err := json.Unmarshal(b, &snap); err != nil {
+	var wire usageSnapshotWire
+	if err := json.Unmarshal(b, &wire); err != nil {
 		return usageSnapshot{}, false, err
+	}
+	snap = usageSnapshot{
+		FiveHour:         wire.FiveHour.resolve(),
+		Weekly:           wire.Weekly.resolve(),
+		ObservedAt:       wire.ObservedAt,
+		ResponseObserved: wire.ResponseObserved,
 	}
 	return snap, true, nil
 }
