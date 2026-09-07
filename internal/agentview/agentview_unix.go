@@ -28,6 +28,14 @@ type Runtime struct {
 	Output     io.Writer
 	CWD        string
 	ReadKey    func(*bufio.Reader) (KeyEvent, error)
+	// Worktrees discovers the additional ScopeDescendants roots for CWD
+	// (see session.Scope.WorktreeDirectories) -- e.g.
+	// internal/workspace.Worktrees in production. Nil skips discovery,
+	// degrading ScopeDescendants to just CWD's own subtree; Runtime never
+	// performs this git/filesystem I/O itself (see the DesignDoc's
+	// git/filesystem discovery -> normalized scope roots -> pure session
+	// filtering dependency direction).
+	Worktrees func(ctx context.Context, dir string) []string
 }
 
 // Run starts the terminal event loop: raw mode, an initial catalog load,
@@ -98,7 +106,11 @@ func beginTerminal(w io.Writer) { _, _ = io.WriteString(w, "\x1b[?1049h\x1b[?25l
 func endTerminal(w io.Writer)   { _, _ = io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l") }
 
 func (r *Runtime) reload(ctx context.Context) {
-	snap := r.Controller.Load(ctx, session.Scope{CurrentDirectory: r.CWD, Directory: r.State.Scope})
+	scope := session.Scope{CurrentDirectory: r.CWD, Directory: r.State.Scope}
+	if r.State.Scope == session.ScopeDescendants && r.Worktrees != nil {
+		scope.WorktreeDirectories = r.Worktrees(ctx, r.CWD)
+	}
+	snap := r.Controller.Load(ctx, scope)
 	r.State.SetRows(snap.Sessions)
 	r.State.Warnings = snap.Warnings
 }

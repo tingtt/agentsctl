@@ -207,20 +207,20 @@ func TestRenameEscCancelsWithoutIntent(t *testing.T) {
 
 func TestCtrlGCyclesScopeAndRequestsRefresh(t *testing.T) {
 	s := NewState()
-	if s.Scope != session.ScopeCWD {
-		t.Fatalf("initial scope=%v, want ScopeCWD", s.Scope)
+	if s.Scope != session.ScopeSame {
+		t.Fatalf("initial scope=%v, want ScopeSame", s.Scope)
 	}
 	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
-	if intent.Kind != IntentRefresh || s.Scope != session.ScopeSubtree {
-		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeSubtree", intent, s.Scope)
+	if intent.Kind != IntentRefresh || s.Scope != session.ScopeDescendants {
+		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeDescendants", intent, s.Scope)
 	}
 	s.Handle(KeyEvent{Key: KeyCtrlG})
 	if s.Scope != session.ScopeAll {
 		t.Fatalf("scope=%v, want ScopeAll", s.Scope)
 	}
 	s.Handle(KeyEvent{Key: KeyCtrlG})
-	if s.Scope != session.ScopeCWD {
-		t.Fatalf("scope=%v, want wrap back to ScopeCWD", s.Scope)
+	if s.Scope != session.ScopeSame {
+		t.Fatalf("scope=%v, want wrap back to ScopeSame", s.Scope)
 	}
 }
 
@@ -237,18 +237,6 @@ func TestCtrlLRequestsRefresh(t *testing.T) {
 	s := NewState()
 	if intent := s.Handle(KeyEvent{Key: KeyCtrlL}); intent.Kind != IntentRefresh {
 		t.Fatalf("intent=%+v", intent)
-	}
-}
-
-func TestCtrlSlashCyclesCWDDepthWithoutAnIntent(t *testing.T) {
-	s := NewState()
-	start := s.CWDDepth
-	intent := s.Handle(KeyEvent{Key: KeyCtrlSlash})
-	if intent.Kind != IntentNone {
-		t.Fatalf("intent=%+v, want none (depth change is its own feedback)", intent)
-	}
-	if s.CWDDepth == start {
-		t.Fatal("CWDDepth did not change")
 	}
 }
 

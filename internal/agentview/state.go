@@ -23,14 +23,12 @@ type State struct {
 
 	Composer Composer
 
-	// Scope selects which sessions' CWDs are shown (cwd -> cwd/** -> all
-	// -> cwd, cycled by Ctrl+G). session.ScopeCWD is the zero value, so a
-	// fresh State starts scoped to the current directory without an
-	// explicit default here.
+	// Scope selects which sessions' CWDs are shown (same directory ->
+	// descendants + worktree directories -> all -> same directory, cycled
+	// by Ctrl+G). session.ScopeSame is the zero value, so a fresh State
+	// starts scoped to the current directory without an explicit default
+	// here.
 	Scope session.DirectoryScope
-	// CWDDepth is the directory-path display depth (1-3 trailing
-	// components, or CWDDepthAll), cycled by Ctrl+/.
-	CWDDepth int
 
 	// Error holds the most recent action failure. It is the only thing
 	// ever rendered in the composer-top notification area, reserved for
@@ -59,15 +57,10 @@ type State struct {
 	HasLastAttached bool
 }
 
-// CWDDepthAll is the sentinel State.CWDDepth value selecting the "all"
-// directory-depth display mode.
-const CWDDepthAll = 0
-
 // NewState returns a freshly-initialized State: Claude as the initial
-// composer provider target and a 2-component CWD display depth, matching
-// the pre-refactor default.
+// composer provider target, matching the pre-refactor default.
 func NewState() State {
-	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, CWDDepth: 2}
+	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}}
 }
 
 // SetRows installs rows as the current catalog snapshot, preserving
@@ -177,42 +170,28 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 	}
 }
 
-// nextCWDDepth cycles the directory-depth display mode: 1 -> 2 -> 3 ->
-// all -> 1.
-func nextCWDDepth(depth int) int {
-	switch depth {
-	case 1:
-		return 2
-	case 2:
-		return 3
-	case 3:
-		return CWDDepthAll
-	default:
-		return 1
-	}
-}
-
-// nextScope cycles the session-list directory scope: cwd -> cwd/** -> all
-// -> cwd, bound to Ctrl+G.
+// nextScope cycles the session-list directory scope: same directory ->
+// descendants + worktree directories -> all -> same directory, bound to
+// Ctrl+G.
 func nextScope(scope session.DirectoryScope) session.DirectoryScope {
 	switch scope {
-	case session.ScopeCWD:
-		return session.ScopeSubtree
-	case session.ScopeSubtree:
+	case session.ScopeSame:
+		return session.ScopeDescendants
+	case session.ScopeDescendants:
 		return session.ScopeAll
 	default:
-		return session.ScopeCWD
+		return session.ScopeSame
 	}
 }
 
 // scopeLabel is the short header text for scope.
 func scopeLabel(scope session.DirectoryScope) string {
 	switch scope {
-	case session.ScopeSubtree:
-		return "cwd/**"
+	case session.ScopeDescendants:
+		return "descendants"
 	case session.ScopeAll:
 		return "all"
 	default:
-		return "cwd"
+		return "same"
 	}
 }

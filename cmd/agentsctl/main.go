@@ -16,6 +16,7 @@ import (
 	"github.com/tingtt/agentsctl/internal/provider/codex"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 	"github.com/tingtt/agentsctl/internal/supervisor"
+	"github.com/tingtt/agentsctl/internal/workspace"
 )
 
 func main() {
@@ -65,7 +66,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd}
+	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd, Worktrees: workspace.Worktrees}
 	return rt.Run(ctx)
 }
 func configDir() (string, error) {

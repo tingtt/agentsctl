@@ -137,16 +137,13 @@ func padCells(value string, width int) string {
 	return value
 }
 
-// displayCWD renders row's working directory per the active
-// directory-depth mode: depth 1-3 show that many trailing path components
-// (HOME is never counted as a component); CWDDepthAll shows the
-// shortHome-abbreviated full path.
-func displayCWD(path string, depth int) string {
-	if depth == CWDDepthAll {
-		return shortHome(path)
-	}
-	home, _ := os.UserHomeDir()
-	return trailingComponents(path, home, depth)
+// displayCWD renders row's working directory as the shortHome-abbreviated
+// full path (see Slice B / #14: the previous depth-limited display and its
+// Ctrl+/ toggle are gone -- a session row shows either no CWD at all in a
+// same-directory scope, or its full abbreviated path in a multi-directory
+// scope).
+func displayCWD(path string) string {
+	return shortHome(path)
 }
 
 // withTrailingSlash appends a directory separator "/" to a displayed CWD,
@@ -156,31 +153,6 @@ func withTrailingSlash(value string) string {
 		return value
 	}
 	return value + "/"
-}
-
-// trailingComponents returns the last n path components of path (HOME
-// stripped and not counted as a component).
-func trailingComponents(path, home string, n int) string {
-	rel := filepath.Clean(path)
-	if home != "" {
-		home = filepath.Clean(home)
-		if rel == home {
-			return "~"
-		}
-		if strings.HasPrefix(rel, home+string(filepath.Separator)) {
-			rel = rel[len(home)+1:]
-		}
-	}
-	var parts []string
-	for _, p := range strings.Split(rel, string(filepath.Separator)) {
-		if p != "" {
-			parts = append(parts, p)
-		}
-	}
-	if len(parts) > n {
-		parts = parts[len(parts)-n:]
-	}
-	return strings.Join(parts, "/")
 }
 
 // shortHome renders path with the user's home directory abbreviated to

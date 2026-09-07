@@ -45,7 +45,7 @@ func (s State) View(width, height int) string {
 			if s.Confirmation != nil && row.Key == s.Confirmation.Key {
 				cursor = "x"
 			}
-			cwdPlain := withTrailingSlash(displayCWD(row.CWD, s.CWDDepth))
+			cwdPlain := withTrailingSlash(displayCWD(row.CWD))
 			notice, hasNotice := s.rowNotice(row.Key)
 			noticeCells := 0
 			if hasNotice {

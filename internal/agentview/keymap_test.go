@@ -23,7 +23,7 @@ func equalBinding(got, want Binding) bool {
 // typo shows up as a Binding change, not a silently-diverged literal
 // string in render.go.
 func TestFooterLinesMatchCentralizedBindings(t *testing.T) {
-	if got, want := footerText(footerLine1), "Shift+Tab / Enter send/open / Option+Enter/Shift+Enter newline / Ctrl+S stash / Ctrl+O / Ctrl+T pin / Ctrl+/ depth"; got != want {
+	if got, want := footerText(footerLine1), "Shift+Tab / Enter send/open / Option+Enter/Shift+Enter newline / Ctrl+S stash / Ctrl+O / Ctrl+T pin"; got != want {
 		t.Fatalf("footerLine1 = %q, want %q", got, want)
 	}
 	if got, want := footerText(footerLine2), "↑↓ / Ctrl+G scope / Ctrl+R rename / Ctrl+X stop/archive / Ctrl+L refresh / Esc quit"; got != want {
@@ -67,7 +67,7 @@ func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
 func TestFooterComposedFromNamedBindings(t *testing.T) {
 	want1 := []Binding{
 		bindingProviderCycle, bindingSubmit, bindingNewline, bindingStash,
-		bindingOpen, bindingPin, bindingDepth,
+		bindingOpen, bindingPin,
 	}
 	if len(footerLine1) != len(want1) {
 		t.Fatalf("footerLine1 has %d entries, want %d", len(footerLine1), len(want1))
@@ -194,7 +194,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	all := []Key{
 		KeyRune, KeyEnter, KeyNewline, KeyBackspace, KeyDelete, KeyHome, KeyEnd,
 		KeyLeft, KeyRight, KeyUp, KeyDown, KeyShiftTab, KeyEsc, KeyCtrlG, KeyCtrlX,
-		KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, KeyCtrlO, KeyCtrlSlash, KeyUnknown,
+		KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, KeyCtrlO, KeyUnknown,
 	}
 	// Composer/rename text-editing motions and typing, plus keys with no
 	// assigned meaning: not "shortcuts" in the footer/help sense, so they

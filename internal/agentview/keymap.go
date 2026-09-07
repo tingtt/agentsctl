@@ -58,7 +58,6 @@ var (
 	bindingStash         = Binding{Label: "Ctrl+S", Desc: "stash", Keys: []Key{KeyCtrlS}}
 	bindingOpen          = Binding{Label: "Ctrl+O", Keys: []Key{KeyCtrlO}}
 	bindingPin           = Binding{Label: "Ctrl+T", Desc: "pin", Keys: []Key{KeyCtrlT}}
-	bindingDepth         = Binding{Label: "Ctrl+/", Desc: "depth", Keys: []Key{KeyCtrlSlash}}
 	bindingNavigate      = Binding{Label: "↑↓", Keys: []Key{KeyUp, KeyDown}}
 	bindingScope         = Binding{Label: "Ctrl+G", Desc: "scope", Keys: []Key{KeyCtrlG}}
 	bindingRename        = Binding{Label: "Ctrl+R", Desc: "rename", Keys: []Key{KeyCtrlR}}
@@ -80,7 +79,6 @@ var footerLine1 = []Binding{
 	bindingStash,
 	bindingOpen,
 	bindingPin,
-	bindingDepth,
 }
 
 var footerLine2 = []Binding{

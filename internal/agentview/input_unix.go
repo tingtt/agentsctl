@@ -45,9 +45,9 @@ const (
 	KeyDown
 	KeyShiftTab
 	KeyEsc
-	// KeyCtrlG, KeyCtrlX, KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, KeyCtrlO,
-	// and KeyCtrlSlash are the fixed physical shortcuts this build
-	// recognizes. What each means is entirely up to State.Handle.
+	// KeyCtrlG, KeyCtrlX, KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, and
+	// KeyCtrlO are the fixed physical shortcuts this build recognizes. What
+	// each means is entirely up to State.Handle.
 	KeyCtrlG
 	KeyCtrlX
 	KeyCtrlR
@@ -55,7 +55,6 @@ const (
 	KeyCtrlS
 	KeyCtrlL
 	KeyCtrlO
-	KeyCtrlSlash
 	// KeyUnknown is a recognized-but-unbound escape sequence or control
 	// byte: physically decoded, but carrying no assigned meaning.
 	KeyUnknown
@@ -193,13 +192,6 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (KeyEvent
 		return KeyEvent{Key: KeyCtrlS}, nil
 	case 0x0c:
 		return KeyEvent{Key: KeyCtrlL}, nil
-	case 0x1f:
-		// Ctrl+/ (and, on terminals that conflate the two physical keys,
-		// Ctrl+_) universally arrives as the C0 code 0x1F (US, Unit
-		// Separator) rather than the naively-computed '/' & 0x1f = 0x0F --
-		// confirmed against macOS Terminal.app and iTerm2, both xterm-
-		// compatible.
-		return KeyEvent{Key: KeyCtrlSlash}, nil
 	}
 	if b < 0x20 {
 		return KeyEvent{Key: KeyUnknown}, nil

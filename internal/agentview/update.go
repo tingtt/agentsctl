@@ -134,11 +134,6 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 			return Intent{}
 		}
 		return Intent{Kind: IntentPin, Key: row.Key}
-	case bindingDepth.Matches(ev.Key):
-		// The CWD column itself changing for every row is the feedback;
-		// no notification (see State.Error's doc comment).
-		s.CWDDepth = nextCWDDepth(s.CWDDepth)
-		return Intent{}
 	case bindingRefresh.Matches(ev.Key):
 		return Intent{Kind: IntentRefresh}
 	case bindingEscape.Matches(ev.Key):
