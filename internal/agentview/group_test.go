@@ -1,6 +1,7 @@
 package agentview
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/tingtt/agentsctl/internal/session"
@@ -117,6 +118,24 @@ func TestGroupRowsPreservesRowOrderWithinGroup(t *testing.T) {
 func TestGroupRowsEmptyRows(t *testing.T) {
 	if groups := groupRows(nil); len(groups) != 0 {
 		t.Fatalf("groups=%+v, want none", groups)
+	}
+}
+
+// TestGroupHeadingsAndPinnedDirectoryAreGray fixes #14's Colors
+// requirement that the "Pinned" label and directory headings/paths render
+// gray, through the real View pipeline (not just groupRows' partitioning).
+func TestGroupHeadingsAndPinnedDirectoryAreGray(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		rowAt(key("a"), "/work/repo-a", true),
+		rowAt(key("b"), "/work/repo-b", false),
+	})
+	view := s.View(100, 12)
+	if !strings.Contains(view, styleText("Pinned", colorGray)) {
+		t.Fatalf("Pinned label must be styled gray:\n%s", view)
+	}
+	if !strings.Contains(view, styleText(displayCWD("/work/repo-b"), colorGray)) {
+		t.Fatalf("directory group heading must be styled gray:\n%s", view)
 	}
 }
 
