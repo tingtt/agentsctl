@@ -77,6 +77,15 @@ Claude と Codex のセッションを統合し、1つの一覧として表示�
 
 session は作成時刻が新しい順に並べる。Activity や runtime status の変化だけでは並び順を変更しない。これにより、バックグラウンド更新によって閲覧中の行が頻繁に移動することを防ぐ。
 
+##### Grouping
+
+一覧は Pinned group と unpinned group(s) に分ける。
+
+- Pinned session は directory scope に関わらず常に単一の `Pinned` group へ集約する。scope が複数 directory を含む場合、Pinned row には directory path を表示する (directory を跨ぐため group heading だけでは判別できない)。
+- Unpinned session は、表示対象の directory がすべて同一なら単一の `Recently created` group、複数 directory を含むなら directory ごとの group に分ける。directory ごとの group では、その heading が directory を示すため row 自体に directory を表示しない。
+
+grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection は常に `session.Key` で追従するため、grouping の変化 (scope cycling、refresh、pin/unpin) によって選択が失われることはない。
+
 ##### Pin / Unpin
 
 Pin 状態は agentsctl が永続化する。
@@ -133,6 +142,35 @@ provider ごとの起動方法は異なるが、Agent View 上では同じ Dispa
 - TUI 自身は Codex CLI process を直接保持しない。
 - 起動後に追加された Codex thread と managed run を対応付け、通常の session として catalog に統合する。
 
+##### Composer directory context
+
+Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、選択中 session 自身の CWD に追従する。
+
+- 起動 directory 自体 (`Runtime.CWD`) は directory scope の anchor としてのみ機能し、Composer の表示・dispatch context としては使わない。
+- 選択中 session が存在する限り、その CWD が Composer `<cwd>` と dispatch context の両方の source of truth になる。
+- 選択可能な session が一つもない場合 (空 catalog) に限り、起動 directory を fallback として使う。これにより空 catalog からでも新規 prompt を dispatch できる。
+
+表示 (`<cwd>`) と実際の dispatch context が異なる値を参照することは絶対に避ける — 同じ導出結果 (`State.ComposerCWD`) を両方が読む。
+
+##### Contextual footer と Help view
+
+Composer 下部には、常時固定の shortcut 一覧ではなく、現在の状態に応じた最小限の footer を表示する。
+
+- `Ctrl+X` の表示 (`stop` / `archive`) は、選択中 session が実際に持つ Action availability から決める。provider ID による再判定は行わない。
+- `?` と `Esc` の意味は prompt の空/非空、および help view の表示状態によって変わる。
+- Help view は `State` の明示的な UI state (`HelpVisible`) として持つ。terminal decoder は `?` を単なる rune として渡すのみで、"help を開く" という意味付けは `State.Handle` 側で行う。
+- Esc の優先順位は次の順で固定する: help visible なら help を閉じる、次に prompt が非空ならそれを消す、いずれでもなければ (rename/confirmation を除く通常状態で) 終了する。rename・confirmation 中の Esc は従来どおりそれぞれの state を優先する。
+- footer/help が参照する shortcut の物理 key と label は `keymap.go` の named `Binding` を単一の source of truth とする。footer 表示用に別途 key を持たない。
+
+##### Usage capability
+
+Claude/Codex の 5h・weekly 利用率は、`sessionctl` 側の任意 capability `UsageSource` として表現する。
+
+- `UsageSource` を実装しない provider (Source のみの provider を含む) は、単に usage 行に現れないだけであり、Controller の動作を妨げない。
+- 取得は provider ごとに並行して行い、一部 provider の失敗が他方の結果を握りつぶさない (Session catalog の "provider catalog の partial failure" と同じ方針)。
+- 0% (実際に利用率 0 と報告された) と unavailable (そもそも報告されない) を区別する。unavailable を 0% として描画することはない。
+- 巨大な単一 `Provider` interface へ `Usage` を必須 method として追加することはしない。
+
 ##### Prompt stash
 
 Composer は、1つの共有 prompt stash を持つ。
@@ -146,6 +184,12 @@ stash の特徴:
 - agentsctl 終了時に破棄する。
 
 Attach 中は terminal input を対象 CLI へ渡すため、Composer / stash の操作とは分離する。
+
+##### Multiline cursor navigation
+
+prompt が複数行になっている間は、`↑` / `↓` は session selection ではなく Composer 内の行移動を優先する。単一行 (空を含む) の間は従来どおり session selection を移動する。
+
+この優先順位判定は `State.Handle` が行い、terminal decoder (`input_unix.go`) は物理 key (`KeyUp` / `KeyDown`) を渡すだけで prompt の内容を意識しない。行移動時の column 保持は一般的な text editor の挙動 (短い行を経由して長い行へ戻ると元の column を維持する) に合わせる。
 
 #### Attach / Detach
 
@@ -254,23 +298,39 @@ Rename は、既存 session の表示名を変更する。
 
 #### Directory scope
 
-Agent View は、agentsctl を起動した directory を基準に3つの scope を持つ。
+Agent View は、agentsctl を起動した directory (target directory) を基準に3つの scope を持つ。
 
-| Scope    | 対象                                     |
-| -------- | ---------------------------------------- |
-| `cwd`    | 起動 directory と CWD が一致する session |
-| `cwd/**` | 起動 directory 自体と、その descendant   |
-| `all`    | 全 session                               |
+| Scope                            | 対象                                                                     |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| `same directory`                  | target directory と CWD が一致する session                               |
+| `descendants + worktree directories` | target directory 自体とその descendant、および同じ repository に属する worktree directory (とそれぞれの descendant) |
+| `all directories`                 | 全 session                                                               |
 
 scope は以下の順で切り替える。
 
 ```text
-cwd → cwd/** → all → cwd
+same directory -> descendants + worktree directories -> all directories -> same directory
 ```
+
+selection identity (`session.Key`) と scope cycling は独立している。scope を切り替えても選択中 session が引き続き catalog に存在すれば選択は維持される。
+
+##### Worktree discovery
+
+`descendants + worktree directories` scope が必要とする worktree directory の一覧は、`git worktree list --porcelain` を用いた git/filesystem I/O で取得する。
+
+この discovery は `internal/session` の pure な `Filter` の外側 (`internal/workspace`) に置き、以下の dependency direction を守る。
+
+```text
+git/filesystem discovery (internal/workspace)
+        -> normalized scope roots / worktree directories
+        -> pure session filtering (internal/session.Filter)
+```
+
+`internal/session.Scope` は discovery 済みの worktree directory を `WorktreeDirectories` としてそのまま受け取るだけであり、git や filesystem を一切呼び出さない。worktree discovery が失敗する場合 (git repository でない、`git` が利用不可など) は、target directory 自身の descendant のみへ安全にフォールバックする — scope 全体を失敗させない。
 
 ##### Path matching
 
-`cwd/**` は path boundary を考慮する。
+`descendants + worktree directories` は path boundary を考慮する。
 
 例えば以下の場合:
 
@@ -280,7 +340,7 @@ cwd → cwd/** → all → cwd
 /project-other
 ```
 
-`/project` を基準とした `cwd/**` に含むのは以下。
+`/project` を基準とした scope に含むのは以下。
 
 ```text
 /project
@@ -289,7 +349,7 @@ cwd → cwd/** → all → cwd
 
 `/project-other` は含めない。
 
-単純な文字列 prefix matching は使用しない。
+単純な文字列 prefix matching は使用しない。この判定は `/project` (target directory) だけでなく、各 worktree directory を root とした場合にも同様に適用する。
 
 ##### Symlink
 
