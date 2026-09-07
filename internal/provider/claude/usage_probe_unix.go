@@ -21,7 +21,7 @@ import (
 // (see Probe.Usage) -- #14's "1〜5分程度" cache freshness guidance.
 const usageProbeTTL = 3 * time.Minute
 
-// usageProbePrompt is the minimal message Probe.refresh sends into the
+// usageProbePrompt is the minimal message Probe.refreshOnce sends into the
 // probe session to elicit one real API response (the only way Claude Code
 // populates rate_limits for its statusLine -- see UsageProbeSource's doc
 // comment). It deliberately asks for no tool use: this session has no
@@ -29,7 +29,7 @@ const usageProbeTTL = 3 * time.Minute
 // spawned would simply hang until usageProbeSendTimeout.
 const usageProbePrompt = "Reply with just the word OK. Do not use any tools."
 
-// usageProbeSendTimeout bounds how long Probe.refresh waits for the
+// usageProbeSendTimeout bounds how long Probe.refreshOnce waits for the
 // collector to observe a fresh statusLine snapshot (ObservedAt after the
 // prompt was sent) before giving up on this refresh.
 const usageProbeSendTimeout = 30 * time.Second
@@ -84,7 +84,7 @@ const usageProbeDetachTimeout = 5 * time.Second
 // Probe is agentsctl's one owned Claude usage-probe session: an
 // interactive `claude` process, run under a PTY this package owns
 // transiently for each refresh (never left running in the background --
-// see refresh), configured via a dedicated --settings file whose
+// see refreshOnce), configured via a dedicated --settings file whose
 // statusLine points back at this same executable's UsageCollectorCommand.
 // It implements UsageProbeSource for Provider.
 //
@@ -317,7 +317,7 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.refreshCh = ch
 	pr.mu.Unlock()
 
-	snap, err := pr.refresh(ctx)
+	snap, err := pr.refreshWithRecovery(ctx)
 	if err == nil {
 		_ = writeUsageSnapshotAtomic(pr.snapshotPath(), snap)
 	}
@@ -332,28 +332,68 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	return snap, err
 }
 
-// refresh does the actual probe-session work: it starts the one owned
-// Claude session (always addressed by the same persisted --session-id --
-// see probeIdentity's doc comment) under a PTY this call owns transiently,
-// answers the workspace-trust dialog if this is the very first launch
-// ever for this probe identity, sends usageProbePrompt to elicit a real
-// API response (consuming a small amount of quota -- see
-// usageProbePrompt's doc comment), waits for either the collector to
-// observe a snapshot that actually reflects a completed response to this
-// prompt or Claude Code's own terminal output to show a usage-limit
-// indication (see waitForProbeOutcome/classifyProbeOutput), then detaches
-// -- the process is never left running across refreshes (see Probe's doc
-// comment): each refresh is its own short-lived attach, so Claude's own
-// native catalog shows exactly one probe session no matter how many
-// refreshes have run.
+// refreshWithRecovery runs refreshOnce, self-healing exactly one specific
+// failure mode -- errProbeSessionConflict -- within this single call,
+// entirely inside the Claude provider boundary: Agent View, sessionctl,
+// and every other caller of Probe.Usage just see one refresh that either
+// succeeded or failed, never Claude-specific recovery orchestration (see
+// Issue #19's follow-up: refresh's own background fetch is not a polling
+// loop, so recovering only "on the next refresh" could otherwise leave a
+// user staring at a stale/"?%" reading until whatever next triggers a
+// fetch).
+//
+// At most one rotation and one retry ever happen -- never a loop: a
+// second errProbeSessionConflict (or any other error) from the retry is
+// returned exactly as refreshOnce reported it, falling through to
+// refreshShared's/Usage's existing stale-cache-or-error handling
+// unchanged. If rotation itself fails (a persistence error, not a
+// conflict), the original conflict error is returned rather than
+// attempting a retry with no valid new identity to use.
+func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error) {
+	id, err := loadOrCreateProbeIdentity(pr.identityPath())
+	if err != nil {
+		return usageSnapshot{}, fmt.Errorf("load claude usage probe identity: %w", err)
+	}
+	snap, err := pr.refreshOnce(ctx, id)
+	if err == nil || !errors.Is(err, errProbeSessionConflict) {
+		return snap, err
+	}
+	rotated, rerr := rotateProbeIdentity(pr.identityPath(), id)
+	if rerr != nil {
+		return usageSnapshot{}, err
+	}
+	return pr.refreshOnce(ctx, rotated)
+}
+
+// refreshOnce does the actual probe-session work for a single attempt,
+// addressing Claude via id's SessionID (supplied by the caller --
+// refreshWithRecovery -- rather than loaded here, so a post-conflict
+// retry can pass a freshly-rotated identity without this function
+// needing any recovery logic of its own): it starts the one owned Claude
+// session under a PTY this call owns transiently, answers the
+// workspace-trust dialog if id.TrustAccepted is false, sends
+// usageProbePrompt to elicit a real API response (consuming a small
+// amount of quota -- see usageProbePrompt's doc comment), waits for
+// either the collector to observe a snapshot that actually reflects a
+// completed response to this prompt or Claude Code's own terminal output
+// to show a usage-limit or session-conflict indication (see
+// waitForProbeOutcome/classifyProbeOutput/checkSessionConflict), then
+// detaches -- the process is never left running across refreshes (see
+// Probe's doc comment): each attempt is its own short-lived attach, so
+// Claude's own native catalog shows at most one probe session no matter
+// how many refreshes (or recovery retries) have run.
 //
 // A detected limit is returned as a valid (err == nil) exhausted
 // usageSnapshot, not a failure -- see exhaustedSnapshot and Issue #19's
-// "limit 到達を...単なる refresh failure として扱わない". Only a genuine
-// non-limit failure (timeout, parse failure, process failure) still
-// returns an error, preserving #14's existing stale-cache fallback policy
-// for those cases (see Usage's own doc comment).
-func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
+// "limit 到達を...単なる refresh failure として扱わない". A detected session
+// conflict is returned as an error wrapping errProbeSessionConflict (see
+// checkSessionConflict), which only refreshWithRecovery ever interprets
+// specially. Any other, genuinely unrelated failure (timeout, parse
+// failure, process launch failure) returns a plain error, preserving
+// #14's existing stale-cache fallback policy for those cases unchanged
+// (see Usage's own doc comment) -- refreshWithRecovery does not rotate or
+// retry for these.
+func (pr *Probe) refreshOnce(ctx context.Context, id probeIdentity) (usageSnapshot, error) {
 	if err := os.MkdirAll(pr.Dir, 0o700); err != nil {
 		return usageSnapshot{}, err
 	}
@@ -363,10 +403,6 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 	}
 	if err := writeUsageSettings(pr.settingsPath(), exe, pr.snapshotPath()); err != nil {
 		return usageSnapshot{}, fmt.Errorf("write claude usage probe settings: %w", err)
-	}
-	id, err := loadOrCreateProbeIdentity(pr.identityPath())
-	if err != nil {
-		return usageSnapshot{}, fmt.Errorf("load claude usage probe identity: %w", err)
 	}
 
 	args := []string{"--session-id", id.SessionID, "--settings", pr.settingsPath()}
@@ -448,18 +484,21 @@ func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
 }
 
 // checkSessionConflict reports (via ok) whether capture shows Claude Code
-// rejecting id.SessionID as already in use (see probeSessionConflict),
-// discarding this probe's persisted identity as a side effect so the next
-// refresh mints a fresh one -- see discardProbeIdentity. Called at more
-// than one point in refresh (see its own call sites) so a conflict is
-// caught promptly in the common case but never missed just because it
-// showed up a moment later than the first check ran.
+// rejecting id.SessionID as already in use (see probeSessionConflict). It
+// is a pure classifier with no side effect on persisted state -- deciding
+// what to do about a conflict (rotate the identity and retry once) is
+// refreshWithRecovery's responsibility, not refreshOnce's; this only
+// needs to produce a distinguishable error (wrapping
+// errProbeSessionConflict, checked via errors.Is, never by re-parsing a
+// message string). Called at more than one point in refreshOnce (see its
+// own call sites) so a conflict is caught promptly in the common case but
+// never missed just because it showed up a moment later than the first
+// check ran.
 func (pr *Probe) checkSessionConflict(capture *probeOutputCapture, id probeIdentity) (err error, ok bool) {
 	if !probeSessionConflict(capture.String()) {
 		return nil, false
 	}
-	_ = discardProbeIdentity(pr.identityPath())
-	return fmt.Errorf("claude usage probe: session id %s rejected as already in use; a new identity will be used on the next refresh", id.SessionID), true
+	return fmt.Errorf("claude usage probe: session id %s rejected as already in use: %w", id.SessionID, errProbeSessionConflict), true
 }
 
 // probeSettle waits for d, or returns ctx's error if ctx is cancelled

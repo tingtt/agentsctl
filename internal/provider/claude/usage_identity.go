@@ -13,34 +13,55 @@ import (
 // probe session -- the source of truth Provider.List uses to exclude the
 // probe from the normal session catalog (see UsageProbeSource's
 // KnownSessionID) and the probe orchestration (usage_probe_unix.go)
-// addresses on every refresh via --session-id. SessionID is the identity;
+// addresses on every refresh via --session-id.
+//
+// SessionID and TrustAccepted have deliberately different lifetimes,
+// tracked together here only because they're persisted together:
+//
+//   - SessionID identifies a Claude Code session. Normally reused
+//     unchanged across every refresh -- addressing an already-known
+//     --session-id, with or without resumable history, is not itself an
+//     error (verified against the installed CLI: an ID Claude has no
+//     saved transcript for, e.g. one whose process had to be
+//     force-killed, behaves like a brand new one). But Claude Code CAN
+//     permanently reject a specific ID as already in use elsewhere (see
+//     errProbeSessionConflict) -- confirmed via a live reproduction of
+//     Issue #19's "?% stuck forever" symptom, where the same rejected ID
+//     failed identically and indefinitely on every retry. When that
+//     happens the ID itself is replaced (see rotateProbeIdentity); the
+//     probe never depends on any given ID's conversation surviving (one
+//     trivial round trip is all any refresh ever needs), so losing one
+//     costs nothing beyond needing a fresh one.
+//   - TrustAccepted tracks a completely different, longer-lived fact:
+//     whether agentsctl has ever answered Claude Code's workspace-trust
+//     confirmation dialog for this probe's dedicated *directory* (see
+//     Probe.refreshOnce). That dialog is a property of the directory, not
+//     of any particular session ID -- verified against the installed
+//     CLI, Claude Code itself remembers a directory as trusted (in its
+//     own local state, not anything agentsctl writes) regardless of
+//     which session ID is later used within it. rotateProbeIdentity
+//     therefore always carries TrustAccepted forward unchanged: a
+//     rotation only ever happens within the same probe directory, so
+//     whatever trust state was already established for that directory
+//     still applies to the new ID. Getting this wrong would mean
+//     resending the blind trust-dialog keystroke sequence into what is,
+//     from Claude Code's own perspective, an already-trusted directory's
+//     live chat composer.
+//
 // DisplayName is decorative only (see the DesignDoc's Claude usage probe
 // section -- identity is never derived from a display name or CWD).
-//
-// Every refresh uses --session-id (never --resume): verified against the
-// installed CLI that re-addressing an existing session ID via
-// --session-id never errors, whether or not that ID has any resumable
-// history (a session ID Claude has no saved transcript for -- e.g. one
-// whose process had to be force-killed -- behaves exactly like a brand
-// new one). The probe never depends on conversation continuity for its
-// own purpose (one trivial round trip per refresh), so there is nothing
-// to lose either way; this sidesteps needing to track or verify whether a
-// given refresh's session survives to be resumable, and the earlier
-// "confirm this session appeared in the native catalog, then switch to
-// --resume" design this replaced never actually needed to run.
 type probeIdentity struct {
 	SessionID   string `json:"sessionId"`
 	DisplayName string `json:"displayName"`
 	// TrustAccepted is set once this probe has answered Claude Code's
-	// workspace-trust confirmation dialog for its dedicated directory
-	// (see Probe.refresh in usage_probe_unix.go) -- shown only the
-	// very first time any interactive session runs in a directory Claude
-	// hasn't seen before, and, once accepted, remembered by Claude Code
-	// itself (in its own local state, not anything agentsctl writes) for
-	// every later session in that same directory. Refresh only attempts
-	// to answer it while this is false, so a later refresh's real prompt
-	// is never preceded by a blind, unnecessary keystroke into a live
-	// chat composer.
+	// workspace-trust confirmation dialog for its dedicated directory --
+	// shown only the very first time any interactive session runs in a
+	// directory Claude hasn't seen before. refreshOnce only attempts to
+	// answer it while this is false, so a later refresh's real prompt is
+	// never preceded by a blind, unnecessary keystroke into a live chat
+	// composer. See probeIdentity's own doc comment for why this survives
+	// a SessionID rotation unchanged (rotateProbeIdentity) even though a
+	// rotation always mints a brand new SessionID.
 	TrustAccepted bool `json:"trustAccepted"`
 }
 
@@ -126,35 +147,52 @@ func writeProbeIdentity(path string, id probeIdentity) error {
 // the probe's own terminal output immediately on startup (well within the
 // settle delay, before any prompt is ever sent), and every subsequent
 // refresh attempt using that same session ID failed identically and
-// indefinitely -- reproduced twice in a row with no change. Minting a
-// brand-new identity (see discardProbeIdentity) and retrying was
+// indefinitely -- reproduced twice in a row with no change. Rotating to a
+// brand-new identity (see rotateProbeIdentity) and retrying was
 // confirmed, against the same real installed CLI, to succeed immediately.
 const probeSessionConflictPhrase = "is already in use"
+
+// errProbeSessionConflict is the sentinel Probe.refreshOnce's error wraps
+// when probeSessionConflict classifies a refresh's captured output as
+// Claude Code rejecting the session ID used -- see
+// probeSessionConflictPhrase's doc comment. Kept distinguishable via
+// errors.Is (never by re-parsing an error string) specifically so
+// Probe.refreshWithRecovery can react to this one failure mode -- and
+// only this one -- with an identity rotation and a single bounded retry,
+// while every other refreshOnce failure (timeout, parse failure, process
+// launch failure, ...) falls straight through to the existing stale-cache
+// fallback untouched.
+var errProbeSessionConflict = errors.New("claude usage probe: session id rejected as already in use")
 
 // probeSessionConflict reports whether output shows Claude Code rejecting
 // this probe's --session-id as already in use elsewhere -- see
 // probeSessionConflictPhrase's doc comment. This is a process/session-
 // identity-level signal, unrelated to classifyProbeOutput's usage-limit
 // wording (a different failure mode entirely, checked separately in
-// Probe.refresh).
+// Probe.refreshOnce).
 func probeSessionConflict(output string) bool {
 	return strings.Contains(output, probeSessionConflictPhrase)
 }
 
-// discardProbeIdentity removes path's persisted identity so the next
-// loadOrCreateProbeIdentity call mints a fresh session ID -- the only
-// recovery available once Claude Code has permanently rejected the
-// current one (see probeSessionConflict): the probe's design of reusing
-// one persisted identity forever (see probeIdentity's own doc comment)
-// has no other way to recover from a rejection that never clears on its
-// own. A missing file is not an error: discarding an identity that's
-// already gone (e.g. a concurrent refresh already discarded it) is a
-// no-op.
-func discardProbeIdentity(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+// rotateProbeIdentity replaces path's persisted identity with a freshly
+// minted SessionID, carrying DisplayName and -- critically -- TrustAccepted
+// forward unchanged from old (see probeIdentity's own doc comment for why
+// TrustAccepted survives a rotation: it belongs to the probe *directory*,
+// which a rotation never changes, not to the SessionID being replaced).
+// This is the only recovery available once Claude Code has permanently
+// rejected an identity's SessionID (see probeSessionConflict): the
+// probe's design of otherwise reusing one persisted identity forever has
+// no other way to recover from a rejection that never clears on its own.
+func rotateProbeIdentity(path string, old probeIdentity) (probeIdentity, error) {
+	uuid, err := newUUIDv4()
+	if err != nil {
+		return probeIdentity{}, err
 	}
-	return nil
+	id := probeIdentity{SessionID: uuid, DisplayName: old.DisplayName, TrustAccepted: old.TrustAccepted}
+	if err := writeProbeIdentity(path, id); err != nil {
+		return probeIdentity{}, err
+	}
+	return id, nil
 }
 
 // newUUIDv4 generates a random RFC 4122 version-4 UUID -- sufficient for

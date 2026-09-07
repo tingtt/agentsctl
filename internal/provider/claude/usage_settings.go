@@ -10,7 +10,7 @@ import (
 // collector on a fixed timer in addition to Claude Code's own event-driven
 // triggers, so a snapshot keeps getting re-observed (with a fresh
 // ObservedAt) even during a quiet stretch with no new API response. It
-// does not, by itself, cause a new API request -- only Probe.refresh
+// does not, by itself, cause a new API request -- only Probe.refreshOnce
 // writing a fresh prompt into the session does that (see
 // usage_probe_unix.go) -- so this is cheap local bookkeeping, not an
 // additional quota cost.
@@ -44,7 +44,7 @@ type usageStatusLineSetting struct {
 // settingsPath, pointing its statusLine at this same agentsctl executable
 // re-invoked as the UsageCollectorCommand hidden subcommand (see
 // usage_collector.go), writing to snapshotPath. It is idempotent and cheap
-// enough to call on every refresh (see Probe.refresh): the content is a
+// enough to call on every refresh (see Probe.refreshOnce): the content is a
 // deterministic function of exePath/snapshotPath, so a redundant rewrite
 // with unchanged inputs produces byte-identical output.
 func writeUsageSettings(settingsPath, exePath, snapshotPath string) error {

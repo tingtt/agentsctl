@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -605,24 +606,54 @@ func TestProbeUsageAppliesResetBoundaryThroughClock(t *testing.T) {
 	}
 }
 
-// TestProbeRecoversFromSessionIDConflictByMintingNewIdentity fixes Issue
-// #19's follow-up root cause: a probe whose persisted --session-id has
-// been permanently rejected by Claude Code ("Session ID ... is already in
-// use") must discard that identity and mint a fresh one, rather than
-// repeating the exact same doomed refresh forever -- reproduced live
-// against the installed CLI (2.1.263), where retrying with the same
-// rejected ID failed identically and indefinitely, but a freshly-minted
-// ID succeeded immediately (see probeSessionConflict's doc comment).
-func TestProbeRecoversFromSessionIDConflictByMintingNewIdentity(t *testing.T) {
+// fakeProbeInvocationCount counts probe_session invocations recorded by
+// the fake CLI's probe_invocations.log (see the fake CLI's own doc
+// comment on it) -- used by the bounded-retry test below to prove a
+// session-conflict recovery attempt spawns at most one rotation retry,
+// never a loop.
+func fakeProbeInvocationCount(t *testing.T, fakeDir string) int {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(fakeDir, "probe_invocations.log"))
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return 0
+	}
+	return len(lines)
+}
+
+// TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust
+// fixes Issue #19's follow-up review: recovery from a permanently
+// rejected --session-id ("Session ID ... is already in use") must happen
+// within the SAME Usage() call -- not "discard now, succeed on whatever
+// refresh happens next" -- since Agent View's usage fetch is a background
+// fetch triggered by startup/reload, not a polling loop a user is
+// guaranteed to trigger again soon. It also fixes the trust-state pitfall
+// discarding (rather than rotating) an identity would reintroduce:
+// workspace trust is remembered by Claude Code per probe *directory*, not
+// per session ID (see probeIdentity's doc comment), so a probe directory
+// already trusted under the rejected ID must still be treated as trusted
+// under the rotated one -- verified directly here, not just inferred from
+// the call succeeding (see this fake CLI's own leniency note on
+// first_submitted_line.bin).
+func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
 	probeDir := t.TempDir()
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
 	pr.ExePath = probeExePath(t)
 
-	// Seed a persisted identity as a real probe dir would already have
-	// (from before its session id became permanently rejected), and a
-	// fixture simulating that rejection.
+	// Simulate a probe directory Claude Code has already trusted (from a
+	// prior, separate successful refresh under the old identity) --
+	// mirrors the fake CLI's own per-directory trust_marker model.
+	if err := os.WriteFile(filepath.Join(probeDir, ".fake-claude-trust-accepted"), []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	rejectedID, err := loadOrCreateProbeIdentity(pr.identityPath())
 	if err != nil {
 		t.Fatal(err)
@@ -631,18 +662,10 @@ func TestProbeRecoversFromSessionIDConflictByMintingNewIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFakeSessionConflict(t, fakeDir, "Error: Session ID "+rejectedID.SessionID+" is already in use.\r\n")
-
-	if _, err := pr.Usage(context.Background()); err == nil {
-		t.Fatal("want an error while the session id is still rejected")
-	}
-	if _, ok, _ := readProbeIdentityIfExists(pr.identityPath()); ok {
-		t.Fatal("the rejected identity must be discarded, not left in place for the next refresh to retry")
-	}
-
-	// The conflict no longer applies to whatever fresh identity gets
-	// minted next; seed normal usage data for that refresh to succeed
-	// with.
-	if err := os.Remove(filepath.Join(fakeDir, "session_conflict.txt")); err != nil {
+	// Scope the rejection to the original identity only, so the rotated
+	// identity this test expects to succeed within the same Usage() call
+	// actually can -- see the fake CLI's own doc comment on this fixture.
+	if err := os.WriteFile(filepath.Join(fakeDir, "session_conflict_session_ids.txt"), []byte(rejectedID.SessionID+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	writeFakeRateLimits(t, fakeDir, map[string]any{
@@ -651,17 +674,112 @@ func TestProbeRecoversFromSessionIDConflictByMintingNewIdentity(t *testing.T) {
 
 	got, err := pr.Usage(context.Background())
 	if err != nil {
-		t.Fatalf("Usage() with a freshly-minted identity errored: %v", err)
+		t.Fatalf("Usage() errored instead of self-healing the conflict within the same call: %v", err)
 	}
 	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 10 {
-		t.Fatalf("got=%+v, want Available/10%% once a fresh identity is used", got.FiveHour)
+		t.Fatalf("got=%+v, want Available/10%% from a single Usage() call that recovers internally", got.FiveHour)
 	}
+
 	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
 	if err != nil || !ok {
 		t.Fatalf("no identity after recovery: ok=%v err=%v", ok, err)
 	}
 	if newID.SessionID == rejectedID.SessionID {
-		t.Fatal("recovery must mint a new session id, not reuse the rejected one")
+		t.Fatal("recovery must rotate to a new session id, not reuse the rejected one")
+	}
+	if !newID.TrustAccepted {
+		t.Fatal("TrustAccepted must be preserved across rotation -- workspace trust belongs to the probe directory, not the rotated-away session id")
+	}
+
+	// Direct proof no blind trust-dialog keystroke was sent into the
+	// already-trusted composer on the post-rotation retry: this fake CLI
+	// would have accepted the raw TRUST_DIALOG_ACCEPT bytes as if they
+	// were an ordinary (nonsensical) submitted line and still returned a
+	// usage reading, so success alone would not have caught this.
+	firstLine, err := os.ReadFile(filepath.Join(fakeDir, "first_submitted_line.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstLine) == usageProbeTrustDialogAccept {
+		t.Fatalf("a blind trust-dialog keystroke was sent to an already-trusted composer: %q", firstLine)
+	}
+	if !strings.HasPrefix(string(firstLine), usageProbePrompt) {
+		t.Fatalf("first submitted line=%q, want it to start with the real probe prompt", firstLine)
+	}
+}
+
+// TestProbeSessionConflictRetryIsBoundedToOneRotation fixes that recovery
+// never loops: if the rotated identity is ALSO rejected, Usage() must
+// fail (falling through to the existing stale/error policy) after
+// exactly two probe attempts -- the original identity and one rotation
+// retry -- never a third.
+func TestProbeSessionConflictRetryIsBoundedToOneRotation(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	origID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This fixture doesn't key off any particular session id, so it keeps
+	// rejecting the rotated identity too.
+	writeFakeSessionConflict(t, fakeDir, "Error: Session ID is already in use.\r\n")
+
+	_, err = pr.Usage(context.Background())
+	if err == nil {
+		t.Fatal("want an error when both the original and the rotated identity are rejected")
+	}
+	if !errors.Is(err, errProbeSessionConflict) {
+		t.Fatalf("err=%v, want it to wrap errProbeSessionConflict", err)
+	}
+
+	if got := fakeProbeInvocationCount(t, fakeDir); got != 2 {
+		t.Fatalf("fake CLI invocations=%d, want exactly 2 (the original attempt plus one rotation retry, no third attempt)", got)
+	}
+
+	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	if err != nil || !ok {
+		t.Fatalf("no identity after the bounded retry: ok=%v err=%v", ok, err)
+	}
+	if newID.SessionID == origID.SessionID {
+		t.Fatal("the one allowed rotation must still have happened even though the retry also conflicted")
+	}
+}
+
+// TestProbeUnrelatedFailureDoesNotRotateIdentity fixes that
+// refreshWithRecovery's rotation is specific to errProbeSessionConflict:
+// a genuinely unrelated failure (here, a process launch failure -- an
+// unusable claude binary path) must be returned as-is, with no rotation
+// and no retry, and the persisted identity must be left completely
+// untouched.
+func TestProbeUnrelatedFailureDoesNotRotateIdentity(t *testing.T) {
+	t.Setenv("AGENTSCTL_FAKE_DIR", t.TempDir())
+	probeDir := t.TempDir()
+	pr := newFastProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	id, err := loadOrCreateProbeIdentity(pr.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = pr.Usage(context.Background())
+	if err == nil {
+		t.Fatal("want an error for a genuine process-launch failure")
+	}
+	if errors.Is(err, errProbeSessionConflict) {
+		t.Fatalf("err=%v, a process-launch failure must not be misclassified as a session conflict", err)
+	}
+
+	stillID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	if err != nil || !ok {
+		t.Fatalf("identity missing after an unrelated failure: ok=%v err=%v", ok, err)
+	}
+	if stillID.SessionID != id.SessionID {
+		t.Fatal("an unrelated failure must not rotate the identity")
 	}
 }
 
@@ -797,12 +915,12 @@ func TestProbeKnownSessionIDExcludesCatalogRowNotJustCWD(t *testing.T) {
 
 // TestFakeCLIRejectsPromptWithoutTrustDialogAccept fixes the fake CLI's
 // own fidelity to the real bug this package's Fix B addresses: driven
-// directly (bypassing Probe.refresh entirely), a brand-new probe
+// directly (bypassing Probe.refreshOnce entirely), a brand-new probe
 // directory's fake session must reject a prompt sent WITHOUT first
 // answering the workspace-trust dialog -- reproducing the original defect
 // (a blind prompt+Enter selects the fake's own default "No, exit" and the
 // session exits, never invoking statusLine) -- so that the other tests in
-// this file, which all pass through Probe.refresh's real trust-dialog
+// this file, which all pass through Probe.refreshOnce's real trust-dialog
 // handling, are proven against a fake that can actually fail, not one
 // that trivially succeeds regardless of what's sent.
 func TestFakeCLIRejectsPromptWithoutTrustDialogAccept(t *testing.T) {

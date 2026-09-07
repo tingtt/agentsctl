@@ -29,7 +29,7 @@ TRUST_DIALOG_ACCEPT = b"\x1b[B\r"
 def probe_session(session_id, settings_flag):
     # Stands in for a real, actively-rendering interactive `claude`
     # session for usage_probe_unix.go's Probe: it goes raw, and once it
-    # sees a full line (terminated by '\r', matching Probe.refresh's own
+    # sees a full line (terminated by '\r', matching Probe.refreshOnce's own
     # prompt submission), it invokes the statusLine command named in
     # --settings with a canned rate_limits payload piped to its stdin --
     # the same shape Claude Code itself invokes a statusLine command with
@@ -37,6 +37,13 @@ def probe_session(session_id, settings_flag):
     # AGENTSCTL_FAKE_DIR controls the payload; its absence means "no
     # rate_limits yet" (payload has none), matching a pre-first-response
     # session.
+    #
+    # probe_invocations.log records one line per invocation of this
+    # function, regardless of outcome -- usage_probe_unix_test.go's bounded-
+    # retry tests (Issue #19's session-conflict recovery) count these to
+    # prove a recovery retry happens at most once, never a loop.
+    with (root / "probe_invocations.log").open("a") as f:
+        f.write(session_id + "\n")
     #
     # tty.setraw(0) must run before ANY other I/O in this process
     # (matching the "attach" branch below), not just before this
@@ -79,11 +86,25 @@ def probe_session(session_id, settings_flag):
     # immediately, well before any trust dialog or chat input -- see
     # probeSessionConflict's doc comment. Checked before anything else in
     # this function that would otherwise consume stdin.
+    #
+    # session_conflict_session_ids.txt, if present alongside it, scopes
+    # the rejection to only the listed session IDs (one per line) --
+    # modeling a specific ID being rejected (Issue #19's real, live
+    # observation) rather than every ID this fake CLI is ever invoked
+    # with, so a test can drive a rejected-then-rotated identity through
+    # ONE Usage() call and observe the rotated ID succeed. Its absence
+    # means unconditional rejection, for tests that want every attempt
+    # (including a rotation retry) to keep failing.
     conflict_path = root / "session_conflict.txt"
     if conflict_path.exists():
-        os.write(1, conflict_path.read_bytes())
-        termios.tcsetattr(0, termios.TCSADRAIN, old)
-        sys.exit(1)
+        ids_path = root / "session_conflict_session_ids.txt"
+        reject = True
+        if ids_path.exists():
+            reject = session_id in ids_path.read_text().splitlines()
+        if reject:
+            os.write(1, conflict_path.read_bytes())
+            termios.tcsetattr(0, termios.TCSADRAIN, old)
+            sys.exit(1)
 
     rows = load()
     rows = [r for r in rows if r["id"] != session_id]
@@ -126,6 +147,22 @@ def probe_session(session_id, settings_flag):
                 continue  # suspend request, not an exit -- see above
             buf += b
             if b in (b"\r", b"\n"):
+                # first_submitted_line.bin records the raw bytes of the
+                # first ever submitted line, across however many
+                # probe_session invocations one test drives (only the
+                # first write sticks): usage_probe_unix_test.go's
+                # session-conflict-recovery test uses this to directly
+                # assert that a post-rotation retry into an
+                # already-trusted composer (trust_marker already exists,
+                # so the trust-dialog-accept wait above never ran) never
+                # receives the blind TRUST_DIALOG_ACCEPT keystroke
+                # sequence -- proving the real prompt was sent, not just
+                # that some usage reading eventually came back (which
+                # this fake CLI's own leniency -- treating any submitted
+                # line as a valid chat turn -- would not otherwise catch).
+                first_line_path = root / "first_submitted_line.bin"
+                if not first_line_path.exists():
+                    first_line_path.write_bytes(buf)
                 # limit_banner.txt (usage_probe_unix_test.go's limit-
                 # detection fixtures) stands in for the real CLI hitting a
                 # 5h/weekly usage limit: verified against the installed
