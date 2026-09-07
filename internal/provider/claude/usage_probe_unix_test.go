@@ -240,11 +240,12 @@ func TestProbeRefreshDetectsFiveHourLimitAndPreservesWeekly(t *testing.T) {
 	}
 
 	// Force a new refresh, this time observing a 5-hour usage-limit banner
-	// instead of a fresh statusLine snapshot.
+	// (the shape closest to Claude Code's actual display, per this
+	// package's own wording notes) instead of a fresh statusLine snapshot.
 	pr.mu.Lock()
 	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
 	pr.mu.Unlock()
-	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
+	writeFakeLimitBanner(t, fakeDir, "You've hit your session limit · resets 3pm\r\n")
 
 	got, err := pr.Usage(context.Background())
 	if err != nil {
@@ -279,7 +280,7 @@ func TestProbeRefreshDetectsWeeklyLimitAndPreservesFiveHour(t *testing.T) {
 	pr.mu.Lock()
 	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
 	pr.mu.Unlock()
-	writeFakeLimitBanner(t, fakeDir, "You have reached your weekly usage limit.\r\n")
+	writeFakeLimitBanner(t, fakeDir, "You've hit your weekly limit · resets Sep 10\r\n")
 
 	got, err := pr.Usage(context.Background())
 	if err != nil {

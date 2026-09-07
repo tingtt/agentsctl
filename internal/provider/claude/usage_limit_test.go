@@ -45,6 +45,53 @@ func TestClassifyProbeOutputBothQualifiersReportsBoth(t *testing.T) {
 	}
 }
 
+// TestClassifyProbeOutputHitsYourSessionLimitBanner fixes the real-shaped
+// banner text this classifier previously missed entirely (it required a
+// "usage limit" substring, which this text never contains): "You've hit
+// your session limit · resets 3pm" classifies as the 5-hour/session
+// window only. See fiveHourLimitPhrases' doc comment for the evidence
+// behind this specific phrase -- not confirmed against a live limit
+// event.
+func TestClassifyProbeOutputHitsYourSessionLimitBanner(t *testing.T) {
+	sig := classifyProbeOutput("You've hit your session limit · resets 3pm")
+	if !sig.FiveHour || sig.Weekly {
+		t.Fatalf("sig=%+v, want FiveHour only", sig)
+	}
+}
+
+// TestClassifyProbeOutputHitsYourWeeklyLimitBanner is the weekly-window
+// counterpart of TestClassifyProbeOutputHitsYourSessionLimitBanner.
+func TestClassifyProbeOutputHitsYourWeeklyLimitBanner(t *testing.T) {
+	sig := classifyProbeOutput("You've hit your weekly limit · resets Sep 10")
+	if !sig.Weekly || sig.FiveHour {
+		t.Fatalf("sig=%+v, want Weekly only", sig)
+	}
+}
+
+// TestClassifyProbeOutputRejectsUnrelatedLimitWording fixes the false-
+// positive risk explicitly guarded against in weeklyLimitPhrases'/
+// fiveHourLimitPhrases' doc comments: the bare word "limit" is never
+// enough, and phrases that merely contain the substrings "session limit"
+// or "weekly limit" without a "hit/reached your" clause (an upsell nudge,
+// or the lower-priority-mode reset flow, both confirmed embedded in the
+// installed CLI binary) must not be misread as an active exhaustion
+// notice, on top of entirely unrelated non-rate-limit uses of the word.
+func TestClassifyProbeOutputRejectsUnrelatedLimitWording(t *testing.T) {
+	cases := []string{
+		"Context limit reached, compacting conversation.",
+		"You've exceeded the token limit for this request.",
+		"Tool output limit exceeded; truncating result.",
+		"for higher session limits every month, upgrade your plan",
+		"Reset your session limit now and keep working",
+		"Couldn't reset your session limit right now",
+	}
+	for _, text := range cases {
+		if sig := classifyProbeOutput(text); sig.any() {
+			t.Fatalf("classifyProbeOutput(%q) = %+v, want no signal for unrelated limit wording", text, sig)
+		}
+	}
+}
+
 // TestClassifyProbeOutputNoLimitWordingReportsNoSignal fixes that ordinary
 // probe output (a normal chat reply, or this package's own attach banner)
 // never spuriously classifies as a limit.
