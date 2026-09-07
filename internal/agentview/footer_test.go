@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
-	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
 func TestTopRuleExactWidthAndCWDColor(t *testing.T) {
@@ -94,11 +93,11 @@ func TestUsageColorThresholds(t *testing.T) {
 // like a 0% utilization.
 func TestUsageWindowUnavailableIsNotZeroPercent(t *testing.T) {
 	now := time.Now()
-	unavailable := usageWindowText(sessionctl.UsageWindow{Available: false}, now)
+	unavailable := usageWindowText(session.UsageWindow{Available: false}, now)
 	if strings.Contains(unavailable, "%") {
 		t.Fatalf("unavailable window must not render a percentage: %q", unavailable)
 	}
-	zero := usageWindowText(sessionctl.UsageWindow{Available: true, Percent: 0, Reset: now}, now)
+	zero := usageWindowText(session.UsageWindow{Available: true, Percent: 0, Reset: now}, now)
 	if !strings.Contains(zero, "0%") {
 		t.Fatalf("available 0%% window must render 0%%: %q", zero)
 	}
@@ -119,9 +118,9 @@ func TestFormatResetTimeSameDayVsOtherDay(t *testing.T) {
 // TestUsageLineTextRendersClaudeBeforeCodexInOrder fixes #14's usage
 // render order: "claude <5h>/<weekly> · codex <5h>/<weekly>".
 func TestUsageLineTextRendersClaudeBeforeCodexInOrder(t *testing.T) {
-	usages := []sessionctl.Usage{
-		{Provider: session.ProviderClaude, FiveHour: sessionctl.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: sessionctl.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}},
-		{Provider: session.ProviderCodex, FiveHour: sessionctl.UsageWindow{Available: true, Percent: 0, Reset: time.Now()}, Weekly: sessionctl.UsageWindow{Available: true, Percent: 100, Reset: time.Now()}},
+	usages := []session.Usage{
+		{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{Available: true, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 20, Reset: time.Now()}},
+		{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{Available: true, Percent: 100, Reset: time.Now()}},
 	}
 	line, ok := usageLineText(usages)
 	if !ok {

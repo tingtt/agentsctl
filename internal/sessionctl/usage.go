@@ -4,38 +4,19 @@ import (
 	"context"
 	"sort"
 	"sync"
-	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
-// UsageWindow is one rate-limit window's utilization -- e.g. Claude/Codex's
-// 5h or weekly quota. Available distinguishes "reported 0% used" from
-// "not reported at all": a provider that cannot report a window must never
-// be rendered as if it reported 0%.
-type UsageWindow struct {
-	Available bool
-	Percent   int
-	Reset     time.Time
-}
-
-// Usage is one provider's account-level utilization, independent of any
-// single session -- FiveHour and Weekly mirror Claude/Codex's own rate-
-// limit windows (see #14's Composer footer section).
-type Usage struct {
-	Provider session.ProviderID
-	FiveHour UsageWindow
-	Weekly   UsageWindow
-}
-
 // UsageSource is an optional provider capability (see the DesignDoc's
 // capability-composition principle): a provider that does not implement it
-// -- any future provider, e.g. Issue #6's ChatGPT -- simply never
-// contributes a Usage row. Controller.Usage never requires it, the same
-// way Controller.Load's actionsFor never requires Stopper/Renamer/
-// Archiver from a Source-only provider.
+// -- any future provider, e.g. Issue #6's ChatGPT, or a provider for which
+// no stable usage interface exists -- simply never contributes a
+// session.Usage row. Controller.Usage never requires it, the same way
+// Controller.Load's actionsFor never requires Stopper/Renamer/Archiver
+// from a Source-only provider.
 type UsageSource interface {
-	Usage(ctx context.Context) (Usage, error)
+	Usage(ctx context.Context) (session.Usage, error)
 }
 
 // Usage collects account-level utilization from every configured provider
@@ -46,10 +27,10 @@ type UsageSource interface {
 // never fail the whole call, matching Load's partial-provider-failure
 // principle for session catalogs. The result is sorted by ProviderID for a
 // deterministic render order (claude, then codex).
-func (c Controller) Usage(ctx context.Context) []Usage {
+func (c Controller) Usage(ctx context.Context) []session.Usage {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var result []Usage
+	var result []session.Usage
 	for _, p := range c.Providers {
 		src, ok := p.(UsageSource)
 		if !ok {

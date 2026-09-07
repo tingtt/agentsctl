@@ -31,6 +31,12 @@ def rpc():
             page = rows[start:start+limit]
             next_cursor = str(start+limit) if start+limit < len(rows) else None
             result = {"data":page,"nextCursor":next_cursor}
+        elif method == "account/rateLimits/read":
+            rl_path = root / "ratelimits.json"
+            if rl_path.exists():
+                result = json.loads(rl_path.read_text())
+            else:
+                result = {"rateLimits": {"primary": {"usedPercent": 0, "resetsAt": None}, "secondary": {"usedPercent": 0, "resetsAt": None}}}
         elif method in ("thread/archive","thread/unarchive","thread/name/set"):
             rows = load()
             for row in rows:

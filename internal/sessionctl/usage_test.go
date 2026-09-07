@@ -14,11 +14,11 @@ import (
 // these tests can't accidentally depend on them.
 type fakeUsageSource struct {
 	fakeSource
-	usage    Usage
+	usage    session.Usage
 	usageErr error
 }
 
-func (f fakeUsageSource) Usage(context.Context) (Usage, error) { return f.usage, f.usageErr }
+func (f fakeUsageSource) Usage(context.Context) (session.Usage, error) { return f.usage, f.usageErr }
 
 // TestControllerUsageSkipsProvidersWithoutTheCapability fixes the
 // optional-capability contract (see the DesignDoc's capability-composition
@@ -38,8 +38,8 @@ func TestControllerUsageSkipsProvidersWithoutTheCapability(t *testing.T) {
 // goroutine completion order.
 func TestControllerUsageOrdersClaudeBeforeCodex(t *testing.T) {
 	c := Controller{Providers: []Source{
-		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: Usage{Provider: session.ProviderCodex}},
-		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderClaude}, usage: Usage{Provider: session.ProviderClaude}},
+		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex}},
+		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderClaude}, usage: session.Usage{Provider: session.ProviderClaude}},
 	}}
 	got := c.Usage(context.Background())
 	if len(got) != 2 || got[0].Provider != session.ProviderClaude || got[1].Provider != session.ProviderCodex {
@@ -54,7 +54,7 @@ func TestControllerUsageOrdersClaudeBeforeCodex(t *testing.T) {
 func TestControllerUsagePartialFailureKeepsOtherProvider(t *testing.T) {
 	c := Controller{Providers: []Source{
 		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderClaude}, usageErr: errBoom},
-		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: Usage{Provider: session.ProviderCodex, FiveHour: UsageWindow{Available: true, Percent: 42, Reset: time.Now()}}},
+		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 42, Reset: time.Now()}}},
 	}}
 	got := c.Usage(context.Background())
 	if len(got) != 1 || got[0].Provider != session.ProviderCodex {

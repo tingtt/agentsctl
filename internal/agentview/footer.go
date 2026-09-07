@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
-	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
 // topRule renders the composer's top border: a gray horizontal rule with
@@ -82,7 +81,7 @@ func usageColor(percent int) string {
 // usageWindowText renders one rate-limit window ("<pct>% (reset at
 // <time>)"), or a gray "n/a" when the provider didn't report it --
 // Available must never be conflated with a reported 0% (see UsageWindow).
-func usageWindowText(w sessionctl.UsageWindow, now time.Time) string {
+func usageWindowText(w session.UsageWindow, now time.Time) string {
 	if !w.Available {
 		return styleText("n/a", colorGray)
 	}
@@ -93,7 +92,7 @@ func usageWindowText(w sessionctl.UsageWindow, now time.Time) string {
 
 // usageProviderText renders one provider's "<provider> <5h> / <weekly>"
 // segment (see #14's Composer footer render order).
-func usageProviderText(u sessionctl.Usage, now time.Time) string {
+func usageProviderText(u session.Usage, now time.Time) string {
 	name := styleText(providerName(u.Provider), providerColor(u.Provider))
 	return name + " " + usageWindowText(u.FiveHour, now) + styleText(" / ", colorGray) + usageWindowText(u.Weekly, now)
 }
@@ -101,9 +100,9 @@ func usageProviderText(u sessionctl.Usage, now time.Time) string {
 // usageLineText joins every provider's usage segment into #14's single
 // usage line ("claude <5h>/<weekly> · codex <5h>/<weekly>"), or reports
 // ok=false when there is nothing to show at all (no provider implements
-// sessionctl.UsageSource, or none reported usage this reload) -- the line
+// session.UsageSource, or none reported usage this reload) -- the line
 // is omitted entirely rather than rendered empty.
-func usageLineText(usages []sessionctl.Usage) (string, bool) {
+func usageLineText(usages []session.Usage) (string, bool) {
 	if len(usages) == 0 {
 		return "", false
 	}

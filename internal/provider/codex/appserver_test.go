@@ -126,6 +126,40 @@ func TestCommandAppServerListDedupesWithinASinglePage(t *testing.T) {
 	}
 }
 
+// TestCommandAppServerRateLimitsReadsAccountRateLimits exercises the real
+// subprocess/JSON-RPC boundary for account/rateLimits/read -- the RPC
+// method confirmed against the installed `codex` CLI's own generated
+// protocol schema (`codex app-server generate-json-schema`) and a live
+// request/response exchange to carry Codex's 5h (primary) and weekly
+// (secondary) rate-limit windows.
+func TestCommandAppServerRateLimitsReadsAccountRateLimits(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", dir)
+	b, err := json.Marshal(map[string]any{
+		"rateLimits": map[string]any{
+			"primary":   map[string]any{"usedPercent": 70, "resetsAt": 1788776728},
+			"secondary": map[string]any{"usedPercent": 20, "resetsAt": 1789363528},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ratelimits.json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	api := &CommandAppServer{Path: fakeCodexPath(t)}
+	got, err := api.RateLimits(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.RateLimits.Primary == nil || got.RateLimits.Primary.UsedPercent != 70 || got.RateLimits.Primary.ResetsAt == nil || *got.RateLimits.Primary.ResetsAt != 1788776728 {
+		t.Fatalf("Primary=%+v, want 70%% resetting at 1788776728", got.RateLimits.Primary)
+	}
+	if got.RateLimits.Secondary == nil || got.RateLimits.Secondary.UsedPercent != 20 || got.RateLimits.Secondary.ResetsAt == nil || *got.RateLimits.Secondary.ResetsAt != 1789363528 {
+		t.Fatalf("Secondary=%+v, want 20%% resetting at 1789363528", got.RateLimits.Secondary)
+	}
+}
+
 // TestCommandAppServerListDedupesAcrossPaginationBoundary places a
 // duplicate thread ID on either side of the app-server's page boundary
 // (List requests limit=100) to prove the pagination-merging loop in

@@ -49,6 +49,32 @@ type NativeRenamer interface {
 // to see the rename succeed -- see Provider.Rename.
 const renameCleanupTimeout = 8 * time.Second
 
+// Provider deliberately does not implement sessionctl.UsageSource (#14's
+// composer usage line). Investigated and ruled out as not currently
+// feasible without either burning quota to inspect API response headers or
+// hijacking a real interactive terminal:
+//   - `claude` has no usage/limits/quota subcommand or flag (checked
+//     `claude --help`, every listed subcommand's own `--help`, and
+//     `claude auth status --json`, which reports login/plan identity only).
+//   - No local cache or state file under `~/.claude` carries a rate-limit
+//     snapshot (checked settings/session/cache files for
+//     utilization/resetsAt-shaped keys).
+//   - Claude Code's `statusLine` hook JSON payload does carry exactly this
+//     shape (`rate_limits.five_hour`/`seven_day`, each with
+//     `used_percentage`/`resets_at` -- see
+//     https://code.claude.com/docs/en/statusline), but it is only invoked
+//     from a live, actively-rendering interactive TUI loop after that
+//     session's first API response; verified empirically that `claude -p`
+//     (print/headless mode, the same mode `--bg` sessions run under) never
+//     invokes it at all. There is no way to request one JSON payload
+//     on demand without attaching a real terminal to a session, which
+//     Usage has no business doing just to read a percentage.
+//
+// If a stable, on-demand, headless interface appears in a future Claude
+// Code release, add a Usage method here the same way codex.Provider's
+// wraps account/rateLimits/read -- Controller.Usage already treats
+// UsageSource as fully optional per provider, so nothing else needs to
+// change.
 type Provider struct {
 	Path   string
 	Runner base.Runner

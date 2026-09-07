@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,11 +17,16 @@ import (
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
+var errBoom = errors.New("boom")
+
 type fakeAPI struct {
 	rows       []Thread
 	archived   string
 	unarchived string
 	renamed    string
+
+	rateLimits    AccountRateLimits
+	rateLimitsErr error
 }
 
 func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
@@ -42,6 +48,61 @@ func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
 	}
 }
 
+// TestUsageMapsPrimaryToFiveHourAndSecondaryToWeekly fixes the mapping
+// confirmed against the installed CLI's account/rateLimits/read response
+// (windowDurationMins 300 for Primary, 10080 for Secondary): Primary is
+// the 5h window, Secondary the weekly one.
+func TestUsageMapsPrimaryToFiveHourAndSecondaryToWeekly(t *testing.T) {
+	resetsAt5h := int64(1000)
+	resetsAtWeek := int64(2000)
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{
+		Primary:   &RateLimitWindow{UsedPercent: 42, ResetsAt: &resetsAt5h},
+		Secondary: &RateLimitWindow{UsedPercent: 7, ResetsAt: &resetsAtWeek},
+	}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != session.ProviderCodex {
+		t.Fatalf("Provider=%v, want codex", got.Provider)
+	}
+	if !got.FiveHour.Available || got.FiveHour.Percent != 42 || got.FiveHour.Reset.Unix() != resetsAt5h {
+		t.Fatalf("FiveHour=%+v, want Available/42%%/reset %d", got.FiveHour, resetsAt5h)
+	}
+	if !got.Weekly.Available || got.Weekly.Percent != 7 || got.Weekly.Reset.Unix() != resetsAtWeek {
+		t.Fatalf("Weekly=%+v, want Available/7%%/reset %d", got.Weekly, resetsAtWeek)
+	}
+}
+
+// TestUsageMissingWindowIsUnavailableNotZero fixes that a window the
+// backend didn't report (nil, or present with no resetsAt) renders as
+// unavailable rather than a false 0%.
+func TestUsageMissingWindowIsUnavailableNotZero(t *testing.T) {
+	api := &fakeAPI{rateLimits: AccountRateLimits{RateLimits: RateLimitSnapshot{Primary: nil, Secondary: &RateLimitWindow{UsedPercent: 0, ResetsAt: nil}}}}
+	p := Provider{API: api}
+	got, err := p.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FiveHour.Available {
+		t.Fatalf("FiveHour=%+v, want Available=false for a nil Primary window", got.FiveHour)
+	}
+	if got.Weekly.Available {
+		t.Fatalf("Weekly=%+v, want Available=false for a window with no resetsAt", got.Weekly)
+	}
+}
+
+// TestUsagePropagatesAPIError fixes that a failed account/rateLimits/read
+// call is surfaced as an error, not silently reported as empty usage.
+func TestUsagePropagatesAPIError(t *testing.T) {
+	api := &fakeAPI{rateLimitsErr: errBoom}
+	p := Provider{API: api}
+	if _, err := p.Usage(context.Background()); err == nil {
+		t.Fatal("want an error when the app-server call fails")
+	}
+}
+
 func (f *fakeAPI) List(context.Context, bool) ([]Thread, error) {
 	return append([]Thread(nil), f.rows...), nil
 }
@@ -52,6 +113,9 @@ func (f *fakeAPI) Rename(_ context.Context, id, name string) error {
 func (f *fakeAPI) Archive(_ context.Context, id string) error   { f.archived = id; return nil }
 func (f *fakeAPI) Unarchive(_ context.Context, id string) error { f.unarchived = id; return nil }
 func (f *fakeAPI) CodexHome() string                            { return "" }
+func (f *fakeAPI) RateLimits(context.Context) (AccountRateLimits, error) {
+	return f.rateLimits, f.rateLimitsErr
+}
 
 func TestAmbiguousThreadBindingIsNeverGuessed(t *testing.T) {
 	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))

@@ -29,11 +29,47 @@ type Thread struct {
 	Turns     []Turn       `json:"turns"`
 }
 
+// RateLimitWindow is one account-level rate-limit window, decoded straight
+// from the app-server's account/rateLimits/read response (see
+// RateLimitSnapshot). ResetsAt is nil when the backend didn't report a
+// reset time for this window (observed, per the app-server's own generated
+// JSON Schema, to be legitimately absent -- callers must not treat this
+// the same as a 0% reading).
+type RateLimitWindow struct {
+	UsedPercent int    `json:"usedPercent"`
+	ResetsAt    *int64 `json:"resetsAt"`
+}
+
+// RateLimitSnapshot mirrors account/rateLimits/read's "backward-compatible
+// single-bucket view" (its own schema doc's wording): Primary is Codex's
+// rolling 5-hour window, Secondary its weekly window -- confirmed against
+// the installed CLI (windowDurationMins 300 and 10080 respectively).
+type RateLimitSnapshot struct {
+	Primary   *RateLimitWindow `json:"primary"`
+	Secondary *RateLimitWindow `json:"secondary"`
+}
+
+// AccountRateLimits is the account/rateLimits/read response shape this
+// package actually consumes -- a small subset of the full generated
+// GetAccountRateLimitsResponse schema (which also carries credits, spend
+// controls, and multi-bucket data this provider has no use for).
+type AccountRateLimits struct {
+	RateLimits RateLimitSnapshot `json:"rateLimits"`
+}
+
 type AppServer interface {
 	List(context.Context, bool) ([]Thread, error)
 	Rename(context.Context, string, string) error
 	Archive(context.Context, string) error
 	Unarchive(context.Context, string) error
+	// RateLimits reads the account's current 5h/weekly rate-limit
+	// utilization via the app-server's account/rateLimits/read method --
+	// the same native, machine-readable transport List/Rename/Archive
+	// already use (`codex app-server --stdio`), confirmed against the
+	// installed CLI's own generated JSON Schema
+	// (`codex app-server generate-json-schema`) and a live request/
+	// response exchange, never by parsing TUI display output.
+	RateLimits(context.Context) (AccountRateLimits, error)
 	CodexHome() string
 }
 
@@ -154,6 +190,13 @@ func (c *CommandAppServer) Unarchive(ctx context.Context, id string) error {
 	return c.withClient(ctx, func(cl *rpcClient) error {
 		return cl.call(ctx, "thread/unarchive", map[string]string{"threadId": id}, nil)
 	})
+}
+func (c *CommandAppServer) RateLimits(ctx context.Context) (AccountRateLimits, error) {
+	var res AccountRateLimits
+	err := c.withClient(ctx, func(cl *rpcClient) error {
+		return cl.call(ctx, "account/rateLimits/read", nil, &res)
+	})
+	return res, err
 }
 
 type rpcClient struct {

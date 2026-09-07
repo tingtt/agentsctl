@@ -181,6 +181,35 @@ func isTerminalRunState(state string) bool {
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
 	return p.API.Unarchive(ctx, k.ID)
 }
+
+// Usage implements sessionctl.UsageSource via the app-server's
+// account/rateLimits/read method (see AppServer.RateLimits) -- the same
+// native, machine-readable transport List/Rename/Archive already use.
+// Primary is Codex's rolling 5-hour window, Secondary its weekly window
+// (confirmed against the installed CLI: windowDurationMins 300 and 10080
+// respectively).
+func (p *Provider) Usage(ctx context.Context) (session.Usage, error) {
+	limits, err := p.API.RateLimits(ctx)
+	if err != nil {
+		return session.Usage{}, err
+	}
+	return session.Usage{
+		Provider: session.ProviderCodex,
+		FiveHour: rateLimitWindow(limits.RateLimits.Primary),
+		Weekly:   rateLimitWindow(limits.RateLimits.Secondary),
+	}, nil
+}
+
+// rateLimitWindow converts one app-server RateLimitWindow into the
+// provider-neutral session.UsageWindow. A nil window, or one with no
+// ResetsAt, means the backend didn't report this window at all -- reported
+// as Available: false so it renders as "not reported", never a false 0%.
+func rateLimitWindow(w *RateLimitWindow) session.UsageWindow {
+	if w == nil || w.ResetsAt == nil {
+		return session.UsageWindow{}
+	}
+	return session.UsageWindow{Available: true, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
+}
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")

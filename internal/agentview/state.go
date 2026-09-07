@@ -66,7 +66,7 @@ type State struct {
 	// A provider absent here either doesn't implement
 	// sessionctl.UsageSource or failed to report usage on the last
 	// reload -- either way it is simply omitted, never rendered as 0%.
-	Usage []sessionctl.Usage
+	Usage []session.Usage
 
 	// LastAttachedKey/HasLastAttached identify the session most recently
 	// Opened from the overview, regardless of how that Open ended (an
