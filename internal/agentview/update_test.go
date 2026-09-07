@@ -37,6 +37,59 @@ func TestNavigationMovesSelectionByKeyNotIndex(t *testing.T) {
 	}
 }
 
+// TestMultilineUpDownMovesCursorNotSelection fixes #14's input-priority
+// requirement: with a multiline prompt, Up/Down move the in-prompt cursor
+// and must never move session selection, resolved in State.Handle (not
+// the terminal decoder, which emits the same physical KeyUp/KeyDown either
+// way).
+func TestMultilineUpDownMovesCursorNotSelection(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
+	s.selectIndex(0)
+	s.Composer.Prompt = "first\nsecond"
+	s.Composer.Cursor = len([]rune(s.Composer.Prompt)) // end of "second" (col 6)
+
+	intent := s.Handle(KeyEvent{Key: KeyUp})
+	if intent.Kind != IntentNone {
+		t.Fatalf("intent=%+v, want none", intent)
+	}
+	if s.SelectedIndex() != 0 {
+		t.Fatalf("SelectedIndex=%d, want unchanged 0 (multiline Up must not move selection)", s.SelectedIndex())
+	}
+	if want := len([]rune("first")); s.Composer.Cursor != want { // clamped onto "first"'s own EOL (col 5)
+		t.Fatalf("Cursor=%d, want %d (moved onto \"first\", clamped to its EOL)", s.Composer.Cursor, want)
+	}
+
+	s.Handle(KeyEvent{Key: KeyDown})
+	if s.SelectedIndex() != 0 {
+		t.Fatalf("SelectedIndex=%d, want still unchanged 0", s.SelectedIndex())
+	}
+	if want := len([]rune("first\nsecond")); s.Composer.Cursor != want {
+		t.Fatalf("Cursor=%d, want %d (back onto \"second\")", s.Composer.Cursor, want)
+	}
+}
+
+// TestSingleLineUpDownStillMovesSessionSelectionEvenWithText fixes that
+// the multiline-priority carve-out is scoped to an actual embedded
+// newline: a non-empty but single-line prompt must still let Up/Down
+// drive session-list navigation exactly like an empty one (see
+// TestNavigationMovesSelectionByKeyNotIndex for the empty-composer case).
+func TestSingleLineUpDownStillMovesSessionSelectionEvenWithText(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
+	s.selectIndex(0)
+	s.Composer.Prompt = "no newline here"
+	s.Composer.Cursor = 5
+
+	s.Handle(KeyEvent{Key: KeyDown})
+	if s.SelectedIndex() != 1 {
+		t.Fatalf("SelectedIndex=%d, want 1 (single-line prompt must not block selection)", s.SelectedIndex())
+	}
+	if s.Composer.Cursor != 5 {
+		t.Fatalf("Cursor=%d, want unchanged 5 (single-line Up/Down must not touch the composer)", s.Composer.Cursor)
+	}
+}
+
 func TestComposerEditingInsertsAndDeletes(t *testing.T) {
 	s := NewState()
 	for _, r := range "hi" {

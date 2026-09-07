@@ -1,5 +1,7 @@
 package agentview
 
+import "strings"
+
 // Composer is the shared prompt-editing state: a single stash shared
 // across providers and directory scopes, held only in memory and
 // discarded on exit (see the DesignDoc's Prompt stash section). It is
@@ -10,6 +12,17 @@ type Composer struct {
 	Prompt string
 	Cursor int
 	Stash  string
+
+	// preferredColumn/hasPreferredColumn implement #14's multiline Up/Down
+	// cursor navigation (CursorUp/CursorDown): the column a run of
+	// consecutive vertical moves is trying to stay on, independent of how
+	// short an intermediate line is -- the same "sticky column" behavior
+	// as any text editor's arrow-key navigation. Any horizontal edit
+	// (typing, Left/Right, Home/End, stash) invalidates it via
+	// resetPreferredColumn, so the next vertical move starts fresh from
+	// the cursor's actual column again.
+	preferredColumn    int
+	hasPreferredColumn bool
 }
 
 // InsertAtCursor splices text into Prompt at Cursor (a rune index) and
@@ -18,6 +31,7 @@ type Composer struct {
 // so both splice in exactly the same way -- not appended, and not treated
 // as a separate line buffer.
 func (c *Composer) InsertAtCursor(text string) {
+	c.resetPreferredColumn()
 	runes := []rune(c.Prompt)
 	c.clampCursor(runes)
 	insert := []rune(text)
@@ -28,6 +42,7 @@ func (c *Composer) InsertAtCursor(text string) {
 }
 
 func (c *Composer) Backspace() {
+	c.resetPreferredColumn()
 	r := []rune(c.Prompt)
 	c.clampCursor(r)
 	if c.Cursor > 0 {
@@ -38,6 +53,7 @@ func (c *Composer) Backspace() {
 }
 
 func (c *Composer) Delete() {
+	c.resetPreferredColumn()
 	r := []rune(c.Prompt)
 	c.clampCursor(r)
 	if c.Cursor < len(r) {
@@ -46,15 +62,20 @@ func (c *Composer) Delete() {
 	}
 }
 
-func (c *Composer) Home() { c.Cursor = 0 }
-func (c *Composer) End()  { c.Cursor = len([]rune(c.Prompt)) }
-func (c *Composer) Left() { c.Cursor = max(0, min(c.Cursor, len([]rune(c.Prompt)))-1) }
+func (c *Composer) Home() { c.resetPreferredColumn(); c.Cursor = 0 }
+func (c *Composer) End()  { c.resetPreferredColumn(); c.Cursor = len([]rune(c.Prompt)) }
+func (c *Composer) Left() {
+	c.resetPreferredColumn()
+	c.Cursor = max(0, min(c.Cursor, len([]rune(c.Prompt)))-1)
+}
 func (c *Composer) Right() {
+	c.resetPreferredColumn()
 	c.Cursor = min(len([]rune(c.Prompt)), c.Cursor+1)
 }
 
 // ToggleStash swaps Prompt and Stash (Ctrl+S), a no-op if both are empty.
 func (c *Composer) ToggleStash() {
+	c.resetPreferredColumn()
 	if c.Prompt != "" || c.Stash != "" {
 		c.Prompt, c.Stash = c.Stash, c.Prompt
 		c.Cursor = len([]rune(c.Prompt))
@@ -63,6 +84,7 @@ func (c *Composer) ToggleStash() {
 
 // Clear resets the prompt after a successful dispatch.
 func (c *Composer) Clear() {
+	c.resetPreferredColumn()
 	c.Prompt = ""
 	c.Cursor = 0
 }
@@ -71,12 +93,12 @@ func (c *Composer) clampCursor(runes []rune) {
 	c.Cursor = min(max(c.Cursor, 0), len(runes))
 }
 
+func (c *Composer) resetPreferredColumn() { c.hasPreferredColumn = false }
+
 // IsMultiline reports whether Prompt currently spans more than one
-// logical line, the condition that (per the DesignDoc/#14) will someday
-// give Up/Down cursor-movement priority over session-list navigation.
-// Not wired to that behavior yet (#14 is out of scope for this refactor),
-// but exposed now so update.go's key routing has a single, correct place
-// to add that priority without touching composer internals.
+// logical line -- the condition that gives CursorUp/CursorDown priority
+// over session-list navigation in State.Handle (see update.go's
+// bindingNavigate case).
 func (c Composer) IsMultiline() bool {
 	for _, r := range c.Prompt {
 		if r == '\n' {
@@ -84,4 +106,56 @@ func (c Composer) IsMultiline() bool {
 		}
 	}
 	return false
+}
+
+// CursorUp moves the cursor to the previous logical line (see #14's
+// multiline cursor navigation), preserving its preferred column across
+// shorter intermediate lines. A no-op on the first logical line.
+func (c *Composer) CursorUp() {
+	lines := strings.Split(c.Prompt, "\n")
+	line, col := promptCursorPosition(lines, c.Cursor)
+	if line == 0 {
+		return
+	}
+	c.moveToLine(lines, line-1, col)
+}
+
+// CursorDown moves the cursor to the next logical line, mirroring
+// CursorUp. A no-op on the last logical line.
+func (c *Composer) CursorDown() {
+	lines := strings.Split(c.Prompt, "\n")
+	line, col := promptCursorPosition(lines, c.Cursor)
+	if line >= len(lines)-1 {
+		return
+	}
+	c.moveToLine(lines, line+1, col)
+}
+
+// moveToLine moves the cursor onto lines[targetLine], at the tracked
+// preferredColumn if a vertical move is already in progress, or at
+// currentCol (the column the cursor is actually leaving) if this is the
+// first vertical move in a new run -- then clamps to that line's own
+// length (a shorter line's EOL) without losing the wider preferred column,
+// so moving on to a longer line later restores it. This is the same
+// "sticky column" behavior common to multiline text editors' arrow-key
+// navigation.
+func (c *Composer) moveToLine(lines []string, targetLine, currentCol int) {
+	col := currentCol
+	if c.hasPreferredColumn {
+		col = c.preferredColumn
+	}
+	c.preferredColumn, c.hasPreferredColumn = col, true
+	target := []rune(lines[targetLine])
+	c.Cursor = lineStartOffset(lines, targetLine) + min(col, len(target))
+}
+
+// lineStartOffset returns the rune-index offset (into the full,
+// newline-joined Prompt, matching promptCursorPosition's own indexing) of
+// the first rune of lines[lineIndex].
+func lineStartOffset(lines []string, lineIndex int) int {
+	offset := 0
+	for i := 0; i < lineIndex; i++ {
+		offset += len([]rune(lines[i])) + 1 // +1 for the "\n" separator
+	}
+	return offset
 }

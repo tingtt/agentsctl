@@ -63,6 +63,19 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		}
 		return Intent{}
 	case bindingNavigate.Matches(ev.Key):
+		// #14: a multiline prompt gives Up/Down to in-prompt cursor
+		// movement instead of session-list navigation -- resolved here in
+		// State.Handle, not the terminal decoder (which only ever emits
+		// physical KeyUp/KeyDown regardless of prompt content).
+		if s.Composer.IsMultiline() {
+			switch ev.Key {
+			case KeyUp:
+				s.Composer.CursorUp()
+			case KeyDown:
+				s.Composer.CursorDown()
+			}
+			return Intent{}
+		}
 		switch ev.Key {
 		case KeyUp:
 			if i := s.SelectedIndex(); i > 0 {
