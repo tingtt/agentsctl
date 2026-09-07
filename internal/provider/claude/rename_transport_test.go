@@ -1,4 +1,6 @@
-package pty
+//go:build darwin || linux
+
+package claude
 
 import (
 	"context"
@@ -10,11 +12,11 @@ import (
 )
 
 // TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay fixes the
-// mechanical contract of SendClaudeRename against a fake `claude attach
+// mechanical contract of sendClaudeRename against a fake `claude attach
 // <id>` client: the exact "/rename <name>\r" bytes must reach the child,
 // and Send must return as soon as that write succeeds -- not after some
 // fixed settle window. This is the regression test for the latency fix:
-// SendClaudeRename used to wait a fixed 1.5s before writing and another
+// sendClaudeRename used to wait a fixed 1.5s before writing and another
 // fixed 1.2s after, neither of which was ever load-bearing for
 // correctness (see its doc comment for the real-CLI measurements that
 // proved this).
@@ -28,16 +30,16 @@ func TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay(t *testing.T) {
 		len(command), outPath))
 
 	start := time.Now()
-	cleanup, err := SendClaudeRename(context.Background(), script, "id", name)
+	cleanup, err := sendClaudeRename(context.Background(), script, "id", name)
 	elapsed := time.Since(start)
 	if err != nil {
-		t.Fatalf("SendClaudeRename err=%v", err)
+		t.Fatalf("sendClaudeRename err=%v", err)
 	}
 	if cleanup == nil {
-		t.Fatal("SendClaudeRename returned a nil cleanup on success")
+		t.Fatal("sendClaudeRename returned a nil cleanup on success")
 	}
 	if elapsed > 500*time.Millisecond {
-		t.Fatalf("SendClaudeRename took %v to return -- a fixed settle delay appears to have been reintroduced", elapsed)
+		t.Fatalf("sendClaudeRename took %v to return -- a fixed settle delay appears to have been reintroduced", elapsed)
 	}
 
 	done := make(chan error, 1)
@@ -65,7 +67,7 @@ func TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay(t *testing.T) {
 // Provider.Rename's own check: a name containing a raw control character
 // (here CR, which -- reproduced against the installed CLI -- submits
 // `/rename` early and turns the remainder into a brand-new prompt the live
-// agent actually executes) must be rejected before SendClaudeRename ever
+// agent actually executes) must be rejected before sendClaudeRename ever
 // starts the attach client, so no command separator can reach a real PTY
 // at all. The fake client marks a file the instant it starts; that file
 // must never appear, and cleanup must be nil since nothing needs cleaning up.
@@ -74,7 +76,7 @@ func TestSendClaudeRenameRejectsControlCharacterWithoutStartingChild(t *testing.
 	marker := filepath.Join(dir, "started")
 	script := writeFakeClaudeAttachScript(t, fmt.Sprintf(`: > "%s"; stty raw -echo; exit 0`, marker))
 
-	cleanup, err := SendClaudeRename(context.Background(), script, "id", "evil\rhi there")
+	cleanup, err := sendClaudeRename(context.Background(), script, "id", "evil\rhi there")
 	if err == nil {
 		t.Fatal("a name containing a raw CR was accepted")
 	}
@@ -95,8 +97,7 @@ func TestSendClaudeRenameRejectsControlCharacterWithoutStartingChild(t *testing.
 // hang or panic, and if it does return a cleanup, that cleanup must itself
 // return promptly rather than getting stuck waiting on a client that's
 // already gone. The actual failure surfaces one layer up, in
-// Provider.confirmRenamed's native-catalog check, which is exercised
-// separately in the claude package's own tests.
+// Provider.confirmRenamed's native-catalog check.
 func TestSendClaudeRenameDoesNotHangOrPanicOnEarlyClientExit(t *testing.T) {
 	script := writeFakeClaudeAttachScript(t, "exit 1")
 	type result struct {
@@ -105,14 +106,14 @@ func TestSendClaudeRenameDoesNotHangOrPanicOnEarlyClientExit(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		cleanup, err := SendClaudeRename(context.Background(), script, "id", "Some Name")
+		cleanup, err := sendClaudeRename(context.Background(), script, "id", "Some Name")
 		done <- result{cleanup, err}
 	}()
 	var r result
 	select {
 	case r = <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("SendClaudeRename did not return after an early client exit")
+		t.Fatal("sendClaudeRename did not return after an early client exit")
 	}
 	if r.err != nil {
 		if r.cleanup != nil {
@@ -134,7 +135,7 @@ func TestSendClaudeRenameDoesNotHangOrPanicOnEarlyClientExit(t *testing.T) {
 
 // TestValidateRenameNameRejectsControlCharactersAndBlank and
 // TestValidateRenameNameAllowsUnicode exercise validateRenameName directly:
-// it is the last gate before SendClaudeRename assembles the literal pty
+// it is the last gate before sendClaudeRename assembles the literal pty
 // input, independent of whatever validation a caller already did.
 func TestValidateRenameNameRejectsControlCharactersAndBlank(t *testing.T) {
 	cases := []string{"", "   ", "evil\r", "evil\n", "evil\x1b", "evil\x03", "evil\x7f", "evil\x1a", "evil\x1d"}

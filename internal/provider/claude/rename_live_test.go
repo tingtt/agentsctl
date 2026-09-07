@@ -1,6 +1,6 @@
 //go:build darwin || linux
 
-package pty
+package claude
 
 import (
 	"context"
@@ -12,24 +12,22 @@ import (
 )
 
 // TestRealClaudeRenameMutatesSessionInPlace exercises the actual installed
-// `claude` CLI (never a fake), the same way
-// TestRealClaudeCtrlBracketDetachSurvivesEarlyRace does for detach: it
-// dispatches a real, disposable background session, renames it via
-// SendClaudeRename, and confirms — via `claude agents --json --all`, the
-// same native source Provider.List/confirmRenamed use, never PTY output —
-// that the rename landed on the very same session (same id and sessionId)
-// with no extra session created alongside it.
+// `claude` CLI (never a fake): it dispatches a real, disposable background
+// session, renames it via sendClaudeRename, and confirms -- via `claude
+// agents --json --all`, the same native source List/confirmRenamed use,
+// never PTY output -- that the rename landed on the very same session
+// (same id and sessionId) with no extra session created alongside it.
 //
 // It also measures user-visible rename latency (Send -> catalog confirms
 // the new name, mirroring what Provider.Rename's confirmRenamed loop does
 // -- cleanup is deliberately excluded, since Provider.Rename runs it
 // concurrently rather than waiting for it before reporting success) and
-// asserts it stays well under the ~2.7s of fixed settle delay the previous
+// asserts it stays well under the ~2.7s of fixed settle delay a previous
 // design always paid, without hard-coding a specific millisecond figure
 // that would make this test flaky.
 //
 // This intentionally exercises only a quick/completed session for
-// determinism and cost; SendClaudeRename's doc comment records what was
+// determinism and cost; sendClaudeRename's doc comment records what was
 // separately, manually verified during this feature's investigation for a
 // working (mid-tool-call) session: same id/sessionId/pid, no fork, no
 // interruption of the in-flight background execution, and the same
@@ -69,9 +67,9 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	cleanup, sendErr := SendClaudeRename(ctx, claudePath, id, wantName)
+	cleanup, sendErr := sendClaudeRename(ctx, claudePath, id, wantName)
 	if sendErr != nil {
-		t.Fatalf("SendClaudeRename: %v", sendErr)
+		t.Fatalf("sendClaudeRename: %v", sendErr)
 	}
 	// Mirrors Provider.Rename: catalog confirmation is what decides success,
 	// and cleanup runs concurrently rather than gating it.
@@ -86,7 +84,7 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 	}
 
 	if userVisibleLatency > 2500*time.Millisecond {
-		t.Fatalf("user-visible rename latency was %v -- expected well under the ~2.7s the previous fixed-settle design always paid", userVisibleLatency)
+		t.Fatalf("user-visible rename latency was %v -- expected well under the ~2.7s a previous fixed-settle design always paid", userVisibleLatency)
 	}
 	t.Logf("user-visible rename latency (Send -> catalog confirmed, cleanup excluded): %v", userVisibleLatency)
 
@@ -143,10 +141,8 @@ func realClaudeRowByID(rows []map[string]any, id string) (sessionID, name string
 }
 
 // pollUntilNativeName polls `claude agents --json --all` until session id
-// reports name, mirroring internal/provider/claude.Provider.confirmRenamed
-// closely enough for this live test's own latency measurement (this
-// package cannot import the claude provider package to reuse it directly
-// without an import cycle).
+// reports name, mirroring Provider.confirmRenamed closely enough for this
+// live test's own latency measurement.
 func pollUntilNativeName(claudePath, id, name string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {

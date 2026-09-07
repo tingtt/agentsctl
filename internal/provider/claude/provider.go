@@ -19,10 +19,10 @@ import (
 
 // NativeRenamer performs Claude's native, in-place session rename (see
 // Provider.Rename). It is an interface -- rather than Provider calling
-// straight into internal/pty -- so this package stays buildable on every
-// platform even though the only real implementation
-// (NewNativeRenamer/internal/pty's transient-attach transport, in
-// rename_unix.go) is darwin/linux only.
+// straight into rename_transport_unix.go -- so this package stays
+// buildable on every platform even though the only real implementation
+// (NewNativeRenamer/sendClaudeRename, in rename_unix.go/
+// rename_transport_unix.go) is darwin/linux only.
 //
 // Send is split from cleanup (its own return value) rather than being one
 // blocking call, specifically so Provider.Rename can run native-catalog
@@ -30,8 +30,8 @@ import (
 // serially: cleanup ending the transient attach client has nothing to do
 // with whether the rename itself succeeded (see Provider.Rename), and
 // serializing them was the single largest source of avoidable rename
-// latency (see internal/pty.SendClaudeRename's doc comment for the
-// real-CLI measurements behind this).
+// latency (see sendClaudeRename's doc comment for the real-CLI
+// measurements behind this).
 type NativeRenamer interface {
 	// Send starts a transient attach client and submits the rename
 	// command, returning once that submission is durable. cleanup is nil
@@ -39,9 +39,9 @@ type NativeRenamer interface {
 	Send(ctx context.Context, path, id, name string) (cleanup func(context.Context, time.Duration) error, err error)
 }
 
-// renameCleanupTimeout is looser than AttachClaude's interactive detach
-// timeout (app_unix.go passes 2s there, where a slow detach is directly
-// visible to a waiting user): rename's cleanup has no one watching it in
+// renameCleanupTimeout is looser than Open's interactive detach timeout
+// (openDetachTimeout, where a slow detach is directly visible to a
+// waiting user): rename's cleanup has no one watching it in
 // real time, and was observed, under heavy concurrent-claude-process load,
 // to occasionally take noticeably longer than 5s for the attach client to
 // actually exit after SIGTERM even though it reliably did exit. Unlike the
@@ -216,14 +216,14 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 }
 
 // Rename performs Claude's own native, in-place session rename via a
-// Claude-specific transport (NativeRenamer/internal/pty.RenameClaude on
+// Claude-specific transport (NativeRenamer/sendClaudeRename on
 // darwin/linux): it drives a transient, headless `claude attach <id>`
 // client that sends the CLI's own `/rename <name>` slash command, then
 // detaches only that client — the native session, its lifetime, and its
 // identity (id/sessionId/pid) are all left untouched. See the doc comment
-// on internal/pty.RenameClaude for what was verified against the installed
-// CLI, and NativeRenamer's for why this is an interface rather than a
-// direct call into internal/pty.
+// on sendClaudeRename for what was verified against the installed CLI, and
+// NativeRenamer's for why this is an interface rather than a direct call
+// into rename_transport_unix.go.
 //
 // `claude --bg --resume <id> --name <name>` is deliberately not used here:
 // verified (against `claude` 2.1.260/2.1.263) to always fork a new session
@@ -232,12 +232,12 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 //
 // Rename is rename-only: on failure, no state changes at all — in
 // particular, it never falls back to writing a local-only override, and it
-// never touches state.Data.ClaudeArchived or any other session-lifecycle
-// field. On confirmed success it deletes any stale
-// state.Data.ClaudeNames[k.ID] left over from before native rename existed
-// (see that field's doc comment), since List() now treats it purely as a
-// legacy fallback and a stale entry must not go on hiding the new native
-// name.
+// never touches the Claude archive overlay or any other session-lifecycle
+// field. On confirmed success it deletes any stale legacy name for k.ID
+// left over from before native rename existed (see
+// localstate.Store.ClaudeState's doc comment), since List() now treats it
+// purely as a legacy fallback and a stale entry must not go on hiding the
+// new native name.
 //
 // The native catalog check (confirmRenamed) always runs and is what
 // actually decides success/failure here, even when Send itself returned an
@@ -253,8 +253,8 @@ func (p *Provider) Unarchive(_ context.Context, k session.Key) error {
 // sequentially: cleanup is unrelated to whether the rename succeeded (see
 // NativeRenamer), and serializing "wait for the client to exit" before
 // "check whether the rename landed" was the single largest source of
-// avoidable rename latency (see internal/pty.SendClaudeRename's doc
-// comment). Rename still waits for cleanup to finish (bounded by
+// avoidable rename latency (see sendClaudeRename's doc comment). Rename
+// still waits for cleanup to finish (bounded by
 // renameCleanupTimeout) before returning, the same as before -- only the
 // order changed from serial to parallel -- so a transient attach client is
 // never left to outlive this call.
