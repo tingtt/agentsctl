@@ -24,20 +24,10 @@ func (s State) View(width, height int) string {
 	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", scopeLabel(s.Scope)), width), ""}
 	list := make([]displayLine, 0, len(s.Rows)+4)
 	selectedIndex := s.SelectedIndex()
-	groups := []struct {
-		title  string
-		pinned bool
-	}{{"Pinned", true}, {"Other", false}}
-	for _, g := range groups {
-		shown := false
-		for i, row := range s.Rows {
-			if row.Pinned != g.pinned {
-				continue
-			}
-			if !shown {
-				list = append(list, displayLine{text: clipLine(g.title, width), rowIndex: -1})
-				shown = true
-			}
+	for _, g := range groupRows(s.Rows) {
+		list = append(list, displayLine{text: clipLine(styleText(g.title, colorGray), width), rowIndex: -1})
+		for _, i := range g.indices {
+			row := s.Rows[i]
 			cursor := " "
 			if i == selectedIndex {
 				cursor = ">"
@@ -45,7 +35,10 @@ func (s State) View(width, height int) string {
 			if s.Confirmation != nil && row.Key == s.Confirmation.Key {
 				cursor = "x"
 			}
-			cwdPlain := withTrailingSlash(displayCWD(row.CWD))
+			var cwdPlain string
+			if g.showCWD {
+				cwdPlain = displayCWD(row.CWD)
+			}
 			notice, hasNotice := s.rowNotice(row.Key)
 			noticeCells := 0
 			if hasNotice {
@@ -65,14 +58,15 @@ func (s State) View(width, height int) string {
 			if noticeWidth > 0 {
 				noticeSegment = styleText(clipLine(notice.Message, noticeWidth), noticeColor(notice.Severity)) + " "
 			}
-			cwd := fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth)
 			provider := styleText(providerLabel(row.Key.Provider), providerColor(row.Key.Provider))
-			line := cursor + " " + statusIcon(row.Activity) + " " + name + noticeSegment + provider + " " + cwd
+			line := cursor + " " + statusIcon(row.Activity) + " " + name + noticeSegment + provider
+			if cwdWidth > 0 {
+				cwd := styleText(fitCells(truncateLeftCells(cwdPlain, cwdWidth), cwdWidth), colorGray)
+				line += " " + cwd
+			}
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
-		if shown {
-			list = append(list, displayLine{text: "", rowIndex: -1})
-		}
+		list = append(list, displayLine{text: "", rowIndex: -1})
 	}
 	unavailable := ""
 	if err := s.Warnings[s.Provider]; err != nil {

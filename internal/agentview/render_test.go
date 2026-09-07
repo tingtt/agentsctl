@@ -36,13 +36,15 @@ func TestArchiveConfirmationRendersRedOnTargetRowNotFooter(t *testing.T) {
 
 // TestFullwidthTitleWithNoticeKeepsCWDAlignment fixes that the provider/
 // cwd block's start column stays identical whether or not a row carries a
-// notice, and regardless of full-width glyphs in the title.
+// notice, and regardless of full-width glyphs in the title. Only Pinned
+// rows across more than one directory carry an inline CWD column (see
+// groupRows), so both rows here are pinned and given distinct directories
+// under a shared "/work/project..." prefix.
 func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
-	cwd := "/work/project"
 	s := NewState()
 	s.SetRows([]session.Session{
-		{Key: key("a"), Name: "short", Activity: session.ActivityIdle, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
-		{Key: key("b"), Name: "日本語のタイトル", Activity: session.ActivityWorking, CWD: cwd, Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("a"), Name: "short", Pinned: true, Activity: session.ActivityIdle, CWD: "/work/project-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "日本語のタイトル", Pinned: true, Activity: session.ActivityWorking, CWD: "/work/project-b", Actions: session.Actions{session.ActionArchive: {Available: true}}},
 	})
 	s.selectIndex(1)
 	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms the confirmation on row "b"
@@ -50,7 +52,7 @@ func TestFullwidthTitleWithNoticeKeepsCWDAlignment(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
 	var offsets []int
 	for _, line := range lines {
-		if idx := strings.Index(line, "project"); idx >= 0 {
+		if idx := strings.Index(line, "/work/project"); idx >= 0 {
 			offsets = append(offsets, lineCells(line[:idx]))
 		}
 	}
@@ -95,5 +97,23 @@ func TestNarrowTerminalNeverPanics(t *testing.T) {
 	s.Handle(KeyEvent{Key: KeyCtrlX})
 	for _, dims := range [][2]int{{0, 0}, {1, 1}, {5, 3}, {80, 0}} {
 		_ = s.View(dims[0], dims[1])
+	}
+}
+
+// TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth is a
+// representative narrow-terminal guarantee for #14's new list rendering:
+// a Pinned row's directory column, a directory group heading, the
+// provider field, the title, a row notice, and full-width Japanese glyphs
+// must all degrade gracefully together (never panic) at a narrow width.
+func TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Name: "日本語のセッションタイトルとても長い", Pinned: true, CWD: "/workspace/github.com/tingtt/agentsctl", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "second", CWD: "/workspace/github.com/tingtt-dojo/third-score", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+	})
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms a row notice on row "a"
+	for width := 1; width <= 40; width++ {
+		_ = s.View(width, 12)
 	}
 }

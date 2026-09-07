@@ -99,9 +99,17 @@ const rowRightFixed = providerFieldWidth + 1
 // splitRowWidth lays out a session row in strict priority order --
 // provider field + CWD first, then an optional row notice, then the title
 // gets whatever cells remain -- so the row fills the terminal width
-// exactly. A notice never takes width from CWD/provider.
+// exactly. A notice never takes width from CWD/provider. cwdCells == 0
+// means the row carries no CWD column at all (see groupRows'
+// showCWD -- most rows since #14 don't, their group heading says the
+// directory instead), in which case no width is reserved for the
+// separator space a CWD column would otherwise need either.
 func splitRowWidth(width, cwdCells, noticeCells int) (title, notice, cwd int) {
-	available := width - rowLeftFixed - rowRightFixed
+	rightFixed := providerFieldWidth
+	if cwdCells > 0 {
+		rightFixed = rowRightFixed
+	}
+	available := width - rowLeftFixed - rightFixed
 	if available < 0 {
 		available = 0
 	}
@@ -144,15 +152,6 @@ func padCells(value string, width int) string {
 // scope).
 func displayCWD(path string) string {
 	return shortHome(path)
-}
-
-// withTrailingSlash appends a directory separator "/" to a displayed CWD,
-// unless value already ends in one.
-func withTrailingSlash(value string) string {
-	if strings.HasSuffix(value, "/") {
-		return value
-	}
-	return value + "/"
 }
 
 // shortHome renders path with the user's home directory abbreviated to
