@@ -103,7 +103,7 @@ func TestUsageWindowUnavailableIsNotZeroPercent(t *testing.T) {
 	if strings.Contains(unavailable, "0%") {
 		t.Fatalf("unknown window must not render a real percentage: %q", unavailable)
 	}
-	zero := usageWindowText(session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: now}, now)
+	zero := usageWindowText(session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: now.Add(time.Hour)}, now)
 	if !strings.Contains(zero, "0%") {
 		t.Fatalf("available 0%% window must render 0%%: %q", zero)
 	}
@@ -175,8 +175,8 @@ func freshUsageState(usages ...session.Usage) State {
 // render order: "claude <5h>/<weekly> · codex <5h>/<weekly>".
 func TestUsageLineTextRendersClaudeBeforeCodexInOrder(t *testing.T) {
 	s := freshUsageState(
-		session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now()}},
-		session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 100, Reset: time.Now()}},
+		session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now().Add(time.Hour)}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now().Add(time.Hour)}},
+		session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 0, Reset: time.Now().Add(time.Hour)}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 100, Reset: time.Now().Add(time.Hour)}},
 	)
 	line := usageLineText(s)
 	claudeIdx := strings.Index(line, "claude")
@@ -209,7 +209,7 @@ func TestUsageLineTextShowsUnknownPlaceholderWhenNeverFetched(t *testing.T) {
 // update is older than usageStaleAfter falls back to the unknown
 // placeholder even though Usage still holds its last real reading.
 func TestUsageLineTextShowsUnknownPlaceholderWhenStale(t *testing.T) {
-	s := freshUsageState(session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now()}})
+	s := freshUsageState(session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 70, Reset: time.Now().Add(time.Hour)}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now().Add(time.Hour)}})
 	s.UsageUpdatedAt[session.ProviderClaude] = time.Now().Add(-(usageStaleAfter + time.Minute))
 	line := usageLineText(s)
 	if strings.Contains(line, "70%") || strings.Contains(line, "20%") {
@@ -226,7 +226,7 @@ func TestUsageLineTextShowsUnknownPlaceholderWhenStale(t *testing.T) {
 // showing the unknown placeholder must not affect a different, freshly-
 // updated provider's real reading.
 func TestUsageLineTextKeepsFreshProviderWhileOtherIsUnknown(t *testing.T) {
-	s := freshUsageState(session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now()}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 5, Reset: time.Now()}})
+	s := freshUsageState(session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now().Add(time.Hour)}, Weekly: session.UsageWindow{State: session.UsageAvailable, Percent: 5, Reset: time.Now().Add(time.Hour)}})
 	// Claude was never applied at all -- still unknown.
 	line := usageLineText(s)
 	if !strings.Contains(line, "42%") {
@@ -260,6 +260,75 @@ func TestUsageLineTextRendersExhaustedWindowEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(line, "84%") {
 		t.Fatalf("usage line=%q, want the still-available weekly window's real 84%% preserved", line)
+	}
+}
+
+// TestUsageLineTextExpiresFiveHourAtReadTimeWithoutNewRefresh fixes Issue
+// #19's review follow-up: reset-boundary expiry must apply at Agent
+// View's own read/render time, not only inside the Claude provider's own
+// conversion. Here a usage update arrives (via ApplyUsageUpdate, well
+// within usageStaleAfter so the provider-level staleness gate does not
+// apply) carrying a 5h window whose own Reset has ALREADY passed by the
+// time this renders -- simulating "now crossed Reset with no further
+// provider refresh in between" -- while weekly's Reset is still in the
+// future. The rendered line must show "?%" for 5h specifically, not the
+// stale 92%, while weekly's still-valid 84% renders normally.
+func TestUsageLineTextExpiresFiveHourAtReadTimeWithoutNewRefresh(t *testing.T) {
+	s := freshUsageState(session.Usage{
+		Provider: session.ProviderClaude,
+		FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 92, Reset: time.Now().Add(-time.Minute)},
+		Weekly:   session.UsageWindow{State: session.UsageAvailable, Percent: 84, Reset: time.Now().Add(5 * 24 * time.Hour)},
+	})
+	line := usageLineText(s)
+	if strings.Contains(line, "92%") {
+		t.Fatalf("usage line=%q, want the reset-boundary-crossed 5h reading replaced by the unknown placeholder, not the stale 92%%", line)
+	}
+	if !strings.Contains(line, "84%") {
+		t.Fatalf("usage line=%q, want weekly's still-valid 84%% unaffected by 5h's own reset crossing", line)
+	}
+	claudeIdx := strings.Index(line, "claude")
+	if claudeIdx < 0 || !strings.Contains(line[claudeIdx:], "?%") {
+		t.Fatalf("usage line=%q, want claude's 5h segment to show the unknown placeholder", line)
+	}
+}
+
+// TestUsageLineTextExpiresWeeklyAtReadTimeWithoutNewRefresh is the mirror
+// of TestUsageLineTextExpiresFiveHourAtReadTimeWithoutNewRefresh: weekly's
+// Reset has passed while 5h's has not, and only weekly's reading expires.
+func TestUsageLineTextExpiresWeeklyAtReadTimeWithoutNewRefresh(t *testing.T) {
+	s := freshUsageState(session.Usage{
+		Provider: session.ProviderClaude,
+		FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 20, Reset: time.Now().Add(time.Hour)},
+		Weekly:   session.UsageWindow{State: session.UsageAvailable, Percent: 84, Reset: time.Now().Add(-time.Minute)},
+	})
+	line := usageLineText(s)
+	if strings.Contains(line, "84%") {
+		t.Fatalf("usage line=%q, want the reset-boundary-crossed weekly reading replaced by the unknown placeholder, not the stale 84%%", line)
+	}
+	if !strings.Contains(line, "20%") {
+		t.Fatalf("usage line=%q, want 5h's still-valid 20%% unaffected by weekly's own reset crossing", line)
+	}
+}
+
+// TestUsageLineTextExpiresExhaustedAtReadTimeWithoutNewRefresh fixes that
+// an exhausted window, not just an available one, also expires at read
+// time once its own known Reset has passed with no new refresh.
+func TestUsageLineTextExpiresExhaustedAtReadTimeWithoutNewRefresh(t *testing.T) {
+	s := freshUsageState(session.Usage{
+		Provider: session.ProviderClaude,
+		FiveHour: session.UsageWindow{State: session.UsageExhausted, Percent: 100, Reset: time.Now().Add(-time.Minute)},
+	})
+	line := usageLineText(s)
+	claudeIdx := strings.Index(line, "claude")
+	codexIdx := strings.Index(line, "codex")
+	if claudeIdx < 0 || codexIdx < 0 {
+		t.Fatalf("usage line=%q, want both providers present", line)
+	}
+	if strings.Contains(line[claudeIdx:codexIdx], "100%") {
+		t.Fatalf("usage line=%q, want the reset-boundary-crossed exhausted reading replaced by the unknown placeholder, not a stale 100%%", line)
+	}
+	if !strings.Contains(line[claudeIdx:codexIdx], "?%") {
+		t.Fatalf("usage line=%q, want claude's 5h segment to show the unknown placeholder", line)
 	}
 }
 

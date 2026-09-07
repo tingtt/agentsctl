@@ -154,7 +154,7 @@ func TestEventLoopAppliesUsageUpdateAndRedrawsWithoutConsumingKeyRead(t *testing
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now()}}}
+	rt.usageCh <- usageEvent{gen: 1, provider: session.ProviderClaude, usage: session.Usage{Provider: session.ProviderClaude, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now().Add(time.Hour)}}}
 
 	waitFor(t, 2*time.Second, func() bool { return bytes.Contains([]byte(out.String()), []byte("42%")) })
 

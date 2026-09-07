@@ -46,6 +46,35 @@ type UsageWindow struct {
 	Reset   time.Time
 }
 
+// At returns w as it should be treated at wall-clock time now: a reading
+// (Available or Exhausted) whose own Reset has already passed (now is not
+// before Reset) belonged to a period that has since ended and is reported
+// as UsageUnknown (the zero value) instead -- a stale percentage, or a
+// stale exhausted state, must never be presented as describing the
+// *current* window just because no fresher reading has arrived yet (see
+// Issue #19's "cached snapshot の percentage は、その snapshot が属していた usage
+// window に対してのみ有効").
+//
+// This is provider-neutral and deliberately NOT tied to when a provider
+// last refreshed: any caller holding a UsageWindow -- a provider
+// converting its own cache (see the Claude provider's toSessionUsageWindow,
+// which calls this directly), Agent View re-rendering an already-received
+// value with no new provider refresh in between, or a future #20 read --
+// must apply the exact same rule against its own current `now`, so the
+// same UsageWindow value is never valid on one side of that boundary and
+// stale-but-still-shown on the other. A window with no Reset at all (zero
+// value) has nothing to compare against and is returned unchanged, as is
+// one already UsageUnknown.
+func (w UsageWindow) At(now time.Time) UsageWindow {
+	if w.State == UsageUnknown {
+		return w
+	}
+	if !w.Reset.IsZero() && !now.Before(w.Reset) {
+		return UsageWindow{}
+	}
+	return w
+}
+
 // Usage is one provider's account-level utilization, independent of any
 // single session -- FiveHour and Weekly mirror Claude/Codex's own rate-
 // limit windows. It lives in this provider-neutral package (rather than
@@ -57,4 +86,11 @@ type Usage struct {
 	Provider ProviderID
 	FiveHour UsageWindow
 	Weekly   UsageWindow
+}
+
+// At returns u with FiveHour and Weekly each independently normalized via
+// UsageWindow.At(now) -- one window crossing its own reset boundary never
+// affects the other (see Issue #19's "5h と weekly は独立して評価してください").
+func (u Usage) At(now time.Time) Usage {
+	return Usage{Provider: u.Provider, FiveHour: u.FiveHour.At(now), Weekly: u.Weekly.At(now)}
 }

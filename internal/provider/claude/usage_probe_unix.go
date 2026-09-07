@@ -218,11 +218,13 @@ func (pr *Probe) KnownSessionID() (string, bool) {
 //
 // Every returned snapshot passes through toSessionUsage with the same
 // "now" (see pr.now()), which independently normalizes each window
-// against its own cached Reset time (see toSessionUsageWindow) -- a
-// window whose reset boundary has passed since it was cached renders as
+// against its own cached Reset time via session.Usage.At -- a window
+// whose reset boundary has passed since it was cached renders as
 // session.UsageUnknown here regardless of which of the three paths below
 // produced the underlying snapshot (see Issue #19's reset-boundary
-// handling).
+// handling). Agent View applies the exact same session.Usage.At rule
+// again at its own read/render time, so a value already normalized here
+// is never shown differently on the other side of that boundary.
 func (pr *Probe) Usage(ctx context.Context) (session.Usage, error) {
 	pr.loadPersistedSnapshotOnce()
 	now := pr.now()
@@ -456,7 +458,7 @@ func waitForProbeOutcome(ctx context.Context, path string, capture *probeOutputC
 // window never destroys the other's still-valid snapshot (see Issue #19's
 // "片方だけ exhausted の場合...もう片方の有効な snapshot を不必要に失わない"); that
 // carried-forward window is still subject to the normal reset-boundary
-// normalization at toSessionUsageWindow's read boundary, same as any
+// normalization session.Usage.At applies in toSessionUsage, same as any
 // other cached window.
 func (pr *Probe) exhaustedSnapshot(sig probeLimitSignal, now time.Time) usageSnapshot {
 	prev, _ := pr.cachedAny()
@@ -514,38 +516,26 @@ func (pr *Probe) detachProbeSession(ctx context.Context, cmd *exec.Cmd, wait <-c
 // toSessionUsage converts this package's own Claude-specific snapshot into
 // the provider-neutral session.Usage -- the boundary past which no
 // statusLine-shaped detail leaks (see UsageProbeSource's doc comment).
-// now is compared against each window's own cached Reset independently
-// (see toSessionUsageWindow), so a 5h window whose reset boundary has
-// passed renders as unknown even while weekly's still-valid snapshot
-// renders normally, and vice versa (see Issue #19's "5h と weekly は独立
-// して評価してください").
+// The reset-boundary rule itself (Issue #19: a cached window's reading is
+// only valid while now is still before its own Reset) is NOT duplicated
+// here -- it is applied uniformly via session.Usage.At, the same
+// provider-neutral method Agent View applies again at its own read/render
+// time (see footer.go's usageWindowText), so a value already normalized
+// here can never drift from how a later read of the same session.Usage
+// treats it (see the DesignDoc's usage contract).
 func toSessionUsage(snap usageSnapshot, now time.Time) session.Usage {
-	return session.Usage{
+	u := session.Usage{
 		Provider: session.ProviderClaude,
-		FiveHour: toSessionUsageWindow(snap.FiveHour, now),
-		Weekly:   toSessionUsageWindow(snap.Weekly, now),
+		FiveHour: toSessionUsageWindow(snap.FiveHour),
+		Weekly:   toSessionUsageWindow(snap.Weekly),
 	}
+	return u.At(now)
 }
 
-// toSessionUsageWindow converts one cached window, applying Issue #19's
-// reset-boundary rule: a cached reading (State != UsageUnknown) is only
-// used as-is while now is still before its own ResetAt. Once now reaches
-// or passes ResetAt, that reading belonged to a window period that has
-// since ended -- it is no longer a valid reading for the *current* period
-// (a new one may not have been fetched yet), so this reports
-// session.UsageUnknown (the zero value) rather than carrying the old
-// Percent/State forward as if it still described "now" (see the
-// DesignDoc's "cached snapshot の percentage は、その snapshot が属していた usage
-// window に対してのみ有効"). A window with no ResetAt at all (State ==
-// UsageUnknown, or -- see exhaustedWindowSnapshot -- an exhausted window
-// detected with no prior reset ever cached) has nothing to compare
-// against and is never boundary-invalidated on that basis alone.
-func toSessionUsageWindow(w usageWindowSnapshot, now time.Time) session.UsageWindow {
-	if w.State == session.UsageUnknown {
-		return session.UsageWindow{}
-	}
-	if !w.ResetAt.IsZero() && !now.Before(w.ResetAt) {
-		return session.UsageWindow{}
-	}
+// toSessionUsageWindow converts one cached window's shape into the
+// provider-neutral session.UsageWindow, with no reset-boundary judgment
+// of its own -- see toSessionUsage, which applies session.Usage.At right
+// after calling this.
+func toSessionUsageWindow(w usageWindowSnapshot) session.UsageWindow {
 	return session.UsageWindow{State: w.State, Percent: w.Percent, Reset: w.ResetAt}
 }

@@ -87,13 +87,25 @@ func usageColor(percent int) string {
 // the Claude provider's exhausted-snapshot construction), UsageAvailable
 // renders the real percentage, and UsageUnknown (never fetched, not
 // reported by the provider, or a cached reading whose own window has since
-// reset -- see the Claude provider's reset-boundary handling) renders the
-// same "?%" unknown placeholder usageProviderText already falls back to
-// for a whole stale/never-updated provider (usageUnknownPercentText) --
-// one consistent "no trustworthy reading" representation regardless of
-// which of those reasons produced it, never a percentage that could look
-// like a real 0%.
+// reset) renders the same "?%" unknown placeholder usageProviderText
+// already falls back to for a whole stale/never-updated provider
+// (usageUnknownPercentText) -- one consistent "no trustworthy reading"
+// representation regardless of which of those reasons produced it, never
+// a percentage that could look like a real 0%.
+//
+// w.At(now) is applied here, at read/render time, before branching on
+// State -- not just once when the provider first produced w. State.Usage
+// can sit unchanged across many renders with no new provider refresh in
+// between (see State's own doc comment: "直前の値を... 表示し続ける"), so a
+// window's own Reset time can pass between when it arrived and when this
+// runs again; w.At re-checks that boundary every time, independently of
+// whether the Claude provider that produced w already applied the same
+// rule once on its own side (see session.UsageWindow.At's doc comment --
+// this is the same provider-neutral rule, applied again here so Agent
+// View can never show a value the provider boundary would already
+// consider expired).
 func usageWindowText(w session.UsageWindow, now time.Time) string {
+	w = w.At(now)
 	switch w.State {
 	case session.UsageExhausted:
 		pct := styleText(fmt.Sprintf("%3d%%", 100), colorRed)
