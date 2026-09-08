@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -72,5 +73,106 @@ func TestNewUUIDv4LooksLikeAValidUUID(t *testing.T) {
 	}
 	if id[14] != '4' {
 		t.Fatalf("id=%q, want version nibble '4' at index 14", id)
+	}
+}
+
+// TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust fixes ordinary
+// rotation: rotating must mint a brand-new SessionID, retire the old one
+// into RetiredSessionIDs, and carry TrustAccepted forward unchanged.
+func TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+	orig, err := loadOrCreateProbeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := markTrustAccepted(path, orig); err != nil {
+		t.Fatal(err)
+	}
+
+	rotated, err := rotateProbeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.SessionID == orig.SessionID {
+		t.Fatal("rotation must mint a new SessionID, not reuse the rejected one")
+	}
+	if !rotated.TrustAccepted {
+		t.Fatal("TrustAccepted must be preserved across rotation")
+	}
+	if len(rotated.RetiredSessionIDs) != 1 || rotated.RetiredSessionIDs[0] != orig.SessionID {
+		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q]", rotated.RetiredSessionIDs, orig.SessionID)
+	}
+
+	// And it's durably persisted, not just returned.
+	persisted, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("no identity persisted after rotation: ok=%v err=%v", ok, err)
+	}
+	if persisted.SessionID != rotated.SessionID {
+		t.Fatalf("persisted SessionID=%q, want %q", persisted.SessionID, rotated.SessionID)
+	}
+}
+
+// TestAppendRetiredSessionIDDoesNotDuplicate fixes that retiring the same
+// session ID more than once (e.g. a rotation retried after a partial
+// failure) never grows a duplicate entry in the retired list.
+func TestAppendRetiredSessionIDDoesNotDuplicate(t *testing.T) {
+	retired := appendRetiredSessionID(nil, "a")
+	retired = appendRetiredSessionID(retired, "b")
+	retired = appendRetiredSessionID(retired, "a")
+	if len(retired) != 2 {
+		t.Fatalf("retired=%v, want exactly [a b] with no duplicate", retired)
+	}
+	if retired[0] != "a" || retired[1] != "b" {
+		t.Fatalf("retired=%v, want [a b] in insertion order", retired)
+	}
+}
+
+// TestProbeIdentityOwnsSessionIDIncludesCurrentAndRetired fixes
+// probeIdentity.ownsSessionID/allSessionIDs, the ownership primitives
+// Provider.List's catalog exclusion and Probe.KnownSessionIDs are built
+// on: both the live SessionID and every RetiredSessionIDs entry must
+// count as owned, and nothing else does.
+func TestProbeIdentityOwnsSessionIDIncludesCurrentAndRetired(t *testing.T) {
+	id := probeIdentity{SessionID: "current", RetiredSessionIDs: []string{"old-1", "old-2"}}
+	for _, owned := range []string{"current", "old-1", "old-2"} {
+		if !id.ownsSessionID(owned) {
+			t.Fatalf("ownsSessionID(%q)=false, want true", owned)
+		}
+	}
+	if id.ownsSessionID("someone-elses-session") {
+		t.Fatal("ownsSessionID must not report ownership of an unrelated session id")
+	}
+	if id.ownsSessionID("") {
+		t.Fatal("ownsSessionID must not treat an empty id as owned")
+	}
+	all := id.allSessionIDs()
+	if len(all) != 3 || all[0] != "current" || all[1] != "old-1" || all[2] != "old-2" {
+		t.Fatalf("allSessionIDs()=%v, want [current old-1 old-2]", all)
+	}
+}
+
+// TestReadProbeIdentityIfExistsLoadsLegacyFileWithoutRetiredField fixes
+// backward compatibility with a probe.json persisted before
+// RetiredSessionIDs existed: it must still decode successfully, with
+// RetiredSessionIDs simply empty -- no proactive migration write required.
+func TestReadProbeIdentityIfExistsLoadsLegacyFileWithoutRetiredField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+	legacy := `{"sessionId":"legacy-id","displayName":"agentsctl usage probe","trustAccepted":true}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("legacy probe.json failed to load: ok=%v err=%v", ok, err)
+	}
+	if id.SessionID != "legacy-id" || !id.TrustAccepted {
+		t.Fatalf("id=%+v, want SessionID=legacy-id TrustAccepted=true", id)
+	}
+	if len(id.RetiredSessionIDs) != 0 {
+		t.Fatalf("RetiredSessionIDs=%v, want empty for a legacy file", id.RetiredSessionIDs)
+	}
+	if !id.ownsSessionID("legacy-id") {
+		t.Fatal("a legacy identity must still own its own current session id")
 	}
 }

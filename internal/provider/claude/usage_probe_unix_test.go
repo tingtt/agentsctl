@@ -990,7 +990,7 @@ func TestProbeConcurrentUsageSingleFlightsRefresh(t *testing.T) {
 
 // TestProbeKnownSessionIDExcludesCatalogRowNotJustCWD fixes the catalog-
 // exclusion contract end to end against the fake CLI's own native
-// catalog: after a refresh, Provider.List (via KnownSessionID) must
+// catalog: after a refresh, Provider.List (via KnownSessionIDs) must
 // exclude the probe's own row by its exact recorded session ID, while a
 // normal session sharing the same CWD as the probe (a plausible
 // coincidence, e.g. both happen to run from $HOME) must NOT be excluded.
@@ -1007,10 +1007,11 @@ func TestProbeKnownSessionIDExcludesCatalogRowNotJustCWD(t *testing.T) {
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	probeID, ok := pr.KnownSessionID()
-	if !ok || probeID == "" {
-		t.Fatal("KnownSessionID did not report an identity after a successful refresh")
+	probeIDs := pr.KnownSessionIDs()
+	if len(probeIDs) != 1 || probeIDs[0] == "" {
+		t.Fatalf("KnownSessionIDs did not report exactly one identity after a successful refresh: %v", probeIDs)
 	}
+	probeID := probeIDs[0]
 
 	runner := base.ExecRunner{}
 	p := &Provider{Path: fakeClaudePath(t), Runner: runner, UsageProbe: pr, Store: newStore(t)}
@@ -1052,6 +1053,50 @@ func TestProbeKnownSessionIDExcludesCatalogRowNotJustCWD(t *testing.T) {
 	}
 	if foundProbe {
 		t.Fatal("the probe's own session was not excluded from a mixed catalog")
+	}
+}
+
+// TestProbeKnownSessionIDsSurviveRestart fixes that ownership of a
+// rotated-away identity isn't just an in-memory fact of the Probe
+// instance that performed the rotation: a brand-new *Probe constructed
+// against the same Dir (simulating an agentsctl restart) must still
+// report both the current and every retired session ID from what's
+// persisted on disk -- exactly what Provider.List needs after a restart
+// to keep excluding a rotated-away probe row from the catalog.
+func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
+	probeDir := t.TempDir()
+	pr1 := newFastProbe("claude", probeDir)
+
+	orig, err := loadOrCreateProbeIdentity(pr1.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated, err := rotateProbeIdentity(pr1.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A brand-new Probe, never having rotated anything itself -- only the
+	// persisted probe.json under the same Dir carries this history.
+	pr2 := newFastProbe("claude", probeDir)
+	ids := pr2.KnownSessionIDs()
+	if len(ids) != 2 {
+		t.Fatalf("KnownSessionIDs after restart=%v, want exactly 2 (current + retired)", ids)
+	}
+	foundCurrent, foundRetired := false, false
+	for _, id := range ids {
+		if id == rotated.SessionID {
+			foundCurrent = true
+		}
+		if id == orig.SessionID {
+			foundRetired = true
+		}
+	}
+	if !foundCurrent {
+		t.Fatalf("KnownSessionIDs after restart=%v, missing current id %q", ids, rotated.SessionID)
+	}
+	if !foundRetired {
+		t.Fatalf("KnownSessionIDs after restart=%v, missing retired id %q", ids, orig.SessionID)
 	}
 }
 
@@ -1121,10 +1166,11 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	firstID, ok := pr.KnownSessionID()
-	if !ok {
-		t.Fatal("no identity after first refresh")
+	firstIDs := pr.KnownSessionIDs()
+	if len(firstIDs) != 1 {
+		t.Fatalf("no identity after first refresh: %v", firstIDs)
 	}
+	firstID := firstIDs[0]
 
 	// Force a second real refresh.
 	pr.mu.Lock()
@@ -1136,10 +1182,11 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	secondID, ok := pr.KnownSessionID()
-	if !ok {
-		t.Fatal("no identity after second refresh")
+	secondIDs := pr.KnownSessionIDs()
+	if len(secondIDs) != 1 {
+		t.Fatalf("no identity after second refresh: %v", secondIDs)
 	}
+	secondID := secondIDs[0]
 	if secondID != firstID {
 		t.Fatalf("session ID changed across refreshes: %q -> %q", firstID, secondID)
 	}

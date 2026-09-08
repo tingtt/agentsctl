@@ -9,20 +9,22 @@ import (
 	"strings"
 )
 
-// probeIdentity is agentsctl's local record of its one owned Claude usage
-// probe session -- the source of truth Provider.List uses to exclude the
-// probe from the normal session catalog (see UsageProbeSource's
-// KnownSessionID) and the probe orchestration (usage_probe_unix.go)
-// addresses on every refresh via --session-id.
+// probeIdentity is agentsctl's local record of every Claude usage probe
+// session ID it has ever owned -- the source of truth Provider.List uses
+// to exclude the probe from the normal session catalog (see
+// UsageProbeSource's KnownSessionIDs) and the probe orchestration
+// (usage_probe_unix.go) addresses on every refresh via --session-id
+// (always SessionID, never one of RetiredSessionIDs).
 //
-// SessionID and TrustAccepted have deliberately different lifetimes,
-// tracked together here only because they're persisted together:
+// SessionID, RetiredSessionIDs, and TrustAccepted have deliberately
+// different lifetimes, tracked together here only because they're
+// persisted together:
 //
-//   - SessionID identifies a Claude Code session. Normally reused
-//     unchanged across every refresh -- addressing an already-known
-//     --session-id, with or without resumable history, is not itself an
-//     error (verified against the installed CLI: an ID Claude has no
-//     saved transcript for, e.g. one whose process had to be
+//   - SessionID identifies the probe's current, live Claude Code session.
+//     Normally reused unchanged across every refresh -- addressing an
+//     already-known --session-id, with or without resumable history, is
+//     not itself an error (verified against the installed CLI: an ID
+//     Claude has no saved transcript for, e.g. one whose process had to be
 //     force-killed, behaves like a brand new one). But Claude Code CAN
 //     permanently reject a specific ID as already in use elsewhere (see
 //     errProbeSessionConflict) -- confirmed via a live reproduction of
@@ -32,6 +34,14 @@ import (
 //     probe never depends on any given ID's conversation surviving (one
 //     trivial round trip is all any refresh ever needs), so losing one
 //     costs nothing beyond needing a fresh one.
+//   - RetiredSessionIDs holds every SessionID a rotation has ever replaced
+//     -- Claude Code's own native catalog does not remove a rejected
+//     session's row just because agentsctl has stopped addressing it, so
+//     without this list a rotated-away ID would resurface in Provider.List
+//     as an ordinary user session (pinnable, renameable, stoppable) the
+//     moment it stopped being `SessionID`. Ownership of a probe is
+//     therefore the full set {SessionID} ∪ RetiredSessionIDs, never just
+//     the current one -- see probeIdentity.ownsSessionID.
 //   - TrustAccepted tracks a completely different, longer-lived fact:
 //     whether agentsctl has ever answered Claude Code's workspace-trust
 //     confirmation dialog for this probe's dedicated *directory* (see
@@ -63,18 +73,72 @@ type probeIdentity struct {
 	// a SessionID rotation unchanged (rotateProbeIdentity) even though a
 	// rotation always mints a brand new SessionID.
 	TrustAccepted bool `json:"trustAccepted"`
+	// RetiredSessionIDs lists every SessionID a prior rotation has
+	// replaced, oldest first, deduplicated (see appendRetiredSessionID).
+	// A probe.json persisted before this field existed simply decodes it
+	// as nil/empty -- ownsSessionID and allSessionIDs treat that exactly
+	// like "no retired IDs yet", so no proactive migration write is
+	// needed; the field is populated naturally the next time a rotation
+	// happens. See probeIdentity's own doc comment.
+	RetiredSessionIDs []string `json:"retiredSessionIds,omitempty"`
+}
+
+// ownsSessionID reports whether sessionID is this probe's current ID or
+// one of its retired ones -- the exact-identity ownership test
+// Provider.List uses (via Probe.KnownSessionIDs) to exclude every row
+// agentsctl has ever addressed as its probe, not just the live one. Never
+// derived from CWD or DisplayName (see probeIdentity's own doc comment).
+func (id probeIdentity) ownsSessionID(sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	if id.SessionID == sessionID {
+		return true
+	}
+	for _, r := range id.RetiredSessionIDs {
+		if r == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+// allSessionIDs returns every session ID this probe owns -- the current
+// one (if any) followed by every retired one -- for a caller like
+// Probe.KnownSessionIDs that needs the full set at once rather than a
+// per-ID membership test.
+func (id probeIdentity) allSessionIDs() []string {
+	ids := make([]string, 0, len(id.RetiredSessionIDs)+1)
+	if id.SessionID != "" {
+		ids = append(ids, id.SessionID)
+	}
+	return append(ids, id.RetiredSessionIDs...)
+}
+
+// appendRetiredSessionID returns retired with sessionID added, unless
+// it's already present -- rotateProbeIdentity's own dedup guarantee, kept
+// as a separate pure function so it's independently testable: a retired
+// list must never grow a duplicate entry no matter how many times the
+// same ID is (attempted to be) retired.
+func appendRetiredSessionID(retired []string, sessionID string) []string {
+	for _, r := range retired {
+		if r == sessionID {
+			return retired
+		}
+	}
+	return append(append([]string{}, retired...), sessionID)
 }
 
 // probeDisplayName is the fixed, human-readable name given to the probe
 // session when it's first created -- shown only if a human ever inspects
 // Claude's own native session list directly; agentsctl's own Agent View
-// never renders this row at all (see Provider.List's KnownSessionID
+// never renders this row at all (see Provider.List's KnownSessionIDs
 // exclusion).
 const probeDisplayName = "agentsctl usage probe"
 
 // readProbeIdentityIfExists reads path's persisted probe identity without
 // creating one -- the read-only half of loadOrCreateProbeIdentity, for a
-// caller (Probe.KnownSessionID) that must never mint a new identity as a
+// caller (Probe.KnownSessionIDs) that must never mint a new identity as a
 // side effect of a read. ok is false for a missing file, an empty
 // SessionID, or a decode error -- never treated as a fatal condition by
 // callers that only want "is there one, and if so what is it".
@@ -183,11 +247,16 @@ func probeSessionConflict(output string) bool {
 // minted SessionID, carrying DisplayName and -- critically -- TrustAccepted
 // forward unchanged (see probeIdentity's own doc comment for why
 // TrustAccepted survives a rotation: it belongs to the probe *directory*,
-// which a rotation never changes, not to the SessionID being replaced).
-// This is the only recovery available once Claude Code has permanently
-// rejected an identity's SessionID (see probeSessionConflict): the
-// probe's design of otherwise reusing one persisted identity forever has
-// no other way to recover from a rejection that never clears on its own.
+// which a rotation never changes, not to the SessionID being replaced),
+// and retires the old current SessionID into RetiredSessionIDs
+// (deduplicated -- see appendRetiredSessionID) so Provider.List keeps
+// excluding it from the normal catalog even after it stops being current
+// (Claude Code's own native catalog does not remove a rejected session's
+// row on its own -- see probeIdentity's own doc comment). This is the
+// only recovery available once Claude Code has permanently rejected an
+// identity's SessionID (see probeSessionConflict): the probe's design of
+// otherwise reusing one persisted identity forever has no other way to
+// recover from a rejection that never clears on its own.
 //
 // It deliberately re-reads path itself rather than taking the caller's
 // own probeIdentity value as the record to rotate from: a caller like
@@ -216,7 +285,12 @@ func rotateProbeIdentity(path string) (probeIdentity, error) {
 	if err != nil {
 		return probeIdentity{}, err
 	}
-	rotated := probeIdentity{SessionID: uuid, DisplayName: current.DisplayName, TrustAccepted: current.TrustAccepted}
+	rotated := probeIdentity{
+		SessionID:         uuid,
+		DisplayName:       current.DisplayName,
+		TrustAccepted:     current.TrustAccepted,
+		RetiredSessionIDs: appendRetiredSessionID(current.RetiredSessionIDs, current.SessionID),
+	}
 	if err := writeProbeIdentity(path, rotated); err != nil {
 		return probeIdentity{}, err
 	}

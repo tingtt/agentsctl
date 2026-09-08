@@ -71,10 +71,15 @@ const renameCleanupTimeout = 8 * time.Second
 // hijacking a real user session or terminal.
 type UsageProbeSource interface {
 	Usage(ctx context.Context) (session.Usage, error)
-	// KnownSessionID reports the probe's own Claude session identity, if
-	// one has ever been created, so List can exclude that exact row from
-	// the normal catalog (see Provider.List) -- identity, never CWD alone.
-	KnownSessionID() (string, bool)
+	// KnownSessionIDs reports every exact Claude session ID this probe has
+	// ever owned -- its current one and every one a rotation has since
+	// retired (see probeIdentity's own doc comment) -- so List can exclude
+	// all of them from the normal catalog (see Provider.List). Ownership
+	// is exact-identity, never CWD or display-name inference: a rotated-
+	// away ID stays in Claude's own native catalog (Claude doesn't remove
+	// it just because agentsctl stopped addressing it) and must keep being
+	// excluded there too, not just the current one.
+	KnownSessionIDs() []string
 }
 
 type Provider struct {
@@ -133,9 +138,19 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		return nil, fmt.Errorf("decode claude agents JSON: %w", err)
 	}
 	claudeArchived, legacyNames, _ := p.Store.ClaudeState()
-	var probeID string
+	// Loaded once per List call, not once per row: probeIDs is the full
+	// set of session IDs this probe has ever owned -- its current one and
+	// every one a rotation has since retired (see
+	// UsageProbeSource.KnownSessionIDs) -- so both a live probe row and a
+	// rotated-away one Claude's own catalog still happens to carry are
+	// excluded below, applied before the archive-overlay filter right
+	// after it so neither the active nor the archived listing can ever
+	// leak either one.
+	probeIDs := map[string]bool{}
 	if p.UsageProbe != nil {
-		probeID, _ = p.UsageProbe.KnownSessionID()
+		for _, id := range p.UsageProbe.KnownSessionIDs() {
+			probeIDs[id] = true
+		}
 	}
 	rows := make([]session.Session, 0, len(raw))
 	for _, v := range raw {
@@ -143,14 +158,14 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		if id == "" {
 			continue
 		}
-		// The usage probe's own session must never appear in the normal
+		// The usage probe's own session(s) must never appear in the normal
 		// catalog (pin/rename/attach/stop/archive/grouping all operate on
-		// session.Session rows) -- excluded by its exact recorded identity,
+		// session.Session rows) -- excluded by exact recorded identity,
 		// never by CWD alone, so a real user session that happens to share
 		// the probe's dedicated app-data directory (which nothing else
 		// should ever use, but fail-closed matters more than convenience
-		// here) is never hidden by mistake. See UsageProbeSource.KnownSessionID.
-		if probeID != "" && id == probeID {
+		// here) is never hidden by mistake. See UsageProbeSource.KnownSessionIDs.
+		if probeIDs[id] {
 			continue
 		}
 		isArchived := claudeArchived[id]

@@ -189,17 +189,20 @@ func (pr *Probe) exePath() (string, error) {
 	return os.Executable()
 }
 
-// KnownSessionID implements UsageProbeSource: a pure local-file read (no
+// KnownSessionIDs implements UsageProbeSource: a pure local-file read (no
 // process spawned, no catalog call), so Provider.List can cheaply exclude
-// the probe's row on every load. An identity that has never been created,
-// or that can't be read, reports ok=false -- List then excludes nothing,
-// never guessing (see Provider.List's doc comment on this call site).
-func (pr *Probe) KnownSessionID() (string, bool) {
+// every row this probe has ever owned -- its current SessionID and every
+// RetiredSessionIDs entry a rotation has left behind (see probeIdentity's
+// own doc comment) -- on every load. An identity that has never been
+// created, or that can't be read, reports an empty/nil slice -- List then
+// excludes nothing, never guessing (see Provider.List's doc comment on
+// this call site).
+func (pr *Probe) KnownSessionIDs() []string {
 	id, ok, err := readProbeIdentityIfExists(pr.identityPath())
 	if err != nil || !ok {
-		return "", false
+		return nil
 	}
-	return id.SessionID, true
+	return id.allSessionIDs()
 }
 
 // Usage implements UsageProbeSource. A fresh cached snapshot (within
