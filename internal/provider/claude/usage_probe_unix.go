@@ -13,13 +13,30 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // usageProbeTTL bounds how long a cached Claude usage snapshot is served
 // before Usage() triggers a fresh refresh through the owned probe session
-// (see Probe.Usage) -- #14's "1〜5分程度" cache freshness guidance.
+// (see Probe.Usage) -- #14's "1〜5分程度" cache freshness guidance. Also
+// the freshness window refreshCrossProcess re-checks the persisted
+// snapshot against after acquiring the cross-process refresh lock -- the
+// same TTL policy, not a second one (see refreshCrossProcess's own doc
+// comment).
 const usageProbeTTL = 3 * time.Minute
+
+// usageProbeRefreshLockPollInterval is the retry cadence Probe.lockRefresh
+// polls at while waiting for another process's refresh transaction to
+// release the cross-process refresh lock. Unlike lockProbeIdentityFile's
+// plain blocking unix.Flock (an identity transaction is always short --
+// one local read plus one atomic write), a refresh transaction can hold
+// this lock for as long as a full Claude round trip takes, so a
+// context-cancellable wait matters here: LOCK_EX|LOCK_NB polled at this
+// interval, rather than a single blocking LOCK_EX, so Usage(ctx)'s own
+// cancellation semantics are never made worse by this lock's existence.
+const usageProbeRefreshLockPollInterval = 50 * time.Millisecond
 
 // usageProbePrompt is the minimal message Probe.refreshOnce sends into the
 // probe session to elicit one real API response (the only way Claude Code
@@ -89,8 +106,10 @@ const usageProbeDetachTimeout = 5 * time.Second
 // It implements UsageProbeSource for Provider.
 //
 // A Probe is safe for concurrent use: Usage single-flights refreshes (see
-// refreshShared) so concurrent callers never spawn more than one probe
-// process or send more than one prompt at a time.
+// refreshShared) so concurrent callers within this process never spawn
+// more than one probe process or send more than one prompt at a time.
+// That guarantee extends across every agentsctl process sharing this
+// probe's Dir too, not just within one -- see refreshCrossProcess.
 type Probe struct {
 	// Path is the `claude` binary path; empty means "claude" (resolved via
 	// PATH, matching Provider.path()).
@@ -181,6 +200,19 @@ func (pr *Probe) now() time.Time {
 func (pr *Probe) settingsPath() string { return filepath.Join(pr.Dir, "settings.json") }
 func (pr *Probe) snapshotPath() string { return filepath.Join(pr.Dir, "usage.json") }
 func (pr *Probe) identityPath() string { return filepath.Join(pr.Dir, "probe.json") }
+
+// refreshLockPath is the dedicated cross-process refresh lock (see
+// refreshCrossProcess) -- deliberately its own file, never probe.json.lock
+// itself: refreshOnce calls markTrustAccepted, which acquires
+// probe.json.lock as its own short-lived identity transaction, so holding
+// probe.json.lock across an entire refresh attempt (this lock's actual
+// scope, potentially a full Claude round trip) would make that inner
+// acquisition either deadlock against itself or require reentrant
+// locking. Keeping the two locks -- and the two files backing them --
+// entirely separate keeps the ordering strictly one-directional (refresh
+// lock held first, identity lock acquired and released many times inside
+// it, never the reverse) with no risk of lock-order inversion.
+func (pr *Probe) refreshLockPath() string { return filepath.Join(pr.Dir, "refresh.lock") }
 
 func (pr *Probe) exePath() (string, error) {
 	if pr.ExePath != "" {
@@ -278,30 +310,17 @@ func (pr *Probe) cachedAny() (usageSnapshot, bool) {
 	return pr.snapshot, pr.hasSnapshot
 }
 
-// refreshShared single-flights refresh: concurrent callers arriving while
-// a refresh is already in progress wait for it (bounded by ctx) and reuse
-// its result instead of starting a second probe process or prompt --
-// guaranteeing at most one probe-session creation and at most one stale
-// refresh request in flight at a time, regardless of how many goroutines
-// call Usage concurrently.
-//
-// A successful result -- including a synthesized exhausted snapshot (see
-// refresh/exhaustedSnapshot), which the statusLine collector never gets a
-// chance to write itself since no completed response ever arrives -- is
-// persisted to this probe's own usage.json via writeUsageSnapshotAtomic
-// (the same path loadPersistedSnapshotOnce reads on a fresh process,
-// never a second cache format) before the in-memory cache is updated, so
-// a limit detected now is still reflected after an agentsctl restart, not
-// just for the remainder of this process's own lifetime (see Issue #19's
-// "次回 refresh まで古い utilization に戻らない", which restart must not
-// undermine). A failed disk write does not revert this refresh's own
-// already-valid result (an exhausted state stays exhausted, a fresh
-// reading stays fresh) -- it is logged nowhere and simply means a later
-// restart, before any further successful refresh, could miss only this
-// one write; the in-memory cache this process holds is unaffected either
-// way (see the DesignDoc's Claude usage cache/failure policy, which
-// already tolerates persistence-layer hiccups without discarding an
-// otherwise-valid in-memory result).
+// refreshShared single-flights refresh WITHIN THIS PROCESS: concurrent
+// callers arriving while a refresh is already in progress wait for it
+// (bounded by ctx) and reuse its result instead of starting a second
+// probe process or prompt of their own, guaranteeing at most one refresh
+// attempt in flight per process at a time, regardless of how many
+// goroutines call Usage concurrently. It delegates the actual work to
+// refreshCrossProcess, which extends that same guarantee across every
+// agentsctl process sharing this probe's Dir -- see its own doc comment;
+// this function's own responsibility ends at the process boundary,
+// exactly like localstate.Store's in-process mu paired with its own
+// cross-process flock.
 func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.mu.Lock()
 	if ch := pr.refreshCh; ch != nil {
@@ -320,10 +339,7 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.refreshCh = ch
 	pr.mu.Unlock()
 
-	snap, err := pr.refreshWithRecovery(ctx)
-	if err == nil {
-		_ = writeUsageSnapshotAtomic(pr.snapshotPath(), snap)
-	}
+	snap, err := pr.refreshCrossProcess(ctx)
 
 	pr.mu.Lock()
 	if err == nil {
@@ -333,6 +349,126 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	pr.mu.Unlock()
 	close(ch)
 	return snap, err
+}
+
+// refreshCrossProcess is refreshShared's cross-process counterpart:
+// exactly one agentsctl process at a time, across every process sharing
+// this probe's Dir, is ever inside refreshWithRecovery for this probe --
+// enforced by holding the exclusive cross-process refresh lock (see
+// lockRefresh) for this call's entire duration, from before the very
+// first freshness check through the final persist. Without that lock,
+// two processes racing a stale cache could each open their own
+// `--session-id A` interactive session concurrently; the earlier rounds'
+// own session-conflict-recovery machinery exists to survive Claude Code
+// rejecting one of those two sessions, but it was never meant to be the
+// steady-state outcome of agentsctl's own normal, non-adversarial
+// operation -- an entirely avoidable self-inflicted conflict, an
+// unnecessary duplicate live API call (consuming quota twice for what
+// should be one refresh), and duplicate statusLine/collector work, all
+// for a result the second process didn't actually need.
+//
+// Once the lock is held, the persisted usage.json is re-read and checked
+// against the exact same usageProbeTTL freshness window Probe.cachedFresh
+// already applies to the in-memory cache -- no separate or looser
+// freshness rule. This is what turns the lock from "just serialize
+// refreshes" into "actually skip the second one": a caller that had to
+// wait for the lock, arriving here right after another process's own
+// refreshCrossProcess call already persisted a fresh result, returns that
+// persisted snapshot directly, never touching Claude at all. A caller
+// that acquires the lock uncontended, or whose wait ends before anyone
+// else's refresh has produced anything fresh, falls through to a real
+// refreshWithRecovery attempt exactly as before.
+//
+// The persist-on-success step (writeUsageSnapshotAtomic) deliberately
+// stays inside the locked section too, not after it: releasing the lock
+// before persisting would reopen the exact window this function exists to
+// close, letting a second process's own freshness re-check run against a
+// still-stale usage.json and duplicate the just-completed refresh. A
+// write failure here is NOT escalated into this call's own error --
+// matching the DesignDoc's existing policy that an otherwise-valid
+// refresh result must survive a persistence-layer hiccup -- but it does
+// mean this specific dedupe guarantee is lost for whichever other
+// process's own wait happens to end before some later successful write
+// finally lands: that process will see a still-stale (or absent)
+// usage.json under the lock and, correctly by its own local information,
+// perform its own redundant refresh. This is a narrow, honestly-documented
+// gap, not a silently-assumed one -- session ID conflict recovery (see
+// refreshWithRecovery) remains available to both processes regardless.
+func (pr *Probe) refreshCrossProcess(ctx context.Context) (usageSnapshot, error) {
+	unlock, err := pr.lockRefresh(ctx)
+	if err != nil {
+		return usageSnapshot{}, fmt.Errorf("acquire claude usage probe refresh lock: %w", err)
+	}
+	defer unlock()
+
+	if snap, ok := pr.persistedFresh(); ok {
+		return snap, nil
+	}
+
+	snap, err := pr.refreshWithRecovery(ctx)
+	if err != nil {
+		return usageSnapshot{}, err
+	}
+	_ = writeUsageSnapshotAtomic(pr.snapshotPath(), snap) // see this function's own doc comment for why a write failure here is deliberately not returned as this call's error
+	return snap, nil
+}
+
+// persistedFresh reads this probe's persisted usage.json and reports it
+// (via ok) only if it's within usageProbeTTL of now -- the exact same
+// freshness rule Probe.cachedFresh applies to the in-memory cache, read
+// here from disk instead so refreshCrossProcess can tell whether another
+// process's refresh, completed while this call was waiting for the lock,
+// already makes a fresh Claude call unnecessary.
+func (pr *Probe) persistedFresh() (usageSnapshot, bool) {
+	snap, ok, err := readUsageSnapshot(pr.snapshotPath())
+	if err != nil || !ok {
+		return usageSnapshot{}, false
+	}
+	if time.Since(snap.ObservedAt) >= usageProbeTTL {
+		return usageSnapshot{}, false
+	}
+	return snap, true
+}
+
+// lockRefresh acquires the exclusive cross-process refresh lock guarding
+// refreshCrossProcess (see its own doc comment and refreshLockPath's),
+// honoring ctx cancellation while waiting -- unlike
+// lockProbeIdentityFile's single blocking unix.Flock call (safe there
+// because an identity transaction never holds its lock for more than one
+// local read plus one atomic write), the caller here can hold this lock
+// for as long as a full Claude round trip takes, so Usage(ctx)'s own
+// cancellation contract has to keep working while waiting for it: a
+// non-blocking LOCK_EX|LOCK_NB attempt, polled at
+// usageProbeRefreshLockPollInterval, rather than one call that could
+// block past ctx's own deadline with no way to interrupt it.
+func (pr *Probe) lockRefresh(ctx context.Context) (func(), error) {
+	if err := os.MkdirAll(pr.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(pr.refreshLockPath(), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			f.Close()
+			return nil, err
+		}
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(usageProbeRefreshLockPollInterval):
+		}
+	}
 }
 
 // refreshWithRecovery runs refreshOnce, self-healing exactly one specific
@@ -493,7 +629,46 @@ func (pr *Probe) refreshOnce(ctx context.Context, id probeIdentity) (usageSnapsh
 		// own doc comment) -- workspace trust is directory-level, so
 		// that's the correct target even if another process rotated
 		// concurrently with this very attempt.
-		_ = markTrustAccepted(pr.identityPath())
+		//
+		// Its error is no longer silently discarded: this is now a
+		// meaningful identity-lock transaction (see markTrustAccepted's
+		// own doc comment), not a fire-and-forget write, and continuing
+		// on to send the real prompt below on the unverified assumption
+		// that it durably persisted would leave a LATER refresh's own
+		// `!id.TrustAccepted` check still true even though Claude Code's
+		// own state already considers this directory trusted -- exactly
+		// the blind-resend hazard TrustAccepted exists to avoid (see
+		// probeIdentity's own doc comment). Failing this attempt instead
+		// falls through to Usage's existing stale-cache fallback, same as
+		// any other refreshOnce failure.
+		//
+		// This alone doesn't fully close that hazard: refreshCrossProcess
+		// (see its own doc comment) is this package's actual primary
+		// defense, serializing first-trust handling across every
+		// agentsctl process sharing this probe directory so the
+		// interleaving this guards against essentially can't occur in
+		// normal operation; a persistence failure occurring right here is
+		// a narrow residual window even that can't close by itself (a
+		// later refresh, still seeing TrustAccepted=false on disk, would
+		// still attempt to answer a dialog Claude Code may no longer be
+		// showing). Deliberately NOT added on top of this: a text-based
+		// "is the trust dialog actually still showing" classifier,
+		// checked alongside checkSessionConflict's kind of output
+		// classification. Unlike probeSessionConflictPhrase or
+		// classifyProbeOutput's limit wording -- both confirmed against
+		// real, captured, quoted installed-CLI terminal output in earlier
+		// rounds -- no real Claude Code workspace-trust dialog text has
+		// ever actually been captured and verified against the installed
+		// CLI for this probe, and this round's fix is required to close
+		// without any further live-quota-consuming Claude calls to go
+		// verify one. A guessed pattern risks exactly the fail-unsafe
+		// outcome this whole mechanism exists to prevent (a false
+		// negative sending real navigation/Enter keystrokes into a live
+		// chat composer), so this residual window is accepted and
+		// documented rather than closed with an unverified classifier.
+		if err := markTrustAccepted(pr.identityPath()); err != nil {
+			return usageSnapshot{}, fmt.Errorf("persist claude workspace trust acceptance: %w", err)
+		}
 		if err := probeSettle(ctx, pr.trustSettleDelay()); err != nil {
 			return usageSnapshot{}, err
 		}

@@ -99,6 +99,36 @@ func newFastProbe(path, dir string) *Probe {
 	return pr
 }
 
+// forceStaleCache backdates pr's in-memory cache timestamp AND, if a
+// snapshot is already persisted, that persisted usage.json's own
+// ObservedAt by the same amount, so a test can simulate "usageProbeTTL
+// has genuinely elapsed" consistently across both freshness checks that
+// now exist: Probe.cachedFresh (in-memory) and Probe.persistedFresh (the
+// on-disk recheck refreshCrossProcess performs under the cross-process
+// refresh lock). Backdating only the in-memory field -- this helper's
+// entire reason to exist, replacing every test's own former inline
+// pr.mu.Lock/pr.snapshotAt=/pr.mu.Unlock sequence -- would leave the
+// on-disk snapshot looking falsely fresh to persistedFresh, silently
+// short-circuiting the very refresh attempt a test forces this for.
+func forceStaleCache(t *testing.T, pr *Probe) {
+	t.Helper()
+	stale := time.Now().Add(-2 * usageProbeTTL)
+	pr.mu.Lock()
+	pr.snapshotAt = stale
+	pr.mu.Unlock()
+	snap, ok, err := readUsageSnapshot(pr.snapshotPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		return
+	}
+	snap.ObservedAt = stale
+	if err := writeUsageSnapshotAtomic(pr.snapshotPath(), snap); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // writeFakeRateLimits seeds AGENTSCTL_FAKE_DIR/ratelimits.json, the
 // fixture the fake CLI's run_statusline reads to build its canned
 // rate_limits payload.
@@ -194,9 +224,7 @@ func TestProbeUsageStaleCacheFailsOverWithoutError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Force the cache to look stale, then break the refresh path.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	pr.Path = filepath.Join(t.TempDir(), "no-such-claude-binary")
 
 	got, err := pr.Usage(context.Background())
@@ -274,9 +302,7 @@ func TestProbeRefreshDetectsFiveHourLimitAndPreservesWeekly(t *testing.T) {
 	// Force a new refresh, this time observing a 5-hour usage-limit banner
 	// (the shape closest to Claude Code's actual display, per this
 	// package's own wording notes) instead of a fresh statusLine snapshot.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeLimitBanner(t, fakeDir, "You've hit your session limit · resets 3pm\r\n")
 
 	got, err := pr.Usage(context.Background())
@@ -309,9 +335,7 @@ func TestProbeRefreshDetectsWeeklyLimitAndPreservesFiveHour(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeLimitBanner(t, fakeDir, "You've hit your weekly limit · resets Sep 10\r\n")
 
 	got, err := pr.Usage(context.Background())
@@ -344,9 +368,7 @@ func TestProbeRefreshDetectsBothLimitsExhausted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeLimitBanner(t, fakeDir, "Usage limit reached: your 5-hour session limit and your weekly usage limit have both been reached.\r\n")
 
 	got, err := pr.Usage(context.Background())
@@ -381,9 +403,7 @@ func TestProbeExhaustedStateSurvivesRestart(t *testing.T) {
 	if _, err := probeA.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	probeA.mu.Lock()
-	probeA.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	probeA.mu.Unlock()
+	forceStaleCache(t, probeA)
 	writeFakeLimitBanner(t, fakeDir, "You've hit your session limit · resets 3pm\r\n")
 
 	exhausted, err := probeA.Usage(context.Background())
@@ -427,9 +447,7 @@ func TestProbeRecoversFromExhaustedAfterFreshSnapshot(t *testing.T) {
 	}
 
 	// First: the limit hits, FiveHour becomes exhausted.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
 	exhausted, err := pr.Usage(context.Background())
 	if err != nil {
@@ -447,9 +465,7 @@ func TestProbeRecoversFromExhaustedAfterFreshSnapshot(t *testing.T) {
 	writeFakeRateLimits(t, fakeDir, map[string]any{
 		"five_hour": map[string]any{"used_percentage": 3, "resets_at": 4102444900},
 	})
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 
 	recovered, err := pr.Usage(context.Background())
 	if err != nil {
@@ -486,9 +502,7 @@ func TestProbeNonLimitTimeoutDoesNotFabricateExhausted(t *testing.T) {
 	// invocation never writes a snapshot at all -- matching a real parse/
 	// process failure -- and no limit banner exists, so
 	// waitForProbeOutcome must time out plainly.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	pr.ExePath = filepath.Join(t.TempDir(), "no-such-agentsctl-exe")
 
 	got, err := pr.Usage(context.Background())
@@ -520,9 +534,7 @@ func TestProbeExhaustedStateCachedWithoutRerefresh(t *testing.T) {
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeLimitBanner(t, fakeDir, "Usage limit reached\r\n")
 
 	first, err := pr.Usage(context.Background())
@@ -577,9 +589,7 @@ func TestProbeRecoversToAvailableAfterResetBoundaryThenFreshRefresh(t *testing.T
 	writeFakeRateLimits(t, fakeDir, map[string]any{
 		"five_hour": map[string]any{"used_percentage": 7, "resets_at": newReset.Unix()},
 	})
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	pr.Clock = nil
 
 	recovered, err := pr.Usage(context.Background())
@@ -1173,9 +1183,7 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 	firstID := firstIDs[0]
 
 	// Force a second real refresh.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	writeFakeRateLimits(t, fakeDir, map[string]any{
 		"five_hour": map[string]any{"used_percentage": 2, "resets_at": 4102444800},
 	})
@@ -1271,9 +1279,7 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 	// (forced stale) completing within the normal fast-test timeout is
 	// strong evidence no leftover process is holding the probe directory
 	// or pty in a bad state.
-	pr.mu.Lock()
-	pr.snapshotAt = time.Now().Add(-2 * usageProbeTTL)
-	pr.mu.Unlock()
+	forceStaleCache(t, pr)
 	done := make(chan error, 1)
 	go func() {
 		_, err := pr.Usage(context.Background())
@@ -1390,5 +1396,169 @@ func TestProbePersistedStaleSnapshotOnNewInstanceStillRefreshes(t *testing.T) {
 	}
 	if got.FiveHour.Percent != 99 {
 		t.Fatalf("got=%+v, want a real refresh (99%%) rather than the stale persisted 1%% value", got)
+	}
+}
+
+// TestProbeCrossProcessRefreshSingleFlightsAcrossProbeInstances is this
+// round's central regression: refreshShared's own single-flight (see its
+// doc comment) is process-local -- keyed off pr.refreshCh, in-memory state
+// no other *Probe instance can ever see -- so it alone does nothing to
+// stop two SEPARATE agentsctl processes sharing one probe Dir from each
+// opening their own interactive `--session-id <same id>` Claude session
+// concurrently. Two distinct *Probe instances (never the same one, unlike
+// TestProbeConcurrentUsageSingleFlightsRefresh) pointed at the same Dir
+// stand in for two separate processes here: unix.Flock contends on open
+// file descriptions, not *Probe values or goroutines, so two fresh
+// os.OpenFile calls against the same refresh.lock path -- exactly what
+// two unrelated processes would each do -- genuinely race for the same
+// kernel-held lock the same way whether they come from one *Probe, two
+// *Probe instances in one process, or two entirely separate processes.
+//
+// Both callers must still succeed, must both observe the exact same
+// resulting usage (never a zero-value or some stale in-memory leftover
+// from the losing side), and -- the one assertion that actually
+// distinguishes "cross-process single-flighted" from "just serialized,
+// still ran twice" -- the fake CLI must have been invoked exactly once:
+// the loser must find the winner's freshly-persisted usage.json already
+// fresh once it acquires the lock, and reuse it rather than opening its
+// own probe session (see refreshCrossProcess/persistedFresh's own doc
+// comments). Without the fix (process-local refreshShared alone), this
+// would be 2, not 1.
+func TestProbeCrossProcessRefreshSingleFlightsAcrossProbeInstances(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 17, "resets_at": 4102444800},
+		"seven_day": map[string]any{"used_percentage": 8, "resets_at": 4102444801},
+	})
+	probeDir := t.TempDir()
+	exe := probeExePath(t)
+	claude := fakeClaudePath(t)
+
+	pr1 := newFastProbe(claude, probeDir)
+	pr1.ExePath = exe
+	pr2 := newFastProbe(claude, probeDir)
+	pr2.ExePath = exe
+
+	var ready sync.WaitGroup
+	ready.Add(2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var got1, got2 session.Usage
+	var err1, err2 error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		ready.Done()
+		<-start
+		got1, err1 = pr1.Usage(context.Background())
+	}()
+	go func() {
+		defer wg.Done()
+		ready.Done()
+		<-start
+		got2, err2 = pr2.Usage(context.Background())
+	}()
+	ready.Wait()
+	close(start)
+	wg.Wait()
+
+	if err1 != nil {
+		t.Fatalf("pr1.Usage: %v", err1)
+	}
+	if err2 != nil {
+		t.Fatalf("pr2.Usage: %v", err2)
+	}
+	if got1.FiveHour.State != session.UsageAvailable || got1.FiveHour.Percent != 17 {
+		t.Fatalf("got1.FiveHour=%+v, want Available/17%%", got1.FiveHour)
+	}
+	if !usageEqual(got1, got2) {
+		t.Fatalf("pr1=%+v pr2=%+v, want both Probe instances to observe the exact same resulting usage", got1, got2)
+	}
+	if got := fakeProbeInvocationCount(t, fakeDir); got != 1 {
+		t.Fatalf("fake CLI invocations=%d, want exactly 1 -- two Probe instances sharing one Dir must single-flight across processes, not just within one", got)
+	}
+}
+
+// usageEqual compares two session.Usage values field by field (rather
+// than Go's own == on the struct) so a Reset time.Time round-tripped
+// through a different marshal/unmarshal path than its counterpart (one
+// side's own in-memory refresh result vs the other side's read back from
+// persisted JSON) is compared by the instant it represents, per
+// time.Time.Equal, never by internal representation.
+func usageEqual(a, b session.Usage) bool {
+	return a.Provider == b.Provider && usageWindowEqual(a.FiveHour, b.FiveHour) && usageWindowEqual(a.Weekly, b.Weekly)
+}
+func usageWindowEqual(a, b session.UsageWindow) bool {
+	return a.State == b.State && a.Percent == b.Percent && a.Reset.Equal(b.Reset)
+}
+
+// TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClaude
+// isolates the "waiter reuses persisted usage.json" half of the fix
+// deterministically, with no goroutine timing involved at all: refresh's
+// own claude path is deliberately unusable, so if refreshCrossProcess ever
+// actually reached refreshWithRecovery here, this would fail loudly (a
+// process-launch error), not silently. A usage.json that's already fresh
+// (within usageProbeTTL) by the time refreshCrossProcess acquires the
+// lock -- exactly what a losing caller sees after the winner of a real
+// race persists its own result -- must be returned as-is, proving the
+// short-circuit this round's fix depends on actually exists and isn't
+// just an artifact of goroutine scheduling in the concurrent test above.
+func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClaude(t *testing.T) {
+	probeDir := t.TempDir()
+	pr := newFastProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	fresh := usageSnapshot{
+		FiveHour:         usageWindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Now().Add(time.Hour)},
+		Weekly:           usageWindowSnapshot{State: session.UsageAvailable, Percent: 9, ResetAt: time.Now().Add(24 * time.Hour)},
+		ObservedAt:       time.Now(),
+		ResponseObserved: true,
+	}
+	if err := writeUsageSnapshotAtomic(pr.snapshotPath(), fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := pr.refreshCrossProcess(context.Background())
+	if err != nil {
+		t.Fatalf("refreshCrossProcess errored instead of reusing the fresh persisted snapshot without ever touching the (deliberately unusable) claude path: %v", err)
+	}
+	if snap.FiveHour.Percent != 42 || snap.Weekly.Percent != 9 {
+		t.Fatalf("snap=%+v, want the persisted fresh snapshot reused byte-for-byte", snap)
+	}
+}
+
+// TestProbeCrossProcessRefreshLockRespectsContextCancellation fixes that
+// lockRefresh -- unlike lockProbeIdentityFile's single blocking
+// unix.Flock, safe there only because an identity transaction is always
+// short -- must not block past its caller's own ctx: a refresh
+// transaction can legitimately hold this lock for as long as a full
+// Claude round trip takes, so Usage(ctx)'s cancellation contract must
+// keep working while waiting for it. The lock is held here directly
+// (rather than by driving a full, slow Usage() call) for a fast,
+// deterministic proof: the elapsed time bound below only needs to rule
+// out "blocked until the lock was released" (which never happens in this
+// test), not race any real timing.
+func TestProbeCrossProcessRefreshLockRespectsContextCancellation(t *testing.T) {
+	probeDir := t.TempDir()
+	holder := newFastProbe("claude", probeDir)
+	unlock, err := holder.lockRefresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	waiter := newFastProbe("claude", probeDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err = waiter.lockRefresh(ctx)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("lockRefresh took %s to respect context cancellation (deadline was 200ms) -- it must poll and return promptly, not block until the lock is released", elapsed)
 	}
 }
