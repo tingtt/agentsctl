@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 )
 
 // UsageCollectorCommand is the hidden subcommand name cmd/agentsctl/main.go
@@ -43,7 +45,7 @@ func RunUsageCollector(args []string, stdin io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("%s: parse statusLine payload: %w", UsageCollectorCommand, err)
 	}
-	if err := writeUsageSnapshotAtomic(*out, snap); err != nil {
+	if err := probestate.NewSnapshotStore(*out).Save(snap); err != nil {
 		return fmt.Errorf("%s: write snapshot: %w", UsageCollectorCommand, err)
 	}
 	return nil

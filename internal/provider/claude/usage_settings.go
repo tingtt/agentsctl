@@ -2,6 +2,8 @@ package claude
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -58,7 +60,43 @@ func writeUsageSettings(settingsPath, exePath, snapshotPath string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(settingsPath, b)
+	return writeSettingsFileAtomic(settingsPath, b)
+}
+
+// writeSettingsFileAtomic writes data to path via a temp-file-plus-rename
+// swap, so a concurrent reader never observes a partially-written
+// settings.json. This package's other persisted state (the probe identity
+// and usage snapshot) has its own copy of this same pattern inside
+// probestate, which owns those files' mutation authority; settings.json
+// carries no such ownership concern (it is rewritten idempotently on every
+// refresh attempt, never read-modify-written), so it keeps this small,
+// self-contained helper rather than reaching into probestate for it.
+func writeSettingsFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // shellQuote wraps value in single quotes for safe inclusion in the shell

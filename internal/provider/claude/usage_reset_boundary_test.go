@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -16,7 +17,7 @@ import (
 // just confirms the field-by-field mapping.
 func TestToSessionUsageWindowIsAPureShapeConversion(t *testing.T) {
 	reset := time.Date(2026, 9, 7, 15, 0, 0, 0, time.UTC)
-	got := toSessionUsageWindow(usageWindowSnapshot{State: session.UsageAvailable, Percent: 92, ResetAt: reset})
+	got := toSessionUsageWindow(probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 92, ResetAt: reset})
 	want := session.UsageWindow{State: session.UsageAvailable, Percent: 92, Reset: reset}
 	if got != want {
 		t.Fatalf("got=%+v, want %+v", got, want)
@@ -33,9 +34,9 @@ func TestToSessionUsageWindowIsAPureShapeConversion(t *testing.T) {
 func TestToSessionUsageAppliesResetBoundaryViaSessionUsageAt(t *testing.T) {
 	reset := time.Date(2026, 9, 7, 15, 0, 0, 0, time.UTC)
 	now := reset.Add(1 * time.Minute)
-	snap := usageSnapshot{
-		FiveHour: usageWindowSnapshot{State: session.UsageAvailable, Percent: 92, ResetAt: reset},
-		Weekly:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 84, ResetAt: time.Date(2026, 9, 13, 5, 0, 0, 0, time.UTC)},
+	snap := probestate.Snapshot{
+		FiveHour: probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 92, ResetAt: reset},
+		Weekly:   probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 84, ResetAt: time.Date(2026, 9, 13, 5, 0, 0, 0, time.UTC)},
 	}
 	got := toSessionUsage(snap, now)
 	if got.FiveHour.State != session.UsageUnknown {
@@ -53,7 +54,7 @@ func TestToSessionUsageAppliesResetBoundaryViaSessionUsageAt(t *testing.T) {
 func TestToSessionUsageExhaustedAfterResetBecomesUnknown(t *testing.T) {
 	reset := time.Date(2026, 9, 7, 15, 0, 0, 0, time.UTC)
 	now := reset.Add(1 * time.Minute)
-	snap := usageSnapshot{FiveHour: usageWindowSnapshot{State: session.UsageExhausted, Percent: 100, ResetAt: reset}}
+	snap := probestate.Snapshot{FiveHour: probestate.WindowSnapshot{State: session.UsageExhausted, Percent: 100, ResetAt: reset}}
 	got := toSessionUsage(snap, now)
 	if got.FiveHour.State != session.UsageUnknown {
 		t.Fatalf("FiveHour=%+v, want Unknown -- exhausted must not survive its own known reset boundary", got.FiveHour)

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -17,7 +18,7 @@ func TestRunUsageCollectorParsesStdinAndWritesSnapshot(t *testing.T) {
 	if err := RunUsageCollector([]string{"--out", out}, stdin); err != nil {
 		t.Fatal(err)
 	}
-	snap, ok, err := readUsageSnapshot(out)
+	snap, ok, err := probestate.NewSnapshotStore(out).Load()
 	if err != nil || !ok {
 		t.Fatalf("readUsageSnapshot ok=%v err=%v", ok, err)
 	}

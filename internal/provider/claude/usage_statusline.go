@@ -5,6 +5,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -79,12 +80,12 @@ type statusLineWindow struct {
 // prompt per probe process, then detaches (see Probe's doc comment), so
 // there is never a second turn within the same process for a cumulative
 // count to conflate with the first.
-func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
+func parseStatusLinePayload(raw []byte) (probestate.Snapshot, error) {
 	var payload statusLinePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return usageSnapshot{}, err
+		return probestate.Snapshot{}, err
 	}
-	snap := usageSnapshot{
+	snap := probestate.Snapshot{
 		ObservedAt:       time.Now(),
 		ResponseObserved: payload.Cost != nil && payload.Cost.TotalAPIDurationMs > 0,
 	}
@@ -102,11 +103,11 @@ func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
 // matching Codex's own rateLimitWindow contract (see
 // provider/codex.rateLimitWindow) so both providers draw the same
 // distinction between "reported 0%" and "not reported".
-func toUsageWindowSnapshot(w *statusLineWindow) usageWindowSnapshot {
+func toUsageWindowSnapshot(w *statusLineWindow) probestate.WindowSnapshot {
 	if w == nil {
-		return usageWindowSnapshot{}
+		return probestate.WindowSnapshot{}
 	}
-	return usageWindowSnapshot{
+	return probestate.WindowSnapshot{
 		State:   session.UsageAvailable,
 		Percent: int(math.Round(w.UsedPercentage)),
 		ResetAt: time.Unix(w.ResetsAt, 0),

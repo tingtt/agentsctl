@@ -3,10 +3,48 @@
 package claude
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"sync"
 )
+
+// probeSessionConflictPhrase is the Claude CLI's own error text when a
+// --session-id is rejected as already connected elsewhere -- confirmed
+// against the installed CLI (2.1.263) via a live reproduction of Issue
+// #19's follow-up "claude ?% / ?% それ自体が全く更新されない" symptom: a real
+// installed agentsctl's persisted probe session ID had become permanently
+// rejected ("Error: Session ID <uuid> is already in use."), printed to
+// the probe's own terminal output immediately on startup (well within the
+// settle delay, before any prompt is ever sent), and every subsequent
+// refresh attempt using that same session ID failed identically and
+// indefinitely -- reproduced twice in a row with no change. Rotating to a
+// brand-new identity (see probestate.IdentityStore.Rotate) and retrying
+// was confirmed, against the same real installed CLI, to succeed
+// immediately.
+const probeSessionConflictPhrase = "is already in use"
+
+// errProbeSessionConflict is the sentinel a probe attempt's error wraps
+// when probeSessionConflict classifies a refresh's captured output as
+// Claude Code rejecting the session ID used -- see
+// probeSessionConflictPhrase's doc comment. Kept distinguishable via
+// errors.Is (never by re-parsing an error string) specifically so the
+// refresh coordinator can react to this one failure mode -- and only this
+// one -- with an identity rotation and a single bounded retry, while every
+// other attempt failure (timeout, parse failure, process launch failure,
+// ...) falls straight through to the existing stale-cache fallback
+// untouched.
+var errProbeSessionConflict = errors.New("claude usage probe: session id rejected as already in use")
+
+// probeSessionConflict reports whether output shows Claude Code rejecting
+// this probe's --session-id as already in use elsewhere -- see
+// probeSessionConflictPhrase's doc comment. This is a process/session-
+// identity-level signal, unrelated to classifyProbeOutput's usage-limit
+// wording (a different failure mode entirely, checked separately by the
+// attempt runner).
+func probeSessionConflict(output string) bool {
+	return strings.Contains(output, probeSessionConflictPhrase)
+}
 
 // probeLimitSignal is the Claude provider boundary's classification of a
 // probe session's terminal output into per-window usage-limit evidence

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	base "github.com/tingtt/agentsctl/internal/provider"
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -116,7 +117,7 @@ func forceStaleCache(t *testing.T, pr *Probe) {
 	pr.mu.Lock()
 	pr.snapshotAt = stale
 	pr.mu.Unlock()
-	snap, ok, err := readUsageSnapshot(pr.snapshotPath())
+	snap, ok, err := probestate.NewSnapshotStore(pr.snapshotPath()).Load()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +125,7 @@ func forceStaleCache(t *testing.T, pr *Probe) {
 		return
 	}
 	snap.ObservedAt = stale
-	if err := writeUsageSnapshotAtomic(pr.snapshotPath(), snap); err != nil {
+	if err := probestate.NewSnapshotStore(pr.snapshotPath()).Save(snap); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -693,7 +694,7 @@ func fakeSubmittedLines(t *testing.T, fakeDir string) []string {
 // guaranteed to trigger again soon. It also fixes the trust-state pitfall
 // discarding (rather than rotating) an identity would reintroduce:
 // workspace trust is remembered by Claude Code per probe *directory*, not
-// per session ID (see probeIdentity's doc comment), so a probe directory
+// per session ID (see probestate.Identity's doc comment), so a probe directory
 // already trusted under the rejected ID must still be treated as trusted
 // under the rotated one -- verified directly here, not just inferred from
 // the call succeeding (see this fake CLI's own leniency note on
@@ -711,11 +712,11 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 	if err := os.WriteFile(filepath.Join(probeDir, ".fake-claude-trust-accepted"), []byte("trusted"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rejectedID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	rejectedID, err := probestate.NewIdentityStore(pr.identityPath()).LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := markTrustAccepted(pr.identityPath()); err != nil {
+	if err := probestate.NewIdentityStore(pr.identityPath()).MarkTrustAccepted(); err != nil {
 		t.Fatal(err)
 	}
 	writeFakeSessionConflict(t, fakeDir, "Error: Session ID "+rejectedID.SessionID+" is already in use.\r\n")
@@ -737,7 +738,7 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 		t.Fatalf("got=%+v, want Available/10%% from a single Usage() call that recovers internally", got.FiveHour)
 	}
 
-	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	newID, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("no identity after recovery: ok=%v err=%v", ok, err)
 	}
@@ -796,7 +797,7 @@ func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t
 	// Deliberately untrusted starting state: no persisted identity yet
 	// (loadOrCreateProbeIdentity mints one with TrustAccepted:false below),
 	// and no directory-level trust marker for the fake CLI either.
-	origID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	origID, err := probestate.NewIdentityStore(pr.identityPath()).LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -822,7 +823,7 @@ func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t
 		t.Fatalf("got=%+v, want Available/20%% from a single Usage() call that recovers internally", got.FiveHour)
 	}
 
-	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	newID, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("no identity after recovery: ok=%v err=%v", ok, err)
 	}
@@ -872,7 +873,7 @@ func TestProbeSessionConflictRetryIsBoundedToOneRotation(t *testing.T) {
 	pr := newFastProbe(fakeClaudePath(t), probeDir)
 	pr.ExePath = probeExePath(t)
 
-	origID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	origID, err := probestate.NewIdentityStore(pr.identityPath()).LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -892,7 +893,7 @@ func TestProbeSessionConflictRetryIsBoundedToOneRotation(t *testing.T) {
 		t.Fatalf("fake CLI invocations=%d, want exactly 2 (the original attempt plus one rotation retry, no third attempt)", got)
 	}
 
-	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	newID, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("no identity after the bounded retry: ok=%v err=%v", ok, err)
 	}
@@ -913,7 +914,7 @@ func TestProbeUnrelatedFailureDoesNotRotateIdentity(t *testing.T) {
 	pr := newFastProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
 	pr.ExePath = probeExePath(t)
 
-	id, err := loadOrCreateProbeIdentity(pr.identityPath())
+	id, err := probestate.NewIdentityStore(pr.identityPath()).LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +927,7 @@ func TestProbeUnrelatedFailureDoesNotRotateIdentity(t *testing.T) {
 		t.Fatalf("err=%v, a process-launch failure must not be misclassified as a session conflict", err)
 	}
 
-	stillID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	stillID, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("identity missing after an unrelated failure: ok=%v err=%v", ok, err)
 	}
@@ -989,7 +990,7 @@ func TestProbeConcurrentUsageSingleFlightsRefresh(t *testing.T) {
 	// was created (loadOrCreateProbeIdentity mints a session ID exactly
 	// once and every concurrent refresh attempt would otherwise race to
 	// create their own).
-	id, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	id, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("identity ok=%v err=%v", ok, err)
 	}
@@ -1077,11 +1078,11 @@ func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
 	probeDir := t.TempDir()
 	pr1 := newFastProbe("claude", probeDir)
 
-	orig, err := loadOrCreateProbeIdentity(pr1.identityPath())
+	orig, err := probestate.NewIdentityStore(pr1.identityPath()).LoadOrCreate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovery, err := rotateProbeIdentity(pr1.identityPath(), orig.SessionID)
+	recovery, err := probestate.NewIdentityStore(pr1.identityPath()).Rotate(orig.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1151,7 +1152,7 @@ func TestFakeCLIRejectsPromptWithoutTrustDialogAccept(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	if _, ok, _ := readUsageSnapshot(snapshotPath); ok {
+	if _, ok, _ := probestate.NewSnapshotStore(snapshotPath).Load(); ok {
 		t.Fatal("a prompt sent without accepting the trust dialog first produced a snapshot -- the fake CLI's trust gate isn't actually enforcing anything")
 	}
 	_ = cmd.Process.Kill()
@@ -1201,10 +1202,10 @@ func TestProbeReusesSameSessionIDAcrossRefreshes(t *testing.T) {
 }
 
 // TestProbeTrustAcceptedPersistsAfterFirstRefresh fixes that
-// probeIdentity.TrustAccepted is actually durably set once the very first
-// refresh has attempted to answer the trust dialog, matching
-// usage_identity_test.go's unit coverage of markTrustAccepted but proven
-// here through the real refresh path end to end.
+// probestate.Identity.TrustAccepted is actually durably set once the very
+// first refresh has attempted to answer the trust dialog, matching
+// probestate's own unit coverage of MarkTrustAccepted but proven here
+// through the real refresh path end to end.
 func TestProbeTrustAcceptedPersistsAfterFirstRefresh(t *testing.T) {
 	fakeDir := t.TempDir()
 	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
@@ -1218,7 +1219,7 @@ func TestProbeTrustAcceptedPersistsAfterFirstRefresh(t *testing.T) {
 	if _, err := pr.Usage(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	id, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	id, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
 	if err != nil || !ok {
 		t.Fatalf("identity ok=%v err=%v", ok, err)
 	}
@@ -1267,7 +1268,7 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok, err := readUsageSnapshot(pr.snapshotPath()); err != nil || !ok {
+	if _, ok, err := probestate.NewSnapshotStore(pr.snapshotPath()).Load(); err != nil || !ok {
 		t.Fatalf("no snapshot after refresh: ok=%v err=%v", ok, err)
 	}
 	// The fake CLI records itself into claude.json while running; once
@@ -1303,11 +1304,11 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 // giving the new instance an unusable claude path.
 func TestProbePersistedFreshSnapshotSkipsRefreshOnNewInstance(t *testing.T) {
 	probeDir := t.TempDir()
-	want := usageSnapshot{
-		FiveHour:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Unix(4102444800, 0)},
+	want := probestate.Snapshot{
+		FiveHour:   probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Unix(4102444800, 0)},
 		ObservedAt: time.Now(),
 	}
-	if err := writeUsageSnapshotAtomic(filepath.Join(probeDir, "usage.json"), want); err != nil {
+	if err := probestate.NewSnapshotStore(filepath.Join(probeDir, "usage.json")).Save(want); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1318,6 +1319,23 @@ func TestProbePersistedFreshSnapshotSkipsRefreshOnNewInstance(t *testing.T) {
 	}
 	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 42 {
 		t.Fatalf("got=%+v, want the persisted 42%% snapshot", got)
+	}
+}
+
+// writeRawSnapshot writes raw JSON text directly to path -- used by the
+// legacy-schema migration tests below to place a persisted document
+// shaped exactly like what a pre-#19 agentsctl build would have written,
+// bypassing probestate.SnapshotStore.Save (which can only ever produce the
+// current schema). probestate's own package tests cover the decode rule
+// in isolation; the two tests here exercise the same legacy compatibility
+// through the full Probe.Usage() path end to end.
+func writeRawSnapshot(t *testing.T, path, raw string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1380,11 +1398,11 @@ func TestProbePersistedStaleSnapshotOnNewInstanceStillRefreshes(t *testing.T) {
 		"five_hour": map[string]any{"used_percentage": 99, "resets_at": 4102444800},
 	})
 	probeDir := t.TempDir()
-	stale := usageSnapshot{
-		FiveHour:   usageWindowSnapshot{State: session.UsageAvailable, Percent: 1, ResetAt: time.Unix(4102444800, 0)},
+	stale := probestate.Snapshot{
+		FiveHour:   probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 1, ResetAt: time.Unix(4102444800, 0)},
 		ObservedAt: time.Now().Add(-2 * usageProbeTTL),
 	}
-	if err := writeUsageSnapshotAtomic(filepath.Join(probeDir, "usage.json"), stale); err != nil {
+	if err := probestate.NewSnapshotStore(filepath.Join(probeDir, "usage.json")).Save(stale); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1509,13 +1527,13 @@ func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClau
 	pr := newFastProbe(filepath.Join(t.TempDir(), "no-such-claude-binary"), probeDir)
 	pr.ExePath = probeExePath(t)
 
-	fresh := usageSnapshot{
-		FiveHour:         usageWindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Now().Add(time.Hour)},
-		Weekly:           usageWindowSnapshot{State: session.UsageAvailable, Percent: 9, ResetAt: time.Now().Add(24 * time.Hour)},
+	fresh := probestate.Snapshot{
+		FiveHour:         probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 42, ResetAt: time.Now().Add(time.Hour)},
+		Weekly:           probestate.WindowSnapshot{State: session.UsageAvailable, Percent: 9, ResetAt: time.Now().Add(24 * time.Hour)},
 		ObservedAt:       time.Now(),
 		ResponseObserved: true,
 	}
-	if err := writeUsageSnapshotAtomic(pr.snapshotPath(), fresh); err != nil {
+	if err := probestate.NewSnapshotStore(pr.snapshotPath()).Save(fresh); err != nil {
 		t.Fatal(err)
 	}
 
