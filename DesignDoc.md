@@ -204,6 +204,68 @@ _Limit detection (#19)_ — Claude Code の `statusLine` は `refreshInterval` �
 
 _Reset boundary (#19)_ — cache 上の snapshot は、それが observe された時点の usage window に対してのみ有効な値である。この判定ルールは Claude provider 内に閉じず、provider-neutral `session.UsageWindow.At(now)` / `session.Usage.At(now)` として一箇所に定義する: window ごとに独立して「現在時刻が、その reading が持つ `Reset` 時刻を過ぎていないか」を確認し、過ぎていれば `UsageAvailable`/`UsageExhausted` を問わず `UsageUnknown` として扱う — reset 前の percentage や exhausted state を、reset を跨いだ新しい window の値として維持することはない。Claude provider は自身の cache を `session.Usage` へ変換する際にこの `At` を一度適用し (`toSessionUsageWindow` 自体は reset 判定を持たない純粋な shape 変換)、Agent View はさらに自分の read/render 時点でも同じ `At` を再適用する (`usageWindowText`) — provider 側の refresh が起きていなくても、State に保持され続けている値が reset boundary を跨いだ後は次の render で `?%` になる。両者が同じ method を呼ぶことで、「Claude provider 内では正規化済みだが Agent View state 内では expiry 済み」というズレを防ぐ。`now` は `time.Now()` を各所に散らすのではなく `Probe.Clock` という単一の injection point を通す (Claude 側の deterministic test のため)。5h と weekly は互いに独立に評価され、片方が reset boundary を跨いでも、もう片方のまだ有効な snapshot には影響しない。
 
+##### Claude probe: resource ownership とライフサイクル
+
+Claude usage probe が扱う machine-global / process-local resource の owner を固定する。実装のクラス名は将来変わりうるが、ownership の構造自体 (「どこからでも読み書きできる」を作らないこと) は変えない。
+
+| Resource                                                          | Scope          | Owner                     |
+| ------------------------------------------------------------------ | -------------- | -------------------------- |
+| probe identity (session ID・retired ownership・trust metadata、`probe.json`) | machine-global | `probestate.IdentityStore` |
+| persisted usage snapshot (`usage.json`)                            | machine-global | `probestate.SnapshotStore` |
+| Claude probe session の実行そのもの (refresh lock・freshness re-check・retry/rotation lifecycle・persist) | machine-global | refresh coordinator        |
+| in-memory snapshot cache                                           | process-local  | `Probe`                     |
+| in-process refresh single-flight                                   | process-local  | `Probe`                     |
+| 1回の Claude PTY attempt (settings・PTY・settle・trust 送信・prompt 送信・detach) | attempt-local  | attempt runner              |
+
+**Mutation authority**
+
+- `probe.json` への書き込みは `probestate.IdentityStore` の domain operation (`LoadOrCreate` / `MarkTrustAccepted` / `Rotate`) を経由してのみ発生する。生の read-modify-write を組み立てられる箇所は `probestate` package の外には存在しない -- transaction lock (`probe.json.lock`) は同 package 内の実装詳細として閉じる。
+- `usage.json` への書き込みは `probestate.SnapshotStore.Save` のみが行う。legacy schema decode (`available bool` → `state`) も同じ persistence boundary の内部に閉じ、domain/orchestration code は wire schema を意識しない。
+- freshness (TTL) 判定は `probestate.SnapshotFresh(observedAt, now, ttl)` という1つの pure policy にのみ定義し、process-local cache の freshness 判定と machine-global の persisted snapshot re-check の両方がこれを呼ぶ (どちらも実時刻ベースで、テスト用の `Probe.Clock` は reset boundary 判定にのみ使う -- OS wait/timeout や TTL freshness のような wall-clock 由来の判断まで無理に testable clock 化はしない)。reset boundary 判定は従来通り provider-neutral `session.Usage.At` に一本化されたまま。
+
+**Refresh lifecycle (owner: refresh coordinator)**
+
+```text
+Usage
+│
+├─ local fresh cache (Probe)
+│    └─ return
+│
+└─ stale/missing
+     ↓
+process single-flight (Probe)
+     ↓
+machine refresh lock (coordinator)
+     ↓
+persisted snapshot re-check (coordinator -> SnapshotStore)
+│
+├─ fresh
+│    └─ reuse
+│
+└─ stale/missing
+     ↓
+identity load/create (coordinator -> IdentityStore)
+     ↓
+attempt #1 (attempt runner)
+     │
+     ├─ success            -> persist snapshot
+     ├─ exhausted           -> persist exhausted snapshot
+     ├─ session conflict    -> IdentityStore.Rotate -> attempt #2 -> persist regardless of outcome
+     └─ other failure       -> stale/error fallback (no rotation)
+```
+
+retry/rotation policy は coordinator だけが所有する。attempt runner 自身は retry しない。session conflict は attempt runner が probe session の出力を分類して返すだけであり、rotate するかどうかの判断は coordinator が行う。
+
+**Lock ordering**
+
+refresh lock (coordinator) を先に取得し、その内側で identity lock (`probestate.IdentityStore` の内部実装詳細) を都度取得・解放する。逆順 (identity lock を保持したまま refresh lock を待つ) は発生しない -- identity lock を握れるのは `IdentityStore` の domain operation 実行中だけであり、それらは常に coordinator の refresh lock 配下からしか呼ばれない。
+
+`Provider.List` の読み取り専用アクセス (`IdentityStore.KnownSessionIDs`) はどちらの lock も取得しない -- atomic rename により、読み取りは常に transaction 前後どちらかの完全な状態のみを見る。
+
+**TrustAccepted の意味**
+
+`TrustAccepted` は Claude ディレクトリ自体の trust state の source of truth ではない。agentsctl が workspace trust flow (dialog への応答) を一度完了し、同じ blind keystroke を再送しないために保持するローカル metadata であり、常にこの意味でのみ扱う。
+
 ##### Prompt stash
 
 Composer は、1つの共有 prompt stash を持つ。
