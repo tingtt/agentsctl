@@ -137,6 +137,34 @@ def probe_session(session_id, settings_flag):
             if got != TRUST_DIALOG_ACCEPT:
                 return  # the default "No, exit" was effectively selected
             trust_marker.write_text("trusted")
+            # Recorded into the same per-invocation log a real submitted
+            # chat line goes into (see below) -- so a test can see, in
+            # order, exactly what raw input every attempt actually
+            # consumed: trust-dialog bytes on a first-contact attempt,
+            # real prompt text on a later, already-trusted one.
+            with (root / "submitted_lines.log").open("a") as f:
+                f.write(got.hex() + "\n")
+
+            # session_conflict_after_trust.txt models Issue #19's
+            # TrustAccepted race: a session conflict that only becomes
+            # observable AFTER this invocation has just accepted the
+            # workspace-trust dialog (by which point agentsctl's own Go
+            # side has already durably persisted TrustAccepted:true --
+            # see markTrustAccepted's doc comment, called unconditionally
+            # right after the trust-dialog write succeeds, before this
+            # invocation ever gets to process a real prompt line) -- as
+            # opposed to session_conflict.txt/session_conflict_session_ids.txt
+            # above, which model a conflict observable immediately on
+            # startup, before any trust interaction at all. Exercises
+            # that rotateProbeIdentity must carry forward the trust state
+            # actually persisted during THIS attempt, not whatever the
+            # caller's own in-memory identity copy looked like before the
+            # attempt started.
+            after_trust_conflict_path = root / "session_conflict_after_trust.txt"
+            if after_trust_conflict_path.exists():
+                os.write(1, after_trust_conflict_path.read_bytes())
+                termios.tcsetattr(0, termios.TCSADRAIN, old)
+                sys.exit(1)
 
         os.write(1, b"FAKE CLAUDE PROBE ATTACHED\r\n")
         while True:
@@ -163,6 +191,15 @@ def probe_session(session_id, settings_flag):
                 first_line_path = root / "first_submitted_line.bin"
                 if not first_line_path.exists():
                     first_line_path.write_bytes(buf)
+                # submitted_lines.log is first_submitted_line.bin's per-
+                # invocation counterpart: one hex-encoded line appended
+                # per submitted line, across every probe_session
+                # invocation in a test (not just the very first) -- so a
+                # test can inspect a SPECIFIC attempt's submission (e.g.
+                # "what did attempt #2, after rotation, actually send")
+                # rather than only ever the first one that ever happened.
+                with (root / "submitted_lines.log").open("a") as f:
+                    f.write(buf.hex() + "\n")
                 # limit_banner.txt (usage_probe_unix_test.go's limit-
                 # detection fixtures) stands in for the real CLI hitting a
                 # 5h/weekly usage limit: verified against the installed

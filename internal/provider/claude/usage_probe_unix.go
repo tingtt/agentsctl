@@ -349,6 +349,16 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 // unchanged. If rotation itself fails (a persistence error, not a
 // conflict), the original conflict error is returned rather than
 // attempting a retry with no valid new identity to use.
+//
+// rotateProbeIdentity is deliberately called with no identity argument of
+// its own -- it re-reads the persisted file rather than rotating from the
+// `id` this function loaded before calling refreshOnce. refreshOnce can
+// itself durably persist a TrustAccepted:true partway through the very
+// attempt that goes on to hit a conflict (a conflict surfacing right
+// after the workspace-trust dialog was just answered); rotating from this
+// function's own now-possibly-stale `id` copy instead of the current
+// on-disk record would silently lose that update (see rotateProbeIdentity's
+// own doc comment for the full race).
 func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error) {
 	id, err := loadOrCreateProbeIdentity(pr.identityPath())
 	if err != nil {
@@ -358,7 +368,7 @@ func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error)
 	if err == nil || !errors.Is(err, errProbeSessionConflict) {
 		return snap, err
 	}
-	rotated, rerr := rotateProbeIdentity(pr.identityPath(), id)
+	rotated, rerr := rotateProbeIdentity(pr.identityPath())
 	if rerr != nil {
 		return usageSnapshot{}, err
 	}

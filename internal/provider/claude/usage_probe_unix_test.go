@@ -4,6 +4,7 @@ package claude
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -227,6 +228,24 @@ func writeFakeLimitBanner(t *testing.T, dir, banner string) {
 func writeFakeSessionConflict(t *testing.T, dir, banner string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "session_conflict.txt"), []byte(banner), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeFakeSessionConflictAfterTrust seeds
+// AGENTSCTL_FAKE_DIR/session_conflict_after_trust.txt, the fixture the
+// fake CLI writes to its own pty output (then exits) immediately after
+// accepting the workspace-trust dialog for the first time, instead of
+// ever reaching a real prompt -- standing in for a session conflict that
+// only becomes observable after this probe attempt has already durably
+// persisted TrustAccepted:true (see markTrustAccepted, called
+// unconditionally right after the trust-dialog write succeeds). See the
+// fake CLI's own doc comment on this fixture for why it's distinct from
+// writeFakeSessionConflict (which fires before any trust interaction at
+// all).
+func writeFakeSessionConflictAfterTrust(t *testing.T, dir, banner string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "session_conflict_after_trust.txt"), []byte(banner), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -627,6 +646,34 @@ func fakeProbeInvocationCount(t *testing.T, fakeDir string) int {
 	return len(lines)
 }
 
+// fakeSubmittedLines decodes the fake CLI's submitted_lines.log (see its
+// own doc comment) into the raw bytes actually submitted on each
+// probe_session invocation, in order -- unlike first_submitted_line.bin
+// (which only ever records the very first one across a whole test), this
+// lets a test inspect a SPECIFIC attempt's submission directly.
+func fakeSubmittedLines(t *testing.T, fakeDir string) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(fakeDir, "submitted_lines.log"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	for _, hexLine := range strings.Split(strings.TrimRight(string(b), "\n"), "\n") {
+		if hexLine == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(hexLine)
+		if err != nil {
+			t.Fatalf("submitted_lines.log entry %q is not valid hex: %v", hexLine, err)
+		}
+		lines = append(lines, string(raw))
+	}
+	return lines
+}
+
 // TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust
 // fixes Issue #19's follow-up review: recovery from a permanently
 // rejected --session-id ("Session ID ... is already in use") must happen
@@ -705,6 +752,101 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 	}
 	if !strings.HasPrefix(string(firstLine), usageProbePrompt) {
 		t.Fatalf("first submitted line=%q, want it to start with the real probe prompt", firstLine)
+	}
+}
+
+// TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust
+// fixes the specific TrustAccepted race the review above missed:
+// TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust only
+// ever starts from an identity ALREADY marked TrustAccepted:true, so
+// refreshOnce's own `if !id.TrustAccepted` branch (and therefore the
+// trust-dialog write and the markTrustAccepted call right after it) never
+// runs at all in that test -- it cannot catch a rotation that carries
+// forward a caller's stale, pre-attempt copy of TrustAccepted instead of
+// whatever refreshOnce most recently persisted.
+//
+// Here the identity starts genuinely untrusted (TrustAccepted:false, and
+// Claude Code's own directory-level trust marker absent too), so attempt
+// #1 must actually answer the trust dialog for the first time -- which
+// durably persists TrustAccepted:true via markTrustAccepted -- and ONLY
+// THEN does the conflict become observable (see
+// writeFakeSessionConflictAfterTrust), before that attempt ever reaches a
+// real prompt. refreshWithRecovery's `id` copy, loaded before attempt #1
+// ran, is still TrustAccepted:false at this point -- proving
+// rotateProbeIdentity must read the current on-disk record (which
+// already has TrustAccepted:true) rather than rotating from that stale
+// copy, or the assertions below would fail.
+func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t *testing.T) {
+	fakeDir := t.TempDir()
+	t.Setenv("AGENTSCTL_FAKE_DIR", fakeDir)
+	probeDir := t.TempDir()
+	pr := newFastProbe(fakeClaudePath(t), probeDir)
+	pr.ExePath = probeExePath(t)
+
+	// Deliberately untrusted starting state: no persisted identity yet
+	// (loadOrCreateProbeIdentity mints one with TrustAccepted:false below),
+	// and no directory-level trust marker for the fake CLI either.
+	origID, err := loadOrCreateProbeIdentity(pr.identityPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if origID.TrustAccepted {
+		t.Fatalf("origID=%+v, want a freshly-minted identity to start untrusted", origID)
+	}
+
+	writeFakeSessionConflictAfterTrust(t, fakeDir, "Error: Session ID "+origID.SessionID+" is already in use.\r\n")
+	// Scope the rejection to the original identity only, so attempt #2
+	// (the rotated identity) can succeed.
+	if err := os.WriteFile(filepath.Join(fakeDir, "session_conflict_session_ids.txt"), []byte(origID.SessionID+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeRateLimits(t, fakeDir, map[string]any{
+		"five_hour": map[string]any{"used_percentage": 20, "resets_at": 4102444800},
+	})
+
+	got, err := pr.Usage(context.Background())
+	if err != nil {
+		t.Fatalf("Usage() errored instead of self-healing a conflict discovered right after trust acceptance: %v", err)
+	}
+	if got.FiveHour.State != session.UsageAvailable || got.FiveHour.Percent != 20 {
+		t.Fatalf("got=%+v, want Available/20%% from a single Usage() call that recovers internally", got.FiveHour)
+	}
+
+	newID, ok, err := readProbeIdentityIfExists(pr.identityPath())
+	if err != nil || !ok {
+		t.Fatalf("no identity after recovery: ok=%v err=%v", ok, err)
+	}
+	if newID.SessionID == origID.SessionID {
+		t.Fatal("recovery must rotate to a new session id, not reuse the rejected one")
+	}
+	// The crucial assertion: TrustAccepted must reflect what refreshOnce
+	// actually persisted moments earlier in this very Usage() call, not
+	// origID's stale (pre-attempt) copy.
+	if !newID.TrustAccepted {
+		t.Fatal("TrustAccepted must be preserved across rotation even though it only became true DURING the very attempt that hit the conflict -- rotation must read the current persisted identity, not a caller's stale in-memory copy")
+	}
+
+	// Direct, per-attempt proof: attempt #1 sent the trust-dialog accept
+	// bytes (expected -- it genuinely needed to, this was a real first
+	// contact with an untrusted directory), and attempt #2 -- now
+	// trusted, per the identity's own TrustAccepted:true above -- sent
+	// the real prompt directly, never re-sending the trust bytes.
+	lines := fakeSubmittedLines(t, fakeDir)
+	if len(lines) != 2 {
+		t.Fatalf("submitted lines=%v, want exactly 2 (attempt #1's trust accept, attempt #2's real prompt)", lines)
+	}
+	if lines[0] != usageProbeTrustDialogAccept {
+		t.Fatalf("attempt #1 submitted=%q, want the trust-dialog accept bytes", lines[0])
+	}
+	if lines[1] == usageProbeTrustDialogAccept {
+		t.Fatal("attempt #2 (post-rotation) must not resend the blind trust-dialog keystroke into an already-trusted composer")
+	}
+	if !strings.HasPrefix(lines[1], usageProbePrompt) {
+		t.Fatalf("attempt #2 submitted=%q, want it to start with the real probe prompt", lines[1])
+	}
+
+	if got := fakeProbeInvocationCount(t, fakeDir); got != 2 {
+		t.Fatalf("fake CLI invocations=%d, want exactly 2 (bounded retry preserved for this scenario too)", got)
 	}
 }
 

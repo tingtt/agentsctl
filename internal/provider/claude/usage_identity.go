@@ -98,10 +98,15 @@ func readProbeIdentityIfExists(path string) (probeIdentity, bool, error) {
 
 // loadOrCreateProbeIdentity reads path's persisted probe identity, or
 // creates and persists a brand-new one (a fresh random session ID,
-// TrustAccepted: false) if none exists yet. This is the only place a new
-// probe session ID is ever minted -- called at most once per app-data
+// TrustAccepted: false) if none exists yet. This is the ordinary,
+// expected path a new probe session ID is minted on -- once per app-data
 // directory's lifetime, after which every refresh reuses the same
-// identity (see the DesignDoc's "probe session は最大1つだけ存在する").
+// identity (see the DesignDoc's "probe session は最大1つだけ存在する"). The
+// only other place a new SessionID is ever minted is rotateProbeIdentity,
+// an exceptional replacement for a specific identity Claude Code has
+// permanently rejected (see probeSessionConflict) -- unlike this
+// function, that one never creates an identity from nothing; it only
+// ever replaces an already-existing one.
 func loadOrCreateProbeIdentity(path string) (probeIdentity, error) {
 	if id, ok, err := readProbeIdentityIfExists(path); err != nil {
 		return probeIdentity{}, fmt.Errorf("decode claude usage probe identity: %w", err)
@@ -176,23 +181,46 @@ func probeSessionConflict(output string) bool {
 
 // rotateProbeIdentity replaces path's persisted identity with a freshly
 // minted SessionID, carrying DisplayName and -- critically -- TrustAccepted
-// forward unchanged from old (see probeIdentity's own doc comment for why
+// forward unchanged (see probeIdentity's own doc comment for why
 // TrustAccepted survives a rotation: it belongs to the probe *directory*,
 // which a rotation never changes, not to the SessionID being replaced).
 // This is the only recovery available once Claude Code has permanently
 // rejected an identity's SessionID (see probeSessionConflict): the
 // probe's design of otherwise reusing one persisted identity forever has
 // no other way to recover from a rejection that never clears on its own.
-func rotateProbeIdentity(path string, old probeIdentity) (probeIdentity, error) {
+//
+// It deliberately re-reads path itself rather than taking the caller's
+// own probeIdentity value as the record to rotate from: a caller like
+// Probe.refreshWithRecovery loaded its copy before calling
+// Probe.refreshOnce, and refreshOnce can itself persist a TrustAccepted
+// update (see markTrustAccepted) partway through that same attempt --
+// specifically, a session conflict can surface right after the
+// workspace-trust dialog was just answered, before the attempt otherwise
+// succeeds. Rotating from the caller's now-stale in-memory copy would
+// silently regress a TrustAccepted:true that was already durably
+// persisted moments earlier, resending the blind trust-dialog keystroke
+// sequence into what Claude Code already considers a trusted directory's
+// live chat composer on the very next attempt. Reading the current
+// on-disk record instead makes the persisted file -- not any particular
+// caller's possibly-outdated copy -- the single source of truth for what
+// gets carried forward.
+func rotateProbeIdentity(path string) (probeIdentity, error) {
+	current, ok, err := readProbeIdentityIfExists(path)
+	if err != nil {
+		return probeIdentity{}, fmt.Errorf("read claude usage probe identity for rotation: %w", err)
+	}
+	if !ok {
+		return probeIdentity{}, errors.New("claude usage probe: no identity to rotate")
+	}
 	uuid, err := newUUIDv4()
 	if err != nil {
 		return probeIdentity{}, err
 	}
-	id := probeIdentity{SessionID: uuid, DisplayName: old.DisplayName, TrustAccepted: old.TrustAccepted}
-	if err := writeProbeIdentity(path, id); err != nil {
+	rotated := probeIdentity{SessionID: uuid, DisplayName: current.DisplayName, TrustAccepted: current.TrustAccepted}
+	if err := writeProbeIdentity(path, rotated); err != nil {
 		return probeIdentity{}, err
 	}
-	return id, nil
+	return rotated, nil
 }
 
 // newUUIDv4 generates a random RFC 4122 version-4 UUID -- sufficient for
