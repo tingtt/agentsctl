@@ -104,12 +104,12 @@ func newFastProbe(path, dir string) *Probe {
 // snapshot is already persisted, that persisted usage.json's own
 // ObservedAt by the same amount, so a test can simulate "usageProbeTTL
 // has genuinely elapsed" consistently across both freshness checks that
-// now exist: Probe.cachedFresh (in-memory) and Probe.persistedFresh (the
-// on-disk recheck refreshCrossProcess performs under the cross-process
+// now exist: Probe.cachedFresh (in-memory) and refreshCoordinator.Refresh's
+// own on-disk recheck, performed under the cross-process
 // refresh lock). Backdating only the in-memory field -- this helper's
 // entire reason to exist, replacing every test's own former inline
 // pr.mu.Lock/pr.snapshotAt=/pr.mu.Unlock sequence -- would leave the
-// on-disk snapshot looking falsely fresh to persistedFresh, silently
+// on-disk snapshot looking falsely fresh to that on-disk recheck, silently
 // short-circuiting the very refresh attempt a test forces this for.
 func forceStaleCache(t *testing.T, pr *Probe) {
 	t.Helper()
@@ -1439,7 +1439,7 @@ func TestProbePersistedStaleSnapshotOnNewInstanceStillRefreshes(t *testing.T) {
 // still ran twice" -- the fake CLI must have been invoked exactly once:
 // the loser must find the winner's freshly-persisted usage.json already
 // fresh once it acquires the lock, and reuse it rather than opening its
-// own probe session (see refreshCrossProcess/persistedFresh's own doc
+// own probe session (see refreshCoordinator.Refresh's own doc
 // comments). Without the fix (process-local refreshShared alone), this
 // would be 2, not 1.
 func TestProbeCrossProcessRefreshSingleFlightsAcrossProbeInstances(t *testing.T) {
@@ -1514,10 +1514,10 @@ func usageWindowEqual(a, b session.UsageWindow) bool {
 // TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClaude
 // isolates the "waiter reuses persisted usage.json" half of the fix
 // deterministically, with no goroutine timing involved at all: refresh's
-// own claude path is deliberately unusable, so if refreshCrossProcess ever
-// actually reached refreshWithRecovery here, this would fail loudly (a
+// own claude path is deliberately unusable, so if refreshCoordinator.Refresh
+// ever actually reached refreshWithRecovery here, this would fail loudly (a
 // process-launch error), not silently. A usage.json that's already fresh
-// (within usageProbeTTL) by the time refreshCrossProcess acquires the
+// (within usageProbeTTL) by the time refreshCoordinator.Refresh acquires the
 // lock -- exactly what a losing caller sees after the winner of a real
 // race persists its own result -- must be returned as-is, proving the
 // short-circuit this round's fix depends on actually exists and isn't
@@ -1537,9 +1537,9 @@ func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClau
 		t.Fatal(err)
 	}
 
-	snap, err := pr.refreshCrossProcess(context.Background())
+	snap, err := pr.newRefreshCoordinator().Refresh(context.Background())
 	if err != nil {
-		t.Fatalf("refreshCrossProcess errored instead of reusing the fresh persisted snapshot without ever touching the (deliberately unusable) claude path: %v", err)
+		t.Fatalf("refreshCoordinator.Refresh errored instead of reusing the fresh persisted snapshot without ever touching the (deliberately unusable) claude path: %v", err)
 	}
 	if snap.FiveHour.Percent != 42 || snap.Weekly.Percent != 9 {
 		t.Fatalf("snap=%+v, want the persisted fresh snapshot reused byte-for-byte", snap)
@@ -1547,9 +1547,9 @@ func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClau
 }
 
 // TestProbeCrossProcessRefreshLockRespectsContextCancellation fixes that
-// lockRefresh -- unlike lockProbeIdentityFile's single blocking
-// unix.Flock, safe there only because an identity transaction is always
-// short -- must not block past its caller's own ctx: a refresh
+// refreshCoordinator.lock -- unlike probestate.IdentityStore's single
+// blocking unix.Flock, safe there only because an identity transaction is
+// always short -- must not block past its caller's own ctx: a refresh
 // transaction can legitimately hold this lock for as long as a full
 // Claude round trip takes, so Usage(ctx)'s cancellation contract must
 // keep working while waiting for it. The lock is held here directly
@@ -1560,7 +1560,7 @@ func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClau
 func TestProbeCrossProcessRefreshLockRespectsContextCancellation(t *testing.T) {
 	probeDir := t.TempDir()
 	holder := newFastProbe("claude", probeDir)
-	unlock, err := holder.lockRefresh(context.Background())
+	unlock, err := holder.newRefreshCoordinator().lock(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1571,12 +1571,12 @@ func TestProbeCrossProcessRefreshLockRespectsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, err = waiter.lockRefresh(ctx)
+	_, err = waiter.newRefreshCoordinator().lock(ctx)
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err=%v, want context.DeadlineExceeded", err)
 	}
 	if elapsed > 2*time.Second {
-		t.Fatalf("lockRefresh took %s to respect context cancellation (deadline was 200ms) -- it must poll and return promptly, not block until the lock is released", elapsed)
+		t.Fatalf("refreshCoordinator.lock took %s to respect context cancellation (deadline was 200ms) -- it must poll and return promptly, not block until the lock is released", elapsed)
 	}
 }
