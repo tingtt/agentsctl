@@ -373,9 +373,13 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 //   - Multiple agentsctl processes can share the same probe.json. Another
 //     process may have already rotated this exact rejected ID away before
 //     this call gets here; rotateProbeIdentity detects that by comparing
-//     id.SessionID against what it freshly reads as current, and hands
-//     that already-rotated identity back instead of minting a redundant
-//     one of its own (see its own doc comment's "cross-process race").
+//     id.SessionID against what it reads as current from inside its own
+//     withProbeIdentityLock transaction -- not just "fresher than this
+//     function's copy" but genuinely race-free, since no other process's
+//     own rotation transaction can be interleaved with this comparison --
+//     and hands that already-rotated identity back instead of minting a
+//     redundant one of its own (see its own doc comment's "cross-process
+//     race").
 //
 // See rotateProbeIdentity's own doc comment for the full detail on both.
 func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error) {
@@ -408,9 +412,15 @@ func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error)
 // to show a usage-limit or session-conflict indication (see
 // waitForProbeOutcome/classifyProbeOutput/checkSessionConflict), then
 // detaches -- the process is never left running across refreshes (see
-// Probe's doc comment): each attempt is its own short-lived attach, so
-// Claude's own native catalog shows at most one probe session no matter
-// how many refreshes (or recovery retries) have run.
+// Probe's doc comment): each attempt runs only one transient probe
+// process, addressing exactly one --session-id. That does NOT mean
+// Claude's own native catalog only ever shows one probe row, though: a
+// rotation (see rotateProbeIdentity) leaves the rejected SessionID's row
+// sitting in that catalog indefinitely, since Claude Code never removes
+// it on its own. Provider.List instead excludes every session ID this
+// probe has ever owned -- current and retired alike (see
+// UsageProbeSource.KnownSessionIDs) -- rather than relying on the
+// catalog ever containing only one such row.
 //
 // A detected limit is returned as a valid (err == nil) exhausted
 // usageSnapshot, not a failure -- see exhaustedSnapshot and Issue #19's
@@ -477,8 +487,13 @@ func (pr *Probe) refreshOnce(ctx context.Context, id probeIdentity) (usageSnapsh
 		// Persisted before the prompt below, not after refresh succeeds:
 		// this dialog is answered at most once ever, regardless of
 		// whether the rest of this particular refresh goes on to
-		// succeed or fail (see probeIdentity.TrustAccepted).
-		_ = markTrustAccepted(pr.identityPath(), id)
+		// succeed or fail (see probeIdentity.TrustAccepted). Marks
+		// whatever identity is LATEST persisted at this instant, not
+		// necessarily this attempt's own `id` (see markTrustAccepted's
+		// own doc comment) -- workspace trust is directory-level, so
+		// that's the correct target even if another process rotated
+		// concurrently with this very attempt.
+		_ = markTrustAccepted(pr.identityPath())
 		if err := probeSettle(ctx, pr.trustSettleDelay()); err != nil {
 			return usageSnapshot{}, err
 		}

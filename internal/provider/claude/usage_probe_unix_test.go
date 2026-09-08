@@ -705,7 +705,7 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := markTrustAccepted(pr.identityPath(), rejectedID); err != nil {
+	if err := markTrustAccepted(pr.identityPath()); err != nil {
 		t.Fatal(err)
 	}
 	writeFakeSessionConflict(t, fakeDir, "Error: Session ID "+rejectedID.SessionID+" is already in use.\r\n")

@@ -3,6 +3,7 @@ package claude
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -40,7 +41,7 @@ func TestMarkTrustAcceptedPersistsAcrossLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := markTrustAccepted(path, id); err != nil {
+	if err := markTrustAccepted(path); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := loadOrCreateProbeIdentity(path)
@@ -87,7 +88,7 @@ func TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := markTrustAccepted(path, orig); err != nil {
+	if err := markTrustAccepted(path); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,5 +232,178 @@ func TestReadProbeIdentityIfExistsLoadsLegacyFileWithoutRetiredField(t *testing.
 	}
 	if !id.ownsSessionID("legacy-id") {
 		t.Fatal("a legacy identity must still own its own current session id")
+	}
+}
+
+// TestRotateProbeIdentityConcurrentCallsProduceExactlyOneWinner fixes the
+// cross-process rotation race directly at the identity-transaction layer:
+// an atomic rename alone only stops a reader from seeing a half-written
+// file, it does not serialize the read-decide-write sequence rotation
+// performs, so two callers that both observe current==rejectedSessionID
+// before either writes could, without a transaction lock around the whole
+// sequence, each mint their own new SessionID and each write -- forking
+// probe identity ownership (the second write's SessionID ends up owned by
+// neither `current` nor `RetiredSessionIDs` of the version that actually
+// survives). Many concurrent callers, released together via a barrier to
+// maximize the chance of that race actually happening absent the fix, must
+// converge on exactly one rotation and one winning identity.
+func TestRotateProbeIdentityConcurrentCallsProduceExactlyOneWinner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+	orig, err := loadOrCreateProbeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 8
+	var ready sync.WaitGroup
+	ready.Add(n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]probeIdentityRecovery, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready.Done()
+			<-start
+			results[i], errs[i] = rotateProbeIdentity(path, orig.SessionID)
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	wg.Wait()
+
+	rotatedCount := 0
+	var winner string
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+		if results[i].Rotated {
+			rotatedCount++
+			winner = results[i].Identity.SessionID
+		}
+	}
+	if rotatedCount != 1 {
+		t.Fatalf("rotatedCount=%d, want exactly 1 (no forked rotation)", rotatedCount)
+	}
+	for i, r := range results {
+		if r.Identity.SessionID != winner {
+			t.Fatalf("caller %d returned SessionID=%q, want every caller to converge on the same winner %q", i, r.Identity.SessionID, winner)
+		}
+	}
+
+	persisted, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("no identity persisted after concurrent rotation: ok=%v err=%v", ok, err)
+	}
+	if persisted.SessionID != winner {
+		t.Fatalf("persisted SessionID=%q, want the winner %q", persisted.SessionID, winner)
+	}
+	if len(persisted.RetiredSessionIDs) != 1 || persisted.RetiredSessionIDs[0] != orig.SessionID {
+		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q] -- a fork would show up here as an extra, unowned SessionID lost from both current and retired", persisted.RetiredSessionIDs, orig.SessionID)
+	}
+}
+
+// TestLoadOrCreateProbeIdentityConcurrentColdStartConverges fixes the
+// cold-start half of the same cross-process race: with no probe.json yet,
+// concurrent callers must mint and persist exactly one identity, not one
+// each -- every caller has to return the same SessionID the winner
+// actually wrote.
+func TestLoadOrCreateProbeIdentityConcurrentColdStartConverges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+
+	const n = 8
+	var ready sync.WaitGroup
+	ready.Add(n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]probeIdentity, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ready.Done()
+			<-start
+			results[i], errs[i] = loadOrCreateProbeIdentity(path)
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	wg.Wait()
+
+	want := results[0].SessionID
+	if want == "" {
+		t.Fatal("no SessionID minted")
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+		if results[i].SessionID != want {
+			t.Fatalf("caller %d SessionID=%q, want %q -- every concurrent cold-start caller must converge on one identity, not mint its own", i, results[i].SessionID, want)
+		}
+	}
+
+	persisted, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("no identity persisted: ok=%v err=%v", ok, err)
+	}
+	if persisted.SessionID != want {
+		t.Fatalf("persisted SessionID=%q, want %q", persisted.SessionID, want)
+	}
+}
+
+// TestMarkTrustAcceptedCannotRollBackARotationItDidNotKnowAbout fixes the
+// other half of the cross-process invariant: markTrustAccepted no longer
+// takes a caller-supplied identity to write back (the old shape this
+// function used to have), specifically because a caller can be holding an
+// identity that's already been rotated away by another process by the
+// time this call actually runs. Writing that stale copy back used to be
+// able to resurrect a rejected SessionID as current again, drop the
+// RetiredSessionIDs entry another process's rotation had just recorded,
+// and still leave the genuinely-current (rotated) identity untrusted --
+// this proves none of that can happen anymore: whatever identity is
+// LATEST persisted when markTrustAccepted actually runs is the one that
+// ends up marked trusted, and only that one bit changes.
+func TestMarkTrustAcceptedCannotRollBackARotationItDidNotKnowAbout(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+	orig, err := loadOrCreateProbeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orig.TrustAccepted {
+		t.Fatalf("orig=%+v, want a freshly created identity to start untrusted", orig)
+	}
+
+	// Simulate another process's rotation landing between some caller
+	// loading `orig` and that caller getting around to calling
+	// markTrustAccepted -- exactly the shape of the race described above.
+	recovery, err := rotateProbeIdentity(path, orig.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovery.Rotated {
+		t.Fatal("setup: rotation should have happened")
+	}
+
+	if err := markTrustAccepted(path); err != nil {
+		t.Fatal(err)
+	}
+
+	persisted, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("no identity persisted: ok=%v err=%v", ok, err)
+	}
+	if persisted.SessionID != recovery.Identity.SessionID {
+		t.Fatalf("current SessionID=%q, want the rotated %q -- markTrustAccepted must not resurrect a rotated-away session id", persisted.SessionID, recovery.Identity.SessionID)
+	}
+	if len(persisted.RetiredSessionIDs) != 1 || persisted.RetiredSessionIDs[0] != orig.SessionID {
+		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q] -- markTrustAccepted must not drop a rotation's retired id", persisted.RetiredSessionIDs, orig.SessionID)
+	}
+	if !persisted.TrustAccepted {
+		t.Fatal("TrustAccepted must become true on the latest (rotated) identity")
 	}
 }

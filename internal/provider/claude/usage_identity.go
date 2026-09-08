@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // probeIdentity is agentsctl's local record of every Claude usage probe
@@ -136,10 +139,91 @@ func appendRetiredSessionID(retired []string, sessionID string) []string {
 // exclusion).
 const probeDisplayName = "agentsctl usage probe"
 
+// probe.json is shared, mutable state across every agentsctl process on
+// the machine (a TUI plus, potentially, more than one background probe
+// refresh in flight at once) -- the same cross-process sharing
+// localstate.Store's state.json already has to contend with. An atomic
+// rename (see writeFileAtomic/writeProbeIdentity) only ever guarantees a
+// reader never observes a half-written file; it does NOT serialize the
+// read-decide-write sequence a mutation like loadOrCreateProbeIdentity,
+// markTrustAccepted, or rotateProbeIdentity performs. Without an explicit
+// cross-process transaction boundary, two processes racing that sequence
+// concurrently can each read the same starting state, each decide
+// independently, and each write -- the second write simply clobbers the
+// first with no error from either side (confirmed to fork probe identity
+// ownership: two simultaneous rotations of the same rejected ID can each
+// believe they're the one recovering from it, minting two different new
+// SessionIDs, only one of which ends up persisted while the other is
+// left owning neither the current identity nor a RetiredSessionIDs entry
+// -- exactly the kind of catalog-leak invariant violation
+// probeIdentity.RetiredSessionIDs exists to prevent in the first place).
+//
+// loadOrCreateProbeIdentity, markTrustAccepted, and rotateProbeIdentity
+// are therefore each one complete read-modify-write transaction, run
+// under an OS-level advisory lock on a dedicated path+".lock" file (see
+// withProbeIdentityLock) -- the same unix.Flock-based pattern
+// localstate.Store.lock already uses for state.json, chosen here for the
+// same reason: it needs no new dependency, and the kernel releases it
+// automatically if a process dies mid-transaction (never a stale lock
+// file that could wedge every future refresh). A single blocking
+// unix.Flock(LOCK_EX) call is also sufficient to serialize concurrent
+// callers WITHIN one process, not just across processes: each call opens
+// its own file description via a fresh os.OpenFile, and flock()
+// contends on open file descriptions, not processes, so two goroutines
+// in this same process racing for the lock block each other exactly as
+// two separate agentsctl processes would -- no additional in-process
+// sync.Mutex is needed for correctness.
+//
+// readProbeIdentityIfExists and writeProbeIdentity themselves never
+// acquire this lock -- they are the plain, lock-free file I/O every
+// transaction function above performs once it already holds the lock
+// (calling them again would try to re-acquire an already-held
+// unix.Flock and deadlock). A caller outside those three transaction
+// functions may still call readProbeIdentityIfExists directly without
+// holding the lock: Probe.KnownSessionIDs is exactly this -- a read-only,
+// eventually-consistent snapshot for Provider.List's catalog exclusion,
+// which writeFileAtomic's rename already guarantees is always either the
+// complete pre-transaction or complete post-transaction state, never a
+// torn mix of the two. Serializing that read behind the same exclusive
+// lock every mutation takes would only make List() contend with, and
+// briefly block on, whatever refresh happens to be rotating or creating
+// an identity at that exact moment, for no correctness benefit.
+func withProbeIdentityLock(path string, fn func() error) error {
+	unlock, err := lockProbeIdentityFile(path)
+	if err != nil {
+		return fmt.Errorf("lock claude usage probe identity: %w", err)
+	}
+	defer unlock()
+	return fn()
+}
+
+// lockProbeIdentityFile acquires the exclusive advisory lock guarding
+// path's identity transactions (see withProbeIdentityLock), blocking
+// until it's available. A failed acquisition (directory creation or open
+// failure; unix.Flock itself only fails for reasons other than
+// contention, since no LOCK_NB is used here) returns before any mutation
+// is attempted, exactly like withProbeIdentityLock's own callers expect.
+func lockProbeIdentityFile(path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { _ = unix.Flock(int(f.Fd()), unix.LOCK_UN); _ = f.Close() }, nil
+}
+
 // readProbeIdentityIfExists reads path's persisted probe identity without
-// creating one -- the read-only half of loadOrCreateProbeIdentity, for a
-// caller (Probe.KnownSessionIDs) that must never mint a new identity as a
-// side effect of a read. ok is false for a missing file, an empty
+// creating one and without acquiring withProbeIdentityLock's transaction
+// lock (see its own doc comment for why that's safe here) -- the
+// read-only half of loadOrCreateProbeIdentity, and also the primitive
+// every locked transaction function below reads through once it already
+// holds the lock itself. ok is false for a missing file, an empty
 // SessionID, or a decode error -- never treated as a fatal condition by
 // callers that only want "is there one, and if so what is it".
 func readProbeIdentityIfExists(path string) (probeIdentity, bool, error) {
@@ -162,8 +246,13 @@ func readProbeIdentityIfExists(path string) (probeIdentity, bool, error) {
 
 // loadOrCreateProbeIdentity reads path's persisted probe identity, or
 // creates and persists a brand-new one (a fresh random session ID,
-// TrustAccepted: false) if none exists yet. This is the ordinary,
-// expected path a new probe session ID is minted on -- once per app-data
+// TrustAccepted: false) if none exists yet -- one read-modify-write
+// transaction under withProbeIdentityLock, so two processes racing a
+// cold start (no probe.json yet) can never each mint and persist their
+// own different SessionID; the second to acquire the lock simply
+// observes the first's now-persisted identity and reuses it, exactly as
+// if it had run after the first entirely. This is the ordinary, expected
+// path a new probe session ID is minted on -- once per app-data
 // directory's lifetime, after which every refresh reuses the same
 // identity (see the DesignDoc's "probe session は最大1つだけ存在する"). The
 // only other place a new SessionID is ever minted is rotateProbeIdentity,
@@ -172,30 +261,71 @@ func readProbeIdentityIfExists(path string) (probeIdentity, bool, error) {
 // function, that one never creates an identity from nothing; it only
 // ever replaces an already-existing one.
 func loadOrCreateProbeIdentity(path string) (probeIdentity, error) {
-	if id, ok, err := readProbeIdentityIfExists(path); err != nil {
-		return probeIdentity{}, fmt.Errorf("decode claude usage probe identity: %w", err)
-	} else if ok {
-		return id, nil
-	}
-	uuid, err := newUUIDv4()
+	var result probeIdentity
+	err := withProbeIdentityLock(path, func() error {
+		id, ok, err := readProbeIdentityIfExists(path)
+		if err != nil {
+			return fmt.Errorf("decode claude usage probe identity: %w", err)
+		}
+		if ok {
+			result = id
+			return nil
+		}
+		uuid, err := newUUIDv4()
+		if err != nil {
+			return err
+		}
+		id = probeIdentity{SessionID: uuid, DisplayName: probeDisplayName}
+		if err := writeProbeIdentity(path, id); err != nil {
+			return err
+		}
+		result = id
+		return nil
+	})
 	if err != nil {
 		return probeIdentity{}, err
 	}
-	id := probeIdentity{SessionID: uuid, DisplayName: probeDisplayName}
-	if err := writeProbeIdentity(path, id); err != nil {
-		return probeIdentity{}, err
-	}
-	return id, nil
+	return result, nil
 }
 
-// markTrustAccepted persists id with TrustAccepted set to true -- called
-// once refresh (usage_probe_unix.go) has attempted to answer the
-// workspace-trust dialog, regardless of whether a dialog actually needed
-// answering, so no later refresh ever repeats that blind keystroke
-// sequence into what might by then be a live chat composer instead.
-func markTrustAccepted(path string, id probeIdentity) error {
-	id.TrustAccepted = true
-	return writeProbeIdentity(path, id)
+// markTrustAccepted marks the LATEST persisted identity at path as
+// TrustAccepted -- called once refresh (usage_probe_unix.go) has
+// attempted to answer the workspace-trust dialog, regardless of whether
+// a dialog actually needed answering, so no later refresh ever repeats
+// that blind keystroke sequence into what might by then be a live chat
+// composer instead.
+//
+// It deliberately takes no probeIdentity argument to merge into -- unlike
+// the caller-supplied-copy shape this function used to have -- and reads
+// the current persisted identity itself, inside the same
+// withProbeIdentityLock transaction it writes back under. TrustAccepted
+// is directory-level state (see probeIdentity's own doc comment): whoever
+// the LATEST persisted current identity is when this call actually runs
+// is exactly who should end up marked trusted, regardless of which
+// identity the caller happened to be looking at when it decided to call
+// this. Concretely, this matters when another process's rotation lands
+// between this caller loading its own copy and this call actually
+// running: writing that stale copy back (the old behavior) would silently
+// resurrect a since-rotated-away SessionID as current again, discard
+// whatever RetiredSessionIDs that other process's rotation had just
+// recorded, and still leave the genuinely-current identity (the rotated
+// one) marked untrusted -- a strictly worse regression than simply
+// leaving TrustAccepted momentarily false. Reading-and-writing the latest
+// persisted identity under the lock instead can never regress SessionID
+// or RetiredSessionIDs; it only ever adds the one bit this call means to
+// add, to whichever identity is actually current the instant it runs.
+func markTrustAccepted(path string) error {
+	return withProbeIdentityLock(path, func() error {
+		id, ok, err := readProbeIdentityIfExists(path)
+		if err != nil {
+			return fmt.Errorf("read claude usage probe identity to mark trust accepted: %w", err)
+		}
+		if !ok {
+			return errors.New("claude usage probe: no identity to mark trust accepted")
+		}
+		id.TrustAccepted = true
+		return writeProbeIdentity(path, id)
+	})
 }
 
 // writeProbeIdentity persists id atomically (see writeFileAtomic).
@@ -261,13 +391,18 @@ type probeIdentityRecovery struct {
 // by Claude Code as already in use (see probeSessionConflict): the only
 // recovery available once that happens, since the probe's design of
 // otherwise reusing one persisted identity forever has no other way to
-// recover from a rejection that never clears on its own.
+// recover from a rejection that never clears on its own. Like
+// loadOrCreateProbeIdentity and markTrustAccepted, this is one
+// read-modify-write transaction under withProbeIdentityLock, not just an
+// atomically-written file: the read below, the decision built on it, and
+// the resulting write all happen while this call alone holds the lock, so
+// no other process's own transaction can interleave with it.
 //
-// It deliberately re-reads path itself rather than taking a caller's own
-// probeIdentity value as the record to rotate from -- for two independent
-// reasons, both requiring the on-disk file, not any particular caller's
-// possibly-outdated copy, to be the single source of truth for what
-// happens next:
+// It deliberately re-reads path itself (inside the lock) rather than
+// taking a caller's own probeIdentity value as the record to rotate from
+// -- for two independent reasons, both requiring the current on-disk
+// record, not any particular caller's possibly-outdated copy, to be the
+// single source of truth for what happens next:
 //
 //   - TrustAccepted race: a caller like Probe.refreshWithRecovery loaded
 //     its copy before calling Probe.refreshOnce, and refreshOnce can
@@ -293,7 +428,18 @@ type probeIdentityRecovery struct {
 //     if they still match, this process is the first to react and
 //     genuinely owns the rotation; if they don't, someone already handled
 //     it and the persisted identity is simply handed back as-is (Rotated:
-//     false), no new UUID minted, no new write.
+//     false), no new UUID minted, no new write. Doing this comparison
+//     under the lock (rather than merely re-reading before an unlocked
+//     write, as an earlier version of this function did) is what actually
+//     closes the race: two processes racing this same function
+//     concurrently used to both be able to read the same current==
+//     rejectedSessionID, both decide to rotate, and both write -- one
+//     write clobbering the other and leaving its own newly-minted
+//     SessionID owned by neither `current` nor `RetiredSessionIDs`. Under
+//     the lock, the second caller's read always observes the first
+//     caller's already-completed write, so at most one of them ever sees
+//     current == rejectedSessionID and only one new SessionID is ever
+//     minted per rejection.
 //
 // A genuine rotation (rejectedSessionID matches the freshly read persisted
 // current) carries DisplayName and TrustAccepted forward unchanged (see
@@ -304,32 +450,43 @@ type probeIdentityRecovery struct {
 // appendRetiredSessionID) so Provider.List keeps excluding it even after
 // it stops being current (see probeIdentity's own doc comment).
 func rotateProbeIdentity(path, rejectedSessionID string) (probeIdentityRecovery, error) {
-	current, ok, err := readProbeIdentityIfExists(path)
-	if err != nil {
-		return probeIdentityRecovery{}, fmt.Errorf("read claude usage probe identity for rotation: %w", err)
-	}
-	if !ok {
-		return probeIdentityRecovery{}, errors.New("claude usage probe: no identity to rotate")
-	}
-	if current.SessionID != rejectedSessionID {
-		// Another process already rotated this exact rejection away --
-		// see this function's own doc comment's "cross-process race".
-		return probeIdentityRecovery{Identity: current, Rotated: false}, nil
-	}
-	uuid, err := newUUIDv4()
+	var result probeIdentityRecovery
+	err := withProbeIdentityLock(path, func() error {
+		current, ok, err := readProbeIdentityIfExists(path)
+		if err != nil {
+			return fmt.Errorf("read claude usage probe identity for rotation: %w", err)
+		}
+		if !ok {
+			return errors.New("claude usage probe: no identity to rotate")
+		}
+		if current.SessionID != rejectedSessionID {
+			// Another process already rotated this exact rejection away,
+			// and this read -- taken under the same lock that process's
+			// own rotation held -- proves it: see this function's own doc
+			// comment's "cross-process race".
+			result = probeIdentityRecovery{Identity: current, Rotated: false}
+			return nil
+		}
+		uuid, err := newUUIDv4()
+		if err != nil {
+			return err
+		}
+		rotated := probeIdentity{
+			SessionID:         uuid,
+			DisplayName:       current.DisplayName,
+			TrustAccepted:     current.TrustAccepted,
+			RetiredSessionIDs: appendRetiredSessionID(current.RetiredSessionIDs, current.SessionID),
+		}
+		if err := writeProbeIdentity(path, rotated); err != nil {
+			return err
+		}
+		result = probeIdentityRecovery{Identity: rotated, Rotated: true}
+		return nil
+	})
 	if err != nil {
 		return probeIdentityRecovery{}, err
 	}
-	rotated := probeIdentity{
-		SessionID:         uuid,
-		DisplayName:       current.DisplayName,
-		TrustAccepted:     current.TrustAccepted,
-		RetiredSessionIDs: appendRetiredSessionID(current.RetiredSessionIDs, current.SessionID),
-	}
-	if err := writeProbeIdentity(path, rotated); err != nil {
-		return probeIdentityRecovery{}, err
-	}
-	return probeIdentityRecovery{Identity: rotated, Rotated: true}, nil
+	return result, nil
 }
 
 // newUUIDv4 generates a random RFC 4122 version-4 UUID -- sufficient for
