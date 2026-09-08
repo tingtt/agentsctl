@@ -267,7 +267,7 @@ func writeFakeSessionConflict(t *testing.T, dir, banner string) {
 // accepting the workspace-trust dialog for the first time, instead of
 // ever reaching a real prompt -- standing in for a session conflict that
 // only becomes observable after this probe attempt has already durably
-// persisted TrustAccepted:true (see markTrustAccepted, called
+// persisted TrustAccepted:true (see probestate.IdentityStore.MarkTrustAccepted, called
 // unconditionally right after the trust-dialog write succeeds). See the
 // fake CLI's own doc comment on this fixture for why it's distinct from
 // writeFakeSessionConflict (which fires before any trust interaction at
@@ -771,7 +771,7 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 // TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust only
 // ever starts from an identity ALREADY marked TrustAccepted:true, so
 // probeAttemptRunner.Run's own `if !id.TrustAccepted` branch (and therefore the
-// trust-dialog write and the markTrustAccepted call right after it) never
+// trust-dialog write and the MarkTrustAccepted call right after it) never
 // runs at all in that test -- it cannot catch a rotation that carries
 // forward a caller's stale, pre-attempt copy of TrustAccepted instead of
 // whatever the attempt most recently persisted.
@@ -779,12 +779,12 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 // Here the identity starts genuinely untrusted (TrustAccepted:false, and
 // Claude Code's own directory-level trust marker absent too), so attempt
 // #1 must actually answer the trust dialog for the first time -- which
-// durably persists TrustAccepted:true via markTrustAccepted -- and ONLY
+// durably persists TrustAccepted:true via probestate.IdentityStore.MarkTrustAccepted -- and ONLY
 // THEN does the conflict become observable (see
 // writeFakeSessionConflictAfterTrust), before that attempt ever reaches a
-// real prompt. refreshWithRecovery's `id` copy, loaded before attempt #1
-// ran, is still TrustAccepted:false at this point -- proving
-// rotateProbeIdentity must read the current on-disk record (which
+// real prompt. refreshCoordinator.refreshWithRecovery's `id` copy, loaded
+// before attempt #1 ran, is still TrustAccepted:false at this point --
+// proving probestate.IdentityStore.Rotate must read the current on-disk record (which
 // already has TrustAccepted:true) rather than rotating from that stale
 // copy, or the assertions below would fail.
 func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t *testing.T) {
@@ -795,7 +795,7 @@ func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t
 	pr.ExePath = probeExePath(t)
 
 	// Deliberately untrusted starting state: no persisted identity yet
-	// (loadOrCreateProbeIdentity mints one with TrustAccepted:false below),
+	// (probestate.IdentityStore.LoadOrCreate mints one with TrustAccepted:false below),
 	// and no directory-level trust marker for the fake CLI either.
 	origID, err := probestate.NewIdentityStore(pr.identityPath()).LoadOrCreate()
 	if err != nil {
@@ -903,7 +903,7 @@ func TestProbeSessionConflictRetryIsBoundedToOneRotation(t *testing.T) {
 }
 
 // TestProbeUnrelatedFailureDoesNotRotateIdentity fixes that
-// refreshWithRecovery's rotation is specific to errProbeSessionConflict:
+// refreshCoordinator.refreshWithRecovery's rotation is specific to errProbeSessionConflict:
 // a genuinely unrelated failure (here, a process launch failure -- an
 // unusable claude binary path) must be returned as-is, with no rotation
 // and no retry, and the persisted identity must be left completely
@@ -987,7 +987,7 @@ func TestProbeConcurrentUsageSingleFlightsRefresh(t *testing.T) {
 		}
 	}
 	// A single confirmed identity file proves at most one probe session
-	// was created (loadOrCreateProbeIdentity mints a session ID exactly
+	// was created (probestate.IdentityStore.LoadOrCreate mints a session ID exactly
 	// once and every concurrent refresh attempt would otherwise race to
 	// create their own).
 	id, ok, err := probestate.NewIdentityStore(pr.identityPath()).Load()
@@ -1251,7 +1251,7 @@ func TestProbeSnapshotWithoutRateLimitsIsUnavailableNotError(t *testing.T) {
 }
 
 // TestProbeProcessExitsAfterRefreshNotOrphaned fixes that
-// detachProbeSession actually ends the probe's OS process rather than
+// probeAttemptRunner.detach actually ends the probe's OS process rather than
 // leaving it running: after Usage() returns, the child PID it started
 // must no longer be running.
 func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
@@ -1275,7 +1275,7 @@ func TestProbeProcessExitsAfterRefreshNotOrphaned(t *testing.T) {
 	// the process has actually exited and this package's own detach has
 	// completed, no python process should still be alive holding the pty
 	// open. We approximate "not orphaned" by confirming Usage() (which
-	// waits out detachProbeSession synchronously before returning) does
+	// waits out probeAttemptRunner.detach synchronously before returning) does
 	// not itself hang or leave a hung child -- a second refresh cycle
 	// (forced stale) completing within the normal fast-test timeout is
 	// strong evidence no leftover process is holding the probe directory
@@ -1515,7 +1515,7 @@ func usageWindowEqual(a, b session.UsageWindow) bool {
 // isolates the "waiter reuses persisted usage.json" half of the fix
 // deterministically, with no goroutine timing involved at all: refresh's
 // own claude path is deliberately unusable, so if refreshCoordinator.Refresh
-// ever actually reached refreshWithRecovery here, this would fail loudly (a
+// ever actually reached refreshCoordinator.refreshWithRecovery here, this would fail loudly (a
 // process-launch error), not silently. A usage.json that's already fresh
 // (within usageProbeTTL) by the time refreshCoordinator.Refresh acquires the
 // lock -- exactly what a losing caller sees after the winner of a real

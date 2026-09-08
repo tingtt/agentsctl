@@ -243,13 +243,13 @@ func (s *IdentityStore) LoadOrCreate() (Identity, error) {
 // marked trusted, regardless of which identity the caller happened to be
 // looking at when it decided to call this. Concretely, this matters when
 // another process's rotation lands between this caller loading its own
-// copy and this call actually running: writing that stale copy back (the
-// old behavior this package replaced) would silently resurrect a
-// since-rotated-away SessionID as current again, discard whatever
-// RetiredSessionIDs that other process's rotation had just recorded, and
-// still leave the genuinely-current identity (the rotated one) marked
-// untrusted. Reading-and-writing the latest persisted identity under the
-// lock instead can never regress SessionID or RetiredSessionIDs; it only
+// copy and this call actually running: writing that stale copy back
+// would silently resurrect a since-rotated-away SessionID as current
+// again, discard whatever RetiredSessionIDs that other process's
+// rotation had just recorded, and still leave the genuinely-current
+// identity (the rotated one) marked untrusted. Reading-and-writing the
+// latest persisted identity under the lock instead can never regress
+// SessionID or RetiredSessionIDs; it only
 // ever adds the one bit this call means to add, to whichever identity is
 // actually current the instant it runs.
 func (s *IdentityStore) MarkTrustAccepted() error {

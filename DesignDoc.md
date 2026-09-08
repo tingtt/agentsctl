@@ -200,7 +200,7 @@ Claude Code には Codex app-server のような on-demand usage 読み取り RP
 - 取得結果は TTL 付きでキャッシュし、Agent View の reload のたびに probe session へ request を送ることはない。cache が stale な場合のみ refresh を行い、複数の呼び出しが同時に発生しても refresh は高々1回に集約する。この集約は同一 process 内の single-flight (`refreshShared`) に加えて、probe directory を共有する process 間でも `probe.json.lock` とは別の専用 refresh lock で行う (`probe.json` の identity mutation lock と responsibility を混同しない: こちらは Claude probe session の実行そのものを直列化する)。lock 取得後は必ず persisted `usage.json` を同じ TTL 基準で再確認し、待機中に別 process が既に fresh な結果を書いていればそれを再利用して Claude を再実行しない。lock は Claude との往復全体 (取得 → refresh → persist) を保持したまま解放するため、`ctx` cancellation を尊重する context-aware な acquisition を用いる。lock ordering は常に「refresh lock → identity lock」の一方向のみで、逆方向 (identity lock を保持したまま refresh lock を待つ) は発生しない。
 - refresh が失敗しても、直前に取得できていた snapshot があればそれを返し、Session catalog や Codex 側の usage を道連れにしない。snapshot が一度も取得できていない場合のみ、この provider の usage を省略する (0% として偽装しない)。
 
-_Limit detection (#19)_ — Claude Code の `statusLine` は `refreshInterval` による定期 tick で再実行されるため、tick が新しいというだけでは「この refresh が送った prompt に対する応答が実際に届いた」ことの証明にならない (installed CLI 2.1.263 で確認: 応答前の tick は `cost.total_api_duration_ms == 0` かつ `rate_limits` 自体が存在しない)。そのため probe は `cost.total_api_duration_ms` が正の値になった tick のみを「この refresh の実応答」として受理する。limit に到達した turn はこの意味での応答を得られないため、probe session 自身の terminal 出力 (以前は破棄していたもの) を limit 到達を示す文言について classify し、この判定だけで Claude provider 境界内に閉じる (統一 rate_limits JSON の解析結果ではなく、terminal 出力の文言に依存する数少ない箇所であり、TUI や provider-neutral domain へは一切漏らさない)。判定は「hit/reached your session limit」「hit/reached your weekly limit」等、具体的な句にのみ一致させ、"limit" という単語単体では判定しない — 同じ CLI バイナリが `context limit` / `token limit` のような無関係な意味でも同じ単語を使うため。5h/weekly いずれか、または両方を独立に `UsageExhausted` として正規化し、影響を受けない側の window は直前の有効な snapshot を保持したまま返す。limit 以外の理由 (timeout・process failure・parse failure) による失敗は、この classify に一致しない限り従来どおりの stale-cache fallback 動作を維持する。検出した exhausted snapshot は (通常の snapshot と同じ `writeUsageSnapshotAtomic` 経由で) probe 自身の `usage.json` にも永続化する — limit 到達時は statusLine collector 自身が書き込む機会を持たないため、ここで明示的に書かないと agentsctl 再起動時に reset 前の percentage へ巻き戻ってしまう。
+_Limit detection (#19)_ — Claude Code の `statusLine` は `refreshInterval` による定期 tick で再実行されるため、tick が新しいというだけでは「この refresh が送った prompt に対する応答が実際に届いた」ことの証明にならない (installed CLI 2.1.263 で確認: 応答前の tick は `cost.total_api_duration_ms == 0` かつ `rate_limits` 自体が存在しない)。そのため probe は `cost.total_api_duration_ms` が正の値になった tick のみを「この refresh の実応答」として受理する。limit に到達した turn はこの意味での応答を得られないため、probe session 自身の terminal 出力 (以前は破棄していたもの) を limit 到達を示す文言について classify し、この判定だけで Claude provider 境界内に閉じる (統一 rate_limits JSON の解析結果ではなく、terminal 出力の文言に依存する数少ない箇所であり、TUI や provider-neutral domain へは一切漏らさない)。判定は「hit/reached your session limit」「hit/reached your weekly limit」等、具体的な句にのみ一致させ、"limit" という単語単体では判定しない — 同じ CLI バイナリが `context limit` / `token limit` のような無関係な意味でも同じ単語を使うため。5h/weekly いずれか、または両方を独立に `UsageExhausted` として正規化し、影響を受けない側の window は直前の有効な snapshot を保持したまま返す。limit 以外の理由 (timeout・process failure・parse failure) による失敗は、この classify に一致しない限り従来どおりの stale-cache fallback 動作を維持する。検出した exhausted snapshot は (通常の snapshot と同じ SnapshotStore 経由で) probe 自身の `usage.json` にも永続化する — limit 到達時は statusLine collector 自身が書き込む機会を持たないため、ここで明示的に書かないと agentsctl 再起動時に reset 前の percentage へ巻き戻ってしまう。
 
 _Reset boundary (#19)_ — cache 上の snapshot は、それが observe された時点の usage window に対してのみ有効な値である。この判定ルールは Claude provider 内に閉じず、provider-neutral `session.UsageWindow.At(now)` / `session.Usage.At(now)` として一箇所に定義する: window ごとに独立して「現在時刻が、その reading が持つ `Reset` 時刻を過ぎていないか」を確認し、過ぎていれば `UsageAvailable`/`UsageExhausted` を問わず `UsageUnknown` として扱う — reset 前の percentage や exhausted state を、reset を跨いだ新しい window の値として維持することはない。Claude provider は自身の cache を `session.Usage` へ変換する際にこの `At` を一度適用し (`toSessionUsageWindow` 自体は reset 判定を持たない純粋な shape 変換)、Agent View はさらに自分の read/render 時点でも同じ `At` を再適用する (`usageWindowText`) — provider 側の refresh が起きていなくても、State に保持され続けている値が reset boundary を跨いだ後は次の render で `?%` になる。両者が同じ method を呼ぶことで、「Claude provider 内では正規化済みだが Agent View state 内では expiry 済み」というズレを防ぐ。`now` は `time.Now()` を各所に散らすのではなく `Probe.Clock` という単一の injection point を通す (Claude 側の deterministic test のため)。5h と weekly は互いに独立に評価され、片方が reset boundary を跨いでも、もう片方のまだ有効な snapshot には影響しない。
 
@@ -248,13 +248,21 @@ identity load/create (coordinator -> IdentityStore)
      ↓
 attempt #1 (attempt runner)
      │
-     ├─ success            -> persist snapshot
-     ├─ exhausted           -> persist exhausted snapshot
-     ├─ session conflict    -> IdentityStore.Rotate -> attempt #2 -> persist regardless of outcome
+     ├─ success / exhausted -> persist snapshot
+     │
+     ├─ session conflict
+     │    ↓
+     │  IdentityStore.Rotate
+     │    ↓
+     │  attempt #2 (attempt runner, no further retry)
+     │    │
+     │    ├─ success / exhausted -> persist snapshot
+     │    └─ error (conflict again, or other) -> stale/error fallback
+     │
      └─ other failure       -> stale/error fallback (no rotation)
 ```
 
-retry/rotation policy は coordinator だけが所有する。attempt runner 自身は retry しない。session conflict は attempt runner が probe session の出力を分類して返すだけであり、rotate するかどうかの判断は coordinator が行う。
+retry は attempt #1 が session conflict を報告した場合の attempt #2 のみで、それ以上のループはない。retry/rotation policy は coordinator だけが所有する。attempt runner 自身は retry しない。session conflict は attempt runner が probe session の出力を分類して返すだけであり、rotate するかどうかの判断は coordinator が行う。
 
 **Lock ordering**
 

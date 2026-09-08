@@ -73,7 +73,7 @@ type UsageProbeSource interface {
 	Usage(ctx context.Context) (session.Usage, error)
 	// KnownSessionIDs reports every exact Claude session ID this probe has
 	// ever owned -- its current one and every one a rotation has since
-	// retired (see probeIdentity's own doc comment) -- so List can exclude
+	// retired (see probestate.Identity's own doc comment) -- so List can exclude
 	// all of them from the normal catalog (see Provider.List). Ownership
 	// is exact-identity, never CWD or display-name inference: a rotated-
 	// away ID stays in Claude's own native catalog (Claude doesn't remove

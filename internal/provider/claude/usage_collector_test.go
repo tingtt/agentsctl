@@ -20,7 +20,7 @@ func TestRunUsageCollectorParsesStdinAndWritesSnapshot(t *testing.T) {
 	}
 	snap, ok, err := probestate.NewSnapshotStore(out).Load()
 	if err != nil || !ok {
-		t.Fatalf("readUsageSnapshot ok=%v err=%v", ok, err)
+		t.Fatalf("SnapshotStore.Load ok=%v err=%v", ok, err)
 	}
 	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 70 {
 		t.Fatalf("FiveHour=%+v, want Available/70%%", snap.FiveHour)

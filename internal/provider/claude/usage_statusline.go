@@ -49,8 +49,8 @@ type statusLineWindow struct {
 	ResetsAt       int64   `json:"resets_at"`
 }
 
-// parseStatusLinePayload decodes one statusLine stdin payload into this
-// package's own provider-neutral-ish snapshot shape (see usage_snapshot.go
+// parseStatusLinePayload decodes one statusLine stdin payload into
+// probestate.Snapshot (see internal/provider/claude/probestate/snapshot.go
 // -- still Claude-specific, but shaped for local storage rather than the
 // raw wire JSON). A payload with no `rate_limits` object at all (a Free
 // plan account, or before the session's first API response) yields a

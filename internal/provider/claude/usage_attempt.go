@@ -175,7 +175,7 @@ func (r *probeAttemptRunner) Run(ctx context.Context, id probestate.Identity) (p
 		// correct target even if another process rotated concurrently
 		// with this very attempt.
 		//
-		// Its error is no longer silently discarded: this is now a
+		// This error must not be silently discarded: MarkTrustAccepted is a
 		// meaningful identity-lock transaction (see
 		// probestate.IdentityStore.MarkTrustAccepted's own doc comment),
 		// not a fire-and-forget write, and continuing on to send the
@@ -202,12 +202,11 @@ func (r *probeAttemptRunner) Run(ctx context.Context, id probestate.Identity) (p
 		// checked alongside checkSessionConflict's kind of output
 		// classification. Unlike probeSessionConflictPhrase or
 		// classifyProbeOutput's limit wording -- both confirmed against
-		// real, captured, quoted installed-CLI terminal output in earlier
-		// rounds -- no real Claude Code workspace-trust dialog text has
-		// ever actually been captured and verified against the installed
-		// CLI for this probe, and this round's fix is required to close
-		// without any further live-quota-consuming Claude calls to go
-		// verify one. A guessed pattern risks exactly the fail-unsafe
+		// real, captured, quoted installed-CLI terminal output -- no real
+		// Claude Code workspace-trust dialog text has ever been captured
+		// and verified against the installed CLI for this probe, and doing
+		// so would require further live-quota-consuming Claude calls this
+		// package avoids. A guessed pattern risks exactly the fail-unsafe
 		// outcome this whole mechanism exists to prevent (a false
 		// negative sending real navigation/Enter keystrokes into a live
 		// chat composer), so this residual window is accepted and
