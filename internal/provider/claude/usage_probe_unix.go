@@ -345,23 +345,39 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 // user staring at a stale/"?%" reading until whatever next triggers a
 // fetch).
 //
-// At most one rotation and one retry ever happen -- never a loop: a
-// second errProbeSessionConflict (or any other error) from the retry is
-// returned exactly as refreshOnce reported it, falling through to
-// refreshShared's/Usage's existing stale-cache-or-error handling
-// unchanged. If rotation itself fails (a persistence error, not a
-// conflict), the original conflict error is returned rather than
-// attempting a retry with no valid new identity to use.
+// At most one rotation/recovery attempt and one retry ever happen --
+// never a loop: a second errProbeSessionConflict (or any other error)
+// from the retry is returned exactly as refreshOnce reported it, falling
+// through to refreshShared's/Usage's existing stale-cache-or-error
+// handling unchanged. If rotateProbeIdentity itself fails (a persistence
+// error, not a conflict), the original conflict error is returned rather
+// than attempting a retry with no valid identity to use. This bound holds
+// regardless of which of rotateProbeIdentity's two outcomes occurs below
+// (see its own doc comment) -- a cross-process recovery that mints no new
+// identity still counts as this call's one allowed retry, never another
+// round of its own.
 //
-// rotateProbeIdentity is deliberately called with no identity argument of
-// its own -- it re-reads the persisted file rather than rotating from the
-// `id` this function loaded before calling refreshOnce. refreshOnce can
-// itself durably persist a TrustAccepted:true partway through the very
-// attempt that goes on to hit a conflict (a conflict surfacing right
-// after the workspace-trust dialog was just answered); rotating from this
-// function's own now-possibly-stale `id` copy instead of the current
-// on-disk record would silently lose that update (see rotateProbeIdentity's
-// own doc comment for the full race).
+// rotateProbeIdentity is deliberately passed id.SessionID -- the specific
+// identity THIS attempt just saw rejected -- rather than being called with
+// no argument of its own, and re-reads the persisted file itself rather
+// than rotating from the `id` this function loaded before calling
+// refreshOnce. Two races this guards against, both requiring the current
+// on-disk record rather than this function's own copy:
+//
+//   - refreshOnce can itself durably persist a TrustAccepted:true partway
+//     through the very attempt that goes on to hit a conflict (a conflict
+//     surfacing right after the workspace-trust dialog was just
+//     answered); rotating from this function's own now-possibly-stale
+//     `id` copy instead of the current on-disk record would silently lose
+//     that update.
+//   - Multiple agentsctl processes can share the same probe.json. Another
+//     process may have already rotated this exact rejected ID away before
+//     this call gets here; rotateProbeIdentity detects that by comparing
+//     id.SessionID against what it freshly reads as current, and hands
+//     that already-rotated identity back instead of minting a redundant
+//     one of its own (see its own doc comment's "cross-process race").
+//
+// See rotateProbeIdentity's own doc comment for the full detail on both.
 func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error) {
 	id, err := loadOrCreateProbeIdentity(pr.identityPath())
 	if err != nil {
@@ -371,11 +387,11 @@ func (pr *Probe) refreshWithRecovery(ctx context.Context) (usageSnapshot, error)
 	if err == nil || !errors.Is(err, errProbeSessionConflict) {
 		return snap, err
 	}
-	rotated, rerr := rotateProbeIdentity(pr.identityPath())
+	recovery, rerr := rotateProbeIdentity(pr.identityPath(), id.SessionID)
 	if rerr != nil {
 		return usageSnapshot{}, err
 	}
-	return pr.refreshOnce(ctx, rotated)
+	return pr.refreshOnce(ctx, recovery.Identity)
 }
 
 // refreshOnce does the actual probe-session work for a single attempt,

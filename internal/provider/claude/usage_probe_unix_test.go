@@ -1071,7 +1071,7 @@ func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rotated, err := rotateProbeIdentity(pr1.identityPath())
+	recovery, err := rotateProbeIdentity(pr1.identityPath(), orig.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1085,7 @@ func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
 	}
 	foundCurrent, foundRetired := false, false
 	for _, id := range ids {
-		if id == rotated.SessionID {
+		if id == recovery.Identity.SessionID {
 			foundCurrent = true
 		}
 		if id == orig.SessionID {
@@ -1093,7 +1093,7 @@ func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
 		}
 	}
 	if !foundCurrent {
-		t.Fatalf("KnownSessionIDs after restart=%v, missing current id %q", ids, rotated.SessionID)
+		t.Fatalf("KnownSessionIDs after restart=%v, missing current id %q", ids, recovery.Identity.SessionID)
 	}
 	if !foundRetired {
 		t.Fatalf("KnownSessionIDs after restart=%v, missing retired id %q", ids, orig.SessionID)

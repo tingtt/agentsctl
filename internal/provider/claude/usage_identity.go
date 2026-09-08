@@ -243,47 +243,82 @@ func probeSessionConflict(output string) bool {
 	return strings.Contains(output, probeSessionConflictPhrase)
 }
 
-// rotateProbeIdentity replaces path's persisted identity with a freshly
-// minted SessionID, carrying DisplayName and -- critically -- TrustAccepted
-// forward unchanged (see probeIdentity's own doc comment for why
-// TrustAccepted survives a rotation: it belongs to the probe *directory*,
-// which a rotation never changes, not to the SessionID being replaced),
-// and retires the old current SessionID into RetiredSessionIDs
-// (deduplicated -- see appendRetiredSessionID) so Provider.List keeps
-// excluding it from the normal catalog even after it stops being current
-// (Claude Code's own native catalog does not remove a rejected session's
-// row on its own -- see probeIdentity's own doc comment). This is the
-// only recovery available once Claude Code has permanently rejected an
-// identity's SessionID (see probeSessionConflict): the probe's design of
+// probeIdentityRecovery is rotateProbeIdentity's result: Identity is
+// always the identity a caller should retry with, and Rotated reports
+// whether this call actually minted a new SessionID (true) or found that
+// another process had already recovered from the same rejection and is
+// simply handing that process's own rotation back (false) -- see
+// rotateProbeIdentity's own doc comment. refreshWithRecovery's retry
+// behavior is identical either way (see its own doc comment); Rotated is
+// exposed only so a caller or test can distinguish the two cases when it
+// matters.
+type probeIdentityRecovery struct {
+	Identity probeIdentity
+	Rotated  bool
+}
+
+// rotateProbeIdentity recovers from rejectedSessionID having been rejected
+// by Claude Code as already in use (see probeSessionConflict): the only
+// recovery available once that happens, since the probe's design of
 // otherwise reusing one persisted identity forever has no other way to
 // recover from a rejection that never clears on its own.
 //
-// It deliberately re-reads path itself rather than taking the caller's
-// own probeIdentity value as the record to rotate from: a caller like
-// Probe.refreshWithRecovery loaded its copy before calling
-// Probe.refreshOnce, and refreshOnce can itself persist a TrustAccepted
-// update (see markTrustAccepted) partway through that same attempt --
-// specifically, a session conflict can surface right after the
-// workspace-trust dialog was just answered, before the attempt otherwise
-// succeeds. Rotating from the caller's now-stale in-memory copy would
-// silently regress a TrustAccepted:true that was already durably
-// persisted moments earlier, resending the blind trust-dialog keystroke
-// sequence into what Claude Code already considers a trusted directory's
-// live chat composer on the very next attempt. Reading the current
-// on-disk record instead makes the persisted file -- not any particular
-// caller's possibly-outdated copy -- the single source of truth for what
-// gets carried forward.
-func rotateProbeIdentity(path string) (probeIdentity, error) {
+// It deliberately re-reads path itself rather than taking a caller's own
+// probeIdentity value as the record to rotate from -- for two independent
+// reasons, both requiring the on-disk file, not any particular caller's
+// possibly-outdated copy, to be the single source of truth for what
+// happens next:
+//
+//   - TrustAccepted race: a caller like Probe.refreshWithRecovery loaded
+//     its copy before calling Probe.refreshOnce, and refreshOnce can
+//     itself persist a TrustAccepted update (see markTrustAccepted)
+//     partway through that same attempt -- specifically, a session
+//     conflict can surface right after the workspace-trust dialog was
+//     just answered, before the attempt otherwise succeeds. Rotating from
+//     the caller's now-stale in-memory copy would silently regress a
+//     TrustAccepted:true that was already durably persisted moments
+//     earlier, resending the blind trust-dialog keystroke sequence into
+//     what Claude Code already considers a trusted directory's live chat
+//     composer on the very next attempt.
+//   - Cross-process race: multiple agentsctl processes can share the same
+//     probe.json. If another process already rotated rejectedSessionID
+//     away (its own refreshWithRecovery hit the same conflict first) by
+//     the time this call runs, blindly minting yet another new SessionID
+//     here would be redundant -- worse, it would start a rotation storm
+//     under any further contention (A→B→C→D...), and would silently
+//     discard whatever that other process already retired into
+//     RetiredSessionIDs. Comparing rejectedSessionID against the freshly
+//     read persisted current -- not a caller's stale copy of what it
+//     believed current to be -- is what makes this comparison meaningful:
+//     if they still match, this process is the first to react and
+//     genuinely owns the rotation; if they don't, someone already handled
+//     it and the persisted identity is simply handed back as-is (Rotated:
+//     false), no new UUID minted, no new write.
+//
+// A genuine rotation (rejectedSessionID matches the freshly read persisted
+// current) carries DisplayName and TrustAccepted forward unchanged (see
+// probeIdentity's own doc comment for why TrustAccepted survives a
+// rotation: it belongs to the probe *directory*, which a rotation never
+// changes, not to the SessionID being replaced) and retires the old
+// current SessionID into RetiredSessionIDs (deduplicated -- see
+// appendRetiredSessionID) so Provider.List keeps excluding it even after
+// it stops being current (see probeIdentity's own doc comment).
+func rotateProbeIdentity(path, rejectedSessionID string) (probeIdentityRecovery, error) {
 	current, ok, err := readProbeIdentityIfExists(path)
 	if err != nil {
-		return probeIdentity{}, fmt.Errorf("read claude usage probe identity for rotation: %w", err)
+		return probeIdentityRecovery{}, fmt.Errorf("read claude usage probe identity for rotation: %w", err)
 	}
 	if !ok {
-		return probeIdentity{}, errors.New("claude usage probe: no identity to rotate")
+		return probeIdentityRecovery{}, errors.New("claude usage probe: no identity to rotate")
+	}
+	if current.SessionID != rejectedSessionID {
+		// Another process already rotated this exact rejection away --
+		// see this function's own doc comment's "cross-process race".
+		return probeIdentityRecovery{Identity: current, Rotated: false}, nil
 	}
 	uuid, err := newUUIDv4()
 	if err != nil {
-		return probeIdentity{}, err
+		return probeIdentityRecovery{}, err
 	}
 	rotated := probeIdentity{
 		SessionID:         uuid,
@@ -292,9 +327,9 @@ func rotateProbeIdentity(path string) (probeIdentity, error) {
 		RetiredSessionIDs: appendRetiredSessionID(current.RetiredSessionIDs, current.SessionID),
 	}
 	if err := writeProbeIdentity(path, rotated); err != nil {
-		return probeIdentity{}, err
+		return probeIdentityRecovery{}, err
 	}
-	return rotated, nil
+	return probeIdentityRecovery{Identity: rotated, Rotated: true}, nil
 }
 
 // newUUIDv4 generates a random RFC 4122 version-4 UUID -- sufficient for

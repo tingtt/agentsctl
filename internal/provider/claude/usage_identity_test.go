@@ -76,9 +76,11 @@ func TestNewUUIDv4LooksLikeAValidUUID(t *testing.T) {
 	}
 }
 
-// TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust fixes ordinary
-// rotation: rotating must mint a brand-new SessionID, retire the old one
-// into RetiredSessionIDs, and carry TrustAccepted forward unchanged.
+// TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust fixes ordinary,
+// single-process rotation: rejectedSessionID matching the freshly read
+// persisted current must mint a brand-new SessionID, retire the old one
+// into RetiredSessionIDs, carry TrustAccepted forward unchanged, and
+// report Rotated:true.
 func TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "probe.json")
 	orig, err := loadOrCreateProbeIdentity(path)
@@ -89,18 +91,21 @@ func TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rotated, err := rotateProbeIdentity(path)
+	recovery, err := rotateProbeIdentity(path, orig.SessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rotated.SessionID == orig.SessionID {
+	if !recovery.Rotated {
+		t.Fatal("want Rotated=true for an ordinary single-process rotation")
+	}
+	if recovery.Identity.SessionID == orig.SessionID {
 		t.Fatal("rotation must mint a new SessionID, not reuse the rejected one")
 	}
-	if !rotated.TrustAccepted {
+	if !recovery.Identity.TrustAccepted {
 		t.Fatal("TrustAccepted must be preserved across rotation")
 	}
-	if len(rotated.RetiredSessionIDs) != 1 || rotated.RetiredSessionIDs[0] != orig.SessionID {
-		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q]", rotated.RetiredSessionIDs, orig.SessionID)
+	if len(recovery.Identity.RetiredSessionIDs) != 1 || recovery.Identity.RetiredSessionIDs[0] != orig.SessionID {
+		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q]", recovery.Identity.RetiredSessionIDs, orig.SessionID)
 	}
 
 	// And it's durably persisted, not just returned.
@@ -108,8 +113,60 @@ func TestRotateProbeIdentityRetiresRejectedIDAndPreservesTrust(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("no identity persisted after rotation: ok=%v err=%v", ok, err)
 	}
-	if persisted.SessionID != rotated.SessionID {
-		t.Fatalf("persisted SessionID=%q, want %q", persisted.SessionID, rotated.SessionID)
+	if persisted.SessionID != recovery.Identity.SessionID {
+		t.Fatalf("persisted SessionID=%q, want %q", persisted.SessionID, recovery.Identity.SessionID)
+	}
+}
+
+// TestRotateProbeIdentityIsIdempotentAcrossProcesses fixes the
+// cross-process race two agentsctl processes sharing the same probe.json
+// can hit: if the persisted current identity has already moved on from
+// rejectedSessionID (another process's own rotation got there first),
+// rotateProbeIdentity must hand that already-rotated identity back as-is
+// -- no new SessionID minted, no new write, and the retired list left
+// exactly as that other process's rotation set it.
+func TestRotateProbeIdentityIsIdempotentAcrossProcesses(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "probe.json")
+	orig, err := loadOrCreateProbeIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate another process already recovering from the exact same
+	// rejection this process is about to react to.
+	external, err := rotateProbeIdentity(path, orig.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !external.Rotated {
+		t.Fatal("setup: the simulated external rotation should itself have rotated")
+	}
+
+	// This process still believes orig is current and reacts to the same
+	// rejection -- rotateProbeIdentity must notice the persisted current
+	// has already moved on.
+	recovery, err := rotateProbeIdentity(path, orig.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.Rotated {
+		t.Fatal("want Rotated=false when another process already recovered from this exact rejection")
+	}
+	if recovery.Identity.SessionID != external.Identity.SessionID {
+		t.Fatalf("got SessionID=%q, want the already-rotated %q -- no redundant SessionID should be minted", recovery.Identity.SessionID, external.Identity.SessionID)
+	}
+	if len(recovery.Identity.RetiredSessionIDs) != 1 || recovery.Identity.RetiredSessionIDs[0] != orig.SessionID {
+		t.Fatalf("RetiredSessionIDs=%v, want exactly [%q] (unchanged by the redundant call)", recovery.Identity.RetiredSessionIDs, orig.SessionID)
+	}
+
+	// And nothing was written to disk by the redundant call: the
+	// persisted identity is still exactly what the external rotation left.
+	persisted, ok, err := readProbeIdentityIfExists(path)
+	if err != nil || !ok {
+		t.Fatalf("no identity persisted: ok=%v err=%v", ok, err)
+	}
+	if persisted.SessionID != external.Identity.SessionID {
+		t.Fatalf("persisted SessionID=%q, want the external rotation's %q untouched", persisted.SessionID, external.Identity.SessionID)
 	}
 }
 
