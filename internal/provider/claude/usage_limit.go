@@ -152,7 +152,7 @@ const probeOutputCaptureMax = 16 * 1024
 
 // probeOutputCapture is a bounded, concurrency-safe accumulator for a
 // probe session's raw terminal output -- written continuously by
-// captureUntilClosed while Probe.refreshOnce's own wait loop repeatedly
+// captureUntilClosed while probeAttemptRunner.Run's own wait loop repeatedly
 // inspects it via classifyProbeOutput.
 type probeOutputCapture struct {
 	mu  sync.Mutex

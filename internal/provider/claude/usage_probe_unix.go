@@ -5,12 +5,9 @@ package claude
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
@@ -37,7 +34,7 @@ const usageProbeTTL = 3 * time.Minute
 // cancellation semantics are never made worse by this lock's existence.
 const usageProbeRefreshLockPollInterval = 50 * time.Millisecond
 
-// usageProbePrompt is the minimal message Probe.refreshOnce sends into the
+// usageProbePrompt is the minimal message probeAttemptRunner.Run sends into the
 // probe session to elicit one real API response (the only way Claude Code
 // populates rate_limits for its statusLine -- see UsageProbeSource's doc
 // comment). It deliberately asks for no tool use: this session has no
@@ -45,7 +42,7 @@ const usageProbeRefreshLockPollInterval = 50 * time.Millisecond
 // spawned would simply hang until usageProbeSendTimeout.
 const usageProbePrompt = "Reply with just the word OK. Do not use any tools."
 
-// usageProbeSendTimeout bounds how long Probe.refreshOnce waits for the
+// usageProbeSendTimeout bounds how long probeAttemptRunner.Run waits for the
 // collector to observe a fresh statusLine snapshot (ObservedAt after the
 // prompt was sent) before giving up on this refresh.
 const usageProbeSendTimeout = 30 * time.Second
@@ -93,14 +90,14 @@ const usageProbeTrustSettleDelay = 2 * time.Second
 // the session's own TUI a moment to settle back to idle first.
 const usageProbeDetachSettleDelay = 2 * time.Second
 
-// usageProbeDetachTimeout bounds how long detachProbeSession waits for a
-// SIGINT-requested clean exit before escalating to SIGKILL.
+// usageProbeDetachTimeout bounds how long probeAttemptRunner.detach waits
+// for a SIGINT-requested clean exit before escalating to SIGKILL.
 const usageProbeDetachTimeout = 5 * time.Second
 
 // Probe is agentsctl's one owned Claude usage-probe session: an
 // interactive `claude` process, run under a PTY this package owns
 // transiently for each refresh (never left running in the background --
-// see refreshOnce), configured via a dedicated --settings file whose
+// see usage_attempt.go's probeAttemptRunner.Run), configured via a dedicated --settings file whose
 // statusLine points back at this same executable's UsageCollectorCommand.
 // It implements UsageProbeSource for Provider.
 //
@@ -226,7 +223,27 @@ func (pr *Probe) newRefreshCoordinator() *refreshCoordinator {
 		identity: pr.identityStore(),
 		snapshot: pr.snapshotStore(),
 		ttl:      usageProbeTTL,
-		attempt:  pr.refreshOnce,
+		now:      pr.now,
+		attempt:  pr.newAttemptRunner().Run,
+	}
+}
+
+// newAttemptRunner builds this probe's single-attempt runner (see
+// probeAttemptRunner's own doc comment) from this Probe's current
+// configuration -- cheap to construct, so a fresh one is built per attempt
+// rather than cached as a field.
+func (pr *Probe) newAttemptRunner() *probeAttemptRunner {
+	return &probeAttemptRunner{
+		dir:               pr.Dir,
+		claudePath:        pr.claudePath(),
+		exePath:           pr.exePath,
+		settingsPath:      pr.settingsPath(),
+		snapshotPath:      pr.snapshotPath(),
+		settleDelay:       pr.settleDelay(),
+		trustSettleDelay:  pr.trustSettleDelay(),
+		detachSettleDelay: pr.detachSettleDelay(),
+		sendTimeout:       pr.sendTimeout(),
+		identity:          pr.identityStore(),
 	}
 }
 
@@ -359,7 +376,13 @@ func (pr *Probe) refreshShared(ctx context.Context) (probestate.Snapshot, error)
 	pr.refreshCh = ch
 	pr.mu.Unlock()
 
-	snap, err := pr.newRefreshCoordinator().Refresh(ctx)
+	// prev feeds refreshCoordinator.resolveOutcome's exhausted-snapshot
+	// merge if this refresh's own attempt detects a usage limit (see its
+	// own doc comment) -- Probe's process-local cache is the only place
+	// that knowledge lives, so it's read here and handed down rather than
+	// the coordinator reaching back into Probe for it.
+	prev, _ := pr.cachedAny()
+	snap, err := pr.newRefreshCoordinator().Refresh(ctx, prev)
 
 	pr.mu.Lock()
 	if err == nil {
@@ -369,304 +392,6 @@ func (pr *Probe) refreshShared(ctx context.Context) (probestate.Snapshot, error)
 	pr.mu.Unlock()
 	close(ch)
 	return snap, err
-}
-
-// refreshOnce does the actual probe-session work for a single attempt,
-// addressing Claude via id's SessionID (supplied by the caller --
-// refreshCoordinator.refreshWithRecovery -- rather than loaded here, so a post-conflict
-// retry can pass a freshly-rotated identity without this function
-// needing any recovery logic of its own): it starts the one owned Claude
-// session under a PTY this call owns transiently, answers the
-// workspace-trust dialog if id.TrustAccepted is false, sends
-// usageProbePrompt to elicit a real API response (consuming a small
-// amount of quota -- see usageProbePrompt's doc comment), waits for
-// either the collector to observe a snapshot that actually reflects a
-// completed response to this prompt or Claude Code's own terminal output
-// to show a usage-limit or session-conflict indication (see
-// waitForProbeOutcome/classifyProbeOutput/checkSessionConflict), then
-// detaches -- the process is never left running across refreshes (see
-// Probe's doc comment): each attempt runs only one transient probe
-// process, addressing exactly one --session-id. That does NOT mean
-// Claude's own native catalog only ever shows one probe row, though: a
-// rotation (see probestate.IdentityStore.Rotate) leaves the rejected
-// SessionID's row sitting in that catalog indefinitely, since Claude Code
-// never removes it on its own. Provider.List instead excludes every
-// session ID this probe has ever owned -- current and retired alike (see
-// UsageProbeSource.KnownSessionIDs) -- rather than relying on the
-// catalog ever containing only one such row.
-//
-// A detected limit is returned as a valid (err == nil) exhausted
-// probestate.Snapshot, not a failure -- see exhaustedSnapshot and Issue
-// #19's "限定到達を...単なる refresh failure として扱わない". A detected
-// session conflict is returned as an error wrapping
-// errProbeSessionConflict (see checkSessionConflict), which only
-// refreshCoordinator.refreshWithRecovery ever interprets specially. Any other, genuinely
-// unrelated failure (timeout, parse failure, process launch failure)
-// returns a plain error, preserving #14's existing stale-cache fallback
-// policy for those cases unchanged (see Usage's own doc comment) --
-// refreshCoordinator.refreshWithRecovery does not rotate or retry for these.
-func (pr *Probe) refreshOnce(ctx context.Context, id probestate.Identity) (probestate.Snapshot, error) {
-	if err := os.MkdirAll(pr.Dir, 0o700); err != nil {
-		return probestate.Snapshot{}, err
-	}
-	exe, err := pr.exePath()
-	if err != nil {
-		return probestate.Snapshot{}, fmt.Errorf("resolve agentsctl executable: %w", err)
-	}
-	if err := writeUsageSettings(pr.settingsPath(), exe, pr.snapshotPath()); err != nil {
-		return probestate.Snapshot{}, fmt.Errorf("write claude usage probe settings: %w", err)
-	}
-
-	args := []string{"--session-id", id.SessionID, "--settings", pr.settingsPath()}
-	cmd := exec.CommandContext(ctx, pr.claudePath(), args...)
-	cmd.Dir = pr.Dir
-	child, err := startClaudeAttachRaw(cmd)
-	if err != nil {
-		return probestate.Snapshot{}, fmt.Errorf("start claude usage probe session: %w", err)
-	}
-	defer child.Close()
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-	// No real terminal is watching this session's output; capture it
-	// (rather than plain drainUntilClosed's discard, as sendClaudeRename
-	// uses) both to keep the pty buffer draining -- an unread buffer would
-	// otherwise make the child block on its own writes -- and so a usage-
-	// limit indication in that output can be classified below.
-	capture := &probeOutputCapture{}
-	go captureUntilClosed(child, capture)
-
-	// See usageProbeSettleDelay's doc comment for why this waits, unlike
-	// sendClaudeRename's immediate write.
-	if err := probeSettle(ctx, pr.settleDelay()); err != nil {
-		return probestate.Snapshot{}, err
-	}
-
-	// A rejected --session-id shows up here, within the settle window,
-	// well before any prompt is sent (see probeSessionConflict's doc
-	// comment) -- checked before the trust-dialog logic below so the
-	// common case never misreports it as a confusing, unrelated pty write
-	// failure once the (already-dead) child's slave end is written to.
-	if err, ok := pr.checkSessionConflict(capture, id); ok {
-		return probestate.Snapshot{}, err
-	}
-
-	if !id.TrustAccepted {
-		if _, err := child.Write([]byte(usageProbeTrustDialogAccept)); err != nil {
-			if cerr, ok := pr.checkSessionConflict(capture, id); ok {
-				return probestate.Snapshot{}, cerr
-			}
-			return probestate.Snapshot{}, fmt.Errorf("accept claude workspace trust dialog: %w", err)
-		}
-		// Persisted before the prompt below, not after refresh succeeds:
-		// this dialog is answered at most once ever, regardless of
-		// whether the rest of this particular refresh goes on to
-		// succeed or fail (see probestate.Identity.TrustAccepted). Marks
-		// whatever identity is LATEST persisted at this instant, not
-		// necessarily this attempt's own `id`
-		// (see probestate.IdentityStore.MarkTrustAccepted's own doc
-		// comment) -- workspace trust is directory-level, so that's the
-		// correct target even if another process rotated concurrently
-		// with this very attempt.
-		//
-		// Its error is no longer silently discarded: this is now a
-		// meaningful identity-lock transaction (see
-		// probestate.IdentityStore.MarkTrustAccepted's own doc comment),
-		// not a fire-and-forget write, and continuing on to send the
-		// real prompt below on the unverified assumption that it
-		// durably persisted would leave a LATER refresh's own
-		// `!id.TrustAccepted` check still true even though Claude Code's
-		// own state already considers this directory trusted -- exactly
-		// the blind-resend hazard TrustAccepted exists to avoid (see
-		// probestate.Identity's own doc comment). Failing this attempt
-		// instead falls through to Usage's existing stale-cache
-		// fallback, same as any other refreshOnce failure.
-		//
-		// This alone doesn't fully close that hazard: refreshCoordinator.Refresh
-		// (see its own doc comment) is this package's actual primary
-		// defense, serializing first-trust handling across every
-		// agentsctl process sharing this probe directory so the
-		// interleaving this guards against essentially can't occur in
-		// normal operation; a persistence failure occurring right here is
-		// a narrow residual window even that can't close by itself (a
-		// later refresh, still seeing TrustAccepted=false on disk, would
-		// still attempt to answer a dialog Claude Code may no longer be
-		// showing). Deliberately NOT added on top of this: a text-based
-		// "is the trust dialog actually still showing" classifier,
-		// checked alongside checkSessionConflict's kind of output
-		// classification. Unlike probeSessionConflictPhrase or
-		// classifyProbeOutput's limit wording -- both confirmed against
-		// real, captured, quoted installed-CLI terminal output in earlier
-		// rounds -- no real Claude Code workspace-trust dialog text has
-		// ever actually been captured and verified against the installed
-		// CLI for this probe, and this round's fix is required to close
-		// without any further live-quota-consuming Claude calls to go
-		// verify one. A guessed pattern risks exactly the fail-unsafe
-		// outcome this whole mechanism exists to prevent (a false
-		// negative sending real navigation/Enter keystrokes into a live
-		// chat composer), so this residual window is accepted and
-		// documented rather than closed with an unverified classifier.
-		if err := pr.identityStore().MarkTrustAccepted(); err != nil {
-			return probestate.Snapshot{}, fmt.Errorf("persist claude workspace trust acceptance: %w", err)
-		}
-		if err := probeSettle(ctx, pr.trustSettleDelay()); err != nil {
-			return probestate.Snapshot{}, err
-		}
-	}
-
-	sentAt := time.Now()
-	if _, err := child.Write([]byte(usageProbePrompt + "\r")); err != nil {
-		// A conflict that arrived just after the settle-time check above
-		// (a narrow race, not observed but not impossible under heavy
-		// system load) would otherwise surface here only as a generic,
-		// unhelpful pty write error with no recovery action taken -- this
-		// re-check is the same identity-discarding recovery as the
-		// settle-time one above, just as a fallback rather than the
-		// common path.
-		if cerr, ok := pr.checkSessionConflict(capture, id); ok {
-			return probestate.Snapshot{}, cerr
-		}
-		return probestate.Snapshot{}, fmt.Errorf("send claude usage probe prompt: %w", err)
-	}
-
-	snap, sig, waitErr := waitForProbeOutcome(ctx, pr.snapshotPath(), capture, sentAt, pr.sendTimeout())
-
-	pr.detachProbeSession(ctx, cmd, wait)
-
-	if sig.any() {
-		return pr.exhaustedSnapshot(sig, pr.now()), nil
-	}
-	if waitErr != nil {
-		return probestate.Snapshot{}, waitErr
-	}
-	return snap, nil
-}
-
-// checkSessionConflict reports (via ok) whether capture shows Claude Code
-// rejecting id.SessionID as already in use (see probeSessionConflict). It
-// is a pure classifier with no side effect on persisted state -- deciding
-// what to do about a conflict (rotate the identity and retry once) is
-// refreshCoordinator.refreshWithRecovery's responsibility, not refreshOnce's; this only
-// needs to produce a distinguishable error (wrapping
-// errProbeSessionConflict, checked via errors.Is, never by re-parsing a
-// message string). Called at more than one point in refreshOnce (see its
-// own call sites) so a conflict is caught promptly in the common case but
-// never missed just because it showed up a moment later than the first
-// check ran.
-func (pr *Probe) checkSessionConflict(capture *probeOutputCapture, id probestate.Identity) (err error, ok bool) {
-	if !probeSessionConflict(capture.String()) {
-		return nil, false
-	}
-	return fmt.Errorf("claude usage probe: session id %s rejected as already in use: %w", id.SessionID, errProbeSessionConflict), true
-}
-
-// probeSettle waits for d, or returns ctx's error if ctx is cancelled
-// first.
-func probeSettle(ctx context.Context, d time.Duration) error {
-	select {
-	case <-time.After(d):
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// waitForProbeOutcome polls both path (the collector's persisted snapshot)
-// and capture (the probe session's own raw terminal output) until one of
-// three outcomes is reached: (1) path holds a snapshot whose ObservedAt is
-// after `after` AND whose ResponseObserved is true -- proving it reflects
-// a completed response to this refresh's own prompt, not a periodic
-// pre-response or stale-prior-turn re-tick (see parseStatusLinePayload's
-// doc comment) -- returned as a normal fresh snapshot; (2) capture's
-// accumulated output classifies as a usage-limit indication (see
-// classifyProbeOutput) -- returned as a limit signal, snapshot zero,
-// error nil, since this is itself a valid outcome, not a failure; or (3)
-// timeout elapses with neither -- a genuine non-limit failure (see
-// refresh's own doc comment for how each outcome is handled).
-func waitForProbeOutcome(ctx context.Context, path string, capture *probeOutputCapture, after time.Time, timeout time.Duration) (probestate.Snapshot, probeLimitSignal, error) {
-	deadline := time.Now().Add(timeout)
-	store := probestate.NewSnapshotStore(path)
-	for {
-		if snap, ok, err := store.Load(); err == nil && ok && snap.ObservedAt.After(after) && snap.ResponseObserved {
-			return snap, probeLimitSignal{}, nil
-		}
-		if sig := classifyProbeOutput(capture.String()); sig.any() {
-			return probestate.Snapshot{}, sig, nil
-		}
-		if !time.Now().Before(deadline) {
-			return probestate.Snapshot{}, probeLimitSignal{}, fmt.Errorf("claude usage probe: no fresh statusLine snapshot within %s", timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return probestate.Snapshot{}, probeLimitSignal{}, ctx.Err()
-		case <-time.After(usageProbePollInterval):
-		}
-	}
-}
-
-// exhaustedSnapshot builds the probestate.Snapshot for a refresh that
-// detected a Claude usage limit (see classifyProbeOutput) instead of
-// obtaining a trustworthy fresh statusLine snapshot. Each window sig
-// marks exhausted becomes session.UsageExhausted at 100%, carrying
-// forward that same window's own prior cached Reset time when one is
-// known (the server-set reset boundary doesn't change just because this
-// refresh couldn't re-confirm it) -- never inventing one. A window sig
-// does NOT mark is left exactly as it was previously cached, so a limit
-// confirmed for one window never destroys the other's still-valid
-// snapshot (see Issue #19's "片方だけ exhausted の場合...もう片方の有効な
-// snapshot を不必要に失わない"); that carried-forward window is still
-// subject to the normal reset-boundary normalization session.Usage.At
-// applies in toSessionUsage, same as any other cached window.
-func (pr *Probe) exhaustedSnapshot(sig probeLimitSignal, now time.Time) probestate.Snapshot {
-	prev, _ := pr.cachedAny()
-	snap := probestate.Snapshot{ObservedAt: now, ResponseObserved: true, FiveHour: prev.FiveHour, Weekly: prev.Weekly}
-	if sig.FiveHour {
-		snap.FiveHour = exhaustedWindowSnapshot(prev.FiveHour)
-	}
-	if sig.Weekly {
-		snap.Weekly = exhaustedWindowSnapshot(prev.Weekly)
-	}
-	return snap
-}
-
-// exhaustedWindowSnapshot builds one exhausted window, carrying forward
-// prev's own Reset time when prev had one (see exhaustedSnapshot).
-func exhaustedWindowSnapshot(prev probestate.WindowSnapshot) probestate.WindowSnapshot {
-	reset := prev.ResetAt
-	if prev.State == session.UsageUnknown {
-		reset = time.Time{}
-	}
-	return probestate.WindowSnapshot{State: session.UsageExhausted, Percent: 100, ResetAt: reset}
-}
-
-// detachProbeSession ends a plain interactive probe session process.
-// Unlike detachClaudeClient (built for `claude attach <id>`'s own
-// documented Ctrl+Z detach hotkey), a brand-new `claude --session-id ...`
-// session does not treat a literal Ctrl+Z byte the same way: verified
-// against the installed CLI, it is instead read as an ordinary job-control
-// suspend request, leaving the process permanently "suspended" (the CLI's
-// own message: "Run `fg` to bring Claude Code back") rather than exiting,
-// until force-killed. SIGINT is what actually works for an otherwise-idle
-// session (also verified against the installed CLI); SIGTERM was tried
-// too and does not reliably end the process either. A SIGKILL fallback
-// here is safe, unlike a mid-turn kill (observed to leave that session's
-// conversation permanently unresumable): this probe never depends on any
-// given refresh's conversation surviving (see probestate.Identity's doc
-// comment), so losing it costs nothing beyond this one process needing to
-// be started again next refresh.
-func (pr *Probe) detachProbeSession(ctx context.Context, cmd *exec.Cmd, wait <-chan error) {
-	if cmd.Process == nil {
-		return
-	}
-	// A bounded, unconditional wait (not tied to ctx) -- cleaning up this
-	// process is worth attempting even if the caller's own ctx has
-	// already been cancelled (e.g. agentsctl itself is exiting).
-	time.Sleep(pr.detachSettleDelay())
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
-	if _, ok := waitForAttachment(ctx, wait, usageProbeDetachTimeout); ok {
-		return
-	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	_, _ = waitForAttachment(ctx, wait, usageProbeDetachTimeout)
 }
 
 // toSessionUsage converts this package's own Claude-specific snapshot into

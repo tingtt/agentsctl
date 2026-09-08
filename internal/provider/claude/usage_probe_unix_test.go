@@ -770,11 +770,11 @@ func TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust(t *testi
 // fixes the specific TrustAccepted race the review above missed:
 // TestProbeSessionConflictRecoversWithinSameUsageCallPreservingTrust only
 // ever starts from an identity ALREADY marked TrustAccepted:true, so
-// refreshOnce's own `if !id.TrustAccepted` branch (and therefore the
+// probeAttemptRunner.Run's own `if !id.TrustAccepted` branch (and therefore the
 // trust-dialog write and the markTrustAccepted call right after it) never
 // runs at all in that test -- it cannot catch a rotation that carries
 // forward a caller's stale, pre-attempt copy of TrustAccepted instead of
-// whatever refreshOnce most recently persisted.
+// whatever the attempt most recently persisted.
 //
 // Here the identity starts genuinely untrusted (TrustAccepted:false, and
 // Claude Code's own directory-level trust marker absent too), so attempt
@@ -830,7 +830,7 @@ func TestProbeSessionConflictAfterTrustAcceptancePreservesLatestPersistedTrust(t
 	if newID.SessionID == origID.SessionID {
 		t.Fatal("recovery must rotate to a new session id, not reuse the rejected one")
 	}
-	// The crucial assertion: TrustAccepted must reflect what refreshOnce
+	// The crucial assertion: TrustAccepted must reflect what the attempt
 	// actually persisted moments earlier in this very Usage() call, not
 	// origID's stale (pre-attempt) copy.
 	if !newID.TrustAccepted {
@@ -1113,12 +1113,12 @@ func TestProbeKnownSessionIDsSurviveRestart(t *testing.T) {
 
 // TestFakeCLIRejectsPromptWithoutTrustDialogAccept fixes the fake CLI's
 // own fidelity to the real bug this package's Fix B addresses: driven
-// directly (bypassing Probe.refreshOnce entirely), a brand-new probe
+// directly (bypassing probeAttemptRunner.Run entirely), a brand-new probe
 // directory's fake session must reject a prompt sent WITHOUT first
 // answering the workspace-trust dialog -- reproducing the original defect
 // (a blind prompt+Enter selects the fake's own default "No, exit" and the
 // session exits, never invoking statusLine) -- so that the other tests in
-// this file, which all pass through Probe.refreshOnce's real trust-dialog
+// this file, which all pass through probeAttemptRunner.Run's real trust-dialog
 // handling, are proven against a fake that can actually fail, not one
 // that trivially succeeds regardless of what's sent.
 func TestFakeCLIRejectsPromptWithoutTrustDialogAccept(t *testing.T) {
@@ -1537,7 +1537,7 @@ func TestProbeRefreshCrossProcessReusesFreshPersistedSnapshotWithoutInvokingClau
 		t.Fatal(err)
 	}
 
-	snap, err := pr.newRefreshCoordinator().Refresh(context.Background())
+	snap, err := pr.newRefreshCoordinator().Refresh(context.Background(), probestate.Snapshot{})
 	if err != nil {
 		t.Fatalf("refreshCoordinator.Refresh errored instead of reusing the fresh persisted snapshot without ever touching the (deliberately unusable) claude path: %v", err)
 	}
