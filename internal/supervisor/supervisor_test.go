@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -139,6 +140,159 @@ func TestHandshakeReportsProtocolBuildAndDaemonIdentity(t *testing.T) {
 	if !response.OK || response.ProtocolVersion != ProtocolVersion || response.BuildVersion != BuildVersion || response.DaemonPID != os.Getpid() || response.DaemonStartTime == 0 {
 		t.Fatalf("handshake=%+v", response)
 	}
+}
+
+func TestCompatibilityRejectsSupervisorWithoutEnvironmentOverrides(t *testing.T) {
+	if compatible(Response{ProtocolVersion: 2, BuildVersion: "session-lifecycle-2026-09-03"}) {
+		t.Fatal("protocol 2 supervisor was treated as compatible with environment overrides")
+	}
+	if !compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: BuildVersion}) {
+		t.Fatal("current supervisor protocol/build was treated as incompatible")
+	}
+}
+
+func TestManagedChildEnvironmentMergesRequestOverrides(t *testing.T) {
+	t.Setenv("CODEX_EDITOR", "nvim")
+	t.Setenv("PATH", "/test/bin:/usr/bin")
+	t.Setenv("HOME", "/test/home")
+
+	cases := []struct {
+		name            string
+		provider        string
+		overrides       map[string]string
+		inheritedEditor string
+		unsetEditor     bool
+		wantEditor      string
+	}{
+		{name: "Codex override without inherited editor", provider: "codex", overrides: map[string]string{"EDITOR": "nvim"}, unsetEditor: true, wantEditor: "nvim"},
+		{name: "Codex override replaces inherited editor", provider: "codex", overrides: map[string]string{"EDITOR": "nvim"}, inheritedEditor: "vim", wantEditor: "nvim"},
+		{name: "Codex inheritance", provider: "codex", inheritedEditor: "vim", wantEditor: "vim"},
+		{name: "Claude does not interpret CODEX_EDITOR", provider: "claude", inheritedEditor: "vim", wantEditor: "vim"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EDITOR", tc.inheritedEditor)
+			if tc.unsetEditor {
+				if err := os.Unsetenv("EDITOR"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dir := t.TempDir()
+			output := filepath.Join(dir, "environment.json")
+			statePath := filepath.Join(dir, "state.json")
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{
+				Store: localstate.New(statePath),
+				runs:  map[string]*process{},
+				ResolveExecutable: func(string) (string, error) {
+					return executable, nil
+				},
+			}
+			overrides := make(map[string]string, len(tc.overrides)+1)
+			for key, value := range tc.overrides {
+				overrides[key] = value
+			}
+			overrides["AGENTSCTL_CHILD_ENV_FILE"] = output
+			response := callServer(t, server, Request{
+				Action:      "start",
+				RunID:       "environment",
+				Provider:    tc.provider,
+				Args:        []string{"-test.run=^TestManagedChildEnvironmentHelper$"},
+				CWD:         dir,
+				Environment: overrides,
+			})
+			if !response.OK && strings.Contains(response.Error, "operation not permitted") {
+				t.Skip("sandbox does not permit PTY process spawn")
+			}
+			if !response.OK {
+				t.Fatal(response.Error)
+			}
+
+			environment := readChildEnvironment(t, output)
+			if got := environment["EDITOR"]; len(got) != 1 || got[0] != tc.wantEditor {
+				t.Fatalf("child EDITOR entries=%v, want exactly [%q]", got, tc.wantEditor)
+			}
+			if got := environment["PATH"]; len(got) != 1 || got[0] != "/test/bin:/usr/bin" {
+				t.Fatalf("child PATH entries=%v, want inherited PATH", got)
+			}
+			if got := environment["HOME"]; len(got) != 1 || got[0] != "/test/home" {
+				t.Fatalf("child HOME entries=%v, want inherited HOME", got)
+			}
+			if got := environment["CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT"]; len(got) != 1 || got[0] != "1" {
+				t.Fatalf("child Codex adaptation entries=%v, want [1]", got)
+			}
+			waitLivePreflightStopped(t, statePath, "environment")
+		})
+	}
+}
+
+func TestMergeEnvironmentReplacesEveryDuplicateOverride(t *testing.T) {
+	merged := mergeEnvironment(
+		[]string{"EDITOR=vim", "PATH=/test/bin", "EDITOR=emacs", "HOME=/test/home"},
+		map[string]string{"EDITOR": "nvim"},
+	)
+	environment := make(map[string][]string, len(merged))
+	for _, entry := range merged {
+		key, value, found := strings.Cut(entry, "=")
+		if found {
+			environment[key] = append(environment[key], value)
+		}
+	}
+	if got := environment["EDITOR"]; len(got) != 1 || got[0] != "nvim" {
+		t.Fatalf("EDITOR entries=%v, want exactly [nvim]", got)
+	}
+	if got := environment["PATH"]; len(got) != 1 || got[0] != "/test/bin" {
+		t.Fatalf("PATH entries=%v, want preserved PATH", got)
+	}
+	if got := environment["HOME"]; len(got) != 1 || got[0] != "/test/home" {
+		t.Fatalf("HOME entries=%v, want preserved HOME", got)
+	}
+}
+
+func TestManagedChildEnvironmentHelper(t *testing.T) {
+	path := os.Getenv("AGENTSCTL_CHILD_ENV_FILE")
+	if path == "" {
+		return
+	}
+	b, err := json.Marshal(os.Environ())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readChildEnvironment(t *testing.T, path string) map[string][]string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entries []string
+		if err := json.Unmarshal(b, &entries); err != nil {
+			t.Fatal(err)
+		}
+		environment := make(map[string][]string, len(entries))
+		for _, entry := range entries {
+			key, value, found := strings.Cut(entry, "=")
+			if found {
+				environment[key] = append(environment[key], value)
+			}
+		}
+		return environment
+	}
+	t.Fatalf("managed child did not write environment to %s", path)
+	return nil
 }
 
 func TestPeerIdentityComesFromUnixSocketCredentials(t *testing.T) {

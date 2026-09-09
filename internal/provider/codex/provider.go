@@ -21,9 +21,9 @@ import (
 )
 
 type Dispatcher interface {
-	Dispatch(context.Context, string, string, []string) (localstate.Run, error)
+	Dispatch(context.Context, string, string, []string, map[string]string) (localstate.Run, error)
 	Stop(context.Context, string) error
-	ResumeExisting(context.Context, string, string) (localstate.Run, error)
+	ResumeExisting(context.Context, string, string, map[string]string) (localstate.Run, error)
 	Attach(ctx context.Context, runID string, in *os.File, out io.Writer) error
 }
 
@@ -120,7 +120,7 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	for _, t := range before {
 		baseline = append(baseline, t.ID)
 	}
-	r, err := p.Runtime.Dispatch(ctx, prompt, cwd, baseline)
+	r, err := p.Runtime.Dispatch(ctx, prompt, cwd, baseline, managedEnvironment())
 	if err != nil {
 		return session.Session{}, err
 	}
@@ -250,11 +250,21 @@ func (p *Provider) PrepareAttach(ctx context.Context, s session.Session) (string
 	if !p.writerAbsent(s.Key.ID) {
 		return "", errors.New("external or unknown writer cannot be attached safely")
 	}
-	r, err := p.Runtime.ResumeExisting(ctx, s.Key.ID, s.CWD)
+	r, err := p.Runtime.ResumeExisting(ctx, s.Key.ID, s.CWD, managedEnvironment())
 	if err != nil {
 		return "", err
 	}
 	return r.ID, nil
+}
+
+func managedEnvironment() map[string]string {
+	// Read the invoking agentsctl process here: the persistent supervisor's
+	// inherited CODEX_EDITOR may belong to an earlier invocation.
+	editor := os.Getenv("CODEX_EDITOR")
+	if editor == "" {
+		return nil
+	}
+	return map[string]string{"EDITOR": editor}
 }
 
 // Open implements sessionctl.Opener: it resolves s to a managed run --

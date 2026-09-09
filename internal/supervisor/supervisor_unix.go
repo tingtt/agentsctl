@@ -26,13 +26,14 @@ import (
 )
 
 type Request struct {
-	Action    string   `json:"action"`
-	RunID     string   `json:"runId,omitempty"`
-	SessionID string   `json:"sessionId,omitempty"`
-	Args      []string `json:"args,omitempty"`
-	CWD       string   `json:"cwd,omitempty"`
-	Provider  string   `json:"provider,omitempty"`
-	Baseline  []string `json:"baseline,omitempty"`
+	Action      string            `json:"action"`
+	RunID       string            `json:"runId,omitempty"`
+	SessionID   string            `json:"sessionId,omitempty"`
+	Args        []string          `json:"args,omitempty"`
+	CWD         string            `json:"cwd,omitempty"`
+	Provider    string            `json:"provider,omitempty"`
+	Baseline    []string          `json:"baseline,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
 }
 type Response struct {
 	OK               bool            `json:"ok"`
@@ -51,8 +52,8 @@ type Response struct {
 	Output           string          `json:"output,omitempty"`
 }
 
-const ProtocolVersion = 2
-const BuildVersion = "session-lifecycle-2026-09-03"
+const ProtocolVersion = 3
+const BuildVersion = "child-environment-2026-09-09"
 
 type process struct {
 	run         localstate.Run
@@ -217,7 +218,12 @@ func (s *Server) start(c net.Conn, req Request) {
 	}
 	cmd := exec.Command(path, req.Args...)
 	cmd.Dir = req.CWD
-	cmd.Env = environmentWith(os.Environ(), "CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT", "1")
+	overrides := make(map[string]string, len(req.Environment)+1)
+	for key, value := range req.Environment {
+		overrides[key] = value
+	}
+	overrides["CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT"] = "1"
+	cmd.Env = mergeEnvironment(os.Environ(), overrides)
 	ptmx, tty, err := pty.Open()
 	if err != nil {
 		_ = s.deleteRun(r.ID)
@@ -470,7 +476,7 @@ func (c Client) Ensure(ctx context.Context) error {
 		peer, peerErr := peerIdentity(conn)
 		response, pingErr := call(conn, Request{Action: "ping"})
 		_ = conn.Close()
-		if pingErr == nil && response.ProtocolVersion == ProtocolVersion && response.BuildVersion == BuildVersion {
+		if pingErr == nil && compatible(response) {
 			return nil
 		}
 		if pingErr != nil {
@@ -511,7 +517,7 @@ func (c Client) start(ctx context.Context) error {
 			if pingErr != nil {
 				return fmt.Errorf("new supervisor handshake: %w", pingErr)
 			}
-			if response.ProtocolVersion != ProtocolVersion || response.BuildVersion != BuildVersion {
+			if !compatible(response) {
 				return fmt.Errorf("new supervisor has incompatible protocol/build %d/%q", response.ProtocolVersion, response.BuildVersion)
 			}
 			return nil
@@ -523,6 +529,10 @@ func (c Client) start(ctx context.Context) error {
 		}
 	}
 	return errors.New("supervisor did not start")
+}
+
+func compatible(response Response) bool {
+	return response.ProtocolVersion == ProtocolVersion && response.BuildVersion == BuildVersion
 }
 
 func (c Client) restartOwned(ctx context.Context, response Response) error {
@@ -676,13 +686,19 @@ func call(conn net.Conn, req Request) (Response, error) {
 	return res, nil
 }
 
-func environmentWith(environment []string, key, value string) []string {
-	prefix := key + "="
-	result := make([]string, 0, len(environment)+1)
+func mergeEnvironment(environment []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(environment)+len(overrides))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
-			result = append(result, entry)
+		key, _, found := strings.Cut(entry, "=")
+		if found {
+			if _, overridden := overrides[key]; overridden {
+				continue
+			}
 		}
+		result = append(result, entry)
 	}
-	return append(result, prefix+value)
+	for key, value := range overrides {
+		result = append(result, key+"="+value)
+	}
+	return result
 }
