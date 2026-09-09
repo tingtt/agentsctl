@@ -13,6 +13,20 @@ go build ./cmd/agentsctl
 ./agentsctl
 ```
 
+## Configuration
+
+### Managed Codex external editor
+
+Set `CODEX_EDITOR` when starting `agentsctl` to select the editor used by newly started managed Codex processes:
+
+```sh
+CODEX_EDITOR=nvim agentsctl
+```
+
+When running the binary built above, use `CODEX_EDITOR=nvim ./agentsctl` instead. A non-empty `CODEX_EDITOR` is passed to managed Codex as `EDITOR`, enabling that editor through Codex's native external-editor shortcut while attached to the session. This setting does not change `agentsctl`'s own `EDITOR` and is not applied to Claude.
+
+When `CODEX_EDITOR` is unset or empty, the managed process keeps the normally inherited environment. Changing it does not update an already running Codex process, so start a new managed Codex process after changing the setting. Codex itself currently prefers an existing `VISUAL` value over `EDITOR`.
+
 ## Keys
 
 | Key | Action |
@@ -85,7 +99,7 @@ Claude sessions use Claude's native background supervisor. Detaching sends Claud
 
 Claude rename is a **native** Claude operation: `agentsctl` renames the very same background session Claude itself tracks, so the new name shows up in `claude agents --json --all` and Claude's own Agent View too, not just in `agentsctl`. The session's ID, its background execution, and its lifecycle are all left untouched — renaming a session that is actively working does not interrupt it, and does not fork a new session (`claude --bg --resume <id> --name <name>` was verified to always fork a new session — under a different ID — rather than mutate the original's saved options, for any session state, active or stopped, which is why `agentsctl` does not use it). It works the same way for a completed session as for one still running, and is available for any non-archived session regardless of whether it is active. A name may contain spaces or non-ASCII text (Japanese, for example) but never a control character (including newlines) — those are rejected outright, since Claude's rename command reads its argument as a single line of terminal input. A leftover display-name override from before `agentsctl` supported native rename is only ever shown for a session Claude itself reports no name for, and is cleared automatically the next time that session is renamed.
 
-Codex conversations, creation time, and archive state come from the Codex app-server. Only Codex gets an `agentsctl` supervisor: it owns a PTY for managed interactive CLI processes so a TUI restart can reattach while the daemon remains alive. On attach, the client synchronizes terminal size. A newly attaching client gets no scrollback replay, so on reattach with an unchanged size the supervisor briefly bounces the PTY to a harmless alternate size and back — two genuine, kernel-delivered `SIGWINCH`-inducing size changes to its owned PTY process group — so Codex fully repaints; a signal raised without an underlying size change was verified against the installed CLI to be silently ignored, since Codex re-reads the size on signal and only repaints when it actually differs. The daemon resolves `codex` from its own effective `PATH` and rejects incompatible protocol/build generations. External or ambiguous writers are fail-closed and cannot be attached or stopped. A new run remains a diagnostic `Starting` row until exactly one new app-server thread is proven; zero or multiple candidates are never guessed.
+Codex conversations, creation time, and archive state come from the Codex app-server. Only Codex gets an `agentsctl` supervisor: it owns a PTY for managed interactive CLI processes so a TUI restart can reattach while the daemon remains alive. On attach, the client synchronizes terminal size. A newly attaching client gets no scrollback replay, so on reattach with an unchanged size the supervisor briefly bounces the PTY to a harmless alternate size and back — two genuine, kernel-delivered `SIGWINCH`-inducing size changes to its owned PTY process group — so Codex fully repaints; a signal raised without an underlying size change was verified against the installed CLI to be silently ignored, since Codex re-reads the size on signal and only repaints when it actually differs. The same resize bounce repaints Codex after returning from its native external editor. The daemon resolves `codex` from its own effective `PATH` and rejects incompatible protocol/build generations. External or ambiguous writers are fail-closed and cannot be attached or stopped. A new run remains a diagnostic `Starting` row until exactly one new app-server thread is proven; zero or multiple candidates are never guessed.
 
 Codex's 5h/weekly usage (shown in the composer's usage line) comes from the same app-server connection, via its `account/rateLimits/read` method. Each returned window is classified into 5h/weekly by its own `windowDurationMins` (300/10080 respectively), never by whether it arrived as `primary` or `secondary` -- the app-server has been observed to place either window in either slot. A window with an unrecognized or missing duration is left unclassified rather than guessed.
 
