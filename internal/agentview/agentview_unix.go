@@ -5,6 +5,7 @@ package agentview
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,8 @@ type Runtime struct {
 	// UsageSource (see sessionctl.Controller.UsageStream).
 	usageCh  chan usageEvent
 	usageGen int
+
+	terminal *overviewTerminal
 }
 
 // usageEvent is one sessionctl.UsageUpdate carried over Runtime.usageCh,
@@ -97,20 +100,22 @@ func startKeyRead(reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent,
 // Agent View readers on r.Input, so the real terminal is safe to hand to
 // the attached child. The next key read is only started again after
 // act() returns control to the overview.
-func (r *Runtime) Run(ctx context.Context) error {
+func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	if r.Input == nil {
 		r.Input = os.Stdin
 	}
 	if r.Output == nil {
 		r.Output = os.Stdout
 	}
-	old, err := term.MakeRaw(int(r.Input.Fd()))
-	if err != nil {
+	terminal := &overviewTerminal{input: r.Input, output: r.Output}
+	if err := terminal.start(); err != nil {
 		return err
 	}
-	defer term.Restore(int(r.Input.Fd()), old)
-	beginTerminal(r.Output)
-	defer endTerminal(r.Output)
+	r.terminal = terminal
+	defer func() {
+		r.terminal = nil
+		runErr = errors.Join(runErr, terminal.close())
+	}()
 	r.reload(ctx)
 	r.render()
 	reader := bufio.NewReader(r.Input)
@@ -189,9 +194,6 @@ func normalizeTerminalNewlines(value string) string {
 	}
 	return b.String()
 }
-
-func beginTerminal(w io.Writer) { _, _ = io.WriteString(w, "\x1b[?1049h\x1b[?25l") }
-func endTerminal(w io.Writer)   { _, _ = io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l") }
 
 // reload re-fetches the session catalog synchronously -- render-ready the
 // moment it returns -- then kicks off a usage refresh in the background
