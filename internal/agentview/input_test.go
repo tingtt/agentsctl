@@ -40,11 +40,11 @@ func TestDecodeKeyPhysicalIdentitiesCarryNoUXMeaning(t *testing.T) {
 		{"Ctrl+O", []byte{0x0f}, KeyEvent{Key: KeyCtrlO}},
 		{"Ctrl+T", []byte{0x14}, KeyEvent{Key: KeyCtrlT}},
 		{"Ctrl+G", []byte{0x07}, KeyEvent{Key: KeyCtrlG}},
+		{"Ctrl+/", []byte{0x1f}, KeyEvent{Key: KeyCtrlSlash}},
 		{"Ctrl+X", []byte{0x18}, KeyEvent{Key: KeyCtrlX}},
 		{"Ctrl+R", []byte{0x12}, KeyEvent{Key: KeyCtrlR}},
 		{"Ctrl+S", []byte{0x13}, KeyEvent{Key: KeyCtrlS}},
 		{"Ctrl+L", []byte{0x0c}, KeyEvent{Key: KeyCtrlL}},
-		{"Ctrl+/ is unbound", []byte{0x1f}, KeyEvent{Key: KeyUnknown}},
 		{"printable ascii", []byte{'q'}, KeyEvent{Key: KeyRune, Rune: 'q'}},
 		{"printable utf8", []byte("あ"), KeyEvent{Key: KeyRune, Rune: 'あ'}},
 	}

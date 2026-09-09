@@ -216,7 +216,7 @@ func (f *countingListProvider) List(ctx context.Context, archived bool) ([]sessi
 }
 
 // TestEventLoopHandlesExactlyOneReloadPerKey fixes the no-duplicate-reads
-// guarantee: one physical key (here, Ctrl+G, a plain reload-triggering
+// guarantee: one physical key (here, Ctrl+/, a plain reload-triggering
 // key) must cause exactly one additional catalog reload -- not zero (the
 // key silently dropped) and not more than one (the one-shot key-read
 // goroutine somehow firing twice for a single physical key).
@@ -238,14 +238,14 @@ func TestEventLoopHandlesExactlyOneReloadPerKey(t *testing.T) {
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlG}}
+	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlSlash}}
 	waitFor(t, 2*time.Second, func() bool { return p.listCalls.Load() == baseline+1 })
 
 	// Give any errant duplicate a bounded window to show up, then confirm
 	// it never does.
 	time.Sleep(50 * time.Millisecond)
 	if got := p.listCalls.Load(); got != baseline+1 {
-		t.Fatalf("listCalls=%d, want exactly %d (baseline+1) after a single Ctrl+G", got, baseline+1)
+		t.Fatalf("listCalls=%d, want exactly %d (baseline+1) after a single Ctrl+/", got, baseline+1)
 	}
 
 	keyIn <- keyResult{err: io.EOF}

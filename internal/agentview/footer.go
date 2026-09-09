@@ -52,6 +52,7 @@ func contextualFooterText(s State) string {
 		provider += styleText(" (unavailable: "+err.Error()+")", colorGray)
 	}
 	segments := []string{provider + styleText(" (shift+tab to cycle)", colorGray)}
+	segments = append(segments, styleText(strings.ToLower(bindingPromptEditor.Label)+" to edit in vim", colorGray))
 	if row, ok := s.SelectedRow(); ok {
 		if label, has := ctrlXHint(row); has {
 			segments = append(segments, styleText("ctrl+x to "+label, colorGray))
@@ -206,8 +207,9 @@ func formatResetTime(t, now time.Time) string {
 // descriptions shown in place of the contextual footer/usage lines while
 // State.HelpVisible is set. Physical keys are read from keymap.go's named
 // Bindings (bindingPin, bindingStopArchive, bindingScope, bindingStash,
-// bindingEscape) rather than re-typed here, so the footer and help view
-// can never drift on which physical key a shortcut is bound to.
+// bindingPromptEditor, bindingEscape) rather than re-typed here, so the
+// footer and help view can never drift on which physical key a shortcut
+// is bound to.
 func helpLines(width int) []string {
 	line := func(text string) string { return clipLine(styleText(text, colorGray), width) }
 	return []string{
@@ -217,6 +219,7 @@ func helpLines(width int) []string {
 		line("    " + strings.ToLower(bindingScope.Label) + " to cycle session listing target directory scope"),
 		line("  prompt"),
 		line("    " + strings.ToLower(bindingStash.Label) + " to stash/pop"),
+		line("    " + strings.ToLower(bindingPromptEditor.Label) + " to edit prompt in vim"),
 		line("  help"),
 		line("    " + strings.ToLower(bindingEscape.Label) + " to hide this help"),
 	}

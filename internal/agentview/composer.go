@@ -89,6 +89,14 @@ func (c *Composer) Clear() {
 	c.Cursor = 0
 }
 
+// ReplacePrompt replaces the editable prompt without changing the shared
+// stash, places the cursor at the end, and resets vertical-navigation state.
+func (c *Composer) ReplacePrompt(prompt string) {
+	c.resetPreferredColumn()
+	c.Prompt = prompt
+	c.Cursor = len([]rune(prompt))
+}
+
 func (c *Composer) clampCursor(runes []rune) {
 	c.Cursor = min(max(c.Cursor, 0), len(runes))
 }

@@ -5,6 +5,7 @@ package agentview
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,9 @@ type Runtime struct {
 	// UsageSource (see sessionctl.Controller.UsageStream).
 	usageCh  chan usageEvent
 	usageGen int
+
+	terminal        overviewLifecycle
+	runPromptEditor promptEditorRunner
 }
 
 // usageEvent is one sessionctl.UsageUpdate carried over Runtime.usageCh,
@@ -97,20 +101,22 @@ func startKeyRead(reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent,
 // Agent View readers on r.Input, so the real terminal is safe to hand to
 // the attached child. The next key read is only started again after
 // act() returns control to the overview.
-func (r *Runtime) Run(ctx context.Context) error {
+func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	if r.Input == nil {
 		r.Input = os.Stdin
 	}
 	if r.Output == nil {
 		r.Output = os.Stdout
 	}
-	old, err := term.MakeRaw(int(r.Input.Fd()))
-	if err != nil {
+	terminal := &overviewTerminal{input: r.Input, output: r.Output}
+	if err := terminal.start(); err != nil {
 		return err
 	}
-	defer term.Restore(int(r.Input.Fd()), old)
-	beginTerminal(r.Output)
-	defer endTerminal(r.Output)
+	r.terminal = terminal
+	defer func() {
+		r.terminal = nil
+		runErr = errors.Join(runErr, terminal.close())
+	}()
 	r.reload(ctx)
 	r.render()
 	reader := bufio.NewReader(r.Input)
@@ -141,6 +147,9 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				return nil
 			}
 			if err := r.act(ctx, intent); err != nil {
+				if errors.Is(err, errOverviewTerminalOwnership) {
+					return err
+				}
 				r.State.Error = "error: " + err.Error()
 			} else if intent.Kind != IntentNone {
 				// A dispatched intent that succeeded (including a plain
@@ -190,15 +199,12 @@ func normalizeTerminalNewlines(value string) string {
 	return b.String()
 }
 
-func beginTerminal(w io.Writer) { _, _ = io.WriteString(w, "\x1b[?1049h\x1b[?25l") }
-func endTerminal(w io.Writer)   { _, _ = io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l") }
-
 // reload re-fetches the session catalog synchronously -- render-ready the
 // moment it returns -- then kicks off a usage refresh in the background
 // (see refreshUsageAsync). Usage is deliberately NOT fetched here: a slow
 // or hung provider (a Claude usage probe waiting out its own timeout, for
 // instance) must never add its latency to catalog loading, since reload
-// runs on Run's own critical path for startup, every Ctrl+G/Ctrl+L
+// runs on Run's own critical path for startup, every Ctrl+/ or Ctrl+L
 // refresh, and every provider action whose sessionctl.Result asks for a
 // reload (including returning from a detached session) -- see the
 // DesignDoc's Agent View responsiveness guarantee.
@@ -241,7 +247,7 @@ func (r *Runtime) refreshUsageAsync(ctx context.Context) {
 }
 
 // act carries out intent via the Controller and applies its Result to
-// State: IntentNone/IntentRefresh short-circuit (a plain Ctrl+G/Ctrl+L
+// State: IntentNone/IntentRefresh short-circuit (a plain Ctrl+/ or Ctrl+L
 // refresh is exactly "reload, no operation"), otherwise every operation's
 // sessionctl.Result decides Reload vs. local Patch application -- Run's
 // loop above never hardcodes a per-intent refresh policy (see
@@ -262,6 +268,8 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 		}
 		r.State.Composer.Clear()
 		r.applyResult(ctx, result)
+	case IntentOpenPromptEditor:
+		return r.editPrompt(ctx)
 	case IntentOpen:
 		row, ok := r.findRow(x.Key)
 		if !ok {

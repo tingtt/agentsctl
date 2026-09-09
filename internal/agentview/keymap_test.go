@@ -33,6 +33,12 @@ func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
 	if !bindingStopArchive.Matches(KeyCtrlX) {
 		t.Fatal("bindingStopArchive must match KeyCtrlX")
 	}
+	if !bindingPromptEditor.Matches(KeyCtrlG) || bindingScope.Matches(KeyCtrlG) {
+		t.Fatal("Ctrl+G must belong only to the prompt editor binding")
+	}
+	if !bindingScope.Matches(KeyCtrlSlash) || bindingPromptEditor.Matches(KeyCtrlSlash) {
+		t.Fatal("Ctrl+/ must belong only to the directory-scope binding")
+	}
 }
 
 // TestEscPriorityOrder fixes #14's Esc priority order end to end: help
@@ -152,7 +158,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// nor a listed non-shortcut key.
 	all := []Key{
 		KeyRune, KeyEnter, KeyNewline, KeyBackspace, KeyDelete, KeyHome, KeyEnd,
-		KeyLeft, KeyRight, KeyUp, KeyDown, KeyShiftTab, KeyEsc, KeyCtrlG, KeyCtrlX,
+		KeyLeft, KeyRight, KeyUp, KeyDown, KeyShiftTab, KeyEsc, KeyCtrlG, KeyCtrlSlash, KeyCtrlX,
 		KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, KeyCtrlO, KeyUnknown,
 	}
 	// Composer/rename text-editing motions and typing, plus keys with no

@@ -2,6 +2,29 @@ package agentview
 
 import "testing"
 
+func TestReplacePromptMaintainsComposerInvariants(t *testing.T) {
+	c := Composer{
+		Prompt:             "old\nvalue",
+		Cursor:             2,
+		Stash:              "keep me",
+		preferredColumn:    4,
+		hasPreferredColumn: true,
+	}
+	c.ReplacePrompt("日本語\nupdated")
+	if c.Prompt != "日本語\nupdated" {
+		t.Fatalf("Prompt=%q", c.Prompt)
+	}
+	if c.Cursor != len([]rune(c.Prompt)) {
+		t.Fatalf("Cursor=%d, want rune length %d", c.Cursor, len([]rune(c.Prompt)))
+	}
+	if c.Stash != "keep me" {
+		t.Fatalf("Stash=%q, want unchanged", c.Stash)
+	}
+	if c.hasPreferredColumn {
+		t.Fatal("replacing the prompt must reset vertical navigation state")
+	}
+}
+
 // TestCursorUpDownPreferredColumnSurvivesShorterLine fixes #14's "long ->
 // short -> long" preferred-column requirement: moving down through a
 // shorter intermediate line and back onto a longer one restores the

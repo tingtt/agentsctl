@@ -157,6 +157,7 @@ Composer が表示する `<cwd>` と、新規 dispatch が実行される direct
 Composer 下部には、常時固定の shortcut 一覧ではなく、現在の状態に応じた最小限の footer を表示する。
 
 - `Ctrl+X` の表示 (`stop` / `archive`) は、選択中 session が実際に持つ Action availability から決める。provider ID による再判定は行わない。
+- `Ctrl+G` は Composer の Vim 編集として contextual footer と Help view の両方へ表示し、directory scope cycle は `Ctrl+/` として Help view へ表示する。
 - `?` と `Esc` の意味は prompt の空/非空、および help view の表示状態によって変わる。
 - Help view は `State` の明示的な UI state (`HelpVisible`) として持つ。terminal decoder は `?` を単なる rune として渡すのみで、"help を開く" という意味付けは `State.Handle` 側で行う。
 - Esc の優先順位は次の順で固定する: help visible なら (rename・confirmation の有無に関わらず) help を閉じるだけで prompt/rename/confirmation のいずれにも触れない、help が非表示かつ prompt が非空ならそれを消す、help が非表示かつ prompt が空なら (rename 中ならその rename をキャンセル、confirmation 中ならそれを解除、どちらでもなければ) 終了する。
@@ -288,6 +289,14 @@ stash の特徴:
 
 Attach 中は terminal input を対象 CLI へ渡すため、Composer / stash の操作とは分離する。
 
+##### Vim prompt editing
+
+`Ctrl+G` は Composer の prompt 全文を foreground の `vim` で編集する。editor 選択は固定であり、`$EDITOR` / `$VISUAL` や provider 固有 behavior は参照しない。terminal decoder は `Ctrl+G` を物理 key として渡し、`State.Handle` が semantic intent へ変換し、temporary file・process・terminal mode の操作は Runtime の external boundary が担当する。
+
+temporary file は prompt 本文だけを private file として保持する。logical prompt の末尾へ structural LF を1つ追加して Vim へ渡し、読み戻し時には CRLF / CR を `\n` へ正規化した後、末尾の structural LF をちょうど1つだけ除く。このため Vim が通常付与する EOF newline は Composer の意図しない空行にならず、prompt が元から持つ末尾改行は失われない。
+
+Vim 起動前の Composer を snapshot とし、Vim が正常終了して temporary file を読み戻せた場合だけ保存内容へ置き換える。`:q!` の未保存変更、Vim の起動・終了失敗、file read failure では snapshot を維持する。editor から戻ること自体は dispatch / session start を一切生成せず、送信には従来どおり明示的な submit が必要となる。stash は Vim の保存内容を適用しても変更しない。
+
 ##### Multiline cursor navigation
 
 prompt が複数行になっている間は、`↑` / `↓` は session selection ではなく Composer 内の行移動を優先する。単一行 (空を含む) の間は従来どおり session selection を移動する。
@@ -299,6 +308,8 @@ prompt が複数行になっている間は、`↑` / `↓` は session selectio
 Attach すると、Agent View から対象 CLI へ terminal を明け渡す。
 
 Detach すると、session を停止せず Agent View へ戻る。
+
+Agent View の raw mode と overview 固有 terminal mode は1つの lifecycle boundary が所有する。foreground の Vim へ terminal を明け渡す場合は overview mode を解除して Agent View 起動前の terminal mode を復元し、Vim の終了後は raw / overview mode を再取得して full redraw する。Vim の実行中は Agent View の key read を開始せず、terminal ownership の再取得に失敗した場合は次の key loop を開始せず cleanup して終了する。overview 固有 mode が増える場合も、この同じ boundary の enter / leave に集約する。
 
 **Claude**
 

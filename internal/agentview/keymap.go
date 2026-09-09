@@ -56,10 +56,11 @@ var (
 	bindingSubmit        = Binding{Label: "Enter", Desc: "send/open", Keys: []Key{KeyEnter}}
 	bindingNewline       = Binding{Label: "Option+Enter/Shift+Enter", Desc: "newline", Keys: []Key{KeyNewline}}
 	bindingStash         = Binding{Label: "Ctrl+S", Desc: "stash", Keys: []Key{KeyCtrlS}}
+	bindingPromptEditor  = Binding{Label: "Ctrl+G", Desc: "Vim", Keys: []Key{KeyCtrlG}}
 	bindingOpen          = Binding{Label: "Ctrl+O", Keys: []Key{KeyCtrlO}}
 	bindingPin           = Binding{Label: "Ctrl+T", Desc: "pin", Keys: []Key{KeyCtrlT}}
 	bindingNavigate      = Binding{Label: "↑↓", Keys: []Key{KeyUp, KeyDown}}
-	bindingScope         = Binding{Label: "Ctrl+G", Desc: "scope", Keys: []Key{KeyCtrlG}}
+	bindingScope         = Binding{Label: "Ctrl+/", Desc: "scope", Keys: []Key{KeyCtrlSlash}}
 	bindingRename        = Binding{Label: "Ctrl+R", Desc: "rename", Keys: []Key{KeyCtrlR}}
 	bindingStopArchive   = Binding{Label: "Ctrl+X", Desc: "stop/archive", Keys: []Key{KeyCtrlX}}
 	bindingRefresh       = Binding{Label: "Ctrl+L", Desc: "refresh", Keys: []Key{KeyCtrlL}}
@@ -72,6 +73,6 @@ var (
 // key -- see TestBindingsCoverEveryShortcutKey).
 var allBindings = []Binding{
 	bindingProviderCycle, bindingSubmit, bindingNewline, bindingStash,
-	bindingOpen, bindingPin, bindingNavigate, bindingScope, bindingRename,
+	bindingPromptEditor, bindingOpen, bindingPin, bindingNavigate, bindingScope, bindingRename,
 	bindingStopArchive, bindingRefresh, bindingEscape,
 }

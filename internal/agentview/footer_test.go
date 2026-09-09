@@ -55,6 +55,9 @@ func TestCtrlXHintReflectsSelectedRowActionsNotProvider(t *testing.T) {
 func TestContextualFooterTextSwapsEmptyVsNonEmptyPrompt(t *testing.T) {
 	s := NewState()
 	empty := contextualFooterText(s)
+	if !strings.Contains(empty, "ctrl+g to edit in vim") {
+		t.Fatalf("empty-prompt footer=%q, want Vim editor hint", empty)
+	}
 	if !strings.Contains(empty, "? to show help") || !strings.Contains(empty, "esc to exit") {
 		t.Fatalf("empty-prompt footer=%q, want show-help and exit hints", empty)
 	}
@@ -63,6 +66,9 @@ func TestContextualFooterTextSwapsEmptyVsNonEmptyPrompt(t *testing.T) {
 	}
 	s.Composer.Prompt = "hi"
 	nonEmpty := contextualFooterText(s)
+	if !strings.Contains(nonEmpty, "ctrl+g to edit in vim") {
+		t.Fatalf("non-empty-prompt footer=%q, want Vim editor hint", nonEmpty)
+	}
 	if !strings.Contains(nonEmpty, "esc to clear") {
 		t.Fatalf("non-empty-prompt footer=%q, want esc to clear", nonEmpty)
 	}
@@ -338,12 +344,15 @@ func TestUsageLineTextExpiresExhaustedAtReadTimeWithoutNewRefresh(t *testing.T) 
 // retyped key.
 func TestHelpLinesDeriveKeysFromBindings(t *testing.T) {
 	lines := strings.Join(helpLines(200), "\n")
-	for _, b := range []Binding{bindingPin, bindingStopArchive, bindingScope, bindingStash, bindingEscape} {
+	for _, b := range []Binding{bindingPin, bindingStopArchive, bindingScope, bindingStash, bindingPromptEditor, bindingEscape} {
 		if !strings.Contains(lines, strings.ToLower(b.Label)) {
 			t.Fatalf("help text missing binding %q:\n%s", b.Label, lines)
 		}
 	}
-	if strings.Contains(strings.ToLower(lines), "ctrl+/") {
-		t.Fatalf("help text must not mention the removed Ctrl+/ binding:\n%s", lines)
+	if !strings.Contains(strings.ToLower(lines), "ctrl+/") {
+		t.Fatalf("help text must mention the directory-scope Ctrl+/ binding:\n%s", lines)
+	}
+	if !strings.Contains(strings.ToLower(lines), "ctrl+g to edit prompt in vim") {
+		t.Fatalf("help text must describe the Ctrl+G Vim binding:\n%s", lines)
 	}
 }
