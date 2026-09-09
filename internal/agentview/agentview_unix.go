@@ -49,7 +49,8 @@ type Runtime struct {
 	usageCh  chan usageEvent
 	usageGen int
 
-	terminal *overviewTerminal
+	terminal        overviewLifecycle
+	runPromptEditor promptEditorRunner
 }
 
 // usageEvent is one sessionctl.UsageUpdate carried over Runtime.usageCh,
@@ -146,6 +147,9 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				return nil
 			}
 			if err := r.act(ctx, intent); err != nil {
+				if errors.Is(err, errOverviewTerminalOwnership) {
+					return err
+				}
 				r.State.Error = "error: " + err.Error()
 			} else if intent.Kind != IntentNone {
 				// A dispatched intent that succeeded (including a plain
@@ -264,6 +268,8 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 		}
 		r.State.Composer.Clear()
 		r.applyResult(ctx, result)
+	case IntentOpenPromptEditor:
+		return r.editPrompt(ctx)
 	case IntentOpen:
 		row, ok := r.findRow(x.Key)
 		if !ok {

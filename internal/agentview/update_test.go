@@ -434,8 +434,8 @@ func TestCtrlSlashCyclesScopeAndRequestsRefresh(t *testing.T) {
 func TestCtrlGDoesNotChangeDirectoryScope(t *testing.T) {
 	s := NewState()
 	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
-	if intent.Kind != IntentNone || s.Scope != session.ScopeSame {
-		t.Fatalf("intent=%+v scope=%v, want no intent and unchanged scope", intent, s.Scope)
+	if intent.Kind != IntentOpenPromptEditor || s.Scope != session.ScopeSame {
+		t.Fatalf("intent=%+v scope=%v, want prompt editor intent and unchanged scope", intent, s.Scope)
 	}
 }
 

@@ -153,7 +153,7 @@ func padCells(value string, width int) string {
 
 // displayCWD renders row's working directory as the shortHome-abbreviated
 // full path (see Slice B / #14: the previous depth-limited display and its
-// Ctrl+/ toggle are gone -- a session row shows either no CWD at all in a
+// display toggle are gone -- a session row shows either no CWD at all in a
 // same-directory scope, or its full abbreviated path in a multi-directory
 // scope).
 func displayCWD(path string) string {

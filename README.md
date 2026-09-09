@@ -21,6 +21,7 @@ go build ./cmd/agentsctl
 | `Enter` | Dispatch the composer prompt in the background, or attach the selected session when the composer is empty. |
 | `Option+Enter` / `Shift+Enter` | Insert a newline into the composer prompt at the cursor, without dispatching. |
 | `Ctrl+S` | Swap the composer text with one shared in-memory stash slot. While attached, forward `Ctrl+S` to the child instead. |
+| `Ctrl+G` | Edit the composer prompt in Vim. Saving and exiting updates the composer without dispatching; exiting without saving preserves it. |
 | `Ctrl+O` | Attach the selected session. |
 | `Ctrl+T` | Pin or unpin the selected session. Pin state is persisted by `agentsctl`. |
 | `↑` / `↓` | Move the session selection, or -- while the composer prompt spans more than one line -- move the cursor to the line above/below within the prompt instead (see Multiline editing). |
@@ -44,7 +45,7 @@ Pinned sessions always form a single `Pinned` group, regardless of how many dire
 ──────────────────────────────────────────────────────────────── <cwd> ─
 ❯ prompt
 ──────────────────────────────────────────────────────────────────────
-  claude (shift+tab to cycle) · ctrl+x to stop · ? to show help · esc to exit
+  claude (shift+tab to cycle) · ctrl+g to edit in vim · ctrl+x to stop · ? to show help · esc to exit
   claude  70% (reset at 07:10 AM) /  20% (reset at Sun 05:00 AM) · codex   0% (reset at 10:00 AM) / 100% (reset at Sat 11:00 PM)
 ```
 
@@ -52,7 +53,7 @@ Pinned sessions always form a single `Pinned` group, regardless of how many dire
 
 Pressing `?` on an empty prompt replaces the contextual/usage lines with a categorized help view (`manage sessions` / `prompt` / `help`) instead. Help stays open while typing; only `Esc` closes it, without touching the prompt.
 
-The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. It supports multiline prompts: `Option+Enter` or `Shift+Enter` inserts a newline at the cursor instead of dispatching, and each embedded newline renders as its own row, indented to align under the `❯ ` prefix; `←` / `→` move across a newline like any other character, and `Home` / `End` still jump to the start/end of the whole prompt (not just the current line). Only plain `Enter` dispatches (or, on an empty composer, attaches). The prompt stash and the `Shift+Tab` provider toggle preserve multiline content, including embedded newlines, exactly as typed. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
+The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. It supports multiline prompts: `Option+Enter` or `Shift+Enter` inserts a newline at the cursor instead of dispatching, and each embedded newline renders as its own row, indented to align under the `❯ ` prefix; `←` / `→` move across a newline like any other character, and `Home` / `End` still jump to the start/end of the whole prompt (not just the current line). Only plain `Enter` dispatches (or, on an empty composer, attaches). `Ctrl+G` opens the complete prompt in foreground Vim; `:wq` returns the saved text to the composer, while `:q!` leaves the prior composer state intact. Returning from Vim never dispatches or starts a session—the normal submit action is still required. The prompt stash and the `Shift+Tab` provider toggle preserve multiline content, including embedded newlines, exactly as typed. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
 
 Whether `Shift+Enter` is distinguishable from plain `Enter` depends on the terminal: `agentsctl` recognizes it when the terminal sends a bare line feed (`\n`) for `Shift+Enter` as opposed to a carriage return (`\r`) for plain `Enter` (confirmed against a real macOS terminal via a raw-byte probe). A terminal that instead sends the identical byte for both cannot be distinguished at the application level. `Option+Enter` works wherever the terminal sends the classic "meta sends escape" convention (`ESC` followed by the Enter byte) for the Option modifier, which is how it was confirmed.
 

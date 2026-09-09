@@ -33,6 +33,12 @@ func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
 	if !bindingStopArchive.Matches(KeyCtrlX) {
 		t.Fatal("bindingStopArchive must match KeyCtrlX")
 	}
+	if !bindingPromptEditor.Matches(KeyCtrlG) || bindingScope.Matches(KeyCtrlG) {
+		t.Fatal("Ctrl+G must belong only to the prompt editor binding")
+	}
+	if !bindingScope.Matches(KeyCtrlSlash) || bindingPromptEditor.Matches(KeyCtrlSlash) {
+		t.Fatal("Ctrl+/ must belong only to the directory-scope binding")
+	}
 }
 
 // TestEscPriorityOrder fixes #14's Esc priority order end to end: help
@@ -160,7 +166,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// carry no Binding.
 	nonShortcut := map[Key]bool{
 		KeyRune: true, KeyBackspace: true, KeyDelete: true, KeyHome: true,
-		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyCtrlG: true, KeyUnknown: true,
+		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyUnknown: true,
 	}
 	documented := map[Key]bool{}
 	for _, b := range allBindings {

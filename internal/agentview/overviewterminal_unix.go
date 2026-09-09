@@ -20,6 +20,12 @@ type overviewTerminal struct {
 	active   bool
 }
 
+type overviewLifecycle interface {
+	suspend() error
+	resume() error
+	close() error
+}
+
 func (t *overviewTerminal) start() error {
 	if t.active {
 		return nil

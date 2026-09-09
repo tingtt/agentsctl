@@ -16,6 +16,7 @@ type IntentKind int
 const (
 	IntentNone IntentKind = iota
 	IntentDispatch
+	IntentOpenPromptEditor
 	IntentOpen
 	IntentStop
 	IntentArchive
@@ -130,6 +131,8 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		// put an embedded newline into the composer.
 		s.Composer.InsertAtCursor("\n")
 		return Intent{}
+	case bindingPromptEditor.Matches(ev.Key):
+		return Intent{Kind: IntentOpenPromptEditor}
 	case bindingOpen.Matches(ev.Key):
 		return s.openSelected()
 	case bindingScope.Matches(ev.Key):
