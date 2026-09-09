@@ -200,7 +200,7 @@ func normalizeTerminalNewlines(value string) string {
 // (see refreshUsageAsync). Usage is deliberately NOT fetched here: a slow
 // or hung provider (a Claude usage probe waiting out its own timeout, for
 // instance) must never add its latency to catalog loading, since reload
-// runs on Run's own critical path for startup, every Ctrl+G/Ctrl+L
+// runs on Run's own critical path for startup, every Ctrl+/ or Ctrl+L
 // refresh, and every provider action whose sessionctl.Result asks for a
 // reload (including returning from a detached session) -- see the
 // DesignDoc's Agent View responsiveness guarantee.
@@ -243,7 +243,7 @@ func (r *Runtime) refreshUsageAsync(ctx context.Context) {
 }
 
 // act carries out intent via the Controller and applies its Result to
-// State: IntentNone/IntentRefresh short-circuit (a plain Ctrl+G/Ctrl+L
+// State: IntentNone/IntentRefresh short-circuit (a plain Ctrl+/ or Ctrl+L
 // refresh is exactly "reload, no operation"), otherwise every operation's
 // sessionctl.Result decides Reload vs. local Patch application -- Run's
 // loop above never hardcodes a per-intent refresh policy (see

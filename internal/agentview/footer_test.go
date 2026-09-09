@@ -343,7 +343,7 @@ func TestHelpLinesDeriveKeysFromBindings(t *testing.T) {
 			t.Fatalf("help text missing binding %q:\n%s", b.Label, lines)
 		}
 	}
-	if strings.Contains(strings.ToLower(lines), "ctrl+/") {
-		t.Fatalf("help text must not mention the removed Ctrl+/ binding:\n%s", lines)
+	if !strings.Contains(strings.ToLower(lines), "ctrl+/") {
+		t.Fatalf("help text must mention the directory-scope Ctrl+/ binding:\n%s", lines)
 	}
 }

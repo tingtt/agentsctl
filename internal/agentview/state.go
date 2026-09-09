@@ -28,7 +28,7 @@ type State struct {
 
 	// Scope selects which sessions' CWDs are shown (same directory ->
 	// descendants + worktree directories -> all -> same directory, cycled
-	// by Ctrl+G). session.ScopeSame is the zero value, so a fresh State
+	// by Ctrl+/). session.ScopeSame is the zero value, so a fresh State
 	// starts scoped to the current directory without an explicit default
 	// here.
 	Scope session.DirectoryScope
@@ -250,7 +250,7 @@ func (s *State) ApplyUsageUpdate(provider session.ProviderID, usage session.Usag
 
 // nextScope cycles the session-list directory scope: same directory ->
 // descendants + worktree directories -> all -> same directory, bound to
-// Ctrl+G.
+// Ctrl+/.
 func nextScope(scope session.DirectoryScope) session.DirectoryScope {
 	switch scope {
 	case session.ScopeSame:

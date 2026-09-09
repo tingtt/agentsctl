@@ -412,22 +412,30 @@ func TestRenameEscCancelsWithoutIntent(t *testing.T) {
 	}
 }
 
-func TestCtrlGCyclesScopeAndRequestsRefresh(t *testing.T) {
+func TestCtrlSlashCyclesScopeAndRequestsRefresh(t *testing.T) {
 	s := NewState()
 	if s.Scope != session.ScopeSame {
 		t.Fatalf("initial scope=%v, want ScopeSame", s.Scope)
 	}
-	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
+	intent := s.Handle(KeyEvent{Key: KeyCtrlSlash})
 	if intent.Kind != IntentRefresh || s.Scope != session.ScopeDescendants {
 		t.Fatalf("intent=%+v scope=%v, want Refresh+ScopeDescendants", intent, s.Scope)
 	}
-	s.Handle(KeyEvent{Key: KeyCtrlG})
+	s.Handle(KeyEvent{Key: KeyCtrlSlash})
 	if s.Scope != session.ScopeAll {
 		t.Fatalf("scope=%v, want ScopeAll", s.Scope)
 	}
-	s.Handle(KeyEvent{Key: KeyCtrlG})
+	s.Handle(KeyEvent{Key: KeyCtrlSlash})
 	if s.Scope != session.ScopeSame {
 		t.Fatalf("scope=%v, want wrap back to ScopeSame", s.Scope)
+	}
+}
+
+func TestCtrlGDoesNotChangeDirectoryScope(t *testing.T) {
+	s := NewState()
+	intent := s.Handle(KeyEvent{Key: KeyCtrlG})
+	if intent.Kind != IntentNone || s.Scope != session.ScopeSame {
+		t.Fatalf("intent=%+v scope=%v, want no intent and unchanged scope", intent, s.Scope)
 	}
 }
 

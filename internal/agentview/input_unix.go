@@ -45,10 +45,11 @@ const (
 	KeyDown
 	KeyShiftTab
 	KeyEsc
-	// KeyCtrlG, KeyCtrlX, KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, and
-	// KeyCtrlO are the fixed physical shortcuts this build recognizes. What
-	// each means is entirely up to State.Handle.
+	// KeyCtrlG, KeyCtrlSlash, KeyCtrlX, KeyCtrlR, KeyCtrlT, KeyCtrlS,
+	// KeyCtrlL, and KeyCtrlO are the fixed physical shortcuts this build
+	// recognizes. What each means is entirely up to State.Handle.
 	KeyCtrlG
+	KeyCtrlSlash
 	KeyCtrlX
 	KeyCtrlR
 	KeyCtrlT
@@ -184,6 +185,8 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (KeyEvent
 		return KeyEvent{Key: KeyCtrlT}, nil
 	case 0x07:
 		return KeyEvent{Key: KeyCtrlG}, nil
+	case 0x1f:
+		return KeyEvent{Key: KeyCtrlSlash}, nil
 	case 0x18:
 		return KeyEvent{Key: KeyCtrlX}, nil
 	case 0x12:

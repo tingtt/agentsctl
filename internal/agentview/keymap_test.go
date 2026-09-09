@@ -152,7 +152,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// nor a listed non-shortcut key.
 	all := []Key{
 		KeyRune, KeyEnter, KeyNewline, KeyBackspace, KeyDelete, KeyHome, KeyEnd,
-		KeyLeft, KeyRight, KeyUp, KeyDown, KeyShiftTab, KeyEsc, KeyCtrlG, KeyCtrlX,
+		KeyLeft, KeyRight, KeyUp, KeyDown, KeyShiftTab, KeyEsc, KeyCtrlG, KeyCtrlSlash, KeyCtrlX,
 		KeyCtrlR, KeyCtrlT, KeyCtrlS, KeyCtrlL, KeyCtrlO, KeyUnknown,
 	}
 	// Composer/rename text-editing motions and typing, plus keys with no
@@ -160,7 +160,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// carry no Binding.
 	nonShortcut := map[Key]bool{
 		KeyRune: true, KeyBackspace: true, KeyDelete: true, KeyHome: true,
-		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyUnknown: true,
+		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyCtrlG: true, KeyUnknown: true,
 	}
 	documented := map[Key]bool{}
 	for _, b := range allBindings {

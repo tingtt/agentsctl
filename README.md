@@ -24,7 +24,7 @@ go build ./cmd/agentsctl
 | `Ctrl+O` | Attach the selected session. |
 | `Ctrl+T` | Pin or unpin the selected session. Pin state is persisted by `agentsctl`. |
 | `↑` / `↓` | Move the session selection, or -- while the composer prompt spans more than one line -- move the cursor to the line above/below within the prompt instead (see Multiline editing). |
-| `Ctrl+G` | Cycle the session-list directory scope: `same directory` → `descendants + worktree directories` → `all directories` → `same directory`. The starting point is the directory `agentsctl` was started in; the current scope is shown in the header. |
+| `Ctrl+/` | Cycle the session-list directory scope: `same directory` → `descendants + worktree directories` → `all directories` → `same directory`. The starting point is the directory `agentsctl` was started in; the current scope is shown in the header. |
 | `Ctrl+R` | Rename the selected session. Edit the current name inline with `←` / `→`, `Home`, `End`, `Backspace`, and `Delete`; use `Enter` to save or `Esc` to cancel. |
 | `Ctrl+X` | Stop an active managed session. For an inactive session, press twice to confirm and archive it. The confirmation ("Press Ctrl+X again to archive") appears on that session's own row, not as a separate message. |
 | `Ctrl+L` | Refresh the active session catalog and runtime state. |
@@ -66,7 +66,7 @@ The composer's `<cwd>` -- and the directory a newly dispatched prompt runs in --
 
 ### Directory scope
 
-`Ctrl+G` cycles the session list through three directory scopes, relative to the directory `agentsctl` was started in (its logical, `filepath.Clean`-ed path; symlinks are never resolved):
+`Ctrl+/` cycles the session list through three directory scopes, relative to the directory `agentsctl` was started in (its logical, `filepath.Clean`-ed path; symlinks are never resolved):
 
 - `same directory` — only sessions whose CWD is exactly that directory.
 - `descendants + worktree directories` — that directory itself, any descendant subdirectory (an inclusive recursive subtree), and the working directories of any `git worktree`s belonging to the same repository (each also included together with its own descendants). A sibling directory that merely shares a path prefix (e.g. `project` vs. `project-other`) is not included — the comparison is path-boundary-aware, not a string prefix match. Worktree directories are discovered via `git worktree list --porcelain`; when that isn't possible (not a git repository, `git` unavailable), the scope simply falls back to the directory's own subtree.
