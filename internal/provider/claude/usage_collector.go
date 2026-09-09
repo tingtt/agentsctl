@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
+
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 )
 
 // UsageCollectorCommand is the hidden subcommand name cmd/agentsctl/main.go
@@ -19,10 +21,11 @@ const UsageCollectorCommand = "claude-usage-collect"
 // RunUsageCollector is a Claude Code statusLine command: it reads exactly
 // one JSON payload from stdin (see statusLinePayload), extracts the
 // rate-limit windows it carries, and atomically persists them to the path
-// named by --out (see writeUsageSnapshotAtomic) -- never anything else
-// from the payload, and never the raw payload itself (Claude-specific JSON
-// shape stays inside this package, never reaching internal/session -- see
-// usage.go's toSessionUsage). It intentionally prints nothing of
+// named by --out (see probestate.SnapshotStore.Save, this package's own
+// usage.json persistence owner) -- never anything else from the payload,
+// and never the raw payload itself (Claude-specific JSON shape stays
+// inside this package, never reaching internal/session -- see this
+// package's own toSessionUsage). It intentionally prints nothing of
 // consequence to stdout: this statusLine is never actually displayed on a
 // real terminal (the probe session's PTY has no human viewer), only
 // invoked for its stdin payload.
@@ -43,7 +46,7 @@ func RunUsageCollector(args []string, stdin io.Reader) error {
 	if err != nil {
 		return fmt.Errorf("%s: parse statusLine payload: %w", UsageCollectorCommand, err)
 	}
-	if err := writeUsageSnapshotAtomic(*out, snap); err != nil {
+	if err := probestate.NewSnapshotStore(*out).Save(snap); err != nil {
 		return fmt.Errorf("%s: write snapshot: %w", UsageCollectorCommand, err)
 	}
 	return nil

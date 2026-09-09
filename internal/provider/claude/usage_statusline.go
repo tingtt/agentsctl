@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"math"
 	"time"
+
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
+	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // statusLinePayload is the slice of Claude Code's statusLine stdin JSON
@@ -24,6 +27,16 @@ import (
 // statusLineWindow.toUsageWindowSnapshot).
 type statusLinePayload struct {
 	RateLimits *statusLineRateLimits `json:"rate_limits"`
+	// Cost is confirmed (by driving the real installed CLI's statusLine
+	// through this package's own probe machinery) to carry
+	// total_api_duration_ms == 0 on a tick observed before this process's
+	// own first completed API response, and non-zero from then on -- see
+	// parseStatusLinePayload's doc comment.
+	Cost *statusLineCost `json:"cost"`
+}
+
+type statusLineCost struct {
+	TotalAPIDurationMs int64 `json:"total_api_duration_ms"`
 }
 
 type statusLineRateLimits struct {
@@ -36,19 +49,46 @@ type statusLineWindow struct {
 	ResetsAt       int64   `json:"resets_at"`
 }
 
-// parseStatusLinePayload decodes one statusLine stdin payload into this
-// package's own provider-neutral-ish snapshot shape (see usage_snapshot.go
+// parseStatusLinePayload decodes one statusLine stdin payload into
+// probestate.Snapshot (see internal/provider/claude/probestate/snapshot.go
 // -- still Claude-specific, but shaped for local storage rather than the
 // raw wire JSON). A payload with no `rate_limits` object at all (a Free
 // plan account, or before the session's first API response) yields a
 // snapshot with both windows unavailable, not an error -- that is a valid,
 // expected shape, not a parse failure.
-func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
+//
+// ResponseObserved is set from cost.total_api_duration_ms: this package's
+// probe re-invokes the same statusLine command on a fixed timer regardless
+// of API activity (see usage_settings.go's refreshInterval), so a tick's
+// ObservedAt alone does not prove it reflects a completed response to
+// *this* refresh's own prompt -- verified against the installed CLI
+// (2.1.263, by capturing the raw statusLine payload end to end through
+// this package's own probe machinery): a brand-new probe process's very
+// first ticks report total_api_duration_ms: 0 (and no rate_limits at all)
+// even for a long-lived, previously-established --session-id, only
+// becoming non-zero once this process's own prompt actually gets an API
+// response, and staying at that same value across further idle re-ticks
+// of the same turn (proving it isn't simply "always non-zero once any
+// history exists" -- see waitForProbeOutcome's doc comment). Without
+// this, waitForProbeOutcome could otherwise accept an earlier, still-
+// pre-response tick as if it were this refresh's real answer.
+//
+// Whether this field is a per-turn value or a running total across every
+// turn in this process's own lifetime was not directly distinguished (no
+// second prompt was ever sent within one process to compare) -- but it
+// does not matter for this package's own usage: refresh sends exactly one
+// prompt per probe process, then detaches (see Probe's doc comment), so
+// there is never a second turn within the same process for a cumulative
+// count to conflate with the first.
+func parseStatusLinePayload(raw []byte) (probestate.Snapshot, error) {
 	var payload statusLinePayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return usageSnapshot{}, err
+		return probestate.Snapshot{}, err
 	}
-	snap := usageSnapshot{ObservedAt: time.Now()}
+	snap := probestate.Snapshot{
+		ObservedAt:       time.Now(),
+		ResponseObserved: payload.Cost != nil && payload.Cost.TotalAPIDurationMs > 0,
+	}
 	if payload.RateLimits == nil {
 		return snap, nil
 	}
@@ -59,17 +99,17 @@ func parseStatusLinePayload(raw []byte) (usageSnapshot, error) {
 
 // toUsageWindowSnapshot converts one statusLine rate-limit window into the
 // local snapshot shape. A nil window (the field was absent from the
-// payload) is Available: false, never a guessed 0% -- matching Codex's own
-// rateLimitWindow contract (see provider/codex.rateLimitWindow) so both
-// providers draw the same distinction between "reported 0%" and "not
-// reported".
-func toUsageWindowSnapshot(w *statusLineWindow) usageWindowSnapshot {
+// payload) is session.UsageUnknown (the zero value), never a guessed 0% --
+// matching Codex's own rateLimitWindow contract (see
+// provider/codex.rateLimitWindow) so both providers draw the same
+// distinction between "reported 0%" and "not reported".
+func toUsageWindowSnapshot(w *statusLineWindow) probestate.WindowSnapshot {
 	if w == nil {
-		return usageWindowSnapshot{}
+		return probestate.WindowSnapshot{}
 	}
-	return usageWindowSnapshot{
-		Available: true,
-		Percent:   int(math.Round(w.UsedPercentage)),
-		ResetAt:   time.Unix(w.ResetsAt, 0),
+	return probestate.WindowSnapshot{
+		State:   session.UsageAvailable,
+		Percent: int(math.Round(w.UsedPercentage)),
+		ResetAt: time.Unix(w.ResetsAt, 0),
 	}
 }

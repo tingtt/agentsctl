@@ -168,25 +168,111 @@ Claude/Codex の 5h・weekly 利用率は、`sessionctl` 側の任意 capability
 
 - `UsageSource` を実装しない provider (Source のみの provider を含む) は、単に usage 行に現れないだけであり、Controller の動作を妨げない。
 - 取得は provider ごとに並行して行い、一部 provider の失敗が他方の結果を握りつぶさない (Session catalog の "provider catalog の partial failure" と同じ方針)。
-- 0% (実際に利用率 0 と報告された) と unavailable (そもそも報告されない) を区別する。unavailable を 0% として描画することはない。
 - 巨大な単一 `Provider` interface へ `Usage` を必須 method として追加することはしない。
 - usage 取得は Agent View の rendering critical path に置かない。catalog は usage の成功/失敗/速度に関係なく即座に render 可能とし、usage は background で provider ごとに独立して取得・反映する (遅い/hung provider が他 provider の表示や画面の再描画を妨げない)。reload のたびに既知の usage を消すことはせず、新しい結果が届くまで直前の値を表示し続ける。
-- ただし直前の値を無期限に表示し続けることはしない。各 provider の usage 行は、直近の成功した取得から一定時間 (5分) 以上経過している場合、または一度も取得できていない場合、percentage を `?%` の unknown placeholder として表示する — 古くなった値をあたかも現在値であるかのように見せない。claude/codex の行自体は常に表示し、取得未完了/stale を理由に行ごと非表示にはしない。
+- ただし直前の値を無期限に表示し続けることはしない。各 provider の usage 行は、直近の成功した取得から一定時間 (5分) 以上経過している場合、または一度も取得できていない場合、percentage を `?%` の unknown placeholder として表示する — 古くなった値をあたかも現在値であるかのように見せない。claude/codex の行自体は常に表示し、取得未完了/stale を理由に行ごと非表示にはしない。この 5分ルールは provider 単位の粗い freshness ゲートであり、window 単位の reset boundary 判定 (下記) とは別の、独立した仕組みである。
+
+**Normalized limit state (#19)**
+
+`session.UsageWindow` は `Available bool` ではなく `State session.UsageLimitState` (`UsageUnknown` | `UsageAvailable` | `UsageExhausted`) を持つ。5h/weekly それぞれ独立にこの3値のいずれかを持ち、#20 のような caller はこの正規化された state だけを見ればよく、provider 固有のエラー文言や `Percent == 100` という慣習を解釈する必要がない。
+
+- `UsageUnknown` (zero value): 一度も取得できていない、provider がその window をそもそも報告しない、reset boundary を跨いだためもう有効ではない、あるいは limit 以外の理由で refresh が失敗した — のいずれか。`Percent`/`Reset` に意味はない。
+- `UsageAvailable`: 直近に取得できた実際の利用率。`Reset` (設定されていれば) はまだ未来。
+- `UsageExhausted`: provider 自身が該当 window の limit 到達を報告した、有効な state transition。`Percent` は 100 固定 (表示上の convention であり、`Percent` から state を逆算することはしない)。
+
+`Percent == 100` を exhausted の判定根拠にすることはない — 逆に `State` が先に決まり、`Percent` はそれに追従する表示値。同様に `Available == false` (旧モデル) 相当の「不明」を unknown/expired/exhausted のどれとも混同しない。
+
+Agent View の rendering (`usageWindowText`) はこの `State` だけを見て分岐する: `UsageExhausted` → 常に `100%` (red)、`UsageAvailable` → 実際の percentage、`UsageUnknown` → provider 単位の stale placeholder と同じ `?%`。
 
 **Codex**
 
-app-server の `account/rateLimits/read` が返す window (`primary`/`secondary`) は position (どちらのフィールドに入っているか) では 5h/weekly を区別しない。各 window 自身が持つ `windowDurationMins` の値によって分類する。未知/欠落した duration は 5h/weekly のどちらへも推測せず、その window を unavailable として扱う (fail closed)。
+app-server の `account/rateLimits/read` が返す window (`primary`/`secondary`) は position (どちらのフィールドに入っているか) では 5h/weekly を区別しない。各 window 自身が持つ `windowDurationMins` の値によって分類する。未知/欠落した duration は 5h/weekly のどちらへも推測せず、その window を `UsageUnknown` として扱う (fail closed)。Codex の transport には limit 到達を示す独自の signal がないため、Codex が `UsageExhausted` を報告することはない。
 
 **Claude**
 
 Claude Code には Codex app-server のような on-demand usage 読み取り RPC がないため、agentsctl が所有する専用の interactive Claude session (usage probe) を1つだけ持ち、その session 向け専用設定の `statusLine` から usage snapshot を収集する。
 
 - probe session は agentsctl が生成・所有する session であり、既存のユーザー session を attach/hijack することはない。
-- probe session の identity (native session ID) は agentsctl local state に保持し、以後の起動でも同じ session を再利用する。名前や CWD だけを identity の根拠にはしない。
-- probe 専用 directory は Claude Code にとって未知の directory であるため、初回起動時のみ workspace trust 確認への応答を行う。以後は Claude Code 自身がその directory を trusted として記憶するため、同じ応答を繰り返さない。
-- probe session は通常の session catalog (Agent View 上の一覧、pin/rename/attach/stop/archive の対象) には現れない。除外は agentsctl が記録している exact な session identity によって provider 境界で行い、CWD だけを条件にはしない。
-- 取得結果は TTL 付きでキャッシュし、Agent View の reload のたびに probe session へ request を送ることはない。cache が stale な場合のみ refresh を行い、複数の呼び出しが同時に発生しても refresh は高々1回に集約する。
+- probe session の identity (native session ID) は agentsctl local state に保持し、通常は以後の起動でも同じ session を再利用する。名前や CWD だけを identity の根拠にはしない。ただし Claude Code が特定の session ID を "already in use" として恒久的に reject するケースが実機で確認されている (#19 follow-up) — この場合のみ、同じ `Probe.Usage()` 呼び出し内で session ID を rotate し、最大1回だけ retry する (無限 retry はしない)。rotate 後の ID も同じ probe directory を使い続けるため、後述の workspace trust 状態は rotate によって失われない。
+- `probe.json` は複数 agentsctl process から共有されうるため、その load/create・workspace trust 更新・rotation は、`probe.json` 専用の advisory file lock (`probe.json.lock` への `flock`) 配下で1つの read-modify-write transaction として実行する。単に書き込み直前に persisted current を読み直すだけでは、read から write までの間に別 process が割り込む余地が残り不十分 — lock によって「read → 判定 → write」全体を1 transaction として直列化して初めて、reject された ID が既に他 process によって rotate 済みだった場合に新たな ID を発行せずその既存の rotate 結果をそのまま使う、という判定が race なく成立する。retry は rotate が実際に起きたかどうかに関わらず最大1回のまま変わらない。この lock は `Provider.List` 等の read-only アクセスまでは block しない (atomic rename により、読み取りは常に transaction 前後どちらかの完全な状態のみを見る)。
+- probe 専用 directory は Claude Code にとって未知の directory であるため、初回起動時のみ workspace trust 確認への応答を行う。以後は Claude Code 自身がその directory を trusted として記憶するため、同じ応答を繰り返さない。この trust 状態は session ID ではなく probe directory に紐づくため、上記の session ID rotation が起きても agentsctl 側の trust 済みフラグは引き継ぎ、trust dialog への応答をやり直すことはない。引き継ぎ元は rotation を呼び出した caller が保持している (refresh 開始時点の) identity のコピーではなく、rotation を実行する時点で probe directory に永続化されている最新の identity である — 同じ refresh attempt の中で trust dialog への応答が完了し `TrustAccepted=true` が永続化された直後に session ID conflict が判明するケースがあり、その場合でも直前に永続化された最新の trust 済み状態を rotation 後の identity へ引き継ぐ。
+- probe session は通常の session catalog (Agent View 上の一覧、pin/rename/attach/stop/archive の対象) には現れない。除外は agentsctl が記録している exact な session identity によって provider 境界で行い、CWD だけを条件にはしない。rotate によって使われなくなった旧 session ID も、Claude Code 自身の native catalog からは自動的には消えないため、agentsctl は rotate 済みの旧 ID も (現在の ID と合わせて) 引き続き保持・除外の対象とする — 除外は「現在の1つの ID」ではなく「agentsctl が probe として所有した exact session ID の集合」に対して行う。
+- 取得結果は TTL 付きでキャッシュし、Agent View の reload のたびに probe session へ request を送ることはない。cache が stale な場合のみ refresh を行い、複数の呼び出しが同時に発生しても refresh は高々1回に集約する。この集約は同一 process 内の single-flight (`refreshShared`) に加えて、probe directory を共有する process 間でも `probe.json.lock` とは別の専用 refresh lock で行う (`probe.json` の identity mutation lock と responsibility を混同しない: こちらは Claude probe session の実行そのものを直列化する)。lock 取得後は必ず persisted `usage.json` を同じ TTL 基準で再確認し、待機中に別 process が既に fresh な結果を書いていればそれを再利用して Claude を再実行しない。lock は Claude との往復全体 (取得 → refresh → persist) を保持したまま解放するため、`ctx` cancellation を尊重する context-aware な acquisition を用いる。lock ordering は常に「refresh lock → identity lock」の一方向のみで、逆方向 (identity lock を保持したまま refresh lock を待つ) は発生しない。
 - refresh が失敗しても、直前に取得できていた snapshot があればそれを返し、Session catalog や Codex 側の usage を道連れにしない。snapshot が一度も取得できていない場合のみ、この provider の usage を省略する (0% として偽装しない)。
+
+_Limit detection (#19)_ — Claude Code の `statusLine` は `refreshInterval` による定期 tick で再実行されるため、tick が新しいというだけでは「この refresh が送った prompt に対する応答が実際に届いた」ことの証明にならない (installed CLI 2.1.263 で確認: 応答前の tick は `cost.total_api_duration_ms == 0` かつ `rate_limits` 自体が存在しない)。そのため probe は `cost.total_api_duration_ms` が正の値になった tick のみを「この refresh の実応答」として受理する。limit に到達した turn はこの意味での応答を得られないため、probe session 自身の terminal 出力 (以前は破棄していたもの) を limit 到達を示す文言について classify し、この判定だけで Claude provider 境界内に閉じる (統一 rate_limits JSON の解析結果ではなく、terminal 出力の文言に依存する数少ない箇所であり、TUI や provider-neutral domain へは一切漏らさない)。判定は「hit/reached your session limit」「hit/reached your weekly limit」等、具体的な句にのみ一致させ、"limit" という単語単体では判定しない — 同じ CLI バイナリが `context limit` / `token limit` のような無関係な意味でも同じ単語を使うため。5h/weekly いずれか、または両方を独立に `UsageExhausted` として正規化し、影響を受けない側の window は直前の有効な snapshot を保持したまま返す。limit 以外の理由 (timeout・process failure・parse failure) による失敗は、この classify に一致しない限り従来どおりの stale-cache fallback 動作を維持する。検出した exhausted snapshot は (通常の snapshot と同じ SnapshotStore 経由で) probe 自身の `usage.json` にも永続化する — limit 到達時は statusLine collector 自身が書き込む機会を持たないため、ここで明示的に書かないと agentsctl 再起動時に reset 前の percentage へ巻き戻ってしまう。
+
+_Reset boundary (#19)_ — cache 上の snapshot は、それが observe された時点の usage window に対してのみ有効な値である。この判定ルールは Claude provider 内に閉じず、provider-neutral `session.UsageWindow.At(now)` / `session.Usage.At(now)` として一箇所に定義する: window ごとに独立して「現在時刻が、その reading が持つ `Reset` 時刻を過ぎていないか」を確認し、過ぎていれば `UsageAvailable`/`UsageExhausted` を問わず `UsageUnknown` として扱う — reset 前の percentage や exhausted state を、reset を跨いだ新しい window の値として維持することはない。Claude provider は自身の cache を `session.Usage` へ変換する際にこの `At` を一度適用し (`toSessionUsageWindow` 自体は reset 判定を持たない純粋な shape 変換)、Agent View はさらに自分の read/render 時点でも同じ `At` を再適用する (`usageWindowText`) — provider 側の refresh が起きていなくても、State に保持され続けている値が reset boundary を跨いだ後は次の render で `?%` になる。両者が同じ method を呼ぶことで、「Claude provider 内では正規化済みだが Agent View state 内では expiry 済み」というズレを防ぐ。`now` は `time.Now()` を各所に散らすのではなく `Probe.Clock` という単一の injection point を通す (Claude 側の deterministic test のため)。5h と weekly は互いに独立に評価され、片方が reset boundary を跨いでも、もう片方のまだ有効な snapshot には影響しない。
+
+##### Claude probe: resource ownership とライフサイクル
+
+Claude usage probe が扱う machine-global / process-local resource の owner を固定する。実装のクラス名は将来変わりうるが、ownership の構造自体 (「どこからでも読み書きできる」を作らないこと) は変えない。
+
+| Resource                                                          | Scope          | Owner                     |
+| ------------------------------------------------------------------ | -------------- | -------------------------- |
+| probe identity (session ID・retired ownership・trust metadata、`probe.json`) | machine-global | `probestate.IdentityStore` |
+| persisted usage snapshot (`usage.json`)                            | machine-global | `probestate.SnapshotStore` |
+| Claude probe session の実行そのもの (refresh lock・freshness re-check・retry/rotation lifecycle・persist) | machine-global | refresh coordinator        |
+| in-memory snapshot cache                                           | process-local  | `Probe`                     |
+| in-process refresh single-flight                                   | process-local  | `Probe`                     |
+| 1回の Claude PTY attempt (settings・PTY・settle・trust 送信・prompt 送信・detach) | attempt-local  | attempt runner              |
+
+**Mutation authority**
+
+- `probe.json` への書き込みは `probestate.IdentityStore` の domain operation (`LoadOrCreate` / `MarkTrustAccepted` / `Rotate`) を経由してのみ発生する。生の read-modify-write を組み立てられる箇所は `probestate` package の外には存在しない -- transaction lock (`probe.json.lock`) は同 package 内の実装詳細として閉じる。
+- `usage.json` への書き込みは `probestate.SnapshotStore.Save` のみが行う。legacy schema decode (`available bool` → `state`) も同じ persistence boundary の内部に閉じ、domain/orchestration code は wire schema を意識しない。
+- freshness (TTL) 判定は `probestate.SnapshotFresh(observedAt, now, ttl)` という1つの pure policy にのみ定義し、process-local cache の freshness 判定と machine-global の persisted snapshot re-check の両方がこれを呼ぶ (どちらも実時刻ベースで、テスト用の `Probe.Clock` は reset boundary 判定にのみ使う -- OS wait/timeout や TTL freshness のような wall-clock 由来の判断まで無理に testable clock 化はしない)。reset boundary 判定は従来通り provider-neutral `session.Usage.At` に一本化されたまま。
+
+**Refresh lifecycle (owner: refresh coordinator)**
+
+```text
+Usage
+│
+├─ local fresh cache (Probe)
+│    └─ return
+│
+└─ stale/missing
+     ↓
+process single-flight (Probe)
+     ↓
+machine refresh lock (coordinator)
+     ↓
+persisted snapshot re-check (coordinator -> SnapshotStore)
+│
+├─ fresh
+│    └─ reuse
+│
+└─ stale/missing
+     ↓
+identity load/create (coordinator -> IdentityStore)
+     ↓
+attempt #1 (attempt runner)
+     │
+     ├─ success / exhausted -> persist snapshot
+     │
+     ├─ session conflict
+     │    ↓
+     │  IdentityStore.Rotate
+     │    ↓
+     │  attempt #2 (attempt runner, no further retry)
+     │    │
+     │    ├─ success / exhausted -> persist snapshot
+     │    └─ error (conflict again, or other) -> stale/error fallback
+     │
+     └─ other failure       -> stale/error fallback (no rotation)
+```
+
+retry は attempt #1 が session conflict を報告した場合の attempt #2 のみで、それ以上のループはない。retry/rotation policy は coordinator だけが所有する。attempt runner 自身は retry しない。session conflict は attempt runner が probe session の出力を分類して返すだけであり、rotate するかどうかの判断は coordinator が行う。
+
+**Lock ordering**
+
+refresh lock (coordinator) を先に取得し、その内側で identity lock (`probestate.IdentityStore` の内部実装詳細) を都度取得・解放する。逆順 (identity lock を保持したまま refresh lock を待つ) は発生しない -- identity lock を握れるのは `IdentityStore` の domain operation 実行中だけであり、それらは常に coordinator の refresh lock 配下からしか呼ばれない。
+
+`Provider.List` の読み取り専用アクセス (`IdentityStore.KnownSessionIDs`) はどちらの lock も取得しない -- atomic rename により、読み取りは常に transaction 前後どちらかの完全な状態のみを見る。
+
+**TrustAccepted の意味**
+
+`TrustAccepted` は Claude ディレクトリ自体の trust state の source of truth ではない。agentsctl が workspace trust flow (dialog への応答) を一度完了し、同じ blind keystroke を再送しないために保持するローカル metadata であり、常にこの意味でのみ扱う。
 
 ##### Prompt stash
 

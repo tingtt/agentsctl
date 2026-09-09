@@ -91,6 +91,43 @@ func TestMalformedJSONDoesNotBecomeCatalog(t *testing.T) {
 		t.Fatal("malformed JSON accepted")
 	}
 }
+
+// fakeUsageProbeSource is a minimal UsageProbeSource test double that
+// reports a fixed, caller-supplied set of owned session IDs -- for tests
+// that only care about Provider.List's catalog-exclusion set-building,
+// with no real probe process or persisted identity file involved at all.
+type fakeUsageProbeSource struct{ ids []string }
+
+func (f *fakeUsageProbeSource) Usage(context.Context) (session.Usage, error) {
+	return session.Usage{}, errors.New("fakeUsageProbeSource.Usage is not implemented")
+}
+func (f *fakeUsageProbeSource) KnownSessionIDs() []string { return f.ids }
+
+// TestListExcludesRetiredAndCurrentProbeSessionsFromCatalog fixes this
+// round's catalog-leakage bug: a session ID rotation replaces which
+// SessionID the probe currently addresses, but Claude's own native
+// catalog does not remove the old, now-rejected row just because
+// agentsctl stopped addressing it -- List must keep excluding that
+// rotated-away row by exact identity right alongside the current one
+// (see UsageProbeSource.KnownSessionIDs), never letting either leak in as
+// an ordinary user session a real user could pin/rename/attach/stop/
+// archive.
+func TestListExcludesRetiredAndCurrentProbeSessionsFromCatalog(t *testing.T) {
+	r := &fakeRunner{result: base.Result{Stdout: []byte(`[
+		{"id":"old-probe","name":"agentsctl usage probe","status":"idle","state":"done"},
+		{"id":"current-probe","name":"agentsctl usage probe","status":"idle","state":"done"},
+		{"id":"real-session","name":"real","status":"idle","state":"done"}
+	]`)}}
+	probe := &fakeUsageProbeSource{ids: []string{"current-probe", "old-probe"}}
+	p := Provider{Path: "ignored", Runner: r, Store: newStore(t), UsageProbe: probe}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Key.ID != "real-session" {
+		t.Fatalf("rows=%+v, want exactly [real-session] with both the old and current probe rows excluded", rows)
+	}
+}
 func TestArchiveIsLocalOverlayAndDoesNotInvokeClaudeDelete(t *testing.T) {
 	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","status":"idle","state":"done"}]`)}}
 	p := Provider{Path: "ignored", Runner: r, Store: newStore(t)}

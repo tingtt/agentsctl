@@ -1,20 +1,24 @@
 package claude
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/tingtt/agentsctl/internal/session"
+)
 
 // TestParseStatusLinePayloadMapsFiveHourAndSevenDay fixes the core mapping
 // confirmed against the installed CLI's own statusLine documentation:
 // rate_limits.five_hour -> FiveHour, rate_limits.seven_day -> Weekly.
 func TestParseStatusLinePayloadMapsFiveHourAndSevenDay(t *testing.T) {
-	raw := []byte(`{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}}`)
+	raw := []byte(`{"cost":{"total_api_duration_ms":1000},"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}}`)
 	snap, err := parseStatusLinePayload(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available || snap.FiveHour.Percent != 24 || snap.FiveHour.ResetAt.Unix() != 1738425600 {
+	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 24 || snap.FiveHour.ResetAt.Unix() != 1738425600 {
 		t.Fatalf("FiveHour=%+v, want Available/24%%(rounded)/reset 1738425600", snap.FiveHour)
 	}
-	if !snap.Weekly.Available || snap.Weekly.Percent != 41 || snap.Weekly.ResetAt.Unix() != 1738857600 {
+	if snap.Weekly.State != session.UsageAvailable || snap.Weekly.Percent != 41 || snap.Weekly.ResetAt.Unix() != 1738857600 {
 		t.Fatalf("Weekly=%+v, want Available/41%%/reset 1738857600", snap.Weekly)
 	}
 }
@@ -28,7 +32,7 @@ func TestParseStatusLinePayloadMissingRateLimitsIsUnavailableNotZero(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snap.FiveHour.Available || snap.Weekly.Available {
+	if snap.FiveHour.State == session.UsageAvailable || snap.Weekly.State == session.UsageAvailable {
 		t.Fatalf("snap=%+v, want both windows unavailable when rate_limits is absent", snap)
 	}
 }
@@ -43,10 +47,10 @@ func TestParseStatusLinePayloadWindowIndependentlyAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available {
+	if snap.FiveHour.State != session.UsageAvailable {
 		t.Fatalf("FiveHour=%+v, want Available", snap.FiveHour)
 	}
-	if snap.Weekly.Available {
+	if snap.Weekly.State == session.UsageAvailable {
 		t.Fatalf("Weekly=%+v, want Available=false when seven_day is absent", snap.Weekly)
 	}
 }
@@ -60,7 +64,7 @@ func TestParseStatusLinePayloadZeroPercentIsAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snap.FiveHour.Available || snap.FiveHour.Percent != 0 {
+	if snap.FiveHour.State != session.UsageAvailable || snap.FiveHour.Percent != 0 {
 		t.Fatalf("FiveHour=%+v, want Available=true/Percent=0 for a genuinely reported 0%%", snap.FiveHour)
 	}
 }
@@ -70,5 +74,35 @@ func TestParseStatusLinePayloadZeroPercentIsAvailable(t *testing.T) {
 func TestParseStatusLinePayloadRejectsMalformedJSON(t *testing.T) {
 	if _, err := parseStatusLinePayload([]byte("not json")); err == nil {
 		t.Fatal("malformed payload was accepted")
+	}
+}
+
+// TestParseStatusLinePayloadResponseObservedFromCost fixes the freshness
+// signal waitForProbeOutcome depends on: total_api_duration_ms == 0 (or
+// cost absent entirely) means no completed API response yet, non-zero
+// means one occurred -- verified against the installed CLI (2.1.263) via
+// this package's own probe machinery (see parseStatusLinePayload's doc
+// comment).
+func TestParseStatusLinePayloadResponseObservedFromCost(t *testing.T) {
+	preResponse, err := parseStatusLinePayload([]byte(`{"cost":{"total_api_duration_ms":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preResponse.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=false for total_api_duration_ms=0", preResponse)
+	}
+	noCost, err := parseStatusLinePayload([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noCost.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=false with no cost field at all", noCost)
+	}
+	postResponse, err := parseStatusLinePayload([]byte(`{"cost":{"total_api_duration_ms":1979}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !postResponse.ResponseObserved {
+		t.Fatalf("snap=%+v, want ResponseObserved=true for a positive total_api_duration_ms", postResponse)
 	}
 }

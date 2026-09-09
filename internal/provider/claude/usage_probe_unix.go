@@ -5,23 +5,36 @@ package claude
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/provider/claude/probestate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
 // usageProbeTTL bounds how long a cached Claude usage snapshot is served
 // before Usage() triggers a fresh refresh through the owned probe session
-// (see Probe.Usage) -- #14's "1〜5分程度" cache freshness guidance.
+// (see Probe.Usage) -- #14's "1〜5分程度" cache freshness guidance. Also
+// the freshness window refreshCoordinator.Refresh re-checks the persisted
+// snapshot against after acquiring the cross-process refresh lock -- the
+// same TTL policy (probestate.SnapshotFresh), not a second one (see
+// refreshCoordinator.Refresh's own doc comment).
 const usageProbeTTL = 3 * time.Minute
 
-// usageProbePrompt is the minimal message Probe.refresh sends into the
+// usageProbeRefreshLockPollInterval is the retry cadence refreshCoordinator.lock
+// polls at while waiting for another process's refresh transaction to
+// release the cross-process refresh lock. Unlike probestate.IdentityStore's
+// plain blocking unix.Flock (an identity transaction is always short --
+// one local read plus one atomic write), a refresh transaction can hold
+// this lock for as long as a full Claude round trip takes, so a
+// context-cancellable wait matters here: LOCK_EX|LOCK_NB polled at this
+// interval, rather than a single blocking LOCK_EX, so Usage(ctx)'s own
+// cancellation semantics are never made worse by this lock's existence.
+const usageProbeRefreshLockPollInterval = 50 * time.Millisecond
+
+// usageProbePrompt is the minimal message probeAttemptRunner.Run sends into the
 // probe session to elicit one real API response (the only way Claude Code
 // populates rate_limits for its statusLine -- see UsageProbeSource's doc
 // comment). It deliberately asks for no tool use: this session has no
@@ -29,7 +42,7 @@ const usageProbeTTL = 3 * time.Minute
 // spawned would simply hang until usageProbeSendTimeout.
 const usageProbePrompt = "Reply with just the word OK. Do not use any tools."
 
-// usageProbeSendTimeout bounds how long Probe.refresh waits for the
+// usageProbeSendTimeout bounds how long probeAttemptRunner.Run waits for the
 // collector to observe a fresh statusLine snapshot (ObservedAt after the
 // prompt was sent) before giving up on this refresh.
 const usageProbeSendTimeout = 30 * time.Second
@@ -58,8 +71,8 @@ const usageProbeSettleDelay = 3 * time.Second
 // Verified against the installed CLI: sending this once, then a real
 // prompt, completes a real chat turn, and Claude Code durably remembers
 // the directory as trusted in its own local state from then on (see
-// probeIdentity.TrustAccepted's doc comment for why this is sent at most
-// once per probe identity).
+// probestate.Identity.TrustAccepted's doc comment for why this is sent at
+// most once per probe identity).
 const usageProbeTrustDialogAccept = "\x1b[B\r"
 
 // usageProbeTrustSettleDelay is a second, shorter settle wait after
@@ -77,20 +90,22 @@ const usageProbeTrustSettleDelay = 2 * time.Second
 // the session's own TUI a moment to settle back to idle first.
 const usageProbeDetachSettleDelay = 2 * time.Second
 
-// usageProbeDetachTimeout bounds how long detachProbeSession waits for a
-// SIGINT-requested clean exit before escalating to SIGKILL.
+// usageProbeDetachTimeout bounds how long probeAttemptRunner.detach waits
+// for a SIGINT-requested clean exit before escalating to SIGKILL.
 const usageProbeDetachTimeout = 5 * time.Second
 
 // Probe is agentsctl's one owned Claude usage-probe session: an
 // interactive `claude` process, run under a PTY this package owns
 // transiently for each refresh (never left running in the background --
-// see refresh), configured via a dedicated --settings file whose
+// see usage_attempt.go's probeAttemptRunner.Run), configured via a dedicated --settings file whose
 // statusLine points back at this same executable's UsageCollectorCommand.
 // It implements UsageProbeSource for Provider.
 //
 // A Probe is safe for concurrent use: Usage single-flights refreshes (see
-// refreshShared) so concurrent callers never spawn more than one probe
-// process or send more than one prompt at a time.
+// refreshShared) so concurrent callers within this process never spawn
+// more than one probe process or send more than one prompt at a time.
+// That guarantee extends across every agentsctl process sharing this
+// probe's Dir too, not just within one -- see refreshCoordinator.
 type Probe struct {
 	// Path is the `claude` binary path; empty means "claude" (resolved via
 	// PATH, matching Provider.path()).
@@ -113,9 +128,27 @@ type Probe struct {
 	SettleDelay       time.Duration
 	TrustSettleDelay  time.Duration
 	DetachSettleDelay time.Duration
+	// SendTimeout overrides usageProbeSendTimeout, the bound
+	// waitForProbeOutcome waits for either a genuine fresh snapshot or a
+	// classified usage-limit indication before giving up with a plain
+	// (non-limit) failure; zero uses the production default. Exposed so a
+	// test exercising that plain-failure path (see Issue #19's "limit 以外
+	// の timeout" regression test) isn't forced to wait out the real
+	// production timeout.
+	SendTimeout time.Duration
+	// Clock overrides "now" for reset-boundary decisions (see now,
+	// toSessionUsage, exhaustedSnapshot); nil uses time.Now. Exposed so a
+	// test can deterministically cross a cached window's own Reset time
+	// without sleeping (see Issue #19's reset-boundary regression tests).
+	// TTL freshness (cachedFresh/refreshCoordinator's persisted re-check) does NOT go
+	// through Clock -- see the DesignDoc's "Clock consistency" note: TTL
+	// freshness is a real-wall-clock comparison against when a refresh
+	// actually happened, not a domain decision a test needs to control
+	// independently of wall time.
+	Clock func() time.Time
 
 	mu          sync.Mutex
-	snapshot    usageSnapshot
+	snapshot    probestate.Snapshot
 	hasSnapshot bool
 	snapshotAt  time.Time
 	refreshCh   chan struct{} // non-nil while a refresh is in flight (single-flight)
@@ -150,9 +183,69 @@ func (pr *Probe) detachSettleDelay() time.Duration {
 	}
 	return usageProbeDetachSettleDelay
 }
+func (pr *Probe) sendTimeout() time.Duration {
+	if pr.SendTimeout > 0 {
+		return pr.SendTimeout
+	}
+	return usageProbeSendTimeout
+}
+func (pr *Probe) now() time.Time {
+	if pr.Clock != nil {
+		return pr.Clock()
+	}
+	return time.Now()
+}
 func (pr *Probe) settingsPath() string { return filepath.Join(pr.Dir, "settings.json") }
 func (pr *Probe) snapshotPath() string { return filepath.Join(pr.Dir, "usage.json") }
 func (pr *Probe) identityPath() string { return filepath.Join(pr.Dir, "probe.json") }
+
+// identityStore returns the Root Owner of this probe's identity
+// (probe.json) -- cheap to construct (just wraps a path), so a fresh one
+// is built on demand rather than cached as a field.
+func (pr *Probe) identityStore() *probestate.IdentityStore {
+	return probestate.NewIdentityStore(pr.identityPath())
+}
+
+// snapshotStore returns the Root Owner of this probe's persisted usage
+// snapshot (usage.json) -- see identityStore's own doc comment.
+func (pr *Probe) snapshotStore() *probestate.SnapshotStore {
+	return probestate.NewSnapshotStore(pr.snapshotPath())
+}
+
+// newRefreshCoordinator builds this probe's machine-global refresh
+// coordinator (see refreshCoordinator's own doc comment) from this
+// Probe's current configuration -- cheap to construct, so a fresh one is
+// built per refresh rather than cached as a field (matching
+// identityStore/snapshotStore's own reasoning).
+func (pr *Probe) newRefreshCoordinator() *refreshCoordinator {
+	return &refreshCoordinator{
+		dir:      pr.Dir,
+		identity: pr.identityStore(),
+		snapshot: pr.snapshotStore(),
+		ttl:      usageProbeTTL,
+		now:      pr.now,
+		attempt:  pr.newAttemptRunner().Run,
+	}
+}
+
+// newAttemptRunner builds this probe's single-attempt runner (see
+// probeAttemptRunner's own doc comment) from this Probe's current
+// configuration -- cheap to construct, so a fresh one is built per attempt
+// rather than cached as a field.
+func (pr *Probe) newAttemptRunner() *probeAttemptRunner {
+	return &probeAttemptRunner{
+		dir:               pr.Dir,
+		claudePath:        pr.claudePath(),
+		exePath:           pr.exePath,
+		settingsPath:      pr.settingsPath(),
+		snapshotPath:      pr.snapshotPath(),
+		settleDelay:       pr.settleDelay(),
+		trustSettleDelay:  pr.trustSettleDelay(),
+		detachSettleDelay: pr.detachSettleDelay(),
+		sendTimeout:       pr.sendTimeout(),
+		identity:          pr.identityStore(),
+	}
+}
 
 func (pr *Probe) exePath() (string, error) {
 	if pr.ExePath != "" {
@@ -161,17 +254,16 @@ func (pr *Probe) exePath() (string, error) {
 	return os.Executable()
 }
 
-// KnownSessionID implements UsageProbeSource: a pure local-file read (no
+// KnownSessionIDs implements UsageProbeSource: a pure local-file read (no
 // process spawned, no catalog call), so Provider.List can cheaply exclude
-// the probe's row on every load. An identity that has never been created,
-// or that can't be read, reports ok=false -- List then excludes nothing,
-// never guessing (see Provider.List's doc comment on this call site).
-func (pr *Probe) KnownSessionID() (string, bool) {
-	id, ok, err := readProbeIdentityIfExists(pr.identityPath())
-	if err != nil || !ok {
-		return "", false
-	}
-	return id.SessionID, true
+// every row this probe has ever owned -- its current SessionID and every
+// RetiredSessionIDs entry a rotation has left behind (see
+// probestate.Identity's own doc comment) -- on every load. An identity
+// that has never been created, or that can't be read, reports an
+// empty/nil slice -- List then excludes nothing, never guessing (see
+// Provider.List's doc comment on this call site).
+func (pr *Probe) KnownSessionIDs() []string {
+	return pr.identityStore().KnownSessionIDs()
 }
 
 // Usage implements UsageProbeSource. A fresh cached snapshot (within
@@ -187,17 +279,28 @@ func (pr *Probe) KnownSessionID() (string, bool) {
 // cache/failure policy). Only a refresh failure with no prior snapshot at
 // all surfaces as an error, which sessionctl.Controller.Usage already
 // treats as "omit this provider from the usage line" -- never a fake 0%.
+//
+// Every returned snapshot passes through toSessionUsage with the same
+// "now" (see pr.now()), which independently normalizes each window
+// against its own cached Reset time via session.Usage.At -- a window
+// whose reset boundary has passed since it was cached renders as
+// session.UsageUnknown here regardless of which of the three paths below
+// produced the underlying snapshot (see Issue #19's reset-boundary
+// handling). Agent View applies the exact same session.Usage.At rule
+// again at its own read/render time, so a value already normalized here
+// is never shown differently on the other side of that boundary.
 func (pr *Probe) Usage(ctx context.Context) (session.Usage, error) {
 	pr.loadPersistedSnapshotOnce()
+	now := pr.now()
 	if snap, ok := pr.cachedFresh(); ok {
-		return toSessionUsage(snap), nil
+		return toSessionUsage(snap, now), nil
 	}
 	snap, err := pr.refreshShared(ctx)
 	if err == nil {
-		return toSessionUsage(snap), nil
+		return toSessionUsage(snap, now), nil
 	}
 	if stale, ok := pr.cachedAny(); ok {
-		return toSessionUsage(stale), nil
+		return toSessionUsage(stale, now), nil
 	}
 	return session.Usage{}, err
 }
@@ -217,50 +320,69 @@ func (pr *Probe) loadPersistedSnapshotOnce() {
 	if pr.hasSnapshot {
 		return
 	}
-	if snap, ok, err := readUsageSnapshot(pr.snapshotPath()); err == nil && ok {
+	if snap, ok, err := pr.snapshotStore().Load(); err == nil && ok {
 		pr.snapshot, pr.hasSnapshot, pr.snapshotAt = snap, true, snap.ObservedAt
 	}
 }
 
-func (pr *Probe) cachedFresh() (usageSnapshot, bool) {
+// cachedFresh and cachedAny apply probestate.SnapshotFresh -- the single
+// TTL freshness policy -- against the real wall clock (time.Now(), not
+// pr.now()/pr.Clock): TTL freshness is "how long ago did a refresh
+// actually complete", not a reset-boundary domain decision a test needs to
+// control independently of wall time (see Probe.Clock's own doc comment).
+func (pr *Probe) cachedFresh() (probestate.Snapshot, bool) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-	if pr.hasSnapshot && time.Since(pr.snapshotAt) < usageProbeTTL {
+	if pr.hasSnapshot && probestate.SnapshotFresh(pr.snapshotAt, time.Now(), usageProbeTTL) {
 		return pr.snapshot, true
 	}
-	return usageSnapshot{}, false
+	return probestate.Snapshot{}, false
 }
-func (pr *Probe) cachedAny() (usageSnapshot, bool) {
+func (pr *Probe) cachedAny() (probestate.Snapshot, bool) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 	return pr.snapshot, pr.hasSnapshot
 }
 
-// refreshShared single-flights refresh: concurrent callers arriving while
-// a refresh is already in progress wait for it (bounded by ctx) and reuse
-// its result instead of starting a second probe process or prompt --
-// guaranteeing at most one probe-session creation and at most one stale
-// refresh request in flight at a time, regardless of how many goroutines
-// call Usage concurrently.
-func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
+// refreshShared single-flights refresh WITHIN THIS PROCESS: concurrent
+// callers arriving while a refresh is already in progress wait for it
+// (bounded by ctx) and reuse its result instead of starting a second
+// probe process or prompt of their own, guaranteeing at most one refresh
+// attempt in flight per process at a time, regardless of how many
+// goroutines call Usage concurrently. It delegates the actual work to a
+// fresh refreshCoordinator (see newRefreshCoordinator), which extends
+// that same guarantee across every agentsctl process sharing this probe's
+// Dir too -- see its own doc comment; this function's own responsibility
+// ends at the process boundary, exactly like localstate.Store's
+// in-process mu paired with its own cross-process flock. This function
+// never itself acquires the refresh lock, checks persisted freshness, or
+// persists a result -- see refreshCoordinator.Refresh's own doc comment
+// for why that whole sequence is that type's alone to run.
+func (pr *Probe) refreshShared(ctx context.Context) (probestate.Snapshot, error) {
 	pr.mu.Lock()
 	if ch := pr.refreshCh; ch != nil {
 		pr.mu.Unlock()
 		select {
 		case <-ch:
 		case <-ctx.Done():
-			return usageSnapshot{}, ctx.Err()
+			return probestate.Snapshot{}, ctx.Err()
 		}
 		if snap, ok := pr.cachedFresh(); ok {
 			return snap, nil
 		}
-		return usageSnapshot{}, errors.New("concurrent claude usage refresh did not produce a fresh snapshot")
+		return probestate.Snapshot{}, errors.New("concurrent claude usage refresh did not produce a fresh snapshot")
 	}
 	ch := make(chan struct{})
 	pr.refreshCh = ch
 	pr.mu.Unlock()
 
-	snap, err := pr.refresh(ctx)
+	// prev feeds refreshCoordinator.resolveOutcome's exhausted-snapshot
+	// merge if this refresh's own attempt detects a usage limit (see its
+	// own doc comment) -- Probe's process-local cache is the only place
+	// that knowledge lives, so it's read here and handed down rather than
+	// the coordinator reaching back into Probe for it.
+	prev, _ := pr.cachedAny()
+	snap, err := pr.newRefreshCoordinator().Refresh(ctx, prev)
 
 	pr.mu.Lock()
 	if err == nil {
@@ -272,159 +394,29 @@ func (pr *Probe) refreshShared(ctx context.Context) (usageSnapshot, error) {
 	return snap, err
 }
 
-// refresh does the actual probe-session work: it starts the one owned
-// Claude session (always addressed by the same persisted --session-id --
-// see probeIdentity's doc comment) under a PTY this call owns transiently,
-// answers the workspace-trust dialog if this is the very first launch
-// ever for this probe identity, sends usageProbePrompt to elicit a real
-// API response (consuming a small amount of quota -- see
-// usageProbePrompt's doc comment), waits for the collector to observe a
-// fresh statusLine snapshot, then detaches -- the process is never left
-// running across refreshes (see Probe's doc comment): each refresh is its
-// own short-lived attach, so Claude's own native catalog shows exactly
-// one probe session no matter how many refreshes have run.
-func (pr *Probe) refresh(ctx context.Context) (usageSnapshot, error) {
-	if err := os.MkdirAll(pr.Dir, 0o700); err != nil {
-		return usageSnapshot{}, err
-	}
-	exe, err := pr.exePath()
-	if err != nil {
-		return usageSnapshot{}, fmt.Errorf("resolve agentsctl executable: %w", err)
-	}
-	if err := writeUsageSettings(pr.settingsPath(), exe, pr.snapshotPath()); err != nil {
-		return usageSnapshot{}, fmt.Errorf("write claude usage probe settings: %w", err)
-	}
-	id, err := loadOrCreateProbeIdentity(pr.identityPath())
-	if err != nil {
-		return usageSnapshot{}, fmt.Errorf("load claude usage probe identity: %w", err)
-	}
-
-	args := []string{"--session-id", id.SessionID, "--settings", pr.settingsPath()}
-	cmd := exec.CommandContext(ctx, pr.claudePath(), args...)
-	cmd.Dir = pr.Dir
-	child, err := startClaudeAttachRaw(cmd)
-	if err != nil {
-		return usageSnapshot{}, fmt.Errorf("start claude usage probe session: %w", err)
-	}
-	defer child.Close()
-	wait := make(chan error, 1)
-	go func() { wait <- cmd.Wait() }()
-	// No real terminal is watching this session's output; drain it for the
-	// same reason sendClaudeRename does (an unread pty buffer would
-	// otherwise make the child block on its own writes).
-	go drainUntilClosed(child)
-
-	// See usageProbeSettleDelay's doc comment for why this waits, unlike
-	// sendClaudeRename's immediate write.
-	if err := probeSettle(ctx, pr.settleDelay()); err != nil {
-		return usageSnapshot{}, err
-	}
-
-	if !id.TrustAccepted {
-		if _, err := child.Write([]byte(usageProbeTrustDialogAccept)); err != nil {
-			return usageSnapshot{}, fmt.Errorf("accept claude workspace trust dialog: %w", err)
-		}
-		// Persisted before the prompt below, not after refresh succeeds:
-		// this dialog is answered at most once ever, regardless of
-		// whether the rest of this particular refresh goes on to
-		// succeed or fail (see probeIdentity.TrustAccepted).
-		_ = markTrustAccepted(pr.identityPath(), id)
-		if err := probeSettle(ctx, pr.trustSettleDelay()); err != nil {
-			return usageSnapshot{}, err
-		}
-	}
-
-	sentAt := time.Now()
-	if _, err := child.Write([]byte(usageProbePrompt + "\r")); err != nil {
-		return usageSnapshot{}, fmt.Errorf("send claude usage probe prompt: %w", err)
-	}
-
-	snap, waitErr := waitForFreshSnapshot(ctx, pr.snapshotPath(), sentAt, usageProbeSendTimeout)
-
-	pr.detachProbeSession(ctx, cmd, wait)
-
-	if waitErr != nil {
-		return usageSnapshot{}, waitErr
-	}
-	return snap, nil
-}
-
-// probeSettle waits for d, or returns ctx's error if ctx is cancelled
-// first.
-func probeSettle(ctx context.Context, d time.Duration) error {
-	select {
-	case <-time.After(d):
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// waitForFreshSnapshot polls path until it holds a snapshot whose
-// ObservedAt is after `after` (proving the collector wrote it in response
-// to this refresh's own prompt, not a leftover from an earlier one) or
-// timeout elapses.
-func waitForFreshSnapshot(ctx context.Context, path string, after time.Time, timeout time.Duration) (usageSnapshot, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		if snap, ok, err := readUsageSnapshot(path); err == nil && ok && snap.ObservedAt.After(after) {
-			return snap, nil
-		}
-		if !time.Now().Before(deadline) {
-			return usageSnapshot{}, fmt.Errorf("claude usage probe: no fresh statusLine snapshot within %s", timeout)
-		}
-		select {
-		case <-ctx.Done():
-			return usageSnapshot{}, ctx.Err()
-		case <-time.After(usageProbePollInterval):
-		}
-	}
-}
-
-// detachProbeSession ends a plain interactive probe session process.
-// Unlike detachClaudeClient (built for `claude attach <id>`'s own
-// documented Ctrl+Z detach hotkey), a brand-new `claude --session-id ...`
-// session does not treat a literal Ctrl+Z byte the same way: verified
-// against the installed CLI, it is instead read as an ordinary job-control
-// suspend request, leaving the process permanently "suspended" (the CLI's
-// own message: "Run `fg` to bring Claude Code back") rather than exiting,
-// until force-killed. SIGINT is what actually works for an otherwise-idle
-// session (also verified against the installed CLI); SIGTERM was tried
-// too and does not reliably end the process either. A SIGKILL fallback
-// here is safe, unlike a mid-turn kill (observed to leave that session's
-// conversation permanently unresumable): this probe never depends on any
-// given refresh's conversation surviving (see probeIdentity's doc
-// comment), so losing it costs nothing beyond this one process needing to
-// be started again next refresh.
-func (pr *Probe) detachProbeSession(ctx context.Context, cmd *exec.Cmd, wait <-chan error) {
-	if cmd.Process == nil {
-		return
-	}
-	// A bounded, unconditional wait (not tied to ctx) -- cleaning up this
-	// process is worth attempting even if the caller's own ctx has
-	// already been cancelled (e.g. agentsctl itself is exiting).
-	time.Sleep(pr.detachSettleDelay())
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGINT)
-	if _, ok := waitForAttachment(ctx, wait, usageProbeDetachTimeout); ok {
-		return
-	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	_, _ = waitForAttachment(ctx, wait, usageProbeDetachTimeout)
-}
-
 // toSessionUsage converts this package's own Claude-specific snapshot into
 // the provider-neutral session.Usage -- the boundary past which no
 // statusLine-shaped detail leaks (see UsageProbeSource's doc comment).
-func toSessionUsage(snap usageSnapshot) session.Usage {
-	return session.Usage{
+// The reset-boundary rule itself (Issue #19: a cached window's reading is
+// only valid while now is still before its own Reset) is NOT duplicated
+// here -- it is applied uniformly via session.Usage.At, the same
+// provider-neutral method Agent View applies again at its own read/render
+// time (see footer.go's usageWindowText), so a value already normalized
+// here can never drift from how a later read of the same session.Usage
+// treats it (see the DesignDoc's usage contract).
+func toSessionUsage(snap probestate.Snapshot, now time.Time) session.Usage {
+	u := session.Usage{
 		Provider: session.ProviderClaude,
 		FiveHour: toSessionUsageWindow(snap.FiveHour),
 		Weekly:   toSessionUsageWindow(snap.Weekly),
 	}
+	return u.At(now)
 }
-func toSessionUsageWindow(w usageWindowSnapshot) session.UsageWindow {
-	if !w.Available {
-		return session.UsageWindow{}
-	}
-	return session.UsageWindow{Available: true, Percent: w.Percent, Reset: w.ResetAt}
+
+// toSessionUsageWindow converts one cached window's shape into the
+// provider-neutral session.UsageWindow, with no reset-boundary judgment
+// of its own -- see toSessionUsage, which applies session.Usage.At right
+// after calling this.
+func toSessionUsageWindow(w probestate.WindowSnapshot) session.UsageWindow {
+	return session.UsageWindow{State: w.State, Percent: w.Percent, Reset: w.ResetAt}
 }

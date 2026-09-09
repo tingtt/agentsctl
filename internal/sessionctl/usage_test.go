@@ -79,7 +79,7 @@ func TestUsageStreamDeliversFastProviderWithoutWaitingForSlowOne(t *testing.T) {
 	slowRelease := make(chan struct{})
 	c := Controller{Providers: []Source{
 		blockingUsageSource{fakeSource: fakeSource{id: session.ProviderClaude}, entered: slowEntered, release: slowRelease, usage: session.Usage{Provider: session.ProviderClaude}},
-		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 5}}},
+		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 5}}},
 	}}
 	stream := c.UsageStream(context.Background())
 
@@ -168,7 +168,7 @@ func TestUsageStreamPartialFailureReportsErrForThatProviderOnly(t *testing.T) {
 func TestControllerUsagePartialFailureKeepsOtherProvider(t *testing.T) {
 	c := Controller{Providers: []Source{
 		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderClaude}, usageErr: errBoom},
-		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{Available: true, Percent: 42, Reset: time.Now()}}},
+		fakeUsageSource{fakeSource: fakeSource{id: session.ProviderCodex}, usage: session.Usage{Provider: session.ProviderCodex, FiveHour: session.UsageWindow{State: session.UsageAvailable, Percent: 42, Reset: time.Now()}}},
 	}}
 	got := c.Usage(context.Background())
 	if len(got) != 1 || got[0].Provider != session.ProviderCodex {

@@ -2,6 +2,8 @@ package claude
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -10,7 +12,7 @@ import (
 // collector on a fixed timer in addition to Claude Code's own event-driven
 // triggers, so a snapshot keeps getting re-observed (with a fresh
 // ObservedAt) even during a quiet stretch with no new API response. It
-// does not, by itself, cause a new API request -- only Probe.refresh
+// does not, by itself, cause a new API request -- only probeAttemptRunner.Run
 // writing a fresh prompt into the session does that (see
 // usage_probe_unix.go) -- so this is cheap local bookkeeping, not an
 // additional quota cost.
@@ -44,7 +46,7 @@ type usageStatusLineSetting struct {
 // settingsPath, pointing its statusLine at this same agentsctl executable
 // re-invoked as the UsageCollectorCommand hidden subcommand (see
 // usage_collector.go), writing to snapshotPath. It is idempotent and cheap
-// enough to call on every refresh (see Probe.refresh): the content is a
+// enough to call on every refresh (see probeAttemptRunner.Run): the content is a
 // deterministic function of exePath/snapshotPath, so a redundant rewrite
 // with unchanged inputs produces byte-identical output.
 func writeUsageSettings(settingsPath, exePath, snapshotPath string) error {
@@ -58,7 +60,43 @@ func writeUsageSettings(settingsPath, exePath, snapshotPath string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(settingsPath, b)
+	return writeSettingsFileAtomic(settingsPath, b)
+}
+
+// writeSettingsFileAtomic writes data to path via a temp-file-plus-rename
+// swap, so a concurrent reader never observes a partially-written
+// settings.json. This package's other persisted state (the probe identity
+// and usage snapshot) has its own copy of this same pattern inside
+// probestate, which owns those files' mutation authority; settings.json
+// carries no such ownership concern (it is rewritten idempotently on every
+// refresh attempt, never read-modify-written), so it keeps this small,
+// self-contained helper rather than reaching into probestate for it.
+func writeSettingsFileAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }
 
 // shellQuote wraps value in single quotes for safe inclusion in the shell

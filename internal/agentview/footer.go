@@ -78,16 +78,49 @@ func usageColor(percent int) string {
 	}
 }
 
-// usageWindowText renders one rate-limit window ("<pct>% (reset at
-// <time>)"), or a gray "n/a" when the provider didn't report it --
-// Available must never be conflated with a reported 0% (see UsageWindow).
+// usageWindowText renders one rate-limit window from its normalized
+// session.UsageLimitState (see Issue #19's "Normalized state" and
+// UsageWindow): UsageExhausted always renders 100% regardless of any
+// Percent the provider may have carried forward (100% is the *display*
+// convention for exhausted, never something read back out of Percent as a
+// state judgment -- that direction only ever goes provider -> Percent, see
+// the Claude provider's exhausted-snapshot construction), UsageAvailable
+// renders the real percentage, and UsageUnknown (never fetched, not
+// reported by the provider, or a cached reading whose own window has since
+// reset) renders the same "?%" unknown placeholder usageProviderText
+// already falls back to for a whole stale/never-updated provider
+// (usageUnknownPercentText) -- one consistent "no trustworthy reading"
+// representation regardless of which of those reasons produced it, never
+// a percentage that could look like a real 0%.
+//
+// w.At(now) is applied here, at read/render time, before branching on
+// State -- not just once when the provider first produced w. State.Usage
+// can sit unchanged across many renders with no new provider refresh in
+// between (see State's own doc comment: "直前の値を... 表示し続ける"), so a
+// window's own Reset time can pass between when it arrived and when this
+// runs again; w.At re-checks that boundary every time, independently of
+// whether the Claude provider that produced w already applied the same
+// rule once on its own side (see session.UsageWindow.At's doc comment --
+// this is the same provider-neutral rule, applied again here so Agent
+// View can never show a value the provider boundary would already
+// consider expired).
 func usageWindowText(w session.UsageWindow, now time.Time) string {
-	if !w.Available {
-		return styleText("n/a", colorGray)
+	w = w.At(now)
+	switch w.State {
+	case session.UsageExhausted:
+		pct := styleText(fmt.Sprintf("%3d%%", 100), colorRed)
+		if w.Reset.IsZero() {
+			return pct
+		}
+		reset := styleText("(reset at "+formatResetTime(w.Reset, now)+")", colorGray)
+		return pct + " " + reset
+	case session.UsageAvailable:
+		pct := styleText(fmt.Sprintf("%3d%%", w.Percent), usageColor(w.Percent))
+		reset := styleText("(reset at "+formatResetTime(w.Reset, now)+")", colorGray)
+		return pct + " " + reset
+	default:
+		return usageUnknownPercentText()
 	}
-	pct := styleText(fmt.Sprintf("%3d%%", w.Percent), usageColor(w.Percent))
-	reset := styleText("(reset at "+formatResetTime(w.Reset, now)+")", colorGray)
-	return pct + " " + reset
 }
 
 // usageStaleAfter is how long a provider's last successful usage fetch
@@ -109,9 +142,12 @@ var usageKnownProviders = [...]session.ProviderID{session.ProviderClaude, sessio
 
 // usageUnknownPercentText is the placeholder shown in place of a
 // provider's utilization when it has either never been fetched yet or
-// gone stale (see usageStaleAfter) -- deliberately shaped like
+// gone stale (see usageStaleAfter) -- and, via usageWindowText's
+// UsageUnknown case, in place of a single window's own reading whenever
+// its normalized session.UsageLimitState is UsageUnknown (never reported,
+// or a reset-boundary-crossed cached reading). Deliberately shaped like
 // usageWindowText's own "%3d%%" so the column doesn't shift width when a
-// provider flips between known and unknown.
+// provider or window flips between known and unknown.
 func usageUnknownPercentText() string {
 	return styleText(fmt.Sprintf("%3s%%", "?"), colorGray)
 }
