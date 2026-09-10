@@ -36,10 +36,105 @@ type config struct {
 }
 
 type request struct {
-	ID              int      `json:"id"`
-	Method          string   `json:"method"`
-	ProjectID       string   `json:"projectID,omitempty"`
-	ConversationIDs []string `json:"conversationIDs,omitempty"`
+	ID              int            `json:"id"`
+	Method          string         `json:"method"`
+	ProjectID       string         `json:"projectID,omitempty"`
+	ConversationIDs []string       `json:"conversationIDs,omitempty"`
+	Params          map[string]any `json:"params,omitempty"`
+	Sequence        int            `json:"sequence"`
+}
+
+type queryParam struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type globalConversationsPageDiagnostic struct {
+	Sequence     int            `json:"sequence"`
+	Query        []queryParam   `json:"query"`
+	HideSnorlax  bool           `json:"hideSnorlax"`
+	TopLevelKeys []string       `json:"topLevelKeys"`
+	ItemCount    *int           `json:"itemCount"`
+	Meta         map[string]any `json:"meta"`
+}
+
+// conversationPage is one page of the Project-inclusive (hide_snorlax false/absent) view of
+// /backend-api/conversations, already sanitized and Project-filtered by the bridge.
+type conversationPage struct {
+	Sequence     int
+	HideSnorlax  bool
+	RawItemCount int
+	Limit        int
+	Items        []conversation
+}
+
+// mergeProjectPages is the deterministic core of Project session enumeration: given the
+// Project-inclusive pages observed so far (in any arrival order, possibly with re-observed
+// duplicates), it dedupes conversations by ID and decides whether enumeration can be considered
+// exhausted. It never trusts the endpoint's own `total` field (observed to grow between successive
+// calls in the same session) — exhaustion is decided only by a page whose raw item count is
+// strictly less than its requested limit, the one signal that cannot be an artifact of a
+// concurrently-changing account.
+//
+// It fails closed (returns an error, never a partial result presented as complete) on: a
+// hide_snorlax-excluding page reaching it (caller bug — such a page structurally cannot contain
+// Project conversations and must never be merged), more pages than maxPages (excessive/likely
+// looping pagination), a malformed page (non-positive limit), or the same sequence number
+// reappearing with a different item set (equivalent to a pagination token that stopped identifying
+// a stable page).
+func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []conversation, exhausted bool, err error) {
+	if len(pages) > maxPages {
+		return nil, false, fmt.Errorf("excessive page count: got %d pages, max %d", len(pages), maxPages)
+	}
+	bySequence := make(map[int][]conversation, len(pages))
+	byID := make(map[string]conversation)
+	highestSequence := -1
+	highestSequenceShort := false
+	for _, page := range pages {
+		if page.HideSnorlax {
+			return nil, false, errors.New("malformed input: a hide_snorlax-excluding page cannot be merged into Project enumeration")
+		}
+		if page.Limit <= 0 {
+			return nil, false, fmt.Errorf("malformed page at sequence %d: non-positive limit %d", page.Sequence, page.Limit)
+		}
+		if previous, ok := bySequence[page.Sequence]; ok {
+			if !sameIDs(previous, page.Items) {
+				return nil, false, fmt.Errorf("repeated sequence %d reported different conversations across observations", page.Sequence)
+			}
+		} else {
+			bySequence[page.Sequence] = page.Items
+		}
+		for _, item := range page.Items {
+			if item.ID == "" {
+				return nil, false, fmt.Errorf("malformed page at sequence %d: conversation missing stable identity", page.Sequence)
+			}
+			byID[item.ID] = item
+		}
+		if page.Sequence >= highestSequence {
+			highestSequence = page.Sequence
+			highestSequenceShort = page.RawItemCount < page.Limit
+		}
+	}
+	result := make([]conversation, 0, len(byID))
+	for _, item := range byID {
+		result = append(result, item)
+	}
+	slices.SortFunc(result, func(a, b conversation) int { return strings.Compare(a.ID, b.ID) })
+	return result, len(pages) > 0 && highestSequenceShort, nil
+}
+
+type globalConversationsPageResult struct {
+	Items        []conversation `json:"items"`
+	RawItemCount int            `json:"rawItemCount"`
+	Meta         map[string]any `json:"meta"`
+}
+
+type sidebarScrollResult struct {
+	Triggered                   bool   `json:"triggered"`
+	Reason                      string `json:"reason"`
+	ContainerCount              int    `json:"containerCount"`
+	ConversationLinkCountBefore int    `json:"conversationLinkCountBefore"`
+	ConversationLinkCountAfter  int    `json:"conversationLinkCountAfter"`
 }
 
 type response struct {
@@ -353,6 +448,30 @@ func run(ctx context.Context, cfg config) error {
 			}
 		}
 
+		// Phase B: does our own script get to drive additional pages of this endpoint directly?
+		// Recorded as evidence for the Recommendation, not used as the enumeration mechanism below.
+		raw, err = call(client, request{ID: 99, Method: "globalConversationsPage", ProjectID: projectID,
+			Params: map[string]any{"offset": 0, "limit": 28, "order": "updated", "is_archived": false, "is_starred": false}})
+		if err != nil {
+			fmt.Printf("self-initiated fetch of /backend-api/conversations: NOT AUTHORIZED (%v)\n", err)
+		} else {
+			var result globalConversationsPageResult
+			if err := json.Unmarshal(raw, &result); err != nil {
+				return fmt.Errorf("decode global conversations page: %w", err)
+			}
+			fmt.Printf("self-initiated fetch of /backend-api/conversations: PASS raw_item_count=%d project_filtered_count=%d meta=%v\n",
+				result.RawItemCount, len(result.Items), result.Meta)
+		}
+
+		all, exhausted, pagesUsed, err := enumerateAllConversations(client, projectID, 8, 20)
+		if err != nil {
+			fmt.Printf("global conversations complete enumeration: FAIL (%v)\n", err)
+		} else if exhausted {
+			fmt.Printf("global conversations complete enumeration: COMPLETE count=%d pages_used=%d\n", len(all), pagesUsed)
+		} else {
+			fmt.Printf("global conversations complete enumeration: INCOMPLETE (exhaustion not observed within bound) count_so_far=%d pages_used=%d\n", len(all), pagesUsed)
+		}
+
 		raw, err = call(client, request{ID: 15, Method: "openURLProbe", ProjectID: projectID})
 		if err != nil {
 			fmt.Printf("open URL probe: NOT VERIFIED (%v)\n", err)
@@ -499,6 +618,103 @@ func sortedSet(values map[string]struct{}) []string {
 	}
 	slices.Sort(result)
 	return result
+}
+
+// enumerateAllConversations drives the only mechanism available to this bridge for reaching
+// additional pages of the Project-inclusive /backend-api/conversations view: it cannot issue
+// further authenticated requests itself (see the self-initiated-fetch probe in run(), which
+// observes HTTP 401), so it repeatedly asks the real ChatGPT page to scroll its own conversation
+// list and passively harvests whatever new pages that produces. Each newly observed page is
+// printed as sanitized wire evidence (query shape, hide_snorlax flag, response metadata, raw item
+// count — never conversation content or full IDs) before being folded into mergeProjectPages.
+func enumerateAllConversations(client net.Conn, projectID string, maxScrollAttempts, maxPages int) (conversations []conversation, exhausted bool, pagesUsed int, err error) {
+	seenSequences := make(map[int]bool)
+	var pages []conversationPage
+	nextRequestID := 300
+
+	fetchNewPages := func() error {
+		nextRequestID++
+		raw, err := call(client, request{ID: nextRequestID, Method: "globalConversationsPages"})
+		if err != nil {
+			return fmt.Errorf("list global conversations pages: %w", err)
+		}
+		var diagnostics []globalConversationsPageDiagnostic
+		if err := json.Unmarshal(raw, &diagnostics); err != nil {
+			return fmt.Errorf("decode global conversations pages: %w", err)
+		}
+		for _, d := range diagnostics {
+			if seenSequences[d.Sequence] {
+				continue
+			}
+			seenSequences[d.Sequence] = true
+			queryParts := make([]string, 0, len(d.Query))
+			for _, q := range d.Query {
+				queryParts = append(queryParts, q.Key+"="+q.Value)
+			}
+			itemCount := "null"
+			if d.ItemCount != nil {
+				itemCount = fmt.Sprintf("%d", *d.ItemCount)
+			}
+			fmt.Printf("global conversations wire page #%d: hide_snorlax=%t query=[%s] meta=%v raw_item_count=%s\n",
+				d.Sequence, d.HideSnorlax, strings.Join(queryParts, ","), d.Meta, itemCount)
+			if d.HideSnorlax || d.ItemCount == nil {
+				continue // excludes Project conversations by construction; recorded above for evidence only
+			}
+			rawLimit, ok := d.Meta["limit"].(float64)
+			if !ok || rawLimit <= 0 {
+				return fmt.Errorf("page %d is missing a usable limit in its response metadata", d.Sequence)
+			}
+			nextRequestID++
+			itemsRaw, err := call(client, request{ID: nextRequestID, Method: "globalConversationsPageItems", ProjectID: projectID, Sequence: d.Sequence})
+			if err != nil {
+				return fmt.Errorf("fetch items for page %d: %w", d.Sequence, err)
+			}
+			var items []conversation
+			if err := json.Unmarshal(itemsRaw, &items); err != nil {
+				return fmt.Errorf("decode items for page %d: %w", d.Sequence, err)
+			}
+			pages = append(pages, conversationPage{
+				Sequence:     d.Sequence,
+				RawItemCount: *d.ItemCount,
+				Limit:        int(rawLimit),
+				Items:        items,
+			})
+		}
+		return nil
+	}
+
+	if err := fetchNewPages(); err != nil {
+		return nil, false, 0, err
+	}
+	for attempt := 0; attempt < maxScrollAttempts; attempt++ {
+		conversations, exhausted, err = mergeProjectPages(pages, maxPages)
+		if err != nil {
+			return nil, false, len(pages), err
+		}
+		if exhausted {
+			return conversations, true, len(pages), nil
+		}
+		nextRequestID++
+		scrollRaw, err := call(client, request{ID: nextRequestID, Method: "simulateSidebarScroll"})
+		if err != nil {
+			return conversations, false, len(pages), fmt.Errorf("simulate sidebar scroll: %w", err)
+		}
+		var scroll sidebarScrollResult
+		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
+			return conversations, false, len(pages), fmt.Errorf("decode sidebar scroll result: %w", err)
+		}
+		fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
+			attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount, scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
+		time.Sleep(1500 * time.Millisecond)
+		if err := fetchNewPages(); err != nil {
+			return conversations, false, len(pages), err
+		}
+	}
+	conversations, exhausted, err = mergeProjectPages(pages, maxPages)
+	if err != nil {
+		return nil, false, len(pages), err
+	}
+	return conversations, exhausted, len(pages), nil
 }
 
 func origin(rawURL string) string {
