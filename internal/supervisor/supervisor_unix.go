@@ -67,24 +67,41 @@ type process struct {
 }
 
 // subscriberMaxBufferedBytes bounds how much PTY output a single attach
-// subscriber may accumulate before it is judged too slow to keep and is
-// disconnected. The bound is on total bytes, never on the number of PTY
-// read() chunks: a burst of many small writes (e.g. a Codex redraw made
-// of many short escape sequences) must not exhaust a chunk-counted queue
-// while the underlying byte volume is still trivial -- that chunk-vs-byte
-// mismatch was the root cause of issue #31. 4 MiB comfortably absorbs
-// realistic full-screen redraws many times over while keeping the
-// worst-case per-subscriber memory cost small and fixed.
+// subscriber may have outstanding -- queued in buf *and* already handed
+// to writeTo but not yet confirmed delivered (see inFlight) -- before it
+// is judged too slow to keep and is disconnected. The bound is on total
+// bytes, never on the number of PTY read() chunks: a burst of many small
+// writes (e.g. a Codex redraw made of many short escape sequences) must
+// not exhaust a chunk-counted queue while the underlying byte volume is
+// still trivial -- that chunk-vs-byte mismatch was the root cause of
+// issue #31. 4 MiB comfortably absorbs realistic full-screen redraws many
+// times over while keeping the worst-case per-subscriber memory cost
+// small and fixed.
 const subscriberMaxBufferedBytes = 4 << 20
 
-// subscriberWriteTimeout bounds how long a single frame write to an
-// attach connection may block. subscriberMaxBufferedBytes alone reclaims
-// a subscriber that is merely slow (still draining, just more slowly than
-// output is produced); this instead reclaims one whose consumer has
-// stopped reading altogether, which would otherwise block the writer
-// goroutine on a single write forever with no way to ever notice the
-// subscriber has since been closed.
+// subscriberOutputFrameSize bounds how many bytes writeTo hands to a
+// single Output write. Splitting a large flush into pieces this size
+// limits how much of the stream one stalled write can tear (see
+// protocol.WriteFrame) and lets a stall be detected within roughly one
+// subscriberWriteTimeout of the consumer actually stopping, rather than
+// after an entire multi-megabyte flush's deadline.
+const subscriberOutputFrameSize = 32 << 10
+
+// subscriberWriteTimeout bounds how long a single Output piece write to
+// an attach connection may block. subscriberMaxBufferedBytes alone
+// reclaims a subscriber that is merely slow (still draining, just more
+// slowly than output is produced); this instead reclaims one whose
+// consumer has stopped reading altogether, which would otherwise block
+// the writer goroutine forever with no way to ever notice the subscriber
+// has since been closed.
 const subscriberWriteTimeout = 5 * time.Second
+
+// subscriberFailureFlushTimeout bounds the one best-effort attempt to
+// deliver a terminal Exit/Failure frame once a subscriber is closing --
+// always a short, fixed-size frame, so it does not need
+// subscriberWriteTimeout's more generous allowance for a large Output
+// payload.
+const subscriberFailureFlushTimeout = 2 * time.Second
 
 // subscriberCloseReason records why a subscriber's output pump is ending,
 // so writeTo knows which terminal frame, if any, to send before closing
@@ -96,6 +113,7 @@ const (
 	subscriberClosedByDetach
 	subscriberClosedByProcessExit
 	subscriberClosedByOverflow
+	subscriberClosedByStall
 )
 
 // subscriber is one attach connection's PTY output pump. broadcast never
@@ -105,11 +123,12 @@ const (
 // append, never an I/O call, so a slow or stalled consumer can never block
 // PTY draining or any other subscriber.
 type subscriber struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	buf    []byte
-	reason subscriberCloseReason
-	detail string // set only for subscriberClosedByOverflow
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      []byte
+	inFlight int // bytes writeTo currently holds outside buf, not yet confirmed delivered
+	reason   subscriberCloseReason
+	detail   string // set for subscriberClosedByOverflow and subscriberClosedByStall
 }
 
 func newSubscriber() *subscriber {
@@ -119,7 +138,7 @@ func newSubscriber() *subscriber {
 }
 
 // append adds chunk to the subscriber's pending output. If appending
-// would push the buffered total past subscriberMaxBufferedBytes, chunk is
+// would push inFlight+buf past subscriberMaxBufferedBytes, chunk is
 // rejected and the subscriber is instead marked closed with an overflow
 // reason -- bytes already accepted are kept so writeTo can still flush
 // them before reporting the failure. It reports whether this call is what
@@ -130,7 +149,7 @@ func (s *subscriber) append(chunk []byte) (closedNow bool) {
 	if s.reason != subscriberOpen {
 		return false
 	}
-	if len(s.buf)+len(chunk) > subscriberMaxBufferedBytes {
+	if s.inFlight+len(s.buf)+len(chunk) > subscriberMaxBufferedBytes {
 		s.reason = subscriberClosedByOverflow
 		s.detail = fmt.Sprintf("attach output buffer exceeded %d bytes; consumer was not keeping up", subscriberMaxBufferedBytes)
 		s.cond.Broadcast()
@@ -155,15 +174,11 @@ func (s *subscriber) close(reason subscriberCloseReason) {
 }
 
 // writeTo drains the subscriber's buffered output to conn until it is
-// closed, sends the terminal frame its close reason calls for (none for a
-// plain detach, Exit for a managed process exit, Failure with the
-// overflow detail otherwise), and always closes conn itself. Closing conn
-// unconditionally -- not just on the failure path -- is what reclaims an
-// attach whose consumer never sends anything and never hangs up on its
-// own: it unblocks the attach loop's blocked protocol.Read(conn)
-// regardless of client behavior. Every write carries
-// subscriberWriteTimeout so a consumer that has stopped reading entirely
-// cannot block this goroutine forever either.
+// closed, sends the terminal frame its close reason calls for, and always
+// closes conn itself. Closing conn unconditionally -- not just on a
+// failure path -- is what reclaims an attach whose consumer never sends
+// anything and never hangs up on its own: it unblocks the attach loop's
+// blocked protocol.Read(conn) regardless of client behavior.
 func (s *subscriber) writeTo(conn net.Conn) {
 	defer conn.Close()
 	for {
@@ -173,30 +188,73 @@ func (s *subscriber) writeTo(conn net.Conn) {
 		}
 		pending := s.buf
 		s.buf = nil
+		s.inFlight = len(pending)
 		reason, detail := s.reason, s.detail
 		s.mu.Unlock()
 
-		if len(pending) > 0 {
-			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
-			if protocol.Write(conn, protocol.Output, pending) != nil {
-				return
-			}
+		if !s.flush(conn, pending) {
+			return // stalled or torn -- already reported (if it was safe to) and given up on above
 		}
 		switch reason {
 		case subscriberOpen:
 			continue
 		case subscriberClosedByProcessExit:
-			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+			_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
 			_ = protocol.Write(conn, protocol.Exit, nil)
 			return
-		case subscriberClosedByOverflow:
-			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
-			_ = protocol.Write(conn, protocol.Failure, []byte(detail))
+		case subscriberClosedByOverflow, subscriberClosedByStall:
+			s.sendFailure(conn, detail)
 			return
 		default: // subscriberClosedByDetach
 			return
 		}
 	}
+}
+
+// flush writes pending to conn in subscriberOutputFrameSize pieces,
+// reporting whether every piece was delivered. On failure it uses
+// protocol.WriteFrame's torn result to decide what is still safe to do:
+// a torn piece desynchronizes conn's framing, so nothing more is ever
+// written to it, only closed (via writeTo's deferred conn.Close); a clean
+// failure (the piece never touched the wire at all) leaves conn at a
+// valid frame boundary, so flush marks the subscriber closed for a stall
+// and makes one best-effort attempt to explain why before giving up --
+// this is what lets a stalled consumer see an explicit reason instead of
+// a bare EOF.
+func (s *subscriber) flush(conn net.Conn, pending []byte) bool {
+	for len(pending) > 0 {
+		n := min(len(pending), subscriberOutputFrameSize)
+		_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+		torn, err := protocol.WriteFrame(conn, protocol.Output, pending[:n])
+		if err != nil {
+			s.mu.Lock()
+			s.inFlight = 0
+			if s.reason == subscriberOpen {
+				s.reason = subscriberClosedByStall
+				s.detail = "attach output write stalled: consumer stopped accepting output"
+			}
+			detail := s.detail
+			s.mu.Unlock()
+			if !torn {
+				s.sendFailure(conn, detail)
+			}
+			return false
+		}
+		pending = pending[n:]
+		s.mu.Lock()
+		s.inFlight = len(pending)
+		s.mu.Unlock()
+	}
+	return true
+}
+
+// sendFailure makes one best-effort, short-deadline attempt to deliver a
+// protocol.Failure frame explaining why the subscriber is being
+// disconnected. Called only when the connection is known to still be at a
+// clean frame boundary (see flush and writeTo).
+func (s *subscriber) sendFailure(conn net.Conn, detail string) {
+	_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
+	_ = protocol.Write(conn, protocol.Failure, []byte(detail))
 }
 
 type Server struct {

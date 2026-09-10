@@ -16,7 +16,9 @@ package supervisor
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -69,8 +71,8 @@ func TestBroadcastToleratesBurstOfManyTinyChunksUnderTheByteCap(t *testing.T) {
 // exactly. writeTo is only attached afterward, to verify it correctly
 // flushes a buffer whose final content and close reason were already
 // decided -- production always races the two (see
-// TestReattachSucceedsAfterOverflowDisconnectsAnEarlierSubscriber for that
-// end-to-end case), but that race is irrelevant to what this test checks.
+// TestReattachSucceedsAfterStalledSubscriberIsDropped for that end-to-end
+// case), but that race is irrelevant to what this test checks.
 func TestOverflowFlushesBufferedBytesThenSendsExplicitFailureReason(t *testing.T) {
 	sub := newSubscriber()
 	p := &process{subscribers: map[*subscriber]struct{}{sub: {}}, done: make(chan struct{})}
@@ -203,13 +205,26 @@ func TestAggregatedOutputPreservesExactByteStreamAcrossManyChunkSizes(t *testing
 	}
 }
 
-// TestReattachSucceedsAfterOverflowDisconnectsAnEarlierSubscriber covers
-// two acceptance criteria together: an overflow disconnect must not touch
-// the managed process's tracked lifetime (p.done stays open), and a fresh
-// attach must be able to replace the dropped subscriber and keep
-// receiving live output -- exactly the reattach path a user needs after
-// a burst disconnects their terminal.
-func TestReattachSucceedsAfterOverflowDisconnectsAnEarlierSubscriber(t *testing.T) {
+// TestReattachSucceedsAfterStalledSubscriberIsDropped drives a subscriber
+// whose consumer never reads a single byte through the real end-to-end
+// srv.attach path (a net.Pipe has no OS-level socket buffer, so this hits
+// the write-stall path on the very first flush attempt, well before the
+// byte cap could matter -- a small broadcast volume is enough). It covers
+// three acceptance criteria together: the stalled attach itself does not
+// hang forever and does not leave the first client's Read blocked
+// forever either; the managed process's tracked lifetime (p.done) is
+// untouched; and a fresh attach can replace the dropped subscriber and
+// keep receiving live output -- exactly the reattach path a user needs
+// after their terminal stops responding.
+//
+// It deliberately does not assert the first client saw a Failure frame:
+// a consumer that never performs a single Read cannot receive one by
+// construction (nothing can be delivered to a receiver that never
+// reads), which is exactly why TestStalledOutputStillDeliversExplicitFailureReason
+// tests that guarantee at the subscriber level instead, with a fake
+// connection that can distinguish "stalled but the wire is still
+// healthy" from "never reads at all".
+func TestReattachSucceedsAfterStalledSubscriberIsDropped(t *testing.T) {
 	p := &process{run: localstate.Run{ID: "r"}, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
 	srv := &Server{runs: map[string]*process{"r": p}}
 
@@ -225,32 +240,44 @@ func TestReattachSucceedsAfterOverflowDisconnectsAnEarlierSubscriber(t *testing.
 	}
 	waitForSubscriberCount(t, p, 1)
 
-	// The first client never reads again from here on, so its writer
-	// goroutine's very first flush blocks on the unread connection --
-	// stealing whatever had accumulated by then out of the byte-counted
-	// buffer before this loop can observe it. Broadcasting several times
-	// subscriberMaxBufferedBytes (instead of stopping right at the
-	// boundary, as the byte-accounting test above does with no writer
-	// racing it) guarantees overflow regardless of exactly how much that
-	// steal was.
-	const chunkSize = 1024
-	for total := 0; total < 3*subscriberMaxBufferedBytes; total += chunkSize {
-		p.broadcast(bytes.Repeat([]byte{'x'}, chunkSize))
-	}
-	// firstDone can only fire once the writer's stuck write hits
-	// subscriberWriteTimeout, so this must outlast that deadline.
+	// The first client never reads again from here on. This alone stalls
+	// the writer's very first flush attempt (net.Pipe has no buffering),
+	// well under subscriberMaxBufferedBytes, so this is a pure stall, not
+	// a byte-cap overflow.
+	p.broadcast([]byte("hello"))
+
+	// A stalled flush attempts a Failure frame on its own (also stalled,
+	// since this client never reads that either) before giving up, so
+	// firstDone can only fire after both subscriberWriteTimeout and
+	// subscriberFailureFlushTimeout have elapsed.
+	giveUpBudget := subscriberWriteTimeout + subscriberFailureFlushTimeout + 3*time.Second
 	select {
 	case <-firstDone:
-	case <-time.After(subscriberWriteTimeout + 2*time.Second):
-		t.Fatal("first attach did not end after its subscriber overflowed")
+	case <-time.After(giveUpBudget):
+		t.Fatal("first attach did not end after its subscriber stalled")
 	}
 
 	select {
 	case <-p.done:
-		t.Fatal("managed process was torn down by an overflow disconnect")
+		t.Fatal("managed process was torn down by a stalled-subscriber disconnect")
 	default:
 	}
 	waitForSubscriberCount(t, p, 0)
+
+	// The first client's own blocked Read must also come back (as some
+	// transport-level error, not a hang) once the server gives up and
+	// closes -- a stalled subscriber must not leave the client dangling
+	// forever either.
+	firstReadDone := make(chan struct{})
+	go func() {
+		defer close(firstReadDone)
+		_, _, _ = protocol.Read(firstClient)
+	}()
+	select {
+	case <-firstReadDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first client's Read never returned after the server gave up")
+	}
 
 	secondClient, secondServer := net.Pipe()
 	defer secondClient.Close()
@@ -275,6 +302,120 @@ func TestReattachSucceedsAfterOverflowDisconnectsAnEarlierSubscriber(t *testing.
 	case <-secondDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("reattach did not return after detach")
+	}
+}
+
+// scriptedConn is a minimal net.Conn whose Write follows a fixed script
+// of (n, err) results, one per call, falling back to a full, error-free
+// write once the script is exhausted. It lets subscriber-level
+// stall/torn-write tests be deterministic and independent of real socket
+// buffer sizes and timing -- exactly the partial-write and write-failure
+// scenarios a real transport can only be coaxed into producing by luck.
+// Every other net.Conn method is a harmless no-op or reports closed: these
+// tests only ever exercise subscriber.writeTo, which never reads and
+// tolerates deadlines being no-ops since scriptedWrite's results are
+// unconditional, not actually time-based.
+type scriptedConn struct {
+	mu     sync.Mutex
+	script []scriptedWrite
+	writes [][]byte
+	closed bool
+}
+
+type scriptedWrite struct {
+	n   int
+	err error
+}
+
+func (c *scriptedConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes = append(c.writes, append([]byte(nil), p...))
+	if len(c.script) == 0 {
+		return len(p), nil
+	}
+	next := c.script[0]
+	c.script = c.script[1:]
+	n := min(next.n, len(p))
+	return n, next.err
+}
+func (c *scriptedConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *scriptedConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	return nil
+}
+func (c *scriptedConn) LocalAddr() net.Addr              { return nil }
+func (c *scriptedConn) RemoteAddr() net.Addr             { return nil }
+func (c *scriptedConn) SetDeadline(time.Time) error      { return nil }
+func (c *scriptedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *scriptedConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *scriptedConn) recordedWrites() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([][]byte(nil), c.writes...)
+}
+func (c *scriptedConn) wasClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+// TestStalledOutputStillDeliversExplicitFailureReason is the deterministic
+// counterpart to TestReattachSucceedsAfterStalledSubscriberIsDropped's
+// real-transport version: it proves that when a stall leaves the
+// connection at a clean frame boundary (protocol.WriteFrame reports
+// torn=false -- the realistic case for a consumer that is merely slow or
+// momentarily stopped reading, as opposed to gone for good), writeTo
+// still delivers an explicit protocol.Failure frame rather than only
+// closing the connection.
+func TestStalledOutputStillDeliversExplicitFailureReason(t *testing.T) {
+	sub := newSubscriber()
+	conn := &scriptedConn{script: []scriptedWrite{
+		{n: 0, err: os.ErrDeadlineExceeded}, // the bulk Output flush stalls cleanly
+		// no further scripted entries: the Failure frame attempt succeeds
+	}}
+	sub.buf = []byte("some PTY output the consumer never read")
+
+	sub.writeTo(conn)
+
+	if !conn.wasClosed() {
+		t.Fatal("connection was never closed")
+	}
+	writes := conn.recordedWrites()
+	if len(writes) != 2 {
+		t.Fatalf("write attempts=%d, want 2 (stalled Output, then Failure)", len(writes))
+	}
+	kind, payload, err := protocol.Read(bytes.NewReader(writes[1]))
+	if err != nil || kind != protocol.Failure {
+		t.Fatalf("second write kind=%q err=%v, want a decodable Failure frame", kind, err)
+	}
+	if len(payload) == 0 {
+		t.Fatal("Failure frame carried no reason")
+	}
+}
+
+// TestTornOutputWriteNeverAttemptsAnotherFrame is
+// TestStalledOutputStillDeliversExplicitFailureReason's counterpart for
+// the unsafe case: once a write tears (protocol.WriteFrame reports
+// torn=true), the connection's framing is desynchronized, and writeTo
+// must never attempt to write anything else to it -- only close.
+func TestTornOutputWriteNeverAttemptsAnotherFrame(t *testing.T) {
+	sub := newSubscriber()
+	conn := &scriptedConn{script: []scriptedWrite{
+		{n: 3, err: os.ErrDeadlineExceeded}, // torn: some but not all of the frame reached the peer
+	}}
+	sub.buf = []byte("some PTY output torn mid-write")
+
+	sub.writeTo(conn)
+
+	if !conn.wasClosed() {
+		t.Fatal("connection was never closed")
+	}
+	writes := conn.recordedWrites()
+	if len(writes) != 1 {
+		t.Fatalf("write attempts=%d, want exactly 1 (the torn Output write, and nothing after it)", len(writes))
 	}
 }
 
