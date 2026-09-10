@@ -213,25 +213,31 @@ An Open-URL probe (Phase 7) further confirmed that navigating to the specific co
 
 **Hypothesis:** Official ChatGPT Web UI is usable as the attach-equivalent view.
 
-**Method:** Attempted a foreground `terminal-browser` launch in the current terminal; app-mode requires the same graphics path.
+**Method (sandboxed harness):** Attempted a foreground `terminal-browser` launch in the current terminal; app-mode requires the same graphics path.
 
-**Observed:** The terminal was rejected as unable to show images. Transcript, composer, messages, Work UI, files, approvals, rich content, and popup flows were not exercised.
+**Observed (sandboxed harness):** The terminal was rejected as unable to show images. Not exercised further here.
 
-**Result: NOT VERIFIED**
+**Method (human terminal, iTerm2 with Kitty graphics protocol support):** `terminal-browser open --app-mode --partition=agentsctl-chatgpt https://chatgpt.com`, against the same authenticated partition used throughout. The human viewed both a normal Chat and the Work session created for Phase 6/7, then sent a real message through the in-browser composer.
 
-**Implication:** UI delegation cannot be accepted from this environment. A kitty-capable terminal is mandatory for the remaining experiment.
+**Observed:** Both Chat and Work sessions rendered and were browsable normally. A message was sent successfully through the composer. One concrete UX defect surfaced: `terminal-browser`'s key handling does not distinguish an IME composition-confirm `Enter` from a send `Enter` — composing a prompt with an IME (e.g. Japanese) and pressing `Enter` to confirm the conversion submits the message prematurely instead of confirming the conversion. The workaround is to compose the message elsewhere and paste it in.
+
+**Result: PASS, with a known UX defect.** Transcript rendering, browsing between Chat and Work, and message sending all work. IME-based composition does not work correctly in the terminal-embedded browser.
+
+**Implication:** Official ChatGPT Web UI is usable as the attach-equivalent view for both Chat and Work. The IME defect is a real usability blocker for any user who composes in an IME-dependent language directly inside the terminal-embedded window — it should be reported upstream to `zenbu-labs/terminal-browser` and tracked as a UX caveat in any production design, not silently accepted.
 
 ### Phase 9: return with Ctrl+]
 
 **Hypothesis:** A preload handler can close only the browser view while cloud execution continues.
 
-**Method:** Added an opt-in capture handler using the documented `globalThis.terminalBrowser.quit()` API when `AGENTSCTL_CHATGPT_CLOSE_KEY=1`.
+**Method (sandboxed harness):** Added an opt-in capture handler using the documented `globalThis.terminalBrowser.quit()` API when `AGENTSCTL_CHATGPT_CLOSE_KEY=1`. No visible authenticated Work execution was available for an end-to-end test in that environment.
 
-**Observed:** Source and code path exist, but no visible authenticated Work execution was available for an end-to-end test.
+**Method (human terminal, iTerm2):** `AGENTSCTL_CHATGPT_CLOSE_KEY=1 terminal-browser open --app-mode --partition=agentsctl-chatgpt --preload=$(pwd)/bridge/preload.js https://chatgpt.com`, navigated to the Work session, pressed `Ctrl+]`, then reopened and reselected the same session.
 
-**Result: NOT VERIFIED**
+**Observed:** `Ctrl+]` closed only the `terminal-browser` view; control returned to the shell with no other apparent side effects. On reselecting the same Work session afterward, its running/completed state was preserved exactly as before the view was closed — nothing was reset or re-run. (An initial reopen against the bare `https://chatgpt.com` root URL showed a new-chat screen, as expected for that URL — that was a methodology artifact, not evidence of lost state; reselecting the specific session from the sidebar showed the true, preserved state.)
 
-**Implication:** View-close mechanics are plausible; cloud Work continuity must be observed before acceptance.
+**Result: PASS**
+
+**Implication:** The `Ctrl+]`-closes-view-only, cloud-Work-continues semantics that Issue #7 wants for ChatGPT (as opposed to Claude/Codex's PTY-detach semantics) are achievable with a small opt-in preload handler over the documented `terminalBrowser.quit()` API, and cloud continuity was directly observed, not just inferred.
 
 ### Phase 10: failure behavior
 
@@ -257,8 +263,8 @@ An Open-URL probe (Phase 7) further confirmed that navigating to the specific co
 | 5. Session discovery | PASS, method corrected — global `/backend-api/conversations` filtered by Project required; project-scoped endpoint alone under-reports (5 of 17) |
 | 6. Chat / Work discrimination | CONDITIONAL — B. `async_source` field presence is a plausible undocumented discriminator (n=1 Work sample) |
 | 7. Stable identity and Open | PASS — bare `/c/{conversation_id}` is sufficient; ChatGPT normalizes to the full Project-slug URL itself |
-| 8. App-mode UX | NOT VERIFIED — requires a kitty-capable terminal, not available in the sandboxed harness |
-| 9. Ctrl+] semantics | NOT VERIFIED — same blocker as Phase 8 |
+| 8. App-mode UX | PASS, with a known UX defect — Chat/Work both render and are usable; IME composition (e.g. Japanese) submits prematurely on the conversion-confirm `Enter` |
+| 9. Ctrl+] semantics | PASS — view closes cleanly; reselecting the Work session shows state preserved exactly, not reset |
 | 10. Failure behavior | PASS for exercised cases |
 
 ## Capability matrix
@@ -269,18 +275,18 @@ An Open-URL probe (Phase 7) further confirmed that navigating to the specific co
 | --- | --- | --- | --- | --- |
 | List | Proven, method-corrected (Project resolution + 17-conversation Project-filtered global list; project-scoped endpoint alone under-reports) | N/A | Undocumented / unstable | Two independent endpoints needed; `/backend-api/tasks` investigated and rejected as unrelated |
 | Open | Proven | N/A (delegates to browser UI) | Undocumented navigation behavior, but consistent across 4 probes | Bare `/c/{id}` normalizes correctly for both Chat and a Work-marked sample; no login redirect |
-| Read transcript | Out of scope | Not verified | Unknown | UI could not render in this sandboxed terminal |
-| Send message | Out of scope | Not verified | Unknown | No test message sent |
-| Continue Chat | Out of scope | Not verified | Unknown | Requires a kitty-capable terminal |
-| Continue Work | Out of scope | Not verified | Unknown | Requires a kitty-capable terminal |
-| Observe Work state | Conditional — B (undocumented) | Not verified | Fragile | `messages.[].metadata.async_source` presence is a plausible marker (n=1 sample); top-level `async_status` stayed null and is likely transient, not durable |
+| Read transcript | Out of scope | Proven | Stable enough for delegation | Rendered correctly for both Chat and Work in app-mode |
+| Send message | Out of scope | Proven, with a caveat | IME input does not work correctly | A real message was sent successfully; IME composition (e.g. Japanese) submits prematurely on the conversion-confirm `Enter` — compose-and-paste is the workaround |
+| Continue Chat | Out of scope | Proven | Stable enough for delegation | Reopened and continued normally |
+| Continue Work | Out of scope | Proven | Stable enough for delegation | Reselecting the Work session after a `Ctrl+]` close showed state preserved exactly |
+| Observe Work state | Conditional — B (undocumented) | Proven (visually, via UI) | Fragile programmatically; fine via UI delegation | `messages.[].metadata.async_source` presence is a plausible programmatic marker (n=1 sample); top-level `async_status` stayed null and is likely transient. Visually, the UI itself shows Work progress/state correctly, so UI delegation does not depend on solving the programmatic discriminator |
 | Rename | Out of scope | Not verified | Unknown | No destructive or mutating probe |
 | Archive/delete | Out of scope | Not verified | Unknown | No destructive probe |
 
 ## Known limitations
 
 - Stock `terminal-browser` has no proven display-free service lifecycle. The PTY is a required liveness owner.
-- The sandboxed harness's terminal cannot display terminal-browser graphics; Phases 8 and 9 (app-mode UX, `Ctrl+]`) still require a kitty-capable terminal and have not been exercised at all.
+- The sandboxed harness's terminal cannot display terminal-browser graphics; Phases 8 and 9 were exercised instead from the repository owner's iTerm2 (Kitty graphics protocol support) and passed. `terminal-browser`'s key handling does not distinguish an IME composition-confirm `Enter` from a send `Enter`, so IME-based composition (e.g. Japanese) submits prematurely; this should be reported upstream and treated as a known UX caveat, not solved by this spike.
 - Authentication, Project discovery, and session discovery (Phases 1, 4, 5) are proven against the human's real account and real Project via a human-operated terminal, after one manual login. Session discovery required correcting the method mid-run: the project-scoped conversations endpoint returns an incomplete list (5 of 17), so a production adapter needs the global, Project-filtered endpoint too.
 - Chat/Work discrimination (Phase 6) has moved from "no evidence" to "one undocumented candidate field (`async_source`) confirmed on a single human-created Work sample." It is not yet confirmed absent from ordinary tool-using Chats, and is not a documented, stable API guarantee.
 - **Mid-run correction:** the field-value reporting added for Phase 6 initially printed unredacted `g-p-...` Project IDs and full conversation/turn UUIDs when they appeared as a structural field's *value* (e.g. `conversation_template_id`, `working_turn_id`) rather than as a key. The existing ID-redaction (already applied to `observedBackendPaths` and the Open-URL diagnostic) was not applied to this path. This was caught during the same session, before any further extraction, and fixed by routing all reported values through the shared redaction helper while still computing distinct-value counts from the raw (unredacted) values, so per-item uniqueness signals aren't lost. No cookie, token, or authorization header was ever involved; the exposed values were structural identifiers already visible to the operator from ChatGPT's own URLs. Any adapter built on this pattern must route every value that might contain an ID through the same redaction before logging.
@@ -300,7 +306,7 @@ Structural field values (status/type/kind/mode/origin-style labels used for Chat
 
 **Current decision: CONDITIONAL GO.**
 
-The bridge mechanism, persistent authentication, Project discovery, session discovery, and canonical Open URL are now proven against a real account and a real, human-created Work sample. What remains are the limited blockers CONDITIONAL GO anticipates: the background helper lifecycle is a PTY workaround, not a production lifecycle; the Chat/Work discriminator (`async_source`) is undocumented and confirmed on only one sample; and app-mode UX / `Ctrl+]` semantics are architecturally plausible but unverified because this harness has no kitty-capable terminal.
+The bridge mechanism, persistent authentication, Project discovery, session discovery, canonical Open URL, app-mode UI delegation, and `Ctrl+]` view-close-without-stopping-Work semantics are now all proven against a real account and a real, human-created Work sample, from both the sandboxed harness and a kitty-capable human terminal. The one remaining acceptance-blocking gap is the Chat/Work discriminator: `async_source` field presence is a plausible signal but confirmed on only one Work sample against an undocumented, unstable field name. The background helper lifecycle also remains a PTY workaround, not a production service lifecycle — though it is no longer the binding blocker for UI delegation, since app-mode itself does not need the pseudo-PTY (only discovery does).
 
 ```text
 #6 implementation before blocker resolution: no
@@ -309,9 +315,9 @@ The bridge mechanism, persistent authentication, Project discovery, session disc
 Before starting Issue #6:
 
 1. Corroborate the `async_source`-presence discriminator against more than one Work sample, and confirm it does not also appear on ordinary tool-using Chats (browsing, code interpreter, etc., which already share several marker field names). Do not ship a heuristic confirmed on n=1.
-2. Run Phases 8–9 (app-mode UX, `Ctrl+]` view-close-without-stopping-Work semantics) from a kitty-capable terminal — the only phases this sandboxed harness structurally cannot exercise.
-3. Obtain a supported `terminal-browser` no-render/service lifecycle, or an explicit upstream commitment, suitable for production; the current pseudo-PTY is a PoC workaround only (Phase 2).
-4. Build the production session-discovery adapter against the global `/backend-api/conversations` endpoint filtered by Project association (Phase 5's corrected method), not the project-scoped endpoint alone.
+2. Obtain a supported `terminal-browser` no-render/service lifecycle, or an explicit upstream commitment, suitable for production; the current pseudo-PTY is a PoC workaround only (Phase 2) and is needed for background discovery even though app-mode UI delegation itself works without it.
+3. Build the production session-discovery adapter against the global `/backend-api/conversations` endpoint filtered by Project association (Phase 5's corrected method), not the project-scoped endpoint alone.
+4. Report the IME composition-confirm-`Enter`-sends-prematurely defect to `zenbu-labs/terminal-browser` upstream, and track it as a known UX caveat for any user who composes in an IME-dependent language.
 5. Re-run against the selected/pinned `terminal-browser` version (v0.8.0 tested vs. v0.8.1 current at spike time) and document its compatibility window.
 
 None of these require abandoning the browser-backed direction — they are scoped hardening and verification steps, consistent with CONDITIONAL GO. Do not add a production ChatGPT provider or change shared provider/session contracts from this spike alone.
