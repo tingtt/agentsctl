@@ -1,0 +1,323 @@
+"use strict";
+
+const { ipcRenderer } = require("electron");
+
+const projectIDPattern = /^g-p-[A-Za-z0-9_-]+$/;
+const conversationIDPattern = /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i;
+
+function redactIdentifiers(value) {
+  return value
+    .replace(/g-p-[A-Za-z0-9_-]+/g, "g-p-<redacted>")
+    .replace(/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, "<conversation-id>");
+}
+
+function allObjects(value, found = []) {
+  if (!value || typeof value !== "object") return found;
+  if (Array.isArray(value)) {
+    for (const item of value) allObjects(item, found);
+    return found;
+  }
+  found.push(value);
+  for (const child of Object.values(value)) allObjects(child, found);
+  return found;
+}
+
+function firstString(object, keys) {
+  for (const key of keys) {
+    if (typeof object[key] === "string" && object[key]) return object[key];
+  }
+  return null;
+}
+
+function projectsFrom(payload) {
+  if (!payload || typeof payload !== "object") throw new Error("project response is not an object");
+  const projects = new Map();
+  for (const object of allObjects(payload)) {
+    const id = firstString(object, ["id", "gizmo_id"]);
+    if (!id || !projectIDPattern.test(id)) continue;
+    const display = object.display && typeof object.display === "object" ? object.display : {};
+    const name = firstString(object, ["name", "title", "display_name"]) ||
+      firstString(display, ["name", "title", "display_name"]);
+    if (!name) continue;
+    projects.set(id, { id, name, url: `https://chatgpt.com/g/${id}` });
+  }
+  if (projects.size === 0) throw new Error("project response has no recognized projects");
+  return [...projects.values()];
+}
+
+function conversationsFrom(payload, projectID) {
+  if (!payload || typeof payload !== "object") {
+    throw new Error("conversation response is not an object");
+  }
+  const hasRecognizedCollection = Array.isArray(payload.items) || Array.isArray(payload.conversations);
+  const candidates = new Map();
+  for (const object of allObjects(payload)) {
+    const id = firstString(object, ["id", "conversation_id"]);
+    if (!id || !conversationIDPattern.test(id)) continue;
+    const title = firstString(object, ["title", "name"]);
+    const createdAt = object.create_time ?? object.created_at ?? null;
+    const updatedAt = object.update_time ?? object.updated_at ?? null;
+    if (!title && createdAt === null && updatedAt === null) continue;
+    const association = firstString(object, ["gizmo_id", "project_id"]);
+    const discriminator = {};
+    for (const key of [
+      "conversation_type", "workspace_type", "is_work", "async_status", "status", "kind", "type",
+    ]) {
+      if (["string", "boolean", "number"].includes(typeof object[key])) {
+        discriminator[key] = object[key];
+      }
+    }
+    candidates.set(id, {
+      id,
+      title: title || "",
+      createdAt,
+      updatedAt,
+      archived: object.is_archived ?? object.archived ?? false,
+      projectID: association || projectID,
+      discriminator,
+      availableKeys: Object.keys(object).sort(),
+      openURLCandidates: [
+        `https://chatgpt.com/c/${id}`,
+        `https://chatgpt.com/g/${projectID}/c/${id}`,
+      ],
+    });
+  }
+  if (candidates.size === 0 && !hasRecognizedCollection) {
+    throw new Error("conversation response schema is not recognized");
+  }
+  return [...candidates.values()];
+}
+
+function globalConversationsFrom(payload, projectID) {
+  if (!payload || typeof payload !== "object") throw new Error("global conversation response is not an object");
+  if (!projectIDPattern.test(projectID || "")) throw new Error("invalid Project ID");
+  const candidates = new Map();
+  for (const object of allObjects(payload)) {
+    const id = firstString(object, ["id", "conversation_id"]);
+    if (!id || !conversationIDPattern.test(id)) continue;
+    const association = firstString(object, ["gizmo_id", "project_id"]);
+    if (association !== projectID) continue;
+    const title = firstString(object, ["title", "name"]);
+    const createdAt = object.create_time ?? object.created_at ?? null;
+    const updatedAt = object.update_time ?? object.updated_at ?? null;
+    const discriminator = {};
+    for (const key of [
+      "conversation_type", "workspace_type", "is_work", "async_status", "status", "kind", "type", "is_visible",
+    ]) {
+      if (["string", "boolean", "number"].includes(typeof object[key])) {
+        discriminator[key] = object[key];
+      }
+    }
+    candidates.set(id, {
+      id,
+      title: title || "",
+      createdAt,
+      updatedAt,
+      archived: object.is_archived ?? object.archived ?? false,
+      projectID: association,
+      discriminator,
+      availableKeys: Object.keys(object).sort(),
+      openURLCandidates: [
+        `https://chatgpt.com/c/${id}`,
+        `https://chatgpt.com/g/${projectID}/c/${id}`,
+      ],
+    });
+  }
+  return [...candidates.values()];
+}
+
+function tasksFrom(payload, knownConversationIDs) {
+  if (!payload || typeof payload !== "object") throw new Error("tasks response is not an object");
+  const known = new Set(knownConversationIDs.filter((id) => conversationIDPattern.test(id)));
+  let conversationIDMatches = 0;
+  let overlapWithKnownConversations = 0;
+  const statusValues = new Set();
+  const statusFieldCandidates = new Set();
+  for (const object of allObjects(payload)) {
+    const id = firstString(object, ["conversation_id"]);
+    if (id && conversationIDPattern.test(id)) {
+      conversationIDMatches++;
+      if (known.has(id)) overlapWithKnownConversations++;
+    }
+    for (const key of ["status", "task_status", "state", "kind", "type"]) {
+      if (typeof object[key] === "string" && object[key]) {
+        statusValues.add(`${key}=${object[key]}`);
+        statusFieldCandidates.add(key);
+      }
+    }
+  }
+  return {
+    conversationIDMatches,
+    overlapWithKnownConversations,
+    statusFieldCandidates: [...statusFieldCandidates].sort(),
+    distinctStatusValueCount: statusValues.size,
+  };
+}
+
+function compareConversationEvidence(payloads) {
+  const markers = ["work", "agent", "async", "type", "kind", "status", "mode", "task", "template", "origin"];
+  const excluded = ["content", "text", "title", "prompt", "author", "user", "email", "name"];
+  const samples = payloads.map((payload) => {
+    const fields = new Map();
+    const visit = (value, path, depth) => {
+      if (!value || typeof value !== "object" || depth > 12) return;
+      const entries = Array.isArray(value) ? value.slice(0, 200).map((item) => ["[]", item]) : Object.entries(value);
+      for (const [key, child] of entries) {
+        const lower = key.toLowerCase();
+        if (excluded.some((word) => lower.includes(word))) continue;
+        const childPath = path ? `${path}.${key}` : key;
+        if (child === null || ["string", "boolean", "number"].includes(typeof child)) {
+          if (markers.some((word) => lower.includes(word))) fields.set(childPath, `${typeof child}:${String(child)}`);
+        } else {
+          visit(child, childPath, depth + 1);
+        }
+      }
+    };
+    visit(payload, "", 0);
+    return fields;
+  });
+  const paths = new Set(samples.flatMap((sample) => [...sample.keys()]));
+  return [...paths].sort().map((path) => {
+    const present = samples.filter((sample) => sample.has(path));
+    const distinct = [...new Set(present.map((sample) => sample.get(path)))];
+    return {
+      path,
+      presentCount: present.length,
+      distinctValueCount: distinct.length,
+      // Values are structural enum/status-style labels on allowlisted marker fields (never content/title/author/etc,
+      // excluded above), so exposing them crosses no credential or PII boundary. Project/conversation IDs that show
+      // up as a *value* (e.g. conversation_template_id, working_turn_id) are still redacted before display; distinct
+      // counts above are computed from the raw values, so redaction never hides genuine per-item uniqueness.
+      values: [...new Set(distinct.map((value) => {
+        const redacted = redactIdentifiers(value);
+        return redacted.length > 64 ? `${redacted.slice(0, 61)}...<redacted>` : redacted;
+      }))]
+        .slice(0, 10)
+        .sort(),
+      types: [...new Set(present.map((sample) => sample.get(path).split(":", 1)[0]))].sort(),
+    };
+  });
+}
+
+async function fetchJSON(path) {
+  if (location.hostname !== "chatgpt.com") throw new Error("refusing non-ChatGPT origin");
+  const response = await fetch(path, {
+    credentials: "include",
+    headers: { accept: "application/json" },
+  });
+  if (!response.ok) throw new Error(`undocumented endpoint returned HTTP ${response.status}`);
+  const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) {
+    throw new Error("undocumented endpoint returned non-JSON content");
+  }
+  return response.json();
+}
+
+async function dispatch(request) {
+  if (request.method === "pageInfo") {
+    const textEquals = (element, expected) => element.textContent?.trim().toLowerCase() === expected;
+    const controls = [...document.querySelectorAll("a, button")];
+    const backendPaths = performance.getEntriesByType("resource")
+      .map((entry) => {
+        try {
+          const url = new URL(entry.name);
+          if (url.hostname !== "chatgpt.com" || !url.pathname.startsWith("/backend-api/")) return null;
+          return redactIdentifiers(url.pathname);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    return {
+      href: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      loginPromptVisible: controls.some((element) =>
+        textEquals(element, "log in") || textEquals(element, "sign up")
+      ),
+      accountControlPresent: Boolean(document.querySelector(
+        '[data-testid="accounts-profile-button"], [data-testid="profile-button"], button[aria-label*="profile" i], button[aria-label*="account" i]'
+      )),
+      conversationLinkCount: document.querySelectorAll('a[href^="/c/"]').length,
+      projectLinkCount: document.querySelectorAll('a[href^="/g/g-p-"]').length,
+      observedBackendPaths: [...new Set(backendPaths)].sort().slice(0, 100),
+    };
+  }
+  if (request.method === "sanitizeProjects") {
+    return projectsFrom(request.payload);
+  }
+  if (request.method === "sanitizeTasks") {
+    return tasksFrom(request.payload, Array.isArray(request.conversationIDs) ? request.conversationIDs : []);
+  }
+  if (request.method === "sanitizeGlobalConversations") {
+    return globalConversationsFrom(request.payload, request.projectID);
+  }
+  if (request.method === "navigateRoot") {
+    location.assign("https://chatgpt.com/");
+    return { accepted: true };
+  }
+  if (request.method === "navigateToPath") {
+    const canonicalPath = /^\/c\/[0-9a-f-]{36}$/i;
+    const projectScopedPath = /^\/g\/g-p-[A-Za-z0-9_-]+\/c\/[0-9a-f-]{36}$/i;
+    if (typeof request.path !== "string" || !(canonicalPath.test(request.path) || projectScopedPath.test(request.path))) {
+      throw new Error("invalid navigation path");
+    }
+    location.assign(`https://chatgpt.com${request.path}`);
+    return { accepted: true };
+  }
+  if (request.method === "sanitizeConversations") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    return conversationsFrom(request.payload, request.projectID);
+  }
+  if (request.method === "navigateProject") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    location.assign(`https://chatgpt.com/g/${request.projectID}/project`);
+    return { accepted: true };
+  }
+  if (request.method === "navigateConversation") {
+    if (!conversationIDPattern.test(request.conversationID || "")) throw new Error("invalid conversation ID");
+    location.assign(`https://chatgpt.com/c/${request.conversationID}`);
+    return { accepted: true };
+  }
+  if (request.method === "compareConversationEvidence") {
+    if (!Array.isArray(request.payloads) || request.payloads.length === 0) {
+      throw new Error("conversation evidence payloads are missing");
+    }
+    return compareConversationEvidence(request.payloads);
+  }
+  if (request.method === "projects") {
+    return projectsFrom(await fetchJSON("/backend-api/gizmos/snorlax/sidebar"));
+  }
+  if (request.method === "tasks") {
+    return tasksFrom(await fetchJSON("/backend-api/tasks"), Array.isArray(request.conversationIDs) ? request.conversationIDs : []);
+  }
+  if (request.method === "conversations") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    const path = `/backend-api/gizmos/${encodeURIComponent(request.projectID)}/conversations`;
+    return conversationsFrom(await fetchJSON(path), request.projectID);
+  }
+  throw new Error(`unsupported browser method: ${request.method}`);
+}
+
+ipcRenderer.on("agentsctl-chatgpt:request", async (_event, message) => {
+  try {
+    const result = await dispatch(message.request);
+    ipcRenderer.send("agentsctl-chatgpt:response", { ipcRequestID: message.ipcRequestID, ok: true, result });
+  } catch (error) {
+    ipcRenderer.send("agentsctl-chatgpt:response", {
+      ipcRequestID: message.ipcRequestID,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+if (process.env.AGENTSCTL_CHATGPT_CLOSE_KEY === "1") {
+  addEventListener("keydown", (event) => {
+    if (event.ctrlKey && event.key === "]") {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      globalThis.terminalBrowser.quit();
+    }
+  }, true);
+}
