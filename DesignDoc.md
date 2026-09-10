@@ -794,6 +794,10 @@ subscriber が遅い場合でも、PTY 自体の read loop を停止させない
 
 session process の進行を UI client の描画速度に依存させない。
 
+subscriber ごとの output buffer は bytes 単位で bound する。PTY read() の chunk 数を容量単位として扱わない。
+
+buffer 上限を超えて追いつけない subscriber は、切断理由を Failure frame で明示したうえで attach を終了する。この切断は attach channel のみに関与し、managed process の lifetime には関与しない。
+
 #### OS boundaries
 
 以下には OS 固有機能を利用する。

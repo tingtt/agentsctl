@@ -565,50 +565,6 @@ func TestSupervisorPTYEditorChildHelper(t *testing.T) {
 	_, _ = os.Stdout.WriteString("\x1b[?2004l\x1b[?1004l\x1b[?1049lEDITOR_EXIT\n")
 }
 
-func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
-	disconnected := make(chan struct{})
-	sub := &subscriber{
-		output:     make(chan []byte, subscriberBuffer),
-		disconnect: func() { close(disconnected) },
-	}
-	p := &process{
-		subscribers: map[*subscriber]struct{}{sub: {}},
-		done:        make(chan struct{}),
-	}
-	for i := range subscriberBuffer {
-		p.broadcast([]byte{byte(i)})
-	}
-	select {
-	case <-disconnected:
-		t.Fatal("subscriber disconnected before its bounded queue filled")
-	default:
-	}
-	p.broadcast([]byte("overflow"))
-	select {
-	case <-disconnected:
-	default:
-		t.Fatal("full subscriber remained attached after output could not be queued")
-	}
-	p.mu.Lock()
-	remaining := len(p.subscribers)
-	p.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("subscribers=%d, want 0 after overflow", remaining)
-	}
-	for i := range subscriberBuffer {
-		chunk, ok := <-sub.output
-		if !ok {
-			t.Fatalf("subscriber queue closed after %d chunks, want %d", i, subscriberBuffer)
-		}
-		if len(chunk) != 1 || chunk[0] != byte(i) {
-			t.Fatalf("chunk %d=%v, want ordered byte %d", i, chunk, i)
-		}
-	}
-	if _, ok := <-sub.output; ok {
-		t.Fatal("subscriber queue remained open after disconnect")
-	}
-}
-
 func TestManagedProcessExitEndsAttachAfterQueuedOutput(t *testing.T) {
 	p := &process{
 		run:         localstate.Run{ID: "r"},
@@ -725,21 +681,23 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	}
 	// The production drain() goroutine is the only reader of p.ptmx (a second
 	// direct reader would race it for bytes), so observe output the same way
-	// a real attach does: through a subscriber channel fed by that broadcast.
-	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	// a real attach does: through a subscriber fed by that broadcast, driven
+	// over its real writeTo output pump.
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		t.Fatal("live process rejected subscriber")
 	}
 	defer p.removeSubscriber(sub)
+	out := testSubscriberOutput(t, sub)
 
 	// Establish a known starting size (mirrors the real attach flow, which
 	// sends a Resize frame on connect) before exercising the same-size
 	// reattach path below, and let the helper's signal.Notify land.
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	drainSubscriberFor(sub.output, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
+	drainSubscriberFor(out, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
-	requireSubscriberContains(t, sub.output, "WINCH", 2*time.Second)
+	requireSubscriberContains(t, out, "WINCH", 2*time.Second)
 }
 
 func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
@@ -767,26 +725,27 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 	if p == nil {
 		t.Fatal("run not tracked")
 	}
-	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		t.Fatal("live process rejected subscriber")
 	}
 	defer p.removeSubscriber(sub)
+	out := testSubscriberOutput(t, sub)
 	var output strings.Builder
 	if _, err := p.ptmx.Write([]byte{'s'}); err != nil {
 		t.Fatal(err)
 	}
-	waitSubscriberText(t, sub.output, &output, "TUI_READY", 2*time.Second)
+	waitSubscriberText(t, out, &output, "TUI_READY", 2*time.Second)
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+	waitSubscriberText(t, out, &output, "REDRAW 24x80", 2*time.Second)
 	baselineRedraws := strings.Count(output.String(), "REDRAW ")
 
 	for cycle := 1; cycle <= 2; cycle++ {
 		if _, err := p.ptmx.Write([]byte{'e'}); err != nil {
 			t.Fatal(err)
 		}
-		waitSubscriberCount(t, sub.output, &output, "EDITOR_READY", cycle, 2*time.Second)
+		waitSubscriberCount(t, out, &output, "EDITOR_READY", cycle, 2*time.Second)
 		var editorPGRP, editorForeground, editorParent int
 		if _, err := fmt.Sscanf(textAfterLast(output.String(), "EDITOR_READY "), "%d %d %d", &editorPGRP, &editorForeground, &editorParent); err != nil {
 			t.Fatalf("parse editor process groups from %q: %v", output.String(), err)
@@ -802,13 +761,13 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 		if editorParent != p.cmd.Process.Pid || len(children) != 1 {
 			t.Fatalf("editor parent=%d, managed PID=%d, direct children=%v", editorParent, p.cmd.Process.Pid, children)
 		}
-		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws, 150*time.Millisecond)
+		assertNoSubscriberText(t, out, &output, "REDRAW ", baselineRedraws, 150*time.Millisecond)
 
 		if _, err := p.ptmx.Write([]byte{'q'}); err != nil {
 			t.Fatal(err)
 		}
-		waitSubscriberCount(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 2*time.Second)
-		waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+		waitSubscriberCount(t, out, &output, "REDRAW ", baselineRedraws+2, 2*time.Second)
+		waitSubscriberText(t, out, &output, "REDRAW 24x80", 2*time.Second)
 		current, err := pty.GetsizeFull(p.ptmx)
 		if err != nil {
 			t.Fatal(err)
@@ -816,7 +775,7 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 		if current.Rows != 24 || current.Cols != 80 {
 			t.Fatalf("cycle %d final PTY size=%dx%d, want 24x80", cycle, current.Rows, current.Cols)
 		}
-		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 150*time.Millisecond)
+		assertNoSubscriberText(t, out, &output, "REDRAW ", baselineRedraws+2, 150*time.Millisecond)
 		baselineRedraws += 2
 	}
 
@@ -902,6 +861,33 @@ func TestExternalEditorRedrawDetectorIsCodexSpecific(t *testing.T) {
 	if detector := newExternalEditorRedrawDetector("codex", 123); detector == nil {
 		t.Fatal("Codex process did not receive editor redraw detector")
 	}
+}
+
+// testSubscriberOutput drives sub's real writeTo output pump over an
+// in-memory pipe and republishes each Output frame's payload on a
+// channel, so tests can observe broadcast content the same way these
+// helpers did before subscriber moved to a byte-bounded buffer plus
+// dedicated writer goroutine -- but now through the same code path a real
+// attach uses instead of a bespoke test seam.
+func testSubscriberOutput(t *testing.T, sub *subscriber) <-chan []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	go sub.writeTo(server)
+	out := make(chan []byte)
+	go func() {
+		defer close(out)
+		for {
+			kind, data, err := protocol.Read(client)
+			if err != nil {
+				return
+			}
+			if kind == protocol.Output {
+				out <- data
+			}
+		}
+	}()
+	return out
 }
 
 func waitSubscriberText(t *testing.T, sub <-chan []byte, output *strings.Builder, want string, timeout time.Duration) {

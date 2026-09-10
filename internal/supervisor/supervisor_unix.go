@@ -66,12 +66,139 @@ type process struct {
 	editorRedraw *externalEditorRedrawDetector
 }
 
-const subscriberBuffer = 64
+// subscriberMaxBufferedBytes bounds how much PTY output a single attach
+// subscriber may accumulate before it is judged too slow to keep and is
+// disconnected. The bound is on total bytes, never on the number of PTY
+// read() chunks: a burst of many small writes (e.g. a Codex redraw made
+// of many short escape sequences) must not exhaust a chunk-counted queue
+// while the underlying byte volume is still trivial -- that chunk-vs-byte
+// mismatch was the root cause of issue #31. 4 MiB comfortably absorbs
+// realistic full-screen redraws many times over while keeping the
+// worst-case per-subscriber memory cost small and fixed.
+const subscriberMaxBufferedBytes = 4 << 20
 
+// subscriberWriteTimeout bounds how long a single frame write to an
+// attach connection may block. subscriberMaxBufferedBytes alone reclaims
+// a subscriber that is merely slow (still draining, just more slowly than
+// output is produced); this instead reclaims one whose consumer has
+// stopped reading altogether, which would otherwise block the writer
+// goroutine on a single write forever with no way to ever notice the
+// subscriber has since been closed.
+const subscriberWriteTimeout = 5 * time.Second
+
+// subscriberCloseReason records why a subscriber's output pump is ending,
+// so writeTo knows which terminal frame, if any, to send before closing
+// the connection.
+type subscriberCloseReason uint8
+
+const (
+	subscriberOpen subscriberCloseReason = iota
+	subscriberClosedByDetach
+	subscriberClosedByProcessExit
+	subscriberClosedByOverflow
+)
+
+// subscriber is one attach connection's PTY output pump. broadcast never
+// touches the network connection directly: it only appends to buf, a
+// buffer bounded by subscriberMaxBufferedBytes and drained by a dedicated
+// writeTo goroutine. append is a fast, in-memory, lock-protected slice
+// append, never an I/O call, so a slow or stalled consumer can never block
+// PTY draining or any other subscriber.
 type subscriber struct {
-	output     chan []byte
-	disconnect func()
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    []byte
+	reason subscriberCloseReason
+	detail string // set only for subscriberClosedByOverflow
 }
+
+func newSubscriber() *subscriber {
+	sub := &subscriber{}
+	sub.cond = sync.NewCond(&sub.mu)
+	return sub
+}
+
+// append adds chunk to the subscriber's pending output. If appending
+// would push the buffered total past subscriberMaxBufferedBytes, chunk is
+// rejected and the subscriber is instead marked closed with an overflow
+// reason -- bytes already accepted are kept so writeTo can still flush
+// them before reporting the failure. It reports whether this call is what
+// closed the subscriber, so broadcast knows to drop it from the live set.
+func (s *subscriber) append(chunk []byte) (closedNow bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != subscriberOpen {
+		return false
+	}
+	if len(s.buf)+len(chunk) > subscriberMaxBufferedBytes {
+		s.reason = subscriberClosedByOverflow
+		s.detail = fmt.Sprintf("attach output buffer exceeded %d bytes; consumer was not keeping up", subscriberMaxBufferedBytes)
+		s.cond.Broadcast()
+		return true
+	}
+	s.buf = append(s.buf, chunk...)
+	s.cond.Broadcast()
+	return false
+}
+
+// close marks the subscriber closed for reason, unless it is already
+// closed for a different one -- whichever reason wins the race is the one
+// writeTo reports, and a later call never overwrites it.
+func (s *subscriber) close(reason subscriberCloseReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != subscriberOpen {
+		return
+	}
+	s.reason = reason
+	s.cond.Broadcast()
+}
+
+// writeTo drains the subscriber's buffered output to conn until it is
+// closed, sends the terminal frame its close reason calls for (none for a
+// plain detach, Exit for a managed process exit, Failure with the
+// overflow detail otherwise), and always closes conn itself. Closing conn
+// unconditionally -- not just on the failure path -- is what reclaims an
+// attach whose consumer never sends anything and never hangs up on its
+// own: it unblocks the attach loop's blocked protocol.Read(conn)
+// regardless of client behavior. Every write carries
+// subscriberWriteTimeout so a consumer that has stopped reading entirely
+// cannot block this goroutine forever either.
+func (s *subscriber) writeTo(conn net.Conn) {
+	defer conn.Close()
+	for {
+		s.mu.Lock()
+		for len(s.buf) == 0 && s.reason == subscriberOpen {
+			s.cond.Wait()
+		}
+		pending := s.buf
+		s.buf = nil
+		reason, detail := s.reason, s.detail
+		s.mu.Unlock()
+
+		if len(pending) > 0 {
+			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+			if protocol.Write(conn, protocol.Output, pending) != nil {
+				return
+			}
+		}
+		switch reason {
+		case subscriberOpen:
+			continue
+		case subscriberClosedByProcessExit:
+			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+			_ = protocol.Write(conn, protocol.Exit, nil)
+			return
+		case subscriberClosedByOverflow:
+			_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+			_ = protocol.Write(conn, protocol.Failure, []byte(detail))
+			return
+		default: // subscriberClosedByDetach
+			return
+		}
+	}
+}
+
 type Server struct {
 	Socket            string
 	Store             *localstate.Store
@@ -298,29 +425,24 @@ func (s *Server) attach(c net.Conn, id string) {
 	run := p.run
 	p.mu.Unlock()
 	respond(c, Response{OK: true, Run: &run})
-	sub := &subscriber{
-		output:     make(chan []byte, subscriberBuffer),
-		disconnect: func() { _ = c.Close() },
-	}
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		_ = protocol.Write(c, protocol.Exit, nil)
 		return
 	}
-	defer p.removeSubscriber(sub)
-	done := make(chan struct{})
+	writerDone := make(chan struct{})
 	go func() {
-		defer close(done)
-		for b := range sub.output {
-			if protocol.Write(c, protocol.Output, b) != nil {
-				return
-			}
-		}
-		select {
-		case <-p.done:
-			_ = protocol.Write(c, protocol.Exit, nil)
-		default:
-		}
+		defer close(writerDone)
+		sub.writeTo(c)
 	}()
+	// removeSubscriber runs first (LIFO) so a return from any branch below
+	// (read error, Detach) marks sub closed and wakes writeTo; only then
+	// do we wait for it, so this can never hang on a subscriber that was
+	// never told to stop. writeTo closing c also covers the reverse order
+	// -- a writer-initiated close (process exit, overflow) -- by
+	// unblocking the protocol.Read below regardless of client behavior.
+	defer func() { <-writerDone }()
+	defer p.removeSubscriber(sub)
 	for {
 		kind, b, err := protocol.Read(c)
 		if err != nil {
@@ -337,32 +459,17 @@ func (s *Server) attach(c net.Conn, id string) {
 		case protocol.Detach:
 			return
 		}
-		select {
-		case <-done:
-			return
-		default:
-		}
 	}
 }
 
 func (p *process) broadcast(chunk []byte) {
-	var disconnect []func()
 	p.mu.Lock()
 	for sub := range p.subscribers {
-		select {
-		case sub.output <- chunk:
-		default:
+		if sub.append(chunk) {
 			delete(p.subscribers, sub)
-			close(sub.output)
-			disconnect = append(disconnect, sub.disconnect)
 		}
 	}
 	p.mu.Unlock()
-	for _, closeConnection := range disconnect {
-		if closeConnection != nil {
-			closeConnection()
-		}
-	}
 }
 
 func (p *process) addSubscriber(sub *subscriber) bool {
@@ -379,12 +486,9 @@ func (p *process) addSubscriber(sub *subscriber) bool {
 
 func (p *process) removeSubscriber(sub *subscriber) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, ok := p.subscribers[sub]; !ok {
-		return
-	}
 	delete(p.subscribers, sub)
-	close(sub.output)
+	p.mu.Unlock()
+	sub.close(subscriberClosedByDetach)
 }
 
 func (p *process) finishSubscribers() {
@@ -392,7 +496,7 @@ func (p *process) finishSubscribers() {
 	defer p.mu.Unlock()
 	close(p.done)
 	for sub := range p.subscribers {
-		close(sub.output)
+		sub.close(subscriberClosedByProcessExit)
 	}
 	p.subscribers = map[*subscriber]struct{}{}
 }
