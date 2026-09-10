@@ -53,7 +53,18 @@ type Response struct {
 }
 
 const ProtocolVersion = 3
-const BuildVersion = "child-environment-2026-09-09"
+
+// BuildVersion changed here to attach-backpressure-2026-09-10: the wire
+// format itself (frame layout, Request/Response shapes, the Failure frame
+// kind) is unchanged from the previous build, so ProtocolVersion did not
+// move -- but subscriber.writeTo's backpressure, disconnect, and error-
+// reporting behavior changed enough (see issue #31) that a client built
+// against this behavior must never keep talking to an already-running
+// daemon still running the old implementation. See compatible and
+// Client.restartOwned: an incompatible owned daemon with no active
+// managed run is restarted automatically; one with an active run is left
+// alone rather than silently discarding it.
+const BuildVersion = "attach-backpressure-2026-09-10"
 
 type process struct {
 	run          localstate.Run
@@ -919,6 +930,22 @@ func (c Client) restartOwned(ctx context.Context, response Response) error {
 	if !sameExecutable(response.DaemonExecutable, c.DaemonPath) {
 		return errors.New("existing daemon executable does not match this agentsctl binary")
 	}
+	// An incompatible daemon still owns the PTY and process of any
+	// managed run it is running (see the DesignDoc's Codex supervisor
+	// Lifetime section): killing it here would lose that run exactly the
+	// way a supervisor crash does, with no chance for the run to finish
+	// or be attached to again. Refuse rather than silently discard it --
+	// mirrors restartLegacyOwned's identical check for the pre-versioning
+	// daemon case.
+	runs, err := localstate.New(c.StatePath).Runs()
+	if err != nil {
+		return fmt.Errorf("inspect existing daemon state: %w", err)
+	}
+	for _, run := range runs {
+		if run.State == "running" || run.State == "starting" {
+			return errors.New("existing daemon still owns an active managed run; stop it or wait for it to finish, then retry")
+		}
+	}
 	if err := processinfo.Match(processinfo.Identity{PID: response.DaemonPID, StartTime: response.DaemonStartTime, UID: response.DaemonUID}); err != nil {
 		return fmt.Errorf("existing daemon identity changed: %w", err)
 	}
@@ -927,9 +954,11 @@ func (c Client) restartOwned(ctx context.Context, response Response) error {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := net.DialTimeout("unix", c.Socket, 50*time.Millisecond); err != nil {
+		conn, dialErr := net.DialTimeout("unix", c.Socket, 50*time.Millisecond)
+		if dialErr != nil {
 			return nil
 		}
+		_ = conn.Close() // still alive: this poll's own connection must not leak and sit unread on the daemon's side
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -974,9 +1003,11 @@ func (c Client) restartLegacyOwned(ctx context.Context, identity processinfo.Ide
 func (c Client) waitStopped(ctx context.Context, label string) error {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := net.DialTimeout("unix", c.Socket, 50*time.Millisecond); err != nil {
+		conn, dialErr := net.DialTimeout("unix", c.Socket, 50*time.Millisecond)
+		if dialErr != nil {
 			return nil
 		}
+		_ = conn.Close() // still alive: this poll's own connection must not leak and sit unread on the daemon's side
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
