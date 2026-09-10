@@ -10,6 +10,8 @@ let nextIPCRequestID = 1;
 let capturedProjects = null;
 let capturedTasks = null;
 let capturedGlobalConversations = null;
+const globalConversationsHistory = [];
+const MAX_GLOBAL_CONVERSATIONS_HISTORY = 50;
 const capturedConversations = new Map();
 const capturedConversationDetails = new Map();
 const attachedDebuggers = new WeakSet();
@@ -64,7 +66,7 @@ function attachCapture(contents) {
       const target = captureTarget(params.response?.url || "");
       if (target && params.response.status === 200) {
         matchedResponseCount++;
-        responses.set(params.requestId, target);
+        responses.set(params.requestId, { ...target, url: params.response.url });
       }
       return;
     }
@@ -83,8 +85,10 @@ function attachCapture(contents) {
       const payload = JSON.parse(body);
       if (target.kind === "projects") capturedProjects = payload;
       else if (target.kind === "tasks") capturedTasks = payload;
-      else if (target.kind === "globalConversations") capturedGlobalConversations = payload;
-      else if (target.kind === "conversations") capturedConversations.set(target.projectID, payload);
+      else if (target.kind === "globalConversations") {
+        capturedGlobalConversations = payload;
+        recordGlobalConversationsPage(target.url, payload);
+      } else if (target.kind === "conversations") capturedConversations.set(target.projectID, payload);
       else capturedConversationDetails.set(target.conversationID, payload);
     } catch {
       captureErrorCount++;
@@ -159,8 +163,39 @@ async function dispatch(request) {
       conversationCollectionsCaptured: capturedConversations.size,
     };
   }
-  if (!["pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe"].includes(request.method)) {
+  if (![
+    "pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe",
+    "globalConversationsPages", "globalConversationsPage", "globalConversationsPageItems", "simulateSidebarScroll",
+  ].includes(request.method)) {
     throw new Error(`unsupported method: ${request.method}`);
+  }
+  if (request.method === "globalConversationsPages") {
+    return globalConversationsHistory.map((entry, index) => ({
+      sequence: index,
+      query: entry.query,
+      hideSnorlax: entry.hideSnorlax,
+      topLevelKeys: entry.topLevelKeys,
+      itemCount: entry.itemCount,
+      meta: entry.meta,
+    }));
+  }
+  if (request.method === "globalConversationsPageItems") {
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
+      throw new Error("invalid Project ID");
+    }
+    const entry = globalConversationsHistory[request.sequence];
+    if (!entry) throw new Error(`no captured global conversations page at sequence ${request.sequence}`);
+    return requestPage({ method: "sanitizeGlobalConversations", projectID: request.projectID, payload: entry.payload });
+  }
+  if (request.method === "globalConversationsPage") {
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
+      throw new Error("invalid Project ID");
+    }
+    return requestPage({
+      method: "sanitizeGlobalConversationsPage",
+      projectID: request.projectID,
+      params: request.params && typeof request.params === "object" ? request.params : {},
+    });
   }
   if (request.method === "projects") {
     const payload = await waitForCapture(() => capturedProjects);
@@ -262,6 +297,68 @@ async function dispatch(request) {
     };
   }
   return requestPage(request);
+}
+
+// Reports pagination wire evidence without exposing opaque tokens: plain integers/booleans/short
+// enum-like strings (e.g. "updated") are shown verbatim, anything else is length-only redacted.
+function describeQueryValue(value) {
+  if (/^-?\d+$/.test(value)) return value;
+  if (/^(true|false)$/i.test(value)) return value;
+  if (value.length <= 20 && /^[a-z0-9_.-]+$/i.test(value)) return value;
+  return `<redacted:${value.length}ch>`;
+}
+
+function describeQuery(rawURL) {
+  try {
+    const url = new URL(rawURL);
+    return [...url.searchParams.entries()]
+      .map(([key, value]) => ({ key, value: describeQueryValue(value) }))
+      .sort((a, b) => a.key.localeCompare(b.key));
+  } catch {
+    return [];
+  }
+}
+
+function topLevelKeysOf(payload) {
+  return payload && typeof payload === "object" && !Array.isArray(payload) ? Object.keys(payload).sort() : [];
+}
+
+function itemsArrayOf(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.items)) return payload.items;
+  if (payload && Array.isArray(payload.conversations)) return payload.conversations;
+  return null;
+}
+
+// Only non-array, non-object top-level fields (offset/limit/total-style pagination metadata) are
+// surfaced; none of the observed shapes place an ID at this level, but scalars are reported as-is
+// only because they are plain numbers/booleans here, not because IDs would be considered safe.
+function scalarMetaOf(payload) {
+  const meta = {};
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return meta;
+  for (const [key, value] of Object.entries(payload)) {
+    if (value === null || ["string", "number", "boolean"].includes(typeof value)) meta[key] = value;
+  }
+  return meta;
+}
+
+function recordGlobalConversationsPage(url, payload) {
+  const items = itemsArrayOf(payload);
+  const query = describeQuery(url);
+  // hide_snorlax=true excludes Project/gizmo-associated conversations from `items` (empirically
+  // confirmed: identical account state, item-level Project association present only when this is
+  // false or absent) even though it does not appear to affect the unreliable top-level `total`.
+  // Only pages where this is false/absent are valid input for Project enumeration.
+  const hideSnorlax = query.some((entry) => entry.key === "hide_snorlax" && entry.value === "true");
+  globalConversationsHistory.push({
+    query,
+    hideSnorlax,
+    topLevelKeys: topLevelKeysOf(payload),
+    itemCount: items ? items.length : null,
+    meta: scalarMetaOf(payload),
+    payload,
+  });
+  if (globalConversationsHistory.length > MAX_GLOBAL_CONVERSATIONS_HISTORY) globalConversationsHistory.shift();
 }
 
 function payloadHasAsyncSource(payload) {

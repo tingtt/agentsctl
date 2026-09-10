@@ -199,6 +199,42 @@ function compareConversationEvidence(payloads) {
   });
 }
 
+function findScrollableAncestor(element) {
+  let node = element.parentElement;
+  while (node && node !== document.body) {
+    const style = getComputedStyle(node);
+    if (/(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight) return node;
+    node = node.parentElement;
+  }
+  return null;
+}
+
+async function simulateSidebarScroll() {
+  const anchors = [...document.querySelectorAll('a[href^="/c/"]')];
+  const before = anchors.length;
+  const containers = new Set();
+  for (const anchor of anchors) {
+    const container = findScrollableAncestor(anchor);
+    if (container) containers.add(container);
+  }
+  if (containers.size === 0) {
+    return { triggered: false, reason: "no scrollable sidebar container found", conversationLinkCountBefore: before, conversationLinkCountAfter: before };
+  }
+  for (let i = 0; i < 6; i++) {
+    for (const container of containers) {
+      container.scrollTop = container.scrollHeight;
+      container.dispatchEvent(new Event("scroll", { bubbles: true }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return {
+    triggered: true,
+    containerCount: containers.size,
+    conversationLinkCountBefore: before,
+    conversationLinkCountAfter: document.querySelectorAll('a[href^="/c/"]').length,
+  };
+}
+
 async function fetchJSON(path) {
   if (location.hostname !== "chatgpt.com") throw new Error("refusing non-ChatGPT origin");
   const response = await fetch(path, {
@@ -251,6 +287,35 @@ async function dispatch(request) {
   }
   if (request.method === "sanitizeGlobalConversations") {
     return globalConversationsFrom(request.payload, request.projectID);
+  }
+  if (request.method === "simulateSidebarScroll") {
+    return simulateSidebarScroll();
+  }
+  if (request.method === "sanitizeGlobalConversationsPage") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(request.params || {})) {
+      if (typeof value !== "string" && typeof value !== "number") continue;
+      search.set(key, String(value));
+    }
+    const query = search.toString();
+    const payload = await fetchJSON(`/backend-api/conversations${query ? `?${query}` : ""}`);
+    const itemsArray = Array.isArray(payload) ? payload
+      : Array.isArray(payload?.items) ? payload.items
+      : Array.isArray(payload?.conversations) ? payload.conversations
+      : null;
+    if (!itemsArray) throw new Error("global conversation page response has no recognized item collection");
+    const meta = {};
+    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+      for (const [key, value] of Object.entries(payload)) {
+        if (value === null || ["string", "number", "boolean"].includes(typeof value)) meta[key] = value;
+      }
+    }
+    return {
+      items: globalConversationsFrom(payload, request.projectID),
+      rawItemCount: itemsArray.length,
+      meta,
+    };
   }
   if (request.method === "navigateRoot") {
     location.assign("https://chatgpt.com/");
