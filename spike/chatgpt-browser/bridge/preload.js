@@ -90,6 +90,13 @@ function conversationsFrom(payload, projectID) {
   return [...candidates.values()];
 }
 
+function rawTopLevelItems(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (payload && Array.isArray(payload.items)) return payload.items;
+  if (payload && Array.isArray(payload.conversations)) return payload.conversations;
+  return [];
+}
+
 function globalConversationsFrom(payload, projectID) {
   if (!payload || typeof payload !== "object") throw new Error("global conversation response is not an object");
   if (!projectIDPattern.test(projectID || "")) throw new Error("invalid Project ID");
@@ -289,6 +296,30 @@ async function dispatch(request) {
   }
   if (request.method === "sanitizeGlobalConversations") {
     return globalConversationsFrom(request.payload, request.projectID);
+  }
+  if (request.method === "sanitizeGlobalConversationsCaptureItems") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    const items = globalConversationsFrom(request.payload, request.projectID);
+    // Cross-checks a caller-supplied allowlist of already-known Project conversation IDs (from the
+    // project-scoped endpoint) against this RAW page's own association field. A known Project
+    // conversation ID appearing in this page whose association no longer resolves to the configured
+    // Project is unambiguous schema-drift evidence (a renamed gizmo_id/project_id field, say) — not
+    // guessed from field-presence heuristics that could misfire on ordinary non-Project chats.
+    const knownIDs = new Set(
+      Array.isArray(request.knownConversationIDs)
+        ? request.knownConversationIDs.filter((id) => typeof id === "string" && conversationIDPattern.test(id))
+        : []
+    );
+    let knownIDsSeen = 0;
+    let knownIDsMismatched = 0;
+    for (const raw of rawTopLevelItems(request.payload)) {
+      const id = firstString(raw, ["id", "conversation_id"]);
+      if (!id || !knownIDs.has(id)) continue;
+      knownIDsSeen++;
+      const association = firstString(raw, ["gizmo_id", "project_id"]);
+      if (association !== request.projectID) knownIDsMismatched++;
+    }
+    return { items, knownIDsSeen, knownIDsMismatched };
   }
   if (request.method === "simulateSidebarScroll") {
     return simulateSidebarScroll();
