@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -16,9 +18,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/tingtt/agentsctl/internal/localstate"
 	processinfo "github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/supervisor/protocol"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
 
@@ -139,6 +143,159 @@ func TestHandshakeReportsProtocolBuildAndDaemonIdentity(t *testing.T) {
 	if !response.OK || response.ProtocolVersion != ProtocolVersion || response.BuildVersion != BuildVersion || response.DaemonPID != os.Getpid() || response.DaemonStartTime == 0 {
 		t.Fatalf("handshake=%+v", response)
 	}
+}
+
+func TestCompatibilityRejectsSupervisorWithoutEnvironmentOverrides(t *testing.T) {
+	if compatible(Response{ProtocolVersion: 2, BuildVersion: "session-lifecycle-2026-09-03"}) {
+		t.Fatal("protocol 2 supervisor was treated as compatible with environment overrides")
+	}
+	if !compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: BuildVersion}) {
+		t.Fatal("current supervisor protocol/build was treated as incompatible")
+	}
+}
+
+func TestManagedChildEnvironmentMergesRequestOverrides(t *testing.T) {
+	t.Setenv("CODEX_EDITOR", "nvim")
+	t.Setenv("PATH", "/test/bin:/usr/bin")
+	t.Setenv("HOME", "/test/home")
+
+	cases := []struct {
+		name            string
+		provider        string
+		overrides       map[string]string
+		inheritedEditor string
+		unsetEditor     bool
+		wantEditor      string
+	}{
+		{name: "Codex override without inherited editor", provider: "codex", overrides: map[string]string{"EDITOR": "nvim"}, unsetEditor: true, wantEditor: "nvim"},
+		{name: "Codex override replaces inherited editor", provider: "codex", overrides: map[string]string{"EDITOR": "nvim"}, inheritedEditor: "vim", wantEditor: "nvim"},
+		{name: "Codex inheritance", provider: "codex", inheritedEditor: "vim", wantEditor: "vim"},
+		{name: "Claude does not interpret CODEX_EDITOR", provider: "claude", inheritedEditor: "vim", wantEditor: "vim"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EDITOR", tc.inheritedEditor)
+			if tc.unsetEditor {
+				if err := os.Unsetenv("EDITOR"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dir := t.TempDir()
+			output := filepath.Join(dir, "environment.json")
+			statePath := filepath.Join(dir, "state.json")
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{
+				Store: localstate.New(statePath),
+				runs:  map[string]*process{},
+				ResolveExecutable: func(string) (string, error) {
+					return executable, nil
+				},
+			}
+			overrides := make(map[string]string, len(tc.overrides)+1)
+			for key, value := range tc.overrides {
+				overrides[key] = value
+			}
+			overrides["AGENTSCTL_CHILD_ENV_FILE"] = output
+			response := callServer(t, server, Request{
+				Action:      "start",
+				RunID:       "environment",
+				Provider:    tc.provider,
+				Args:        []string{"-test.run=^TestManagedChildEnvironmentHelper$"},
+				CWD:         dir,
+				Environment: overrides,
+			})
+			if !response.OK && strings.Contains(response.Error, "operation not permitted") {
+				t.Skip("sandbox does not permit PTY process spawn")
+			}
+			if !response.OK {
+				t.Fatal(response.Error)
+			}
+
+			environment := readChildEnvironment(t, output)
+			if got := environment["EDITOR"]; len(got) != 1 || got[0] != tc.wantEditor {
+				t.Fatalf("child EDITOR entries=%v, want exactly [%q]", got, tc.wantEditor)
+			}
+			if got := environment["PATH"]; len(got) != 1 || got[0] != "/test/bin:/usr/bin" {
+				t.Fatalf("child PATH entries=%v, want inherited PATH", got)
+			}
+			if got := environment["HOME"]; len(got) != 1 || got[0] != "/test/home" {
+				t.Fatalf("child HOME entries=%v, want inherited HOME", got)
+			}
+			if got := environment["CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT"]; len(got) != 1 || got[0] != "1" {
+				t.Fatalf("child Codex adaptation entries=%v, want [1]", got)
+			}
+			waitLivePreflightStopped(t, statePath, "environment")
+		})
+	}
+}
+
+func TestMergeEnvironmentReplacesEveryDuplicateOverride(t *testing.T) {
+	merged := mergeEnvironment(
+		[]string{"EDITOR=vim", "PATH=/test/bin", "EDITOR=emacs", "HOME=/test/home"},
+		map[string]string{"EDITOR": "nvim"},
+	)
+	environment := make(map[string][]string, len(merged))
+	for _, entry := range merged {
+		key, value, found := strings.Cut(entry, "=")
+		if found {
+			environment[key] = append(environment[key], value)
+		}
+	}
+	if got := environment["EDITOR"]; len(got) != 1 || got[0] != "nvim" {
+		t.Fatalf("EDITOR entries=%v, want exactly [nvim]", got)
+	}
+	if got := environment["PATH"]; len(got) != 1 || got[0] != "/test/bin" {
+		t.Fatalf("PATH entries=%v, want preserved PATH", got)
+	}
+	if got := environment["HOME"]; len(got) != 1 || got[0] != "/test/home" {
+		t.Fatalf("HOME entries=%v, want preserved HOME", got)
+	}
+}
+
+func TestManagedChildEnvironmentHelper(t *testing.T) {
+	path := os.Getenv("AGENTSCTL_CHILD_ENV_FILE")
+	if path == "" {
+		return
+	}
+	b, err := json.Marshal(os.Environ())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readChildEnvironment(t *testing.T, path string) map[string][]string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entries []string
+		if err := json.Unmarshal(b, &entries); err != nil {
+			t.Fatal(err)
+		}
+		environment := make(map[string][]string, len(entries))
+		for _, entry := range entries {
+			key, value, found := strings.Cut(entry, "=")
+			if found {
+				environment[key] = append(environment[key], value)
+			}
+		}
+		return environment
+	}
+	t.Fatalf("managed child did not write environment to %s", path)
+	return nil
 }
 
 func TestPeerIdentityComesFromUnixSocketCredentials(t *testing.T) {
@@ -343,6 +500,71 @@ func TestSupervisorPTYSignalHelper(t *testing.T) {
 	}
 }
 
+func TestSupervisorPTYEditorLifecycleHelper(t *testing.T) {
+	if os.Getenv("AGENTSCTL_TEST_EDITOR_LIFECYCLE") != "1" {
+		return
+	}
+	previous, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), previous)
+
+	winch := make(chan os.Signal, 8)
+	signal.Notify(winch, syscall.SIGWINCH)
+	defer signal.Stop(winch)
+	lastCols, lastRows, _ := term.GetSize(int(os.Stdin.Fd()))
+	go func() {
+		for range winch {
+			cols, rows, sizeErr := term.GetSize(int(os.Stdin.Fd()))
+			if sizeErr == nil && (cols != lastCols || rows != lastRows) {
+				lastCols, lastRows = cols, rows
+				fmt.Fprintf(os.Stdout, "REDRAW %dx%d\n", rows, cols)
+			}
+		}
+	}()
+	input := make([]byte, 1)
+	if _, err := os.Stdin.Read(input); err != nil || input[0] != 's' {
+		return
+	}
+	foreground, _ := unix.IoctlGetInt(int(os.Stdin.Fd()), unix.TIOCGPGRP)
+	fmt.Fprintf(os.Stdout, "TUI_READY %d %d\n", syscall.Getpgrp(), foreground)
+
+	for {
+		if _, err := os.Stdin.Read(input); err != nil {
+			return
+		}
+		switch input[0] {
+		case 'e':
+			_, _ = os.Stdout.WriteString("\x1b[?2004l\x1b[?1004l")
+			executable, executableErr := os.Executable()
+			if executableErr != nil {
+				t.Fatal(executableErr)
+			}
+			editor := exec.Command(executable, "-test.run=^TestSupervisorPTYEditorChildHelper$")
+			editor.Stdin, editor.Stdout, editor.Stderr = os.Stdin, os.Stdout, os.Stderr
+			if err := editor.Run(); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = os.Stdout.WriteString("\x1b[?2004h\x1b[?1004hTUI_RESUMED\n")
+		case 'x':
+			return
+		}
+	}
+}
+
+func TestSupervisorPTYEditorChildHelper(t *testing.T) {
+	if os.Getenv("AGENTSCTL_TEST_EDITOR_LIFECYCLE") != "1" {
+		return
+	}
+	foreground, _ := unix.IoctlGetInt(int(os.Stdin.Fd()), unix.TIOCGPGRP)
+	_, _ = os.Stdout.WriteString("\x1b[?1049h\x1b[?2004h\x1b[?1004h")
+	fmt.Fprintf(os.Stdout, "EDITOR_READY %d %d %d\n", syscall.Getpgrp(), foreground, os.Getppid())
+	input := make([]byte, 1)
+	_, _ = os.Stdin.Read(input)
+	_, _ = os.Stdout.WriteString("\x1b[?2004l\x1b[?1004l\x1b[?1049lEDITOR_EXIT\n")
+}
+
 func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
 	disconnected := make(chan struct{})
 	sub := &subscriber{
@@ -518,6 +740,227 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
 	requireSubscriberContains(t, sub.output, "WINCH", 2*time.Second)
+}
+
+func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
+	dir := t.TempDir()
+	store := localstate.New(filepath.Join(dir, "state.json"))
+	server := &Server{Store: store, runs: map[string]*process{}}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.ResolveExecutable = func(string) (string, error) { return executable, nil }
+	response := callServer(t, server, Request{
+		Action: "start", RunID: "editor", SessionID: "thread", Provider: "codex", CWD: dir,
+		Args:        []string{"-test.run=^TestSupervisorPTYEditorLifecycleHelper$"},
+		Environment: map[string]string{"AGENTSCTL_TEST_EDITOR_LIFECYCLE": "1"},
+	})
+	if !response.OK && strings.Contains(response.Error, "operation not permitted") {
+		t.Skip("sandbox does not permit PTY process spawn")
+	}
+	if !response.OK {
+		t.Fatal(response.Error)
+	}
+
+	p := server.runs["editor"]
+	if p == nil {
+		t.Fatal("run not tracked")
+	}
+	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	if !p.addSubscriber(sub) {
+		t.Fatal("live process rejected subscriber")
+	}
+	defer p.removeSubscriber(sub)
+	var output strings.Builder
+	if _, err := p.ptmx.Write([]byte{'s'}); err != nil {
+		t.Fatal(err)
+	}
+	waitSubscriberText(t, sub.output, &output, "TUI_READY", 2*time.Second)
+
+	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
+	waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+	baselineRedraws := strings.Count(output.String(), "REDRAW ")
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		if _, err := p.ptmx.Write([]byte{'e'}); err != nil {
+			t.Fatal(err)
+		}
+		waitSubscriberCount(t, sub.output, &output, "EDITOR_READY", cycle, 2*time.Second)
+		var editorPGRP, editorForeground, editorParent int
+		if _, err := fmt.Sscanf(textAfterLast(output.String(), "EDITOR_READY "), "%d %d %d", &editorPGRP, &editorForeground, &editorParent); err != nil {
+			t.Fatalf("parse editor process groups from %q: %v", output.String(), err)
+		}
+		managedPGRP, err := syscall.Getpgid(p.cmd.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if editorPGRP != managedPGRP || editorForeground != editorPGRP {
+			t.Fatalf("editor pgrp=%d foreground=%d, want managed Codex pgrp", editorPGRP, editorForeground)
+		}
+		children := directChildren(p.cmd.Process.Pid)
+		if editorParent != p.cmd.Process.Pid || len(children) != 1 {
+			t.Fatalf("editor parent=%d, managed PID=%d, direct children=%v", editorParent, p.cmd.Process.Pid, children)
+		}
+		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws, 150*time.Millisecond)
+
+		if _, err := p.ptmx.Write([]byte{'q'}); err != nil {
+			t.Fatal(err)
+		}
+		waitSubscriberCount(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 2*time.Second)
+		waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+		current, err := pty.GetsizeFull(p.ptmx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Rows != 24 || current.Cols != 80 {
+			t.Fatalf("cycle %d final PTY size=%dx%d, want 24x80", cycle, current.Rows, current.Cols)
+		}
+		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 150*time.Millisecond)
+		baselineRedraws += 2
+	}
+
+	if _, err := p.ptmx.Write([]byte{'x'}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("managed process did not exit")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		server.mu.RLock()
+		_, live := server.runs["editor"]
+		server.mu.RUnlock()
+		if !live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("managed process was not cleaned up")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestExternalEditorRedrawDetector(t *testing.T) {
+	childActive := false
+	editor := processinfo.Identity{PID: 456, StartTime: 789, UID: 10}
+	persistentChild := processinfo.Identity{PID: 123, StartTime: 456, UID: 10}
+	detector := &externalEditorRedrawDetector{
+		listDirectChildren: func() []processinfo.Identity {
+			children := []processinfo.Identity{persistentChild}
+			if childActive {
+				children = append(children, editor)
+			}
+			return children
+		},
+	}
+	detector.refreshKnownChildren()
+	observeBytes := func(sequence string) bool {
+		t.Helper()
+		redraw := false
+		for i := range len(sequence) {
+			if detector.Observe([]byte{sequence[i]}) {
+				redraw = true
+			}
+		}
+		return redraw
+	}
+
+	// A failed launch restores Codex's screen without a direct child. It must
+	// neither redraw nor leave stale state that can fire during the next editor.
+	if observeBytes("\x1b[?2004l\x1b[?1049l\x1b[?1049h\x1b[?2004h") {
+		t.Fatal("editor launch failure triggered redraw")
+	}
+
+	for cycle := 1; cycle <= 2; cycle++ {
+		if observeBytes("\x1b[?2004l") {
+			t.Fatalf("cycle %d Codex suspend triggered redraw", cycle)
+		}
+		childActive = true
+		if observeBytes("\x1b[?1049h\x1b[?2004h") {
+			t.Fatalf("cycle %d editor start triggered redraw", cycle)
+		}
+		if observeBytes("\x1b[?2004l\x1b[?1049l") {
+			t.Fatalf("cycle %d editor exit modes triggered redraw before Codex resumed", cycle)
+		}
+		childActive = false
+		if !observeBytes("\x1b[?1049h\x1b[?2004h") {
+			t.Fatalf("cycle %d Codex resume did not trigger redraw", cycle)
+		}
+		if observeBytes("\x1b[?2004h") {
+			t.Fatalf("cycle %d repeated Codex mode triggered redraw", cycle)
+		}
+	}
+}
+
+func TestExternalEditorRedrawDetectorIsCodexSpecific(t *testing.T) {
+	if detector := newExternalEditorRedrawDetector("claude", 123); detector != nil {
+		t.Fatal("Claude process received Codex editor redraw detector")
+	}
+	if detector := newExternalEditorRedrawDetector("codex", 123); detector == nil {
+		t.Fatal("Codex process did not receive editor redraw detector")
+	}
+}
+
+func waitSubscriberText(t *testing.T, sub <-chan []byte, output *strings.Builder, want string, timeout time.Duration) {
+	t.Helper()
+	waitSubscriber(t, sub, output, timeout, func(text string) bool { return strings.Contains(text, want) })
+}
+
+func waitSubscriberCount(t *testing.T, sub <-chan []byte, output *strings.Builder, want string, count int, timeout time.Duration) {
+	t.Helper()
+	waitSubscriber(t, sub, output, timeout, func(text string) bool { return strings.Count(text, want) >= count })
+}
+
+func waitSubscriber(t *testing.T, sub <-chan []byte, output *strings.Builder, timeout time.Duration, done func(string) bool) {
+	t.Helper()
+	if done(output.String()) {
+		return
+	}
+	deadline := time.After(timeout)
+	for {
+		select {
+		case chunk, ok := <-sub:
+			if !ok {
+				t.Fatalf("subscriber closed with output %q", output.String())
+			}
+			output.Write(chunk)
+			if done(output.String()) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out with output %q", output.String())
+		}
+	}
+}
+
+func assertNoSubscriberText(t *testing.T, sub <-chan []byte, output *strings.Builder, want string, count int, duration time.Duration) {
+	t.Helper()
+	deadline := time.After(duration)
+	for {
+		select {
+		case chunk, ok := <-sub:
+			if !ok {
+				t.Fatalf("subscriber closed with output %q", output.String())
+			}
+			output.Write(chunk)
+			if got := strings.Count(output.String(), want); got != count {
+				t.Fatalf("%q count=%d during editor activity, want %d; output=%q", want, got, count, output.String())
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+func textAfterLast(text, marker string) string {
+	index := strings.LastIndex(text, marker)
+	if index < 0 {
+		return ""
+	}
+	return text[index+len(marker):]
 }
 
 func drainSubscriberFor(sub <-chan []byte, d time.Duration) {

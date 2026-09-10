@@ -26,13 +26,14 @@ import (
 )
 
 type Request struct {
-	Action    string   `json:"action"`
-	RunID     string   `json:"runId,omitempty"`
-	SessionID string   `json:"sessionId,omitempty"`
-	Args      []string `json:"args,omitempty"`
-	CWD       string   `json:"cwd,omitempty"`
-	Provider  string   `json:"provider,omitempty"`
-	Baseline  []string `json:"baseline,omitempty"`
+	Action      string            `json:"action"`
+	RunID       string            `json:"runId,omitempty"`
+	SessionID   string            `json:"sessionId,omitempty"`
+	Args        []string          `json:"args,omitempty"`
+	CWD         string            `json:"cwd,omitempty"`
+	Provider    string            `json:"provider,omitempty"`
+	Baseline    []string          `json:"baseline,omitempty"`
+	Environment map[string]string `json:"environment,omitempty"`
 }
 type Response struct {
 	OK               bool            `json:"ok"`
@@ -51,16 +52,18 @@ type Response struct {
 	Output           string          `json:"output,omitempty"`
 }
 
-const ProtocolVersion = 2
-const BuildVersion = "session-lifecycle-2026-09-03"
+const ProtocolVersion = 3
+const BuildVersion = "child-environment-2026-09-09"
 
 type process struct {
-	run         localstate.Run
-	cmd         *exec.Cmd
-	ptmx        *os.File
-	mu          sync.Mutex
-	subscribers map[*subscriber]struct{}
-	done        chan struct{}
+	run          localstate.Run
+	cmd          *exec.Cmd
+	ptmx         *os.File
+	mu           sync.Mutex
+	resizeMu     sync.Mutex
+	subscribers  map[*subscriber]struct{}
+	done         chan struct{}
+	editorRedraw *externalEditorRedrawDetector
 }
 
 const subscriberBuffer = 64
@@ -217,7 +220,12 @@ func (s *Server) start(c net.Conn, req Request) {
 	}
 	cmd := exec.Command(path, req.Args...)
 	cmd.Dir = req.CWD
-	cmd.Env = environmentWith(os.Environ(), "CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT", "1")
+	overrides := make(map[string]string, len(req.Environment)+1)
+	for key, value := range req.Environment {
+		overrides[key] = value
+	}
+	overrides["CODEX_TUI_DISABLE_KEYBOARD_ENHANCEMENT"] = "1"
+	cmd.Env = mergeEnvironment(os.Environ(), overrides)
 	ptmx, tty, err := pty.Open()
 	if err != nil {
 		_ = s.deleteRun(r.ID)
@@ -242,6 +250,7 @@ func (s *Server) start(c net.Conn, req Request) {
 		r.Error = "process identity unavailable: " + observeErr.Error()
 	}
 	p := &process{run: r, cmd: cmd, ptmx: ptmx, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
+	p.editorRedraw = newExternalEditorRedrawDetector(req.Provider, cmd.Process.Pid)
 	s.mu.Lock()
 	s.runs[r.ID] = p
 	s.mu.Unlock()
@@ -256,7 +265,11 @@ func (s *Server) drain(p *process) {
 		n, err := p.ptmx.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
+			redraw := p.editorRedraw != nil && p.editorRedraw.Observe(chunk)
 			p.broadcast(chunk)
+			if redraw {
+				forcePTYRedraw(p)
+			}
 		}
 		if err != nil {
 			break
@@ -414,17 +427,198 @@ func syncPTYSize(p *process, size protocol.TerminalSize) {
 	if size.Rows == 0 || size.Cols == 0 {
 		return
 	}
+	p.resizeMu.Lock()
+	defer p.resizeMu.Unlock()
+
 	current, err := pty.GetsizeFull(p.ptmx)
 	unchanged := err == nil && current.Rows == size.Rows && current.Cols == size.Cols
 	if unchanged && size.Redraw {
-		bounce := size.Rows - 1
-		if bounce == 0 {
-			bounce = size.Rows + 1
-		}
-		_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: bounce, Cols: size.Cols})
-		time.Sleep(50 * time.Millisecond)
+		forcePTYRedrawLocked(p, current)
+		return
 	}
 	_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: size.Rows, Cols: size.Cols})
+}
+
+func forcePTYRedraw(p *process) {
+	p.resizeMu.Lock()
+	defer p.resizeMu.Unlock()
+
+	current, err := pty.GetsizeFull(p.ptmx)
+	if err != nil || current.Rows == 0 || current.Cols == 0 {
+		return
+	}
+	forcePTYRedrawLocked(p, current)
+}
+
+func forcePTYRedrawLocked(p *process, size *pty.Winsize) {
+	bounce := size.Rows - 1
+	if bounce == 0 {
+		bounce = size.Rows + 1
+	}
+	_ = pty.Setsize(p.ptmx, &pty.Winsize{Rows: bounce, Cols: size.Cols})
+	time.Sleep(50 * time.Millisecond)
+	_ = pty.Setsize(p.ptmx, size)
+}
+
+// externalEditorRedrawDetector recognizes the terminal lifecycle produced by
+// Codex around a full-screen external editor. These are terminal protocol
+// modes, not editor names or UI text: Codex disables bracketed paste before
+// yielding the terminal, the editor enters and leaves the alternate screen,
+// and Codex enables bracketed paste after regaining control. The detector
+// identifies the new direct child at alternate-screen entry and waits for that
+// same process identity to disappear. This avoids confusing a persistent MCP
+// child with the editor and distinguishes an editor launch failure from a
+// successful handoff. Codex waits for the editor child before resuming, so the
+// final mode enable establishes that the child has exited.
+//
+// Waiting for the editor's alternate-screen leave before accepting Codex's
+// resume avoids resizing the PTY while the editor is active. Observe is called
+// only by drain, so its state needs no synchronization and ends with the
+// managed process instead of requiring a polling goroutine.
+type externalEditorRedrawDetector struct {
+	state              externalEditorRedrawState
+	pending            []byte
+	knownChildren      map[processinfo.Identity]struct{}
+	editor             processinfo.Identity
+	listDirectChildren func() []processinfo.Identity
+	refreshChildren    bool
+}
+
+func newExternalEditorRedrawDetector(provider string, pid int) *externalEditorRedrawDetector {
+	if provider != "codex" {
+		return nil
+	}
+	detector := &externalEditorRedrawDetector{
+		listDirectChildren: func() []processinfo.Identity { return directChildren(pid) },
+	}
+	detector.refreshKnownChildren()
+	return detector
+}
+
+type externalEditorRedrawState uint8
+
+const (
+	waitingForCodexSuspend externalEditorRedrawState = iota
+	waitingForEditorScreen
+	waitingForEditorReturn
+	waitingForCodexResume
+)
+
+var terminalLifecycleSequences = []struct {
+	sequence []byte
+	event    byte
+}{
+	{[]byte("\x1b[?2004l"), 'd'},
+	{[]byte("\x1b[?2004h"), 'e'},
+	{[]byte("\x1b[?1049h"), 'i'},
+	{[]byte("\x1b[?1049l"), 'o'},
+}
+
+func (d *externalEditorRedrawDetector) Observe(chunk []byte) bool {
+	data := append(d.pending, chunk...)
+	redraw := false
+	for len(data) > 0 {
+		index, event, length := nextTerminalLifecycleEvent(data)
+		if index < 0 {
+			break
+		}
+		if d.observeEvent(event) {
+			redraw = true
+		}
+		data = data[index+length:]
+	}
+	const longestSequence = len("\x1b[?2004l")
+	if len(data) >= longestSequence {
+		data = data[len(data)-longestSequence+1:]
+	}
+	d.pending = append(d.pending[:0], data...)
+	if d.refreshChildren {
+		d.refreshKnownChildren()
+		d.refreshChildren = false
+	}
+	return redraw
+}
+
+func nextTerminalLifecycleEvent(data []byte) (int, byte, int) {
+	index, event, length := -1, byte(0), 0
+	for _, candidate := range terminalLifecycleSequences {
+		found := bytes.Index(data, candidate.sequence)
+		if found >= 0 && (index < 0 || found < index) {
+			index, event, length = found, candidate.event, len(candidate.sequence)
+		}
+	}
+	return index, event, length
+}
+
+func (d *externalEditorRedrawDetector) observeEvent(event byte) bool {
+	switch d.state {
+	case waitingForCodexSuspend:
+		if event == 'd' {
+			d.state = waitingForEditorScreen
+		}
+	case waitingForEditorScreen:
+		if event == 'i' {
+			if editor, ok := d.newDirectChild(); ok {
+				d.editor = editor
+				d.state = waitingForEditorReturn
+			} else {
+				d.state = waitingForCodexSuspend
+				d.refreshChildren = true
+			}
+		} else if event == 'e' {
+			d.state = waitingForCodexSuspend
+			d.refreshChildren = true
+		}
+	case waitingForEditorReturn:
+		if event == 'o' {
+			d.state = waitingForCodexResume
+		}
+	case waitingForCodexResume:
+		if event == 'e' {
+			d.state = waitingForCodexSuspend
+			d.refreshChildren = true
+			return !d.editorIsRunning()
+		}
+	}
+	return false
+}
+
+func (d *externalEditorRedrawDetector) refreshKnownChildren() {
+	d.knownChildren = make(map[processinfo.Identity]struct{})
+	if d.listDirectChildren == nil {
+		return
+	}
+	for _, child := range d.listDirectChildren() {
+		d.knownChildren[child] = struct{}{}
+	}
+}
+
+func (d *externalEditorRedrawDetector) newDirectChild() (processinfo.Identity, bool) {
+	if d.listDirectChildren == nil {
+		return processinfo.Identity{}, false
+	}
+	var found processinfo.Identity
+	for _, child := range d.listDirectChildren() {
+		if _, known := d.knownChildren[child]; known {
+			continue
+		}
+		if !found.Valid() || child.StartTime > found.StartTime {
+			found = child
+		}
+	}
+	return found, found.Valid()
+}
+
+func (d *externalEditorRedrawDetector) editorIsRunning() bool {
+	if d.listDirectChildren == nil {
+		return false
+	}
+	for _, child := range d.listDirectChildren() {
+		if child == d.editor {
+			return true
+		}
+	}
+	return false
 }
 func (s *Server) stop(c net.Conn, id string) {
 	s.mu.RLock()
@@ -470,7 +664,7 @@ func (c Client) Ensure(ctx context.Context) error {
 		peer, peerErr := peerIdentity(conn)
 		response, pingErr := call(conn, Request{Action: "ping"})
 		_ = conn.Close()
-		if pingErr == nil && response.ProtocolVersion == ProtocolVersion && response.BuildVersion == BuildVersion {
+		if pingErr == nil && compatible(response) {
 			return nil
 		}
 		if pingErr != nil {
@@ -511,7 +705,7 @@ func (c Client) start(ctx context.Context) error {
 			if pingErr != nil {
 				return fmt.Errorf("new supervisor handshake: %w", pingErr)
 			}
-			if response.ProtocolVersion != ProtocolVersion || response.BuildVersion != BuildVersion {
+			if !compatible(response) {
 				return fmt.Errorf("new supervisor has incompatible protocol/build %d/%q", response.ProtocolVersion, response.BuildVersion)
 			}
 			return nil
@@ -523,6 +717,10 @@ func (c Client) start(ctx context.Context) error {
 		}
 	}
 	return errors.New("supervisor did not start")
+}
+
+func compatible(response Response) bool {
+	return response.ProtocolVersion == ProtocolVersion && response.BuildVersion == BuildVersion
 }
 
 func (c Client) restartOwned(ctx context.Context, response Response) error {
@@ -676,13 +874,19 @@ func call(conn net.Conn, req Request) (Response, error) {
 	return res, nil
 }
 
-func environmentWith(environment []string, key, value string) []string {
-	prefix := key + "="
-	result := make([]string, 0, len(environment)+1)
+func mergeEnvironment(environment []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(environment)+len(overrides))
 	for _, entry := range environment {
-		if !strings.HasPrefix(entry, prefix) {
-			result = append(result, entry)
+		key, _, found := strings.Cut(entry, "=")
+		if found {
+			if _, overridden := overrides[key]; overridden {
+				continue
+			}
 		}
+		result = append(result, entry)
 	}
-	return append(result, prefix+value)
+	for key, value := range overrides {
+		result = append(result, key+"="+value)
+	}
+	return result
 }
