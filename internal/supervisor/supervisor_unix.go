@@ -53,7 +53,18 @@ type Response struct {
 }
 
 const ProtocolVersion = 3
-const BuildVersion = "child-environment-2026-09-09"
+
+// BuildVersion changed here to attach-backpressure-2026-09-10: the wire
+// format itself (frame layout, Request/Response shapes, the Failure frame
+// kind) is unchanged from the previous build, so ProtocolVersion did not
+// move -- but subscriber.writeTo's backpressure, disconnect, and error-
+// reporting behavior changed enough (see issue #31) that a client built
+// against this behavior must never keep talking to an already-running
+// daemon still running the old implementation. See compatible and
+// Client.restartOwned: an incompatible owned daemon with no active
+// managed run is restarted automatically; one with an active run is left
+// alone rather than silently discarding it.
+const BuildVersion = "attach-backpressure-2026-09-10"
 
 type process struct {
 	run          localstate.Run
@@ -66,12 +77,224 @@ type process struct {
 	editorRedraw *externalEditorRedrawDetector
 }
 
-const subscriberBuffer = 64
+// subscriberMaxBufferedBytes bounds how much PTY output a single attach
+// subscriber may have outstanding -- queued in buf *and* already handed
+// to writeTo but not yet confirmed delivered (see inFlight) -- before it
+// is judged too slow to keep and is disconnected. The bound is on total
+// bytes, never on the number of PTY read() chunks: a burst of many small
+// writes (e.g. a Codex redraw made of many short escape sequences) must
+// not exhaust a chunk-counted queue while the underlying byte volume is
+// still trivial -- that chunk-vs-byte mismatch was the root cause of
+// issue #31. 4 MiB comfortably absorbs realistic full-screen redraws many
+// times over while keeping the worst-case per-subscriber memory cost
+// small and fixed.
+const subscriberMaxBufferedBytes = 4 << 20
 
+// subscriberOutputFrameSize bounds how many bytes writeTo hands to a
+// single Output write. Splitting a large flush into pieces this size
+// limits how much of the stream one stalled write can tear (see
+// protocol.WriteFrame) and lets a stall be detected within roughly one
+// subscriberWriteTimeout of the consumer actually stopping, rather than
+// after an entire multi-megabyte flush's deadline.
+const subscriberOutputFrameSize = 32 << 10
+
+// subscriberWriteTimeout bounds how long a single Output piece write to
+// an attach connection may block. subscriberMaxBufferedBytes alone
+// reclaims a subscriber that is merely slow (still draining, just more
+// slowly than output is produced); this instead reclaims one whose
+// consumer has stopped reading altogether, which would otherwise block
+// the writer goroutine forever with no way to ever notice the subscriber
+// has since been closed.
+const subscriberWriteTimeout = 5 * time.Second
+
+// subscriberFailureFlushTimeout bounds the one best-effort attempt to
+// deliver a terminal Exit/Failure frame once a subscriber is closing --
+// always a short, fixed-size frame, so it does not need
+// subscriberWriteTimeout's more generous allowance for a large Output
+// payload.
+const subscriberFailureFlushTimeout = 2 * time.Second
+
+// subscriberCloseReason records why a subscriber's output pump is ending,
+// so writeTo knows which terminal frame, if any, to send before closing
+// the connection.
+type subscriberCloseReason uint8
+
+const (
+	subscriberOpen subscriberCloseReason = iota
+	subscriberClosedByDetach
+	subscriberClosedByProcessExit
+	subscriberClosedByOverflow
+	subscriberClosedByStall
+)
+
+// subscriber is one attach connection's PTY output pump. broadcast never
+// touches the network connection directly: it only appends to buf, a
+// buffer bounded by subscriberMaxBufferedBytes and drained by a dedicated
+// writeTo goroutine. append is a fast, in-memory, lock-protected slice
+// append, never an I/O call, so a slow or stalled consumer can never block
+// PTY draining or any other subscriber.
 type subscriber struct {
-	output     chan []byte
-	disconnect func()
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      []byte
+	inFlight int // bytes writeTo currently holds outside buf, not yet confirmed delivered
+	reason   subscriberCloseReason
+	detail   string // set for subscriberClosedByOverflow and subscriberClosedByStall
 }
+
+func newSubscriber() *subscriber {
+	sub := &subscriber{}
+	sub.cond = sync.NewCond(&sub.mu)
+	return sub
+}
+
+// append adds chunk to the subscriber's pending output. If appending
+// would push inFlight+buf past subscriberMaxBufferedBytes, chunk is
+// rejected and the subscriber is instead marked closed with an overflow
+// reason -- bytes already accepted are kept so writeTo can still flush
+// them before reporting the failure. It reports whether this call is what
+// closed the subscriber, so broadcast knows to drop it from the live set.
+func (s *subscriber) append(chunk []byte) (closedNow bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != subscriberOpen {
+		return false
+	}
+	if s.inFlight+len(s.buf)+len(chunk) > subscriberMaxBufferedBytes {
+		s.reason = subscriberClosedByOverflow
+		s.detail = fmt.Sprintf("attach output buffer exceeded %d bytes; consumer was not keeping up", subscriberMaxBufferedBytes)
+		s.cond.Broadcast()
+		return true
+	}
+	s.buf = append(s.buf, chunk...)
+	s.cond.Broadcast()
+	return false
+}
+
+// close marks the subscriber closed for reason, unless it is already
+// closed for a different one -- whichever reason wins the race is the one
+// writeTo reports, and a later call never overwrites it.
+func (s *subscriber) close(reason subscriberCloseReason) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != subscriberOpen {
+		return
+	}
+	s.reason = reason
+	s.cond.Broadcast()
+}
+
+// writeTo drains the subscriber's buffered output to conn until it is
+// closed, sends the terminal frame its close reason calls for, and always
+// closes conn itself. Closing conn unconditionally -- not just on a
+// failure path -- is what reclaims an attach whose consumer never sends
+// anything and never hangs up on its own: it unblocks the attach loop's
+// blocked protocol.Read(conn) regardless of client behavior.
+func (s *subscriber) writeTo(conn net.Conn) {
+	defer conn.Close()
+	for {
+		s.mu.Lock()
+		for len(s.buf) == 0 && s.reason == subscriberOpen {
+			s.cond.Wait()
+		}
+		pending := s.buf
+		s.buf = nil
+		s.inFlight = len(pending)
+		reason, detail := s.reason, s.detail
+		s.mu.Unlock()
+
+		if !s.flush(conn, pending) {
+			return // stalled or torn -- already reported (if it was safe to) and given up on above
+		}
+		switch reason {
+		case subscriberOpen:
+			continue
+		case subscriberClosedByProcessExit:
+			_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
+			_ = protocol.Write(conn, protocol.Exit, nil)
+			return
+		case subscriberClosedByOverflow, subscriberClosedByStall:
+			s.sendFailure(conn, detail)
+			return
+		default: // subscriberClosedByDetach
+			return
+		}
+	}
+}
+
+// flush writes pending to conn in subscriberOutputFrameSize pieces,
+// reporting whether every piece was delivered. On failure it uses
+// protocol.WriteFrame's torn result to decide what is still safe to do:
+// a torn piece desynchronizes conn's framing, so nothing more is ever
+// written to it, only closed (via writeTo's deferred conn.Close); a clean
+// failure (the piece never touched the wire at all) leaves conn at a
+// valid frame boundary, so flush marks the subscriber closed for a stall
+// and makes one best-effort attempt to explain why before giving up --
+// this is what lets a stalled consumer see an explicit reason instead of
+// a bare EOF.
+func (s *subscriber) flush(conn net.Conn, pending []byte) bool {
+	for len(pending) > 0 {
+		n := min(len(pending), subscriberOutputFrameSize)
+		_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+		torn, err := protocol.WriteFrame(conn, protocol.Output, pending[:n])
+		if err != nil {
+			s.handleFlushFailure(conn, torn)
+			return false
+		}
+		pending = pending[n:]
+		s.mu.Lock()
+		s.inFlight = len(pending)
+		s.mu.Unlock()
+	}
+	return true
+}
+
+// handleFlushFailure decides and, when it is safe to, sends the terminal
+// frame for an Output write that failed partway through a flush. The
+// close reason it acts on may have been decided by this very failure
+// (a still-open subscriber becomes subscriberClosedByStall), or it may
+// already have been decided by a concurrent close()/append() call racing
+// this same write (Detach, ProcessExit, Overflow) -- either way,
+// handleFlushFailure re-reads s.reason itself rather than trusting a
+// snapshot taken before the write, so a reason set by that race is always
+// honored over turning the disconnect into a generic, undifferentiated
+// stall. It never sends an empty Failure frame: Detach and ProcessExit
+// each get the same terminal action a successful flush ending in that
+// reason would have gotten (nothing, and Exit, respectively), never
+// Failure.
+func (s *subscriber) handleFlushFailure(conn net.Conn, torn bool) {
+	s.mu.Lock()
+	s.inFlight = 0
+	if s.reason == subscriberOpen {
+		s.reason = subscriberClosedByStall
+		s.detail = "attach output write stalled: consumer stopped accepting output"
+	}
+	reason, detail := s.reason, s.detail
+	s.mu.Unlock()
+
+	if torn {
+		return // framing is desynchronized: never write anything else to conn
+	}
+	switch reason {
+	case subscriberClosedByOverflow, subscriberClosedByStall:
+		s.sendFailure(conn, detail)
+	case subscriberClosedByProcessExit:
+		_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
+		_ = protocol.Write(conn, protocol.Exit, nil)
+	case subscriberClosedByDetach:
+		// no frame: the client already knows it is detaching
+	}
+}
+
+// sendFailure makes one best-effort, short-deadline attempt to deliver a
+// protocol.Failure frame explaining why the subscriber is being
+// disconnected. Called only when the connection is known to still be at a
+// clean frame boundary (see flush and writeTo).
+func (s *subscriber) sendFailure(conn net.Conn, detail string) {
+	_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
+	_ = protocol.Write(conn, protocol.Failure, []byte(detail))
+}
+
 type Server struct {
 	Socket            string
 	Store             *localstate.Store
@@ -298,29 +521,24 @@ func (s *Server) attach(c net.Conn, id string) {
 	run := p.run
 	p.mu.Unlock()
 	respond(c, Response{OK: true, Run: &run})
-	sub := &subscriber{
-		output:     make(chan []byte, subscriberBuffer),
-		disconnect: func() { _ = c.Close() },
-	}
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		_ = protocol.Write(c, protocol.Exit, nil)
 		return
 	}
-	defer p.removeSubscriber(sub)
-	done := make(chan struct{})
+	writerDone := make(chan struct{})
 	go func() {
-		defer close(done)
-		for b := range sub.output {
-			if protocol.Write(c, protocol.Output, b) != nil {
-				return
-			}
-		}
-		select {
-		case <-p.done:
-			_ = protocol.Write(c, protocol.Exit, nil)
-		default:
-		}
+		defer close(writerDone)
+		sub.writeTo(c)
 	}()
+	// removeSubscriber runs first (LIFO) so a return from any branch below
+	// (read error, Detach) marks sub closed and wakes writeTo; only then
+	// do we wait for it, so this can never hang on a subscriber that was
+	// never told to stop. writeTo closing c also covers the reverse order
+	// -- a writer-initiated close (process exit, overflow) -- by
+	// unblocking the protocol.Read below regardless of client behavior.
+	defer func() { <-writerDone }()
+	defer p.removeSubscriber(sub)
 	for {
 		kind, b, err := protocol.Read(c)
 		if err != nil {
@@ -337,32 +555,17 @@ func (s *Server) attach(c net.Conn, id string) {
 		case protocol.Detach:
 			return
 		}
-		select {
-		case <-done:
-			return
-		default:
-		}
 	}
 }
 
 func (p *process) broadcast(chunk []byte) {
-	var disconnect []func()
 	p.mu.Lock()
 	for sub := range p.subscribers {
-		select {
-		case sub.output <- chunk:
-		default:
+		if sub.append(chunk) {
 			delete(p.subscribers, sub)
-			close(sub.output)
-			disconnect = append(disconnect, sub.disconnect)
 		}
 	}
 	p.mu.Unlock()
-	for _, closeConnection := range disconnect {
-		if closeConnection != nil {
-			closeConnection()
-		}
-	}
 }
 
 func (p *process) addSubscriber(sub *subscriber) bool {
@@ -379,12 +582,9 @@ func (p *process) addSubscriber(sub *subscriber) bool {
 
 func (p *process) removeSubscriber(sub *subscriber) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if _, ok := p.subscribers[sub]; !ok {
-		return
-	}
 	delete(p.subscribers, sub)
-	close(sub.output)
+	p.mu.Unlock()
+	sub.close(subscriberClosedByDetach)
 }
 
 func (p *process) finishSubscribers() {
@@ -392,7 +592,7 @@ func (p *process) finishSubscribers() {
 	defer p.mu.Unlock()
 	close(p.done)
 	for sub := range p.subscribers {
-		close(sub.output)
+		sub.close(subscriberClosedByProcessExit)
 	}
 	p.subscribers = map[*subscriber]struct{}{}
 }
@@ -730,6 +930,22 @@ func (c Client) restartOwned(ctx context.Context, response Response) error {
 	if !sameExecutable(response.DaemonExecutable, c.DaemonPath) {
 		return errors.New("existing daemon executable does not match this agentsctl binary")
 	}
+	// An incompatible daemon still owns the PTY and process of any
+	// managed run it is running (see the DesignDoc's Codex supervisor
+	// Lifetime section): killing it here would lose that run exactly the
+	// way a supervisor crash does, with no chance for the run to finish
+	// or be attached to again. Refuse rather than silently discard it --
+	// mirrors restartLegacyOwned's identical check for the pre-versioning
+	// daemon case.
+	runs, err := localstate.New(c.StatePath).Runs()
+	if err != nil {
+		return fmt.Errorf("inspect existing daemon state: %w", err)
+	}
+	for _, run := range runs {
+		if run.State == "running" || run.State == "starting" {
+			return errors.New("existing daemon still owns an active managed run; stop it or wait for it to finish, then retry")
+		}
+	}
 	if err := processinfo.Match(processinfo.Identity{PID: response.DaemonPID, StartTime: response.DaemonStartTime, UID: response.DaemonUID}); err != nil {
 		return fmt.Errorf("existing daemon identity changed: %w", err)
 	}
@@ -738,9 +954,11 @@ func (c Client) restartOwned(ctx context.Context, response Response) error {
 	}
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := net.DialTimeout("unix", c.Socket, 50*time.Millisecond); err != nil {
+		conn, dialErr := net.DialTimeout("unix", c.Socket, 50*time.Millisecond)
+		if dialErr != nil {
 			return nil
 		}
+		_ = conn.Close() // still alive: this poll's own connection must not leak and sit unread on the daemon's side
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -785,9 +1003,11 @@ func (c Client) restartLegacyOwned(ctx context.Context, identity processinfo.Ide
 func (c Client) waitStopped(ctx context.Context, label string) error {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := net.DialTimeout("unix", c.Socket, 50*time.Millisecond); err != nil {
+		conn, dialErr := net.DialTimeout("unix", c.Socket, 50*time.Millisecond)
+		if dialErr != nil {
 			return nil
 		}
+		_ = conn.Close() // still alive: this poll's own connection must not leak and sit unread on the daemon's side
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

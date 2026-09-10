@@ -694,7 +694,13 @@ supervisor とは以下の compatibility を確認する。
 - Protocol version
 - Build generation
 
+Protocol version は wire format (frame 構造・request/response の contract) の互換性を表す。Build generation は、wire format が同じでも supervisor 実装や runtime の振る舞いが異なる場合に区別するために用いる。振る舞いのみの変更は Protocol version を上げず、Build generation のみを更新する。
+
 互換性を確認できない daemon を、そのまま再利用しない。
+
+active managed run を持たない場合のみ、互換性のない daemon を自動的に再起動する。
+
+active managed run を持つ daemon は自動再起動の対象にしない。managed process と PTY は daemon の生存に紐づくため、run が残ったまま daemon を再起動すると run を失う。利用者が該当 run を終了させるまで、既存 daemon を維持する。
 
 #### Process ownership and identity
 
@@ -793,6 +799,10 @@ supervisor は PTY output を attach subscriber へ配信する。
 subscriber が遅い場合でも、PTY 自体の read loop を停止させない。
 
 session process の進行を UI client の描画速度に依存させない。
+
+subscriber ごとの output buffer は bytes 単位で bound する。PTY read() の chunk 数を容量単位として扱わない。
+
+buffer 上限を超えて追いつけない subscriber は、切断理由を Failure frame で明示したうえで attach を終了する。この切断は attach channel のみに関与し、managed process の lifetime には関与しない。
 
 #### OS boundaries
 

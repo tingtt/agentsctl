@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -148,6 +149,25 @@ func TestHandshakeReportsProtocolBuildAndDaemonIdentity(t *testing.T) {
 func TestCompatibilityRejectsSupervisorWithoutEnvironmentOverrides(t *testing.T) {
 	if compatible(Response{ProtocolVersion: 2, BuildVersion: "session-lifecycle-2026-09-03"}) {
 		t.Fatal("protocol 2 supervisor was treated as compatible with environment overrides")
+	}
+	if !compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: BuildVersion}) {
+		t.Fatal("current supervisor protocol/build was treated as incompatible")
+	}
+}
+
+// TestCompatibilityRequiresExactBuildVersionMatch isolates BuildVersion
+// sensitivity from ProtocolVersion: an owned daemon can share today's
+// wire format (same ProtocolVersion) while still running an older
+// supervisor implementation (a different BuildVersion) whose runtime
+// behavior a new client must not silently keep talking to -- see issue
+// #31, where a still-running pre-fix daemon's chunk-counted subscriber
+// queue kept overflowing attach connections even after the client
+// binary itself had been upgraded, because ProtocolVersion alone hadn't
+// changed and the old BuildVersion was never distinguished from the new
+// one.
+func TestCompatibilityRequiresExactBuildVersionMatch(t *testing.T) {
+	if compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: "child-environment-2026-09-09"}) {
+		t.Fatal("a same-protocol daemon on the previous BuildVersion was treated as compatible")
 	}
 	if !compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: BuildVersion}) {
 		t.Fatal("current supervisor protocol/build was treated as incompatible")
@@ -424,6 +444,171 @@ func TestLegacyDaemonHelper(t *testing.T) {
 	_ = listener.Close()
 }
 
+// TestOwnedRestartRefusesActiveManagedRun is restartOwned's counterpart to
+// TestLegacyRestartRefusesActiveManagedRun: a daemon that already reports
+// a ProtocolVersion/BuildVersion (so Ensure routes it through
+// restartOwned, not restartLegacyOwned) must be refused the same way if
+// it still owns an active managed run -- killing it would lose that run's
+// PTY and process exactly as a crash would (see the DesignDoc's Codex
+// supervisor Lifetime section), with no chance to attach again or let it
+// finish. This never needs to actually kill anything, so it uses the test
+// process's own identity as a stand-in "existing daemon", just as the
+// legacy version does.
+func TestOwnedRestartRefusesActiveManagedRun(t *testing.T) {
+	dir := shortTempDir(t)
+	statePath := filepath.Join(dir, "state.json")
+	store := localstate.New(statePath)
+	if err := store.StartRun(localstate.Run{ID: "active", State: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := processinfo.Observe(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := Client{Socket: filepath.Join(dir, "supervisor.sock"), StatePath: statePath, DaemonPath: executable}
+	response := Response{
+		DaemonPID: identity.PID, DaemonStartTime: identity.StartTime, DaemonUID: identity.UID,
+		DaemonExecutable: executable,
+	}
+	err = client.restartOwned(context.Background(), response)
+	if err == nil || !strings.Contains(err.Error(), "active managed run") {
+		t.Fatalf("restart error=%v, want active-run refusal", err)
+	}
+}
+
+// TestOwnedRestartStopsVerifiedIdleDaemon is restartOwned's counterpart to
+// TestLegacyRestartStopsVerifiedIdleDaemon: an owned daemon reporting a
+// different BuildVersion (the exact shape of issue #31's stale-supervisor
+// case -- see TestCompatibilityRequiresExactBuildVersionMatch) and no
+// active managed run is safe to restart automatically.
+func TestOwnedRestartStopsVerifiedIdleDaemon(t *testing.T) {
+	dir := shortTempDir(t)
+	socket := filepath.Join(dir, "supervisor.sock")
+	probe := listenUnixOrSkip(t, socket)
+	_ = probe.Close()
+	_ = os.Remove(socket)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestVersionedDaemonHelper$")
+	command.Env = append(os.Environ(),
+		"AGENTSCTL_VERSIONED_HELPER=1",
+		"AGENTSCTL_VERSIONED_SOCKET="+socket,
+		"AGENTSCTL_VERSIONED_PROTOCOL="+strconv.Itoa(ProtocolVersion),
+		"AGENTSCTL_VERSIONED_BUILD=child-environment-2026-09-09",
+	)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- command.Wait() }()
+	t.Cleanup(func() {
+		_ = command.Process.Kill()
+		select {
+		case <-waited:
+		default:
+		}
+	})
+	waitForSocket(t, socket, waited)
+	conn, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := call(conn, Request{Action: "ping"})
+	_ = conn.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compatible(response) {
+		t.Fatalf("versioned helper build=%q was treated as compatible with the current BuildVersion", response.BuildVersion)
+	}
+	client := Client{Socket: socket, StatePath: filepath.Join(dir, "state.json"), DaemonPath: executable}
+	if err := client.restartOwned(context.Background(), response); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("versioned helper exit: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("versioned helper did not exit")
+	}
+}
+
+// TestVersionedDaemonHelper is a child-process fixture (never run as a
+// test on its own) modeling a real owned daemon from an older build: it
+// answers a ping with the ProtocolVersion/BuildVersion and identity its
+// caller asks for, then waits for SIGTERM like a real supervisor's
+// Serve loop does.
+func TestVersionedDaemonHelper(t *testing.T) {
+	if os.Getenv("AGENTSCTL_VERSIONED_HELPER") != "1" {
+		return
+	}
+	socket := os.Getenv("AGENTSCTL_VERSIONED_SOCKET")
+	protocolVersion, err := strconv.Atoi(os.Getenv("AGENTSCTL_VERSIONED_PROTOCOL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	buildVersion := os.Getenv("AGENTSCTL_VERSIONED_BUILD")
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := processinfo.Observe(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(socket, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	terminated := make(chan os.Signal, 1)
+	signal.Notify(terminated, syscall.SIGTERM)
+	go func() {
+		<-terminated
+		_ = listener.Close()
+	}()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		// A goroutine per connection, matching Server.Serve's real
+		// handling: a client that dials and never sends or closes (e.g.
+		// a Client.restartOwned/waitStopped liveness poll -- see the
+		// leaked-connection fix those got in this same change) must
+		// never block this loop from reaching listener.Accept() again to
+		// observe the SIGTERM handler's listener.Close() above.
+		go func() {
+			defer conn.Close()
+			kind, b, err := protocol.Read(conn)
+			if err != nil || kind != protocol.Request {
+				return
+			}
+			var req Request
+			if json.Unmarshal(b, &req) != nil || req.Action != "ping" {
+				return
+			}
+			res := Response{
+				OK: true, ProtocolVersion: protocolVersion, BuildVersion: buildVersion,
+				DaemonPID: identity.PID, DaemonStartTime: identity.StartTime, DaemonUID: identity.UID,
+				DaemonExecutable: executable,
+			}
+			resBytes, _ := json.Marshal(res)
+			_ = protocol.Write(conn, protocol.Response, resBytes)
+		}()
+	}
+}
+
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "agentsctl-test-")
@@ -565,50 +750,6 @@ func TestSupervisorPTYEditorChildHelper(t *testing.T) {
 	_, _ = os.Stdout.WriteString("\x1b[?2004l\x1b[?1004l\x1b[?1049lEDITOR_EXIT\n")
 }
 
-func TestSlowSubscriberIsDisconnectedBeforeOutputCanBeDropped(t *testing.T) {
-	disconnected := make(chan struct{})
-	sub := &subscriber{
-		output:     make(chan []byte, subscriberBuffer),
-		disconnect: func() { close(disconnected) },
-	}
-	p := &process{
-		subscribers: map[*subscriber]struct{}{sub: {}},
-		done:        make(chan struct{}),
-	}
-	for i := range subscriberBuffer {
-		p.broadcast([]byte{byte(i)})
-	}
-	select {
-	case <-disconnected:
-		t.Fatal("subscriber disconnected before its bounded queue filled")
-	default:
-	}
-	p.broadcast([]byte("overflow"))
-	select {
-	case <-disconnected:
-	default:
-		t.Fatal("full subscriber remained attached after output could not be queued")
-	}
-	p.mu.Lock()
-	remaining := len(p.subscribers)
-	p.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("subscribers=%d, want 0 after overflow", remaining)
-	}
-	for i := range subscriberBuffer {
-		chunk, ok := <-sub.output
-		if !ok {
-			t.Fatalf("subscriber queue closed after %d chunks, want %d", i, subscriberBuffer)
-		}
-		if len(chunk) != 1 || chunk[0] != byte(i) {
-			t.Fatalf("chunk %d=%v, want ordered byte %d", i, chunk, i)
-		}
-	}
-	if _, ok := <-sub.output; ok {
-		t.Fatal("subscriber queue remained open after disconnect")
-	}
-}
-
 func TestManagedProcessExitEndsAttachAfterQueuedOutput(t *testing.T) {
 	p := &process{
 		run:         localstate.Run{ID: "r"},
@@ -725,21 +866,23 @@ func TestReattachForcesRedrawEvenWhenSizeIsUnchanged(t *testing.T) {
 	}
 	// The production drain() goroutine is the only reader of p.ptmx (a second
 	// direct reader would race it for bytes), so observe output the same way
-	// a real attach does: through a subscriber channel fed by that broadcast.
-	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	// a real attach does: through a subscriber fed by that broadcast, driven
+	// over its real writeTo output pump.
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		t.Fatal("live process rejected subscriber")
 	}
 	defer p.removeSubscriber(sub)
+	out := testSubscriberOutput(t, sub)
 
 	// Establish a known starting size (mirrors the real attach flow, which
 	// sends a Resize frame on connect) before exercising the same-size
 	// reattach path below, and let the helper's signal.Notify land.
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	drainSubscriberFor(sub.output, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
+	drainSubscriberFor(out, 200*time.Millisecond) // let any WINCH from the initial size settle and discard it
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80, Redraw: true})
-	requireSubscriberContains(t, sub.output, "WINCH", 2*time.Second)
+	requireSubscriberContains(t, out, "WINCH", 2*time.Second)
 }
 
 func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
@@ -767,26 +910,27 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 	if p == nil {
 		t.Fatal("run not tracked")
 	}
-	sub := &subscriber{output: make(chan []byte, subscriberBuffer), disconnect: func() {}}
+	sub := newSubscriber()
 	if !p.addSubscriber(sub) {
 		t.Fatal("live process rejected subscriber")
 	}
 	defer p.removeSubscriber(sub)
+	out := testSubscriberOutput(t, sub)
 	var output strings.Builder
 	if _, err := p.ptmx.Write([]byte{'s'}); err != nil {
 		t.Fatal(err)
 	}
-	waitSubscriberText(t, sub.output, &output, "TUI_READY", 2*time.Second)
+	waitSubscriberText(t, out, &output, "TUI_READY", 2*time.Second)
 
 	syncPTYSize(p, protocol.TerminalSize{Rows: 24, Cols: 80})
-	waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+	waitSubscriberText(t, out, &output, "REDRAW 24x80", 2*time.Second)
 	baselineRedraws := strings.Count(output.String(), "REDRAW ")
 
 	for cycle := 1; cycle <= 2; cycle++ {
 		if _, err := p.ptmx.Write([]byte{'e'}); err != nil {
 			t.Fatal(err)
 		}
-		waitSubscriberCount(t, sub.output, &output, "EDITOR_READY", cycle, 2*time.Second)
+		waitSubscriberCount(t, out, &output, "EDITOR_READY", cycle, 2*time.Second)
 		var editorPGRP, editorForeground, editorParent int
 		if _, err := fmt.Sscanf(textAfterLast(output.String(), "EDITOR_READY "), "%d %d %d", &editorPGRP, &editorForeground, &editorParent); err != nil {
 			t.Fatalf("parse editor process groups from %q: %v", output.String(), err)
@@ -802,13 +946,13 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 		if editorParent != p.cmd.Process.Pid || len(children) != 1 {
 			t.Fatalf("editor parent=%d, managed PID=%d, direct children=%v", editorParent, p.cmd.Process.Pid, children)
 		}
-		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws, 150*time.Millisecond)
+		assertNoSubscriberText(t, out, &output, "REDRAW ", baselineRedraws, 150*time.Millisecond)
 
 		if _, err := p.ptmx.Write([]byte{'q'}); err != nil {
 			t.Fatal(err)
 		}
-		waitSubscriberCount(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 2*time.Second)
-		waitSubscriberText(t, sub.output, &output, "REDRAW 24x80", 2*time.Second)
+		waitSubscriberCount(t, out, &output, "REDRAW ", baselineRedraws+2, 2*time.Second)
+		waitSubscriberText(t, out, &output, "REDRAW 24x80", 2*time.Second)
 		current, err := pty.GetsizeFull(p.ptmx)
 		if err != nil {
 			t.Fatal(err)
@@ -816,7 +960,7 @@ func TestEditorReturnForcesRedrawWithoutClientResize(t *testing.T) {
 		if current.Rows != 24 || current.Cols != 80 {
 			t.Fatalf("cycle %d final PTY size=%dx%d, want 24x80", cycle, current.Rows, current.Cols)
 		}
-		assertNoSubscriberText(t, sub.output, &output, "REDRAW ", baselineRedraws+2, 150*time.Millisecond)
+		assertNoSubscriberText(t, out, &output, "REDRAW ", baselineRedraws+2, 150*time.Millisecond)
 		baselineRedraws += 2
 	}
 
@@ -902,6 +1046,33 @@ func TestExternalEditorRedrawDetectorIsCodexSpecific(t *testing.T) {
 	if detector := newExternalEditorRedrawDetector("codex", 123); detector == nil {
 		t.Fatal("Codex process did not receive editor redraw detector")
 	}
+}
+
+// testSubscriberOutput drives sub's real writeTo output pump over an
+// in-memory pipe and republishes each Output frame's payload on a
+// channel, so tests can observe broadcast content the same way these
+// helpers did before subscriber moved to a byte-bounded buffer plus
+// dedicated writer goroutine -- but now through the same code path a real
+// attach uses instead of a bespoke test seam.
+func testSubscriberOutput(t *testing.T, sub *subscriber) <-chan []byte {
+	t.Helper()
+	client, server := net.Pipe()
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	go sub.writeTo(server)
+	out := make(chan []byte)
+	go func() {
+		defer close(out)
+		for {
+			kind, data, err := protocol.Read(client)
+			if err != nil {
+				return
+			}
+			if kind == protocol.Output {
+				out <- data
+			}
+		}
+	}()
+	return out
 }
 
 func waitSubscriberText(t *testing.T, sub <-chan []byte, output *strings.Builder, want string, timeout time.Duration) {
