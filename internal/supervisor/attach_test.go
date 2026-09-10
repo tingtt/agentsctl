@@ -345,7 +345,12 @@ func TestClientAttachNaturalExitReturnsCleanly(t *testing.T) {
 }
 
 // TestClientAttachFailureReturnsError covers an attach-time/runtime error
-// (protocol.Failure).
+// (protocol.Failure). Unlike an unexpected bare connection close (see
+// TestClientAttachUnexpectedConnectionCloseReturnsError), a Failure frame
+// carries a specific reason the supervisor chose to report, and that
+// reason must reach the caller unmodified -- not generalized into the
+// same "attach connection closed unexpectedly" message a reasonless close
+// gets.
 func TestClientAttachFailureReturnsError(t *testing.T) {
 	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
 		_ = protocol.Write(conn, protocol.Failure, []byte("boom"))
@@ -358,8 +363,12 @@ func TestClientAttachFailureReturnsError(t *testing.T) {
 	defer slave.Close()
 
 	client := Client{Socket: sock}
-	if err := client.Attach(context.Background(), "run1", slave, io.Discard); err == nil {
+	err = client.Attach(context.Background(), "run1", slave, io.Discard)
+	if err == nil {
 		t.Fatal("expected an error from a protocol.Failure frame")
+	}
+	if err.Error() != "boom" {
+		t.Fatalf("err=%q, want the server's specific reason %q unmodified", err.Error(), "boom")
 	}
 }
 

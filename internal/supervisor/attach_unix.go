@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -158,7 +159,7 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 				if inputResult.detached {
 					return nil
 				}
-				return msg.err
+				return attachTransportError(msg.err)
 			}
 			switch msg.kind {
 			case protocol.Output:
@@ -172,6 +173,30 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 			}
 		}
 	}
+}
+
+// attachTransportError normalizes an unexpected attach-connection read
+// failure (one that is neither a local Ctrl+] detach nor a caller
+// cancellation) into one message the caller can act on. Client.attach
+// cannot tell a supervisor-initiated close it was given no reason for
+// (see protocol.Failure, handled separately and left untouched by this)
+// apart from a supervisor crash, a broken Unix socket, or the peer simply
+// going away, so it must not guess a specific cause for any of them --
+// doing so risks misattributing, say, a real supervisor crash to "the
+// consumer was too slow". err is wrapped, not discarded, so
+// errors.Is(result, io.EOF) and similar checks on the underlying cause
+// still work for a caller that needs them.
+//
+// This is applied only to protocol.Read(conn)'s own errors (msg.err in
+// the attach loop below), not to inputResult.err: a failure from the
+// input pump can just as easily be a local terminal I/O error as a
+// remote write failure, and mislabeling a local failure as an attach
+// transport problem would be actively misleading.
+func attachTransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("attach connection closed unexpectedly: %w", err)
 }
 
 func pumpAttachInput(ctx context.Context, in *os.File, frames *lockedFrames) inputOutcome {

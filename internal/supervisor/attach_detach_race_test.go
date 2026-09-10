@@ -4,6 +4,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -104,6 +105,14 @@ func TestClientAttachLocalDetachWinsConnectionCloseRace(t *testing.T) {
 // connection close/EOF must still surface as an error, not be mistaken for
 // a clean detach. This guards against an over-broad fix that simply
 // ignores io.EOF or turns every connection error into success.
+//
+// It also fixes the normalization this connection-close path must apply
+// at the attach client boundary: a bare "EOF" is not shown to the caller
+// (which would surface, unhelpfully, as "! error: EOF" in Agent View),
+// but the underlying cause is still reachable via errors.Is for a caller
+// that needs it -- distinct from a protocol.Failure, which carries a
+// specific reason the supervisor chose to report and must pass through
+// unmodified (see TestClientAttachFailureReturnsError).
 func TestClientAttachUnexpectedConnectionCloseReturnsError(t *testing.T) {
 	serverClosed := make(chan struct{})
 	sock := fakeSupervisorSocket(t, func(conn net.Conn) {
@@ -139,6 +148,12 @@ func TestClientAttachUnexpectedConnectionCloseReturnsError(t *testing.T) {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("Attach err=nil, want an error for an unexpected connection close with no local detach")
+		}
+		if err.Error() == "EOF" {
+			t.Fatalf("Attach surfaced a bare %q, want a generic attach transport error", err.Error())
+		}
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("Attach err=%v, want it to still satisfy errors.Is(err, io.EOF)", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Attach did not return after the connection closed unexpectedly")
