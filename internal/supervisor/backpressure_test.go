@@ -400,22 +400,114 @@ func TestStalledOutputStillDeliversExplicitFailureReason(t *testing.T) {
 // TestStalledOutputStillDeliversExplicitFailureReason's counterpart for
 // the unsafe case: once a write tears (protocol.WriteFrame reports
 // torn=true), the connection's framing is desynchronized, and writeTo
-// must never attempt to write anything else to it -- only close.
+// must never attempt to write anything else to it -- only close. This
+// must hold regardless of which close reason (if any) had already been
+// decided by the time the tear happened: a concurrent close()/append()
+// call racing the write does not change that a torn connection gets
+// nothing further written to it.
 func TestTornOutputWriteNeverAttemptsAnotherFrame(t *testing.T) {
-	sub := newSubscriber()
-	conn := &scriptedConn{script: []scriptedWrite{
-		{n: 3, err: os.ErrDeadlineExceeded}, // torn: some but not all of the frame reached the peer
-	}}
-	sub.buf = []byte("some PTY output torn mid-write")
-
-	sub.writeTo(conn)
-
-	if !conn.wasClosed() {
-		t.Fatal("connection was never closed")
+	cases := []struct {
+		name     string
+		preClose subscriberCloseReason // subscriberOpen means "let the failing write itself decide"
+	}{
+		{"still open", subscriberOpen},
+		{"already overflow", subscriberClosedByOverflow},
+		{"already process exit", subscriberClosedByProcessExit},
+		{"already detach", subscriberClosedByDetach},
 	}
-	writes := conn.recordedWrites()
-	if len(writes) != 1 {
-		t.Fatalf("write attempts=%d, want exactly 1 (the torn Output write, and nothing after it)", len(writes))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := newSubscriber()
+			sub.buf = []byte("some PTY output torn mid-write")
+			if tc.preClose != subscriberOpen {
+				sub.close(tc.preClose)
+			}
+			conn := &scriptedConn{script: []scriptedWrite{
+				{n: 3, err: os.ErrDeadlineExceeded}, // torn: some but not all of the frame reached the peer
+			}}
+
+			sub.writeTo(conn)
+
+			if !conn.wasClosed() {
+				t.Fatal("connection was never closed")
+			}
+			if writes := conn.recordedWrites(); len(writes) != 1 {
+				t.Fatalf("write attempts=%d, want exactly 1 (the torn Output write, and nothing after it)", len(writes))
+			}
+		})
+	}
+}
+
+// TestFlushFailureHonorsAlreadyDecidedCloseReason fixes the close-reason
+// race review of PR #32 caught: a subscriber's close reason can be
+// decided by a concurrent close() call (Detach from removeSubscriber,
+// ProcessExit from finishSubscribers) while an Output write is already
+// in flight, not only by that write's own failure. handleFlushFailure
+// must re-read the reason rather than trust a stale "still open"
+// assumption, so it never invents an empty Failure frame for a Detach or
+// ProcessExit it raced, and never overwrites an Overflow already decided
+// by append() with a less specific generic stall.
+func TestFlushFailureHonorsAlreadyDecidedCloseReason(t *testing.T) {
+	overflowDetail := "buffer exceeded before this write ever started"
+	cases := []struct {
+		name       string
+		setup      func(*subscriber)
+		wantFrames int  // total write attempts: 1 (just the failed Output) or 2 (Output, then a terminal frame)
+		wantKind   byte // frame kind of the second write, when wantFrames == 2
+		wantEmpty  bool // whether that second frame's payload must be empty
+	}{
+		{
+			name:       "already overflow keeps the overflow detail, not a generic stall",
+			setup:      func(s *subscriber) { s.reason, s.detail = subscriberClosedByOverflow, overflowDetail },
+			wantFrames: 2,
+			wantKind:   protocol.Failure,
+		},
+		{
+			name:       "already process exit sends Exit, never an empty Failure",
+			setup:      func(s *subscriber) { s.close(subscriberClosedByProcessExit) },
+			wantFrames: 2,
+			wantKind:   protocol.Exit,
+			wantEmpty:  true,
+		},
+		{
+			name:       "already detach sends nothing at all",
+			setup:      func(s *subscriber) { s.close(subscriberClosedByDetach) },
+			wantFrames: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := newSubscriber()
+			sub.buf = []byte("output racing a close decision made elsewhere")
+			tc.setup(sub)
+			conn := &scriptedConn{script: []scriptedWrite{{n: 0, err: os.ErrDeadlineExceeded}}} // clean failure: nothing reached the peer
+
+			sub.writeTo(conn)
+
+			if !conn.wasClosed() {
+				t.Fatal("connection was never closed")
+			}
+			writes := conn.recordedWrites()
+			if len(writes) != tc.wantFrames {
+				t.Fatalf("write attempts=%d, want %d", len(writes), tc.wantFrames)
+			}
+			if tc.wantFrames < 2 {
+				return
+			}
+			kind, payload, err := protocol.Read(bytes.NewReader(writes[1]))
+			if err != nil || kind != tc.wantKind {
+				t.Fatalf("second write kind=%q err=%v, want %q", kind, err, tc.wantKind)
+			}
+			if tc.wantEmpty && len(payload) != 0 {
+				t.Fatalf("%q frame carried a payload %q, want none", tc.wantKind, payload)
+			}
+			if !tc.wantEmpty && len(payload) == 0 {
+				t.Fatal("Failure frame carried no reason (must never be an empty Failure)")
+			}
+			if !tc.wantEmpty && string(payload) != overflowDetail {
+				t.Fatalf("Failure payload=%q, want the overflow detail %q preserved, not overwritten by a generic stall message", payload, overflowDetail)
+			}
+		})
 	}
 }
 

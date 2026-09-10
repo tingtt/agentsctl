@@ -227,17 +227,7 @@ func (s *subscriber) flush(conn net.Conn, pending []byte) bool {
 		_ = conn.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
 		torn, err := protocol.WriteFrame(conn, protocol.Output, pending[:n])
 		if err != nil {
-			s.mu.Lock()
-			s.inFlight = 0
-			if s.reason == subscriberOpen {
-				s.reason = subscriberClosedByStall
-				s.detail = "attach output write stalled: consumer stopped accepting output"
-			}
-			detail := s.detail
-			s.mu.Unlock()
-			if !torn {
-				s.sendFailure(conn, detail)
-			}
+			s.handleFlushFailure(conn, torn)
 			return false
 		}
 		pending = pending[n:]
@@ -246,6 +236,43 @@ func (s *subscriber) flush(conn net.Conn, pending []byte) bool {
 		s.mu.Unlock()
 	}
 	return true
+}
+
+// handleFlushFailure decides and, when it is safe to, sends the terminal
+// frame for an Output write that failed partway through a flush. The
+// close reason it acts on may have been decided by this very failure
+// (a still-open subscriber becomes subscriberClosedByStall), or it may
+// already have been decided by a concurrent close()/append() call racing
+// this same write (Detach, ProcessExit, Overflow) -- either way,
+// handleFlushFailure re-reads s.reason itself rather than trusting a
+// snapshot taken before the write, so a reason set by that race is always
+// honored over turning the disconnect into a generic, undifferentiated
+// stall. It never sends an empty Failure frame: Detach and ProcessExit
+// each get the same terminal action a successful flush ending in that
+// reason would have gotten (nothing, and Exit, respectively), never
+// Failure.
+func (s *subscriber) handleFlushFailure(conn net.Conn, torn bool) {
+	s.mu.Lock()
+	s.inFlight = 0
+	if s.reason == subscriberOpen {
+		s.reason = subscriberClosedByStall
+		s.detail = "attach output write stalled: consumer stopped accepting output"
+	}
+	reason, detail := s.reason, s.detail
+	s.mu.Unlock()
+
+	if torn {
+		return // framing is desynchronized: never write anything else to conn
+	}
+	switch reason {
+	case subscriberClosedByOverflow, subscriberClosedByStall:
+		s.sendFailure(conn, detail)
+	case subscriberClosedByProcessExit:
+		_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
+		_ = protocol.Write(conn, protocol.Exit, nil)
+	case subscriberClosedByDetach:
+		// no frame: the client already knows it is detaching
+	}
 }
 
 // sendFailure makes one best-effort, short-deadline attempt to deliver a
