@@ -39,7 +39,9 @@ function projectsFrom(payload) {
     const name = firstString(object, ["name", "title", "display_name"]) ||
       firstString(display, ["name", "title", "display_name"]);
     if (!name) continue;
-    projects.set(id, { id, name, url: `https://chatgpt.com/g/${id}` });
+    // No URL field: Phase 7 showed a bare Project ID URL is not canonical (the real one carries a
+    // human-readable name slug this harness never resolves), so no candidate is offered here.
+    projects.set(id, { id, name });
   }
   if (projects.size === 0) throw new Error("project response has no recognized projects");
   return [...projects.values()];
