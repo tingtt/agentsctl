@@ -571,6 +571,52 @@ func fetchPins(client net.Conn, id int) (pinsSnapshot, error) {
 	return snap, nil
 }
 
+// maxObservedCaptureID returns the highest CaptureID among ALL /backend-api/conversations captures
+// the bridge has observed so far (any query, not just MATCH-classified target-series ones), or 0 if
+// none. It exists because a live run of this experiment (2026-09-11) discovered that "the target
+// series looks unchanged" and "no fresh network response was ever observed" are indistinguishable
+// from compareMembership's output alone — enumerateAllConversations happily re-derives the same
+// result from the bridge's replayed capture history even when nothing new was fetched, since its own
+// seenCaptures bookkeeping is local to each call. runPinExperiment calls this before and after each
+// operator action and refuses to trust a "no change" result unless the captureID actually advanced.
+func maxObservedCaptureID(client net.Conn, id int) (int, error) {
+	raw, err := call(client, request{ID: id, Method: "globalConversationsPages"})
+	if err != nil {
+		return 0, err
+	}
+	var diagnostics []globalConversationsPageDiagnostic
+	if err := json.Unmarshal(raw, &diagnostics); err != nil {
+		return 0, fmt.Errorf("decode global conversations pages: %w", err)
+	}
+	max := 0
+	for _, d := range diagnostics {
+		if d.CaptureID > max {
+			max = d.CaptureID
+		}
+	}
+	return max, nil
+}
+
+// membershipOutcome classifies a membership comparison against README Phase D's Outcome A/B/C, but
+// ONLY trusts a "no change" (A) or "one member removed" (B) result when freshCapture confirms the
+// bridge actually observed a NEW /backend-api/conversations response between the two observations
+// being compared. Without that, "no change" cannot be distinguished from "no new data was ever
+// fetched" — exactly what the 2026-09-11 live run hit: membership looked unchanged, but the observed
+// captureID never advanced either, so the honest result was NOT VERIFIED, not Outcome A.
+func membershipOutcome(freshCapture bool, disappeared []string) string {
+	if !freshCapture {
+		return "NOT VERIFIED — no fresh /backend-api/conversations capture was observed between these two observations, so an unchanged membership result cannot be trusted as evidence"
+	}
+	switch len(disappeared) {
+	case 0:
+		return "A candidate — no target-series member disappeared, and a fresh capture confirms this reflects a real re-fetch"
+	case 1:
+		return "B candidate — exactly one target-series member disappeared, and a fresh capture confirms this reflects a real re-fetch"
+	default:
+		return "NOT VERIFIED — target series changed ambiguously (more than one member disappeared); cannot attribute to a single controlled action"
+	}
+}
+
 // runPinExperiment drives the interactive, human-in-the-loop Phase 5 is_starred coverage
 // experiment end to end (README "ChatGPT Phase 5: prove is_starred coverage semantics", Phases
 // B through H). It never asks the operator to identify a conversation by title or ID — see
@@ -586,6 +632,10 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 	}
 
 	fmt.Println("=== Phase 5 is_starred coverage experiment ===")
+	baselineMaxCapture, captureErr := maxObservedCaptureID(client, 490)
+	if captureErr != nil {
+		fmt.Printf("baseline capture watermark: NOT VERIFIED (%v)\n", captureErr)
+	}
 	baseline, basePagination, baseCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
 	if err != nil {
 		return fmt.Errorf("baseline enumeration: %w", err)
@@ -604,6 +654,13 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
+	afterPinMaxCapture, afterCaptureErr := maxObservedCaptureID(client, 491)
+	if afterCaptureErr != nil {
+		fmt.Printf("after-pin capture watermark: NOT VERIFIED (%v)\n", afterCaptureErr)
+	}
+	pinCaptureFresh := captureErr == nil && afterCaptureErr == nil && afterPinMaxCapture > baselineMaxCapture
+	fmt.Printf("conversations capture watermark: baseline=%d after_pin=%d fresh=%t\n", baselineMaxCapture, afterPinMaxCapture, pinCaptureFresh)
+
 	after, afterPagination, afterCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
 	if err != nil {
 		return fmt.Errorf("post-pin enumeration: %w", err)
@@ -615,14 +672,7 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		membership.BeforeCount, membership.AfterCount, membership.DisappearedDigests, membership.AppearedDigests)
 
 	disappeared, _ := diffConversationIDs(baseline, after)
-	switch {
-	case len(disappeared) == 0:
-		fmt.Println("outcome: A candidate — no target-series member disappeared after the pin action")
-	case len(disappeared) == 1:
-		fmt.Println("outcome: B candidate — exactly one target-series member disappeared after the pin action")
-	default:
-		fmt.Println("outcome: NOT VERIFIED — target series changed ambiguously (more than one member disappeared); cannot attribute to the pin action alone")
-	}
+	fmt.Printf("outcome: %s\n", membershipOutcome(pinCaptureFresh, disappeared))
 
 	afterPins, afterPinsErr := fetchPins(client, 501)
 	if afterPinsErr != nil {
@@ -642,6 +692,13 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
+	afterRestoreMaxCapture, restoreCaptureErr := maxObservedCaptureID(client, 492)
+	if restoreCaptureErr != nil {
+		fmt.Printf("after-restore capture watermark: NOT VERIFIED (%v)\n", restoreCaptureErr)
+	}
+	restoreCaptureFresh := afterCaptureErr == nil && restoreCaptureErr == nil && afterRestoreMaxCapture > afterPinMaxCapture
+	fmt.Printf("conversations capture watermark: after_pin=%d after_restore=%d fresh=%t\n", afterPinMaxCapture, afterRestoreMaxCapture, restoreCaptureFresh)
+
 	restored, restoredPagination, restoredCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
 	if err != nil {
 		return fmt.Errorf("post-restore enumeration: %w", err)
@@ -651,8 +708,10 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 	restoreMembership := compareMembership(baseline, restored)
 	fmt.Printf("membership evidence (restore vs baseline): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
 		restoreMembership.BeforeCount, restoreMembership.AfterCount, restoreMembership.DisappearedDigests, restoreMembership.AppearedDigests)
-	if len(restoreMembership.DisappearedDigests) == 0 && len(restoreMembership.AppearedDigests) == 0 {
-		fmt.Println("restore evidence: PASS — target series returned to its baseline membership")
+	if !restoreCaptureFresh {
+		fmt.Println("restore evidence: NOT VERIFIED — no fresh /backend-api/conversations capture was observed after the restore action")
+	} else if len(restoreMembership.DisappearedDigests) == 0 && len(restoreMembership.AppearedDigests) == 0 {
+		fmt.Println("restore evidence: PASS — a fresh capture confirms the target series returned to its baseline membership")
 	} else {
 		fmt.Println("restore evidence: NOT VERIFIED — target series did not return to its exact baseline membership")
 	}
