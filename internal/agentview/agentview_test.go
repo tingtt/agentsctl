@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
@@ -90,6 +91,29 @@ func newTestRuntime(provider *fakeProvider) *Runtime {
 	}
 	rt.reload(context.Background())
 	return rt
+}
+
+func TestRuntimeCtrlTUnpinSelectsRemainingPinnedSession(t *testing.T) {
+	a := session.Session{Key: key("a"), CWD: "/work", CreatedAt: time.Unix(2, 0)}
+	b := session.Session{Key: key("b"), CWD: "/work", CreatedAt: time.Unix(1, 0)}
+	pins := &fakePins{pinned: map[string]bool{a.Key.String(): true, b.Key.String(): true}}
+	rt := &Runtime{
+		Controller: sessionctl.Controller{Providers: []sessionctl.Source{&fakeProvider{id: session.ProviderClaude, rows: []session.Session{a, b}}}, Pins: pins},
+		State:      NewState(),
+		CWD:        "/work",
+	}
+	rt.reload(context.Background())
+	rt.State.selectIndex(0)
+
+	intent := rt.State.Handle(KeyEvent{Key: KeyCtrlT})
+	if err := rt.act(context.Background(), intent); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := rt.State.SelectedRow()
+	if !ok || got.Key != b.Key || !got.Pinned {
+		t.Fatalf("selected row=%+v ok=%v, want remaining pinned session b", got, ok)
+	}
 }
 
 // TestRuntimeDispatchReloadsAndShowsNewSession is an integration test

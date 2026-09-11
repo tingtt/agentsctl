@@ -84,13 +84,15 @@ session は作成時刻が新しい順に並べる。Activity や runtime status
 - Pinned session は directory scope に関わらず常に単一の `Pinned` group へ集約する。scope が複数 directory を含む場合、Pinned row には directory path を表示する (directory を跨ぐため group heading だけでは判別できない)。
 - Unpinned session は、表示対象の directory がすべて同一なら単一の `Recently created` group、複数 directory を含むなら directory ごとの group に分ける。directory ごとの group では、その heading が directory を示すため row 自体に directory を表示しない。
 
-grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection は常に `session.Key` で追従するため、grouping の変化 (scope cycling、refresh、pin/unpin) によって選択が失われることはない。
+grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺へ selection を移す。
 
 ##### Pin / Unpin
 
 Pin 状態は agentsctl が永続化する。
 
 Pin / Unpin 操作は即時に表示へ反映するため、provider の catalog を再取得せず、現在の一覧へ ordering rule を再適用する。
+
+選択中の pinned session を Unpin した場合、変更前の Pinned group で1つ下、下がなければ1つ上にあった session を選択する。他の pinned session がなければ、変更前に Pinned の直後へ表示されていた `Recently created` または最初の directory group の先頭 session を選択する。これらの候補がある限り、unpin により移動した session 自体は追従しない。Pin 操作と refresh/reload は引き続き同じ `session.Key` を追従する。
 
 #### Lifecycle
 

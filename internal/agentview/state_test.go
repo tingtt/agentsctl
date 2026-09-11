@@ -151,7 +151,7 @@ func TestSetRowsFollowsRenameTargetDuringRename(t *testing.T) {
 	}
 }
 
-func TestApplyPatchPinReordersWithoutTouchingSelection(t *testing.T) {
+func TestApplyPatchPinKeepsPatchedSessionSelected(t *testing.T) {
 	s := NewState()
 	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
 	s.selectIndex(1) // select "b"
@@ -163,6 +163,114 @@ func TestApplyPatchPinReordersWithoutTouchingSelection(t *testing.T) {
 	}
 	if s.SelectedIndex() != 0 {
 		t.Fatalf("pinned session must sort first: index=%d", s.SelectedIndex())
+	}
+}
+
+func TestApplyPatchUnpinSelectsNeighborFromPreviousPinnedGroup(t *testing.T) {
+	tests := []struct {
+		name     string
+		rows     []session.Session
+		selected session.Key
+		want     session.Key
+	}{
+		{
+			name: "middle selects lower pinned session",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CreatedAt: time.Unix(3, 0)},
+				{Key: key("b"), Pinned: true, CreatedAt: time.Unix(2, 0)},
+				{Key: key("c"), Pinned: true, CreatedAt: time.Unix(1, 0)},
+			},
+			selected: key("b"),
+			want:     key("c"),
+		},
+		{
+			name: "last selects upper pinned session",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CreatedAt: time.Unix(2, 0)},
+				{Key: key("b"), Pinned: true, CreatedAt: time.Unix(1, 0)},
+			},
+			selected: key("b"),
+			want:     key("a"),
+		},
+		{
+			name: "first selects lower pinned session",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CreatedAt: time.Unix(2, 0)},
+				{Key: key("b"), Pinned: true, CreatedAt: time.Unix(1, 0)},
+			},
+			selected: key("a"),
+			want:     key("b"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(tt.rows)
+			for i, row := range s.Rows {
+				if row.Key == tt.selected {
+					s.selectIndex(i)
+				}
+			}
+
+			unpinned := false
+			s.ApplyPatch(sessionctl.Patch{Key: tt.selected, Pinned: &unpinned})
+
+			got, ok := s.SelectedRow()
+			if !ok || got.Key != tt.want {
+				t.Fatalf("selected row=%+v ok=%v, want key %s", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyPatchUnpinOnlyPinnedSelectsFormerRecentlyCreatedHead(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Pinned: true, CWD: "/repo", CreatedAt: time.Unix(3, 0)},
+		{Key: key("b"), CWD: "/repo", CreatedAt: time.Unix(2, 0)},
+		{Key: key("c"), CWD: "/repo", CreatedAt: time.Unix(1, 0)},
+	})
+
+	unpinned := false
+	s.ApplyPatch(sessionctl.Patch{Key: key("a"), Pinned: &unpinned})
+
+	got, ok := s.SelectedRow()
+	if !ok || got.Key != key("b") {
+		t.Fatalf("selected row=%+v ok=%v, want previous Recently created head b", got, ok)
+	}
+}
+
+func TestApplyPatchUnpinOnlyPinnedSelectsFormerFirstFolderGroupHead(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Pinned: true, CWD: "/repo-a", CreatedAt: time.Unix(4, 0)},
+		{Key: key("b"), CWD: "/repo-b", CreatedAt: time.Unix(3, 0)},
+		{Key: key("c"), CWD: "/repo-c", CreatedAt: time.Unix(2, 0)},
+	})
+
+	unpinned := false
+	s.ApplyPatch(sessionctl.Patch{Key: key("a"), Pinned: &unpinned})
+
+	got, ok := s.SelectedRow()
+	if !ok || got.Key != key("b") {
+		t.Fatalf("selected row=%+v ok=%v, want previous first folder-group session b", got, ok)
+	}
+}
+
+func TestApplyPatchUnpinNonSelectedSessionKeepsSelection(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: key("a"), Pinned: true, CreatedAt: time.Unix(2, 0)},
+		{Key: key("b"), Pinned: true, CreatedAt: time.Unix(1, 0)},
+	})
+
+	unpinned := false
+	s.ApplyPatch(sessionctl.Patch{Key: key("b"), Pinned: &unpinned})
+
+	got, ok := s.SelectedRow()
+	if !ok || got.Key != key("a") {
+		t.Fatalf("selected row=%+v ok=%v, want unchanged selection a", got, ok)
 	}
 }
 

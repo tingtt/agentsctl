@@ -12,8 +12,9 @@ import (
 // every input decision, render, and orchestrated operation reads and
 // writes through (see the DesignDoc's "Treat Agent View state as a Root
 // Owner"). Selection is keyed by session.Key (see selectedKey/hasSelection
-// and SelectedRow), never by row index, so it survives refresh, pin/
-// unpin, reordering, and provider reload intact.
+// and SelectedRow), never by row index, so it survives refresh, pin,
+// reordering, and provider reload intact. Unpinning the selected pinned
+// row deliberately replaces that identity; see ApplyPatch.
 type State struct {
 	Rows []session.Session
 
@@ -222,14 +223,18 @@ func (s *State) MarkAttached(key session.Key) {
 
 // ApplyPatch applies a local, already-confirmed sessionctl.Patch directly
 // to the matching row -- see sessionctl.Result's doc comment for why Pin
-// and Rename use this instead of a full reload. Pin also re-sorts (pin
-// state affects ordering) and follows the row to its new position; Rename
-// never affects ordering.
+// and Rename use this instead of a full reload. Pin changes re-sort because
+// pin state affects ordering. Pinning preserves selection identity, while
+// unpinning the selected pinned row selects its previous Pinned-group
+// neighbor (or the following group's first row). Rename never affects
+// ordering.
 func (s *State) ApplyPatch(p sessionctl.Patch) {
 	if p.Pinned != nil {
-		// Re-sorting never disturbs selection: SelectedIndex is derived
-		// from selectedKey on every call (see SelectedIndex), so the
-		// selected session simply reports a new index after this.
+		var replacement session.Key
+		var replaceSelection bool
+		if !*p.Pinned {
+			replacement, replaceSelection = s.selectionReplacementForUnpin(p.Key)
+		}
 		rows := append([]session.Session(nil), s.Rows...)
 		for i := range rows {
 			if rows[i].Key == p.Key {
@@ -238,6 +243,9 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 		}
 		session.SortOverview(rows)
 		s.Rows = rows
+		if replaceSelection {
+			s.selectedKey = replacement
+		}
 		return
 	}
 	if p.Name != nil {
@@ -247,6 +255,40 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 			}
 		}
 	}
+}
+
+// selectionReplacementForUnpin returns the replacement identity for unpinning key
+// when key is the selected pinned row. Candidates come from the current
+// rendered grouping, before the patch can move key into an unpinned group:
+// the next Pinned row, the previous Pinned row, then the first row of the
+// following group.
+func (s State) selectionReplacementForUnpin(key session.Key) (session.Key, bool) {
+	if !s.hasSelection || s.selectedKey != key {
+		return session.Key{}, false
+	}
+
+	groups := groupRows(s.Rows)
+	for groupIndex, group := range groups {
+		for position, rowIndex := range group.indices {
+			row := s.Rows[rowIndex]
+			if row.Key != key || !row.Pinned {
+				continue
+			}
+			if position+1 < len(group.indices) {
+				return s.Rows[group.indices[position+1]].Key, true
+			}
+			if position > 0 {
+				return s.Rows[group.indices[position-1]].Key, true
+			}
+			for _, following := range groups[groupIndex+1:] {
+				if len(following.indices) > 0 {
+					return s.Rows[following.indices[0]].Key, true
+				}
+			}
+			return session.Key{}, false
+		}
+	}
+	return session.Key{}, false
 }
 
 // ApplyUsageUpdate incorporates one provider's incremental usage result
