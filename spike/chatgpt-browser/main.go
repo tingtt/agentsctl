@@ -53,30 +53,40 @@ type queryParam struct {
 // globalConversationsPageDiagnostic mirrors one bridge-side capture record. CaptureID is a
 // bridge-internal reference to this one observed response, assigned once and never reused — it
 // carries no pagination meaning. SeriesKey/Offset are the actual pagination identity, computed by
-// the bridge from the response's own query and metadata. Offset/Limit are pointers because a
-// response missing usable pagination metadata must be distinguishable from one legitimately at
-// offset 0.
+// the bridge from the response's own query and metadata. SeriesKey is a digest of the RAW,
+// unredacted query (see bridge/main.js's canonicalSeriesKeyFrom) — it is NOT derived from the
+// redacted Query diagnostic below, which exists purely for human-readable display and must never be
+// used to decide whether two captures share a pagination series (two different opaque values of the
+// same length redact to the same placeholder and would otherwise collide). Offset/Limit are
+// pointers because a response missing usable pagination metadata must be distinguishable from one
+// legitimately at offset 0. RecognizedCollection distinguishes a response whose top-level item
+// collection could actually be located (even if empty) from one whose shape wasn't recognized at
+// all — the latter must never be treated as "0 items".
 type globalConversationsPageDiagnostic struct {
-	CaptureID         int            `json:"captureID"`
-	SeriesKey         string         `json:"seriesKey"`
-	HideSnorlax       bool           `json:"hideSnorlax"`
-	Offset            *int           `json:"offset"`
-	Limit             *int           `json:"limit"`
-	RawItemCount      int            `json:"rawItemCount"`
-	RecognizedIDCount int            `json:"recognizedIDCount"`
-	RawIdentityDigest string         `json:"rawIdentityDigest"`
-	TopLevelKeys      []string       `json:"topLevelKeys"`
-	Meta              map[string]any `json:"meta"`
+	CaptureID            int            `json:"captureID"`
+	SeriesKey            *string        `json:"seriesKey"`
+	Query                []queryParam   `json:"query"`
+	HideSnorlax          bool           `json:"hideSnorlax"`
+	Offset               *int           `json:"offset"`
+	Limit                *int           `json:"limit"`
+	RecognizedCollection bool           `json:"recognizedCollection"`
+	RawItemCount         int            `json:"rawItemCount"`
+	RecognizedIDCount    int            `json:"recognizedIDCount"`
+	RawIdentityDigest    string         `json:"rawIdentityDigest"`
+	TopLevelKeys         []string       `json:"topLevelKeys"`
+	Meta                 map[string]any `json:"meta"`
 }
 
 // globalConversationsCaptureItemsResult is the bridge's response to fetching one capture's
-// sanitized, Project-filtered items, along with cross-validation against a caller-supplied
-// allowlist of already-known Project conversation IDs (see mergeProjectPages's KnownIDsMismatched
-// handling).
+// sanitized, Project-filtered items, along with cross-validation of a caller-supplied allowlist of
+// already-known Project conversation IDs (KnownIDsMismatched) and a universal per-item association
+// shape check (UnrecognizedAssociationCount) — see mergeProjectPages and the sanitizer comment in
+// bridge/preload.js for what each can and cannot prove.
 type globalConversationsCaptureItemsResult struct {
-	Items              []conversation `json:"items"`
-	KnownIDsSeen       int            `json:"knownIDsSeen"`
-	KnownIDsMismatched int            `json:"knownIDsMismatched"`
+	Items                        []conversation `json:"items"`
+	KnownIDsSeen                 int            `json:"knownIDsSeen"`
+	KnownIDsMismatched           int            `json:"knownIDsMismatched"`
+	UnrecognizedAssociationCount int            `json:"unrecognizedAssociationCount"`
 }
 
 // conversationPage is one page of the Project-inclusive (hide_snorlax false/absent) view of
@@ -86,27 +96,30 @@ type globalConversationsCaptureItemsResult struct {
 // in, and so that two different filter combinations (e.g. differing is_archived, or a limit change)
 // are never treated as continuations of the same series.
 type conversationPage struct {
-	SeriesKey          string
-	HideSnorlax        bool
-	Offset             int
-	Limit              int
-	RawItemCount       int
-	RecognizedIDCount  int
-	RawIdentityDigest  string
-	KnownIDsMismatched int
-	Items              []conversation
+	SeriesKey                    string
+	HideSnorlax                  bool
+	Offset                       int
+	Limit                        int
+	RecognizedCollection         bool
+	RawItemCount                 int
+	RecognizedIDCount            int
+	RawIdentityDigest            string
+	KnownIDsMismatched           int
+	UnrecognizedAssociationCount int
+	Items                        []conversation
 }
 
 // mergeProjectPages is the deterministic core of Project session enumeration. It groups pages by
-// SeriesKey (the query with `offset` removed — see seriesKeyFrom in bridge/main.js), and within
-// each series walks a contiguous offset chain starting at 0 and stepping by that series' own limit.
-// A series is exhausted only when that chain reaches a page whose raw item count is strictly less
-// than its limit — never from the endpoint's own `total` field (observed to grow between successive
-// calls in the same session), and never from a full first page alone (a page exactly as long as its
-// limit does not, by itself, prove no further page exists). The overall result is exhausted only if
-// every observed series is individually exhausted; a gap in one series' offset chain, or a second,
-// unrelated series appearing at a numerically-contiguous-looking offset, can never manufacture a
-// false COMPLETE.
+// SeriesKey (a digest of the RAW query with `offset` removed — see canonicalSeriesKeyFrom in
+// bridge/main.js; never derived from redacted diagnostics, which could collide two different opaque
+// values of the same length), and within each series walks a contiguous offset chain starting at 0
+// and stepping by that series' own limit. A series is exhausted only when that chain reaches a page
+// whose raw item count is strictly less than its limit — never from the endpoint's own `total`
+// field (observed to grow between successive calls in the same session), and never from a full
+// first page alone (a page exactly as long as its limit does not, by itself, prove no further page
+// exists). The overall result is exhausted only if every observed series is individually exhausted;
+// a gap in one series' offset chain, or a second, unrelated series appearing at a
+// numerically-contiguous-looking offset, can never manufacture a false COMPLETE.
 //
 // Item merging (for the returned, possibly-partial conversation list) and identity/schema
 // validation happen over ALL captured pages regardless of chain contiguity, since a gap in one
@@ -116,11 +129,15 @@ type conversationPage struct {
 // their filtered subset while actually differing underneath still fail closed.
 //
 // It fails closed (returns an error, never a partial result presented as complete) on: a
-// hide_snorlax-excluding page reaching it, more pages than maxPages, a malformed page (non-positive
-// limit or negative/unrecognized offset), a raw item whose identity couldn't be recognized
-// (RecognizedIDCount < RawItemCount), a known Project conversation ID that no longer resolves to
-// the configured Project (KnownIDsMismatched > 0), a conversation missing a stable ID, or the same
-// SeriesKey+Offset reporting a different raw page identity across observations.
+// hide_snorlax-excluding page reaching it, a missing SeriesKey, an unrecognized item-collection
+// shape (RecognizedCollection == false — never treated as an empty page), more pages than maxPages,
+// a malformed page (non-positive limit or negative/unrecognized offset), a raw item whose identity
+// couldn't be recognized (RecognizedIDCount < RawItemCount), a raw item exposing no recognizable
+// Project-association field at all (UnrecognizedAssociationCount > 0 — see the sanitizer comment in
+// bridge/preload.js for exactly what this can and cannot prove), a known Project conversation ID
+// that no longer resolves to the configured Project (KnownIDsMismatched > 0), a conversation missing
+// a stable ID, or the same SeriesKey+Offset reporting a different raw page identity across
+// observations.
 func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []conversation, exhausted bool, err error) {
 	if len(pages) > maxPages {
 		return nil, false, fmt.Errorf("excessive page count: got %d pages, max %d", len(pages), maxPages)
@@ -133,6 +150,13 @@ func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []
 		if page.HideSnorlax {
 			return nil, false, errors.New("malformed input: a hide_snorlax-excluding page cannot be merged into Project enumeration")
 		}
+		if page.SeriesKey == "" {
+			return nil, false, errors.New("malformed page: missing pagination series identity")
+		}
+		if !page.RecognizedCollection {
+			return nil, false, fmt.Errorf("schema drift (series=%q offset=%d): response's item collection shape was not recognized — an unrecognized collection must never be treated as an empty page",
+				page.SeriesKey, page.Offset)
+		}
 		if page.Limit <= 0 {
 			return nil, false, fmt.Errorf("malformed page (series=%q offset=%d): non-positive limit %d", page.SeriesKey, page.Offset, page.Limit)
 		}
@@ -142,6 +166,10 @@ func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []
 		if page.RawItemCount > 0 && page.RecognizedIDCount < page.RawItemCount {
 			return nil, false, fmt.Errorf("schema drift (series=%q offset=%d): %d of %d raw items had an unrecognizable identity",
 				page.SeriesKey, page.Offset, page.RecognizedIDCount, page.RawItemCount)
+		}
+		if page.UnrecognizedAssociationCount > 0 {
+			return nil, false, fmt.Errorf("schema drift (series=%q offset=%d): %d raw item(s) exposed no recognizable Project-association field at all",
+				page.SeriesKey, page.Offset, page.UnrecognizedAssociationCount)
 		}
 		if page.KnownIDsMismatched > 0 {
 			return nil, false, fmt.Errorf("schema drift (series=%q offset=%d): %d known Project conversation(s) no longer resolve to the configured Project",
@@ -747,10 +775,24 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			if d.Limit != nil {
 				limitStr = fmt.Sprintf("%d", *d.Limit)
 			}
-			fmt.Printf("global conversations wire capture #%d: hide_snorlax=%t series=%q offset=%s limit=%s raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
-				d.CaptureID, d.HideSnorlax, d.SeriesKey, offsetStr, limitStr, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
+			seriesDisplay := "?"
+			if d.SeriesKey != nil {
+				seriesDisplay = shortDigest(*d.SeriesKey)
+			}
+			queryParts := make([]string, 0, len(d.Query))
+			for _, q := range d.Query {
+				queryParts = append(queryParts, q.Key+"="+q.Value)
+			}
+			fmt.Printf("global conversations wire capture #%d: hide_snorlax=%t series=%s query=[%s] offset=%s limit=%s recognized_collection=%t raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
+				d.CaptureID, d.HideSnorlax, seriesDisplay, strings.Join(queryParts, ","), offsetStr, limitStr, d.RecognizedCollection, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
 			if d.HideSnorlax {
 				continue // excludes Project conversations by construction; recorded above for evidence only
+			}
+			if d.SeriesKey == nil {
+				return fmt.Errorf("capture %d has no usable pagination series identity", d.CaptureID)
+			}
+			if !d.RecognizedCollection {
+				return fmt.Errorf("capture %d has an unrecognized item-collection shape (must not be treated as an empty page)", d.CaptureID)
 			}
 			if d.Offset == nil || d.Limit == nil || *d.Limit <= 0 {
 				return fmt.Errorf("capture %d is missing usable offset/limit pagination metadata", d.CaptureID)
@@ -768,14 +810,16 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 				return fmt.Errorf("decode items for capture %d: %w", d.CaptureID, err)
 			}
 			pages = append(pages, conversationPage{
-				SeriesKey:          d.SeriesKey,
-				Offset:             *d.Offset,
-				Limit:              *d.Limit,
-				RawItemCount:       d.RawItemCount,
-				RecognizedIDCount:  d.RecognizedIDCount,
-				RawIdentityDigest:  d.RawIdentityDigest,
-				KnownIDsMismatched: result.KnownIDsMismatched,
-				Items:              result.Items,
+				SeriesKey:                    *d.SeriesKey,
+				Offset:                       *d.Offset,
+				Limit:                        *d.Limit,
+				RecognizedCollection:         d.RecognizedCollection,
+				RawItemCount:                 d.RawItemCount,
+				RecognizedIDCount:            d.RecognizedIDCount,
+				RawIdentityDigest:            d.RawIdentityDigest,
+				KnownIDsMismatched:           result.KnownIDsMismatched,
+				UnrecognizedAssociationCount: result.UnrecognizedAssociationCount,
+				Items:                        result.Items,
 			})
 		}
 		return nil

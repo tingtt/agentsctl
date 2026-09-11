@@ -312,14 +312,27 @@ async function dispatch(request) {
     );
     let knownIDsSeen = 0;
     let knownIDsMismatched = 0;
+    // Live evidence (Phase 5 second follow-up, multiple captures, 28 raw items each) showed every
+    // raw conversation item — Project-associated or not — carries `gizmo_id` or `project_id` as an
+    // own property; ordinary non-Project chats have it present but null, never absent. A raw item
+    // exposing NEITHER key at all is therefore genuine schema drift (e.g. a rename), not a normal
+    // non-Project conversation, and is counted here so mergeProjectPages can fail closed on it. This
+    // is a universal per-item check; the known-ID cross-check above additionally catches the
+    // narrower case of a *value* that resolves to the wrong Project, kept as defense in depth.
+    let unrecognizedAssociationCount = 0;
     for (const raw of rawTopLevelItems(request.payload)) {
       const id = firstString(raw, ["id", "conversation_id"]);
-      if (!id || !knownIDs.has(id)) continue;
-      knownIDsSeen++;
-      const association = firstString(raw, ["gizmo_id", "project_id"]);
-      if (association !== request.projectID) knownIDsMismatched++;
+      if (id && knownIDs.has(id)) {
+        knownIDsSeen++;
+        const association = firstString(raw, ["gizmo_id", "project_id"]);
+        if (association !== request.projectID) knownIDsMismatched++;
+      }
+      if (!raw || typeof raw !== "object") continue;
+      const hasGizmoID = Object.prototype.hasOwnProperty.call(raw, "gizmo_id");
+      const hasProjectID = Object.prototype.hasOwnProperty.call(raw, "project_id");
+      if (!hasGizmoID && !hasProjectID) unrecognizedAssociationCount++;
     }
-    return { items, knownIDsSeen, knownIDsMismatched };
+    return { items, knownIDsSeen, knownIDsMismatched, unrecognizedAssociationCount };
   }
   if (request.method === "simulateSidebarScroll") {
     return simulateSidebarScroll();

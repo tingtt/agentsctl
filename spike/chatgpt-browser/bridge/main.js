@@ -182,9 +182,11 @@ async function dispatch(request) {
     return [...globalConversationsCaptures.values()].map((capture) => ({
       captureID: capture.captureID,
       seriesKey: capture.seriesKey,
+      query: capture.query, // redacted, for human-readable diagnostics only — never pagination identity
       hideSnorlax: capture.hideSnorlax,
       offset: capture.offset,
       limit: capture.limit,
+      recognizedCollection: capture.recognizedCollection,
       rawItemCount: capture.rawItemCount,
       recognizedIDCount: capture.recognizedIDCount,
       rawIdentityDigest: capture.rawIdentityDigest,
@@ -374,15 +376,31 @@ function rawItemID(item) {
   return id && conversationIDPattern.test(id) ? id : null;
 }
 
-// The pagination series identity: the query with `offset` removed. Two responses belong to the
-// same series only if every other query parameter (limit, order, is_archived, is_starred,
-// hide_snorlax, ...) matches — a limit change or a different filter combination is a different
-// series, never merged into the same offset chain.
-function seriesKeyFrom(query) {
-  return query
-    .filter((entry) => entry.key !== "offset")
-    .map((entry) => `${entry.key}=${entry.value}`)
-    .join("&");
+// The pagination series identity: a digest of the RAW (unredacted) query with `offset` removed,
+// keys/values sorted for order-independence, JSON-encoded for unambiguous delimiting (so no
+// combination of key/value strings can be crafted to collide with a different combination), then
+// SHA-256'd so no raw query value — including opaque ones — ever needs to leave the bridge.
+//
+// This is deliberately NOT built from the redacted `query` diagnostic array: that redaction maps
+// any two same-length opaque values to the same "<redacted:Nch>" placeholder, which would let two
+// genuinely different query series collide into one SeriesKey and be wrongly merged into the same
+// offset chain. Two responses belong to the same series only if every parameter other than offset
+// (limit, order, is_archived, is_starred, hide_snorlax, ...) has the same raw value.
+//
+// Mirrored (for testing only — this is the real implementation) in main_test.go's
+// testCanonicalSeriesKey; keep the two in sync if this changes.
+function canonicalSeriesKeyFrom(rawURL) {
+  try {
+    const url = new URL(rawURL);
+    const pairs = [...url.searchParams.entries()].filter(([key]) => key !== "offset");
+    pairs.sort(([keyA, valueA], [keyB, valueB]) => {
+      if (keyA !== keyB) return keyA < keyB ? -1 : 1;
+      return valueA < valueB ? -1 : valueA > valueB ? 1 : 0;
+    });
+    return crypto.createHash("sha256").update(JSON.stringify(pairs)).digest("hex");
+  } catch {
+    return null;
+  }
 }
 
 // Response-reported offset/limit (from scalarMetaOf), not the request's own query string — this is
@@ -395,6 +413,10 @@ function integerMetaField(meta, key) {
 
 function recordGlobalConversationsPage(url, payload) {
   const items = itemsArrayOf(payload);
+  // A response whose top-level collection field can't be recognized (renamed from items/
+  // conversations, or not an array at all) must never be treated as "0 items" — that would look
+  // identical to a legitimate, recognized empty final page and could produce a false COMPLETE.
+  const recognizedCollection = items !== null;
   const query = describeQuery(url);
   // hide_snorlax=true excludes Project/gizmo-associated conversations from `items` (empirically
   // confirmed: identical account state, item-level Project association present only when this is
@@ -402,21 +424,30 @@ function recordGlobalConversationsPage(url, payload) {
   // Only pages where this is false/absent are valid input for Project enumeration.
   const hideSnorlax = query.some((entry) => entry.key === "hide_snorlax" && entry.value === "true");
   const meta = scalarMetaOf(payload);
-  const rawItemCount = items ? items.length : 0;
-  const recognizedIDs = (items || []).map(rawItemID).filter(Boolean);
+  const rawItemCount = recognizedCollection ? items.length : 0;
+  const recognizedIDs = recognizedCollection ? items.map(rawItemID).filter(Boolean) : [];
   const captureID = nextGlobalConversationCaptureID++;
   globalConversationsCaptures.set(captureID, {
     captureID,
-    seriesKey: seriesKeyFrom(query),
+    // Pagination identity (SeriesKey) is a digest of the RAW, unredacted query — see
+    // canonicalSeriesKeyFrom — so it can never collide the way the redacted `query` diagnostic
+    // below could (two different opaque values of the same length both redact to the same
+    // placeholder). `query` here is for human-readable diagnostics only and must never be used to
+    // decide whether two captures belong to the same pagination series.
+    seriesKey: canonicalSeriesKeyFrom(url),
+    query,
     hideSnorlax,
     offset: integerMetaField(meta, "offset"),
     limit: integerMetaField(meta, "limit"),
+    recognizedCollection,
     topLevelKeys: topLevelKeysOf(payload),
     rawItemCount,
     recognizedIDCount: recognizedIDs.length,
     // A fingerprint of the RAW page's own conversation identity (every item, not just this
     // Project's), so re-observing the same series+offset can be checked for consistency even when
-    // the Project-filtered subset happens to look the same across two different raw pages.
+    // the Project-filtered subset happens to look the same across two different raw pages. Only
+    // meaningful when recognizedCollection is true — an unrecognized-shape page is rejected before
+    // this digest would ever be consulted (see the required-field checks in mergeProjectPages).
     rawIdentityDigest: crypto.createHash("sha256").update([...recognizedIDs].sort().join(",")).digest("hex"),
     meta,
     payload,
