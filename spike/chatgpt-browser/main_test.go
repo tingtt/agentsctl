@@ -922,6 +922,37 @@ func TestCompareMembershipAmbiguousChangeIsNotSingleAttributable(t *testing.T) {
 	}
 }
 
+func TestMembershipOutcomeRequiresFreshCaptureForOutcomeA(t *testing.T) {
+	// The 2026-09-11 live run hit exactly this: membership looked unchanged (disappeared=nil), but
+	// the observed captureID never advanced between observations, so the honest classification is
+	// NOT VERIFIED, not "A candidate" — an unchanged result without a fresh capture proves nothing.
+	got := membershipOutcome(false, nil)
+	if !strings.Contains(got, "NOT VERIFIED") {
+		t.Fatalf("membershipOutcome(false, nil) = %q, want it to report NOT VERIFIED", got)
+	}
+}
+
+func TestMembershipOutcomeFreshNoChangeIsOutcomeA(t *testing.T) {
+	got := membershipOutcome(true, nil)
+	if !strings.Contains(got, "A candidate") {
+		t.Fatalf("membershipOutcome(true, nil) = %q, want an A candidate result", got)
+	}
+}
+
+func TestMembershipOutcomeFreshOneDisappearedIsOutcomeB(t *testing.T) {
+	got := membershipOutcome(true, []string{"fingerprint-of-removed-item"})
+	if !strings.Contains(got, "B candidate") {
+		t.Fatalf("membershipOutcome(true, [1 item]) = %q, want a B candidate result", got)
+	}
+}
+
+func TestMembershipOutcomeFreshAmbiguousChangeIsNotVerified(t *testing.T) {
+	got := membershipOutcome(true, []string{"a", "b"})
+	if !strings.Contains(got, "NOT VERIFIED") {
+		t.Fatalf("membershipOutcome(true, [2 items]) = %q, want NOT VERIFIED", got)
+	}
+}
+
 func TestDiffConversationIDsIgnoresOrder(t *testing.T) {
 	before := conv("a", "b", "c")
 	after := conv("c", "b", "a")
