@@ -468,6 +468,201 @@ func describeQueryValueForTest(value string) string {
 	return fmt.Sprintf("<redacted:%dch>", len(value))
 }
 
+// pageWithDescriptor builds on page() with the coverage-layer descriptor fields
+// (IsArchived/IsStarred/HasUnknownParameters) that mergeProjectPages itself ignores but
+// evaluateTargetPagination/evaluateActiveListCompleteness use to decide which series is relevant.
+func pageWithDescriptor(seriesKey string, offset, limit, rawItemCount, recognizedIDCount int, digest string, isArchived, isStarred *bool, hasUnknownParameters bool, ids ...string) conversationPage {
+	p := page(seriesKey, offset, limit, rawItemCount, recognizedIDCount, digest, ids...)
+	p.IsArchived = isArchived
+	p.IsStarred = isStarred
+	p.HasUnknownParameters = hasUnknownParameters
+	return p
+}
+
+func TestEvaluateTargetPaginationRestrictedSeriesAloneIsIncomplete(t *testing.T) {
+	// Only an is_starred=true series was observed; the requirement is the canonical
+	// is_starred=false active series. A restricted subset must never be mistaken for the default.
+	pages := []conversationPage{
+		pageWithDescriptor("starred-only", 0, 28, 3, 3, "d0", boolPtr(false), boolPtr(true), false, "a", "b", "c"),
+	}
+	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("an is_starred=true-only observation must not satisfy an is_starred=false requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationArchivedOnlySeriesIsIncomplete(t *testing.T) {
+	pages := []conversationPage{
+		pageWithDescriptor("archived-only", 0, 28, 2, 2, "d0", boolPtr(true), boolPtr(false), false, "a"),
+	}
+	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("an is_archived=true-only observation must not satisfy the active (is_archived=false) requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationCanonicalSeriesExhausted(t *testing.T) {
+	pages := []conversationPage{
+		pageWithDescriptor("canonical", 0, 2, 2, 2, "d0", boolPtr(false), boolPtr(false), false, "a", "b"),
+		pageWithDescriptor("canonical", 2, 2, 1, 1, "d1", boolPtr(false), boolPtr(false), false, "c"),
+	}
+	got, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("expected the canonical series' contiguous chain to be recognized as exhausted")
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d conversations, want 3", len(got))
+	}
+}
+
+func TestEvaluateTargetPaginationCanonicalSeriesNotExhausted(t *testing.T) {
+	pages := []conversationPage{
+		pageWithDescriptor("canonical", 0, 28, 28, 28, "d0", boolPtr(false), boolPtr(false), false, "a"),
+	}
+	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("a full first page alone must not satisfy the requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationIrrelevantSeriesDoesNotBlockCompleteness(t *testing.T) {
+	canonical := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
+	starredPartial := pageWithDescriptor("starred", 0, 28, 28, 28, "d1", boolPtr(false), boolPtr(true), false, "b")
+	pages := []conversationPage{canonical, starredPartial}
+
+	// Config A: is_starred is not part of the requirement — the starred series is irrelevant.
+	irrelevantConfig := []seriesRequirement{
+		{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), ForbidUnknownParameters: true},
+	}
+	_, exhausted, err := evaluateTargetPagination(pages, irrelevantConfig, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("an irrelevant, partially-observed series must not block completeness of the required series")
+	}
+
+	// Config B: both series are required — the starred series' incompleteness now matters.
+	bothRequiredConfig := []seriesRequirement{
+		{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), ForbidUnknownParameters: true},
+		{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(true), ForbidUnknownParameters: true},
+	}
+	_, exhausted, err = evaluateTargetPagination(pages, bothRequiredConfig, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("when both series are required, the incomplete starred series must block completeness")
+	}
+}
+
+func TestEvaluateTargetPaginationMultipleRequiredSeries(t *testing.T) {
+	required := []seriesRequirement{
+		{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), ForbidUnknownParameters: true},
+		{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(true), ForbidUnknownParameters: true},
+	}
+	aOnly := []conversationPage{
+		pageWithDescriptor("a", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "x"),
+	}
+	if _, exhausted, err := evaluateTargetPagination(aOnly, required, 20); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	} else if exhausted {
+		t.Fatal("required series B missing entirely must make the result incomplete")
+	}
+
+	both := append(append([]conversationPage{}, aOnly...),
+		pageWithDescriptor("b", 0, 2, 1, 1, "d1", boolPtr(false), boolPtr(true), false, "y"),
+	)
+	got, exhausted, err := evaluateTargetPagination(both, required, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("A and B both exhausted must make the result complete")
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d conversations, want 2", len(got))
+	}
+}
+
+func TestEvaluateTargetPaginationUnknownParameterExcludesSeries(t *testing.T) {
+	// Otherwise-canonical-looking series, but it carries a query parameter this bridge doesn't
+	// understand — it must never be trusted as representing the known target universe.
+	pages := []conversationPage{
+		pageWithDescriptor("canonical-but-unknown", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), true, "a"),
+	}
+	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("a series carrying an unrecognized query parameter must never satisfy a requirement that forbids it")
+	}
+}
+
+func TestEvaluateTargetPaginationIgnoresSchemaDriftInIrrelevantSeries(t *testing.T) {
+	// The core coverage-layer guarantee: an irrelevant series (here, archived — out of scope for the
+	// active-list requirement) is excluded BEFORE mergeProjectPages ever validates it, so even a
+	// completely malformed irrelevant series (unrecognized collection, here) cannot block or error
+	// out completeness of the series that actually matters.
+	canonical := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
+	brokenIrrelevant := conversationPage{
+		SeriesKey: "archived-broken", IsArchived: boolPtr(true), IsStarred: boolPtr(false),
+		Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0,
+	}
+	pages := []conversationPage{canonical, brokenIrrelevant}
+	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("schema drift in an irrelevant (archived) series must not reach the merge step: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("expected the canonical series alone to satisfy the requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationPropagatesSchemaDriftWithinRequiredSeries(t *testing.T) {
+	pages := []conversationPage{
+		{
+			SeriesKey: "canonical", IsArchived: boolPtr(false), IsStarred: boolPtr(false),
+			Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0, RawIdentityDigest: "d0",
+		},
+	}
+	if _, _, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20); err == nil {
+		t.Fatal("expected schema drift within a required series to still fail closed")
+	}
+}
+
+func TestEvaluateActiveListCompletenessCoverageIsUnknownEvenWhenPaginationCompletes(t *testing.T) {
+	// Live evidence in this account never exercised is_starred=true, so even a fully
+	// pagination-exhausted canonical series must not be reported as full COVERAGE completeness —
+	// only pagination completeness. See activeListCoverageCaveat.
+	pages := []conversationPage{
+		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
+	}
+	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pagination.Status != "COMPLETE" {
+		t.Fatalf("pagination = %s, want COMPLETE", pagination.Status)
+	}
+	if coverage.Status != "UNKNOWN" {
+		t.Fatalf("coverage = %s, want UNKNOWN (is_starred semantics unconfirmed)", coverage.Status)
+	}
+}
+
 func TestMergeProjectPagesNoObservedSeriesIsIncompleteNotError(t *testing.T) {
 	got, exhausted, err := mergeProjectPages(nil, 20)
 	if err != nil {
