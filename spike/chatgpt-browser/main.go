@@ -62,14 +62,21 @@ type queryParam struct {
 // legitimately at offset 0. RecognizedCollection distinguishes a response whose top-level item
 // collection could actually be located (even if empty) from one whose shape wasn't recognized at
 // all — the latter must never be treated as "0 items".
+//
+// HideSnorlax/IsArchived/IsStarred/Order are each one of a small set of values this bridge has
+// confirmed the meaning of (see bridge/main.js's recognizeQueryValue), or the literal string
+// "absent" (the query key wasn't present) or "unknown" (present with a value not in the recognized
+// set) — plain strings, never bool/pointer, specifically so a caller can never accidentally coerce
+// "absent" or "unknown" into a recognized value's meaning the way `value == "true" ? true : false`
+// used to.
 type globalConversationsPageDiagnostic struct {
 	CaptureID            int            `json:"captureID"`
 	SeriesKey            *string        `json:"seriesKey"`
 	Query                []queryParam   `json:"query"`
-	HideSnorlax          bool           `json:"hideSnorlax"`
-	IsArchived           *bool          `json:"isArchived"`
-	IsStarred            *bool          `json:"isStarred"`
-	Order                *string        `json:"order"`
+	HideSnorlax          string         `json:"hideSnorlax"`
+	IsArchived           string         `json:"isArchived"`
+	IsStarred            string         `json:"isStarred"`
+	Order                string         `json:"order"`
 	HasUnknownParameters bool           `json:"hasUnknownParameters"`
 	Offset               *int           `json:"offset"`
 	Limit                *int           `json:"limit"`
@@ -99,11 +106,17 @@ type globalConversationsCaptureItemsResult struct {
 // pages can be assembled into a contiguous offset chain regardless of the order they were observed
 // in, and so that two different filter combinations (e.g. differing is_archived, or a limit change)
 // are never treated as continuations of the same series.
+// IsArchived/IsStarred/Order carry the same recognized-value-or-"absent"/"unknown" string
+// convention as globalConversationsPageDiagnostic (never bool/pointer). HideSnorlax stays a plain
+// bool: it is a defensive, structural-only assertion inside mergeProjectPages (a page satisfying it
+// should never even be constructed by the live ingestion path — see enumerateAllConversations's
+// classification step — so this field exists to catch a caller bug, not to carry live semantics).
 type conversationPage struct {
 	SeriesKey                    string
 	HideSnorlax                  bool
-	IsArchived                   *bool
-	IsStarred                    *bool
+	IsArchived                   string
+	IsStarred                    string
+	Order                        string
 	HasUnknownParameters         bool
 	Offset                       int
 	Limit                        int
@@ -244,10 +257,23 @@ func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []
 type seriesRequirement struct {
 	RequireIsArchived       *bool
 	RequireIsStarred        *bool
+	RequireOrder            *string
 	ForbidUnknownParameters bool
 }
 
-func boolPtr(v bool) *bool { return &v }
+func boolPtr(v bool) *bool       { return &v }
+func stringPtr(v string) *string { return &v }
+
+// recognizedBoolString converts a plain bool intent ("this dimension must be exactly true/false")
+// into the recognized-value string form used by conversationPage.IsArchived/IsStarred, so that
+// "absent"/"unknown" (which never equal "true" or "false") can never accidentally satisfy a
+// requirement the way a nil/zero-value comparison could.
+func recognizedBoolString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
 
 func (req seriesRequirement) matches(p conversationPage) bool {
 	if p.HideSnorlax {
@@ -256,10 +282,13 @@ func (req seriesRequirement) matches(p conversationPage) bool {
 	if req.ForbidUnknownParameters && p.HasUnknownParameters {
 		return false
 	}
-	if req.RequireIsArchived != nil && (p.IsArchived == nil || *p.IsArchived != *req.RequireIsArchived) {
+	if req.RequireIsArchived != nil && p.IsArchived != recognizedBoolString(*req.RequireIsArchived) {
 		return false
 	}
-	if req.RequireIsStarred != nil && (p.IsStarred == nil || *p.IsStarred != *req.RequireIsStarred) {
+	if req.RequireIsStarred != nil && p.IsStarred != recognizedBoolString(*req.RequireIsStarred) {
+		return false
+	}
+	if req.RequireOrder != nil && p.Order != *req.RequireOrder {
 		return false
 	}
 	return true
@@ -325,8 +354,88 @@ func evaluateTargetPagination(pages []conversationPage, required []seriesRequire
 // hide_snorlax=false (Project-inclusive; enforced structurally, not via this requirement — see
 // seriesRequirement.matches), is_archived=false, is_starred=false, and no unrecognized query
 // parameter.
+// seriesClassification is the result of classifying one capture's semantics against a target
+// session universe, BEFORE any schema/content validation runs. It is deliberately three-valued,
+// not boolean, because "this capture is definitely not part of the target" and "this capture's
+// relevance to the target is unknown" require opposite handling: a definitely-irrelevant capture
+// must be skipped before validation (so its own schema drift, or malformed pagination metadata,
+// can never affect target completeness), while an unknown capture must NOT be silently skipped in
+// the sense of being treated as harmless — it has to make Coverage unsafe instead. Collapsing both
+// into one boolean `matches()` (as the earlier design did purely at the pagination layer) cannot
+// express that difference.
+type seriesClassification int
+
+const (
+	seriesUnknown seriesClassification = iota
+	seriesMatch
+	seriesDefinitelyIrrelevant
+)
+
+func (c seriesClassification) String() string {
+	switch c {
+	case seriesMatch:
+		return "MATCH"
+	case seriesDefinitelyIrrelevant:
+		return "DEFINITELY_IRRELEVANT"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+// classifyForActiveList classifies one capture's descriptor against the active (non-archived,
+// Project-inclusive) session universe (README Phase A/B/C), returning a human-readable reason
+// alongside the classification (used for wire diagnostics and, for UNKNOWN, composed into
+// Coverage.Reason).
+//
+// DEFINITELY_IRRELEVANT is returned only for dimensions with direct proof of exclusion:
+// hide_snorlax=true structurally excludes every Project conversation (confirmed by direct
+// item-level evidence — see mergeProjectPages's package doc / README), and is_archived=true is out
+// of the active-list scope by design (session.Provider.List(archived=false) — see README Phase A),
+// not by inference. Everything else uncertain is UNKNOWN, never silently folded into either MATCH
+// or DEFINITELY_IRRELEVANT: an unrecognized value on a known key ("unknown"), an unrecognized query
+// parameter, or an unproven "absent" state on is_archived/is_starred/order.
+//
+// hide_snorlax's "false" and "absent" states ARE treated identically here — deliberately, not a
+// shortcut: every real capture in this account's target series carries hide_snorlax absent, never
+// explicitly "false", and item-level filtering evidence directly confirmed both states include
+// Project conversations. is_archived/is_starred/order have no equivalent direct evidence for
+// "absent" (the real UI has never been observed omitting them), so their "absent" state stays
+// UNKNOWN rather than being assumed equivalent to "false".
+func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassification, string) {
+	switch d.HideSnorlax {
+	case "true":
+		return seriesDefinitelyIrrelevant, "hide_snorlax=true structurally excludes Project conversations"
+	case "false", "absent":
+		// proceed
+	default:
+		return seriesUnknown, fmt.Sprintf("hide_snorlax value not recognized (%q)", d.HideSnorlax)
+	}
+	switch d.IsArchived {
+	case "true":
+		return seriesDefinitelyIrrelevant, "is_archived=true is out of the active-list scope by design"
+	case "false":
+		// proceed
+	default: // "absent" or "unknown"
+		return seriesUnknown, fmt.Sprintf("is_archived value not confirmed safe for the active-list target (%q)", d.IsArchived)
+	}
+	if d.HasUnknownParameters {
+		return seriesUnknown, "query carries a parameter this bridge does not recognize"
+	}
+	if d.IsStarred != "false" {
+		return seriesUnknown, fmt.Sprintf("is_starred value not confirmed safe for the active-list target (%q)", d.IsStarred)
+	}
+	if d.Order != "updated" {
+		return seriesUnknown, fmt.Sprintf("order value not confirmed safe for the active-list target (%q)", d.Order)
+	}
+	return seriesMatch, ""
+}
+
+// RequireOrder is included because "updated" is the only order value ever observed on the real
+// default view; a different value has not been shown to select the same result set (see the
+// seriesClassification doc above) — completeness stays conservative rather than assuming order is
+// purely cosmetic.
 var activeListRequiredSeries = []seriesRequirement{
-	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), ForbidUnknownParameters: true},
+	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), RequireOrder: stringPtr("updated"), ForbidUnknownParameters: true},
 }
 
 // activeListCoverageCaveat documents the one dimension this PoC could not confirm or rule out: see
@@ -340,7 +449,15 @@ const activeListCoverageCaveat = "is_starred semantics unconfirmed: no real Chat
 // Pagination succeeds: this account never exercised an is_starred=true query, so whether it
 // represents a separate required bucket was never tested. Overall completeness (decided by the
 // caller) should require BOTH axes to be COMPLETE.
-func evaluateActiveListCompleteness(pages []conversationPage, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, err error) {
+//
+// unknownObservations is a composable list of additional reasons Coverage cannot be trusted,
+// supplied by the live-ingestion caller (see enumerateAllConversations's classification step) for
+// every capture whose semantics could not be classified MATCH or DEFINITELY_IRRELEVANT. Coverage
+// is UNKNOWN unconditionally in this PoC (activeListCoverageCaveat alone already guarantees that),
+// but a non-empty unknownObservations still forces UNKNOWN explicitly and composes into Reason, so
+// that resolving the is_starred blocker someday would not silently upgrade Coverage to COMPLETE
+// while an unrelated unknown-semantics capture was observed and ignored.
+func evaluateActiveListCompleteness(pages []conversationPage, unknownObservations []string, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, err error) {
 	items, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, maxPages)
 	if err != nil {
 		return nil, completenessResult{}, completenessResult{}, err
@@ -350,7 +467,8 @@ func evaluateActiveListCompleteness(pages []conversationPage, maxPages int) (con
 	} else {
 		pagination = completenessResult{Status: "INCOMPLETE", Reason: "the required active-Project series was not observed at all, or not yet pagination-exhausted"}
 	}
-	coverage = completenessResult{Status: "UNKNOWN", Reason: activeListCoverageCaveat}
+	reasons := append([]string{activeListCoverageCaveat}, unknownObservations...)
+	coverage = completenessResult{Status: "UNKNOWN", Reason: strings.Join(reasons, "; ")}
 	return items, pagination, coverage, nil
 }
 
@@ -868,10 +986,20 @@ func shortDigest(digest string) string {
 // list and passively harvests whatever new captures that produces, tracked by CaptureID (a
 // bridge-internal reference to one observed response — not a pagination position; see
 // globalConversationsPageDiagnostic). Each newly observed capture is printed as sanitized wire
-// evidence (series/offset/limit, hide_snorlax/is_archived/is_starred/unknown-parameter descriptor,
-// raw/recognized item counts, a shortened raw identity digest — never conversation content or full
-// IDs) before being folded into evaluateActiveListCompleteness, which does the actual
-// pagination-identity, target-series-coverage, and exhaustion reasoning.
+// evidence (series/offset/limit, hide_snorlax/is_archived/is_starred/order/unknown-parameter
+// descriptor, classification, raw/recognized item counts, a shortened raw identity digest — never
+// conversation content or full IDs).
+//
+// Every capture is classified (classifyForActiveList) BEFORE any schema/content validation runs:
+//   - DEFINITELY_IRRELEVANT: recorded above, then skipped entirely — no collection/offset/limit
+//     check, no item fetch, no schema validation. Such a capture (e.g. is_archived=true) is known
+//     to be outside the active-list target regardless of how malformed its content might be, so
+//     validating it could only ever produce a false FAIL, never useful information.
+//   - UNKNOWN: also skipped from pages (its relevance is not established), but recorded into
+//     unknownObservations, which composes into Coverage.Reason — never silently treated as
+//     harmless the way DEFINITELY_IRRELEVANT is.
+//   - MATCH: only now does the existing collection/offset/limit/item-fetch/schema-validation
+//     pipeline run, and the result is added to `pages` for evaluateActiveListCompleteness.
 //
 // knownConversationIDs (the project-scoped endpoint's already-discovered IDs) is passed through to
 // the bridge on every capture-items fetch, so it can flag a known Project conversation whose
@@ -880,6 +1008,7 @@ func shortDigest(digest string) string {
 func enumerateAllConversations(client net.Conn, projectID string, knownConversationIDs []string, maxScrollAttempts, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, pagesUsed int, err error) {
 	seenCaptures := make(map[int]bool)
 	var pages []conversationPage
+	var unknownObservations []string
 	nextRequestID := 300
 
 	fetchNewPages := func() error {
@@ -912,21 +1041,19 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			for _, q := range d.Query {
 				queryParts = append(queryParts, q.Key+"="+q.Value)
 			}
-			isArchivedStr, isStarredStr, orderStr := "?", "?", "?"
-			if d.IsArchived != nil {
-				isArchivedStr = fmt.Sprintf("%t", *d.IsArchived)
+			classification, classificationReason := classifyForActiveList(d)
+			fmt.Printf("global conversations wire capture #%d: classification=%s (%s) hide_snorlax=%s is_archived=%s is_starred=%s order=%s unknown_parameters=%t series=%s query=[%s] offset=%s limit=%s recognized_collection=%t raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
+				d.CaptureID, classification, classificationReason, d.HideSnorlax, d.IsArchived, d.IsStarred, d.Order, d.HasUnknownParameters, seriesDisplay, strings.Join(queryParts, ","), offsetStr, limitStr, d.RecognizedCollection, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
+
+			switch classification {
+			case seriesDefinitelyIrrelevant:
+				continue // proven outside the target universe; recorded above for evidence only
+			case seriesUnknown:
+				unknownObservations = append(unknownObservations,
+					fmt.Sprintf("capture %d: %s", d.CaptureID, classificationReason))
+				continue // relevance not established — never silently treated as irrelevant
 			}
-			if d.IsStarred != nil {
-				isStarredStr = fmt.Sprintf("%t", *d.IsStarred)
-			}
-			if d.Order != nil {
-				orderStr = *d.Order
-			}
-			fmt.Printf("global conversations wire capture #%d: hide_snorlax=%t is_archived=%s is_starred=%s order=%s unknown_parameters=%t series=%s query=[%s] offset=%s limit=%s recognized_collection=%t raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
-				d.CaptureID, d.HideSnorlax, isArchivedStr, isStarredStr, orderStr, d.HasUnknownParameters, seriesDisplay, strings.Join(queryParts, ","), offsetStr, limitStr, d.RecognizedCollection, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
-			if d.HideSnorlax {
-				continue // excludes Project conversations by construction; recorded above for evidence only
-			}
+			// classification == seriesMatch: only now does content/schema validation run.
 			if d.SeriesKey == nil {
 				return fmt.Errorf("capture %d has no usable pagination series identity", d.CaptureID)
 			}
@@ -952,6 +1079,7 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 				SeriesKey:                    *d.SeriesKey,
 				IsArchived:                   d.IsArchived,
 				IsStarred:                    d.IsStarred,
+				Order:                        d.Order,
 				HasUnknownParameters:         d.HasUnknownParameters,
 				Offset:                       *d.Offset,
 				Limit:                        *d.Limit,
@@ -971,7 +1099,7 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 		return nil, completenessResult{}, completenessResult{}, 0, err
 	}
 	for attempt := 0; attempt < maxScrollAttempts; attempt++ {
-		conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, maxPages)
+		conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, unknownObservations, maxPages)
 		if err != nil {
 			return nil, completenessResult{}, completenessResult{}, len(pages), err
 		}
@@ -994,7 +1122,7 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			return conversations, pagination, coverage, len(pages), err
 		}
 	}
-	conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, maxPages)
+	conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, unknownObservations, maxPages)
 	if err != nil {
 		return nil, completenessResult{}, completenessResult{}, len(pages), err
 	}

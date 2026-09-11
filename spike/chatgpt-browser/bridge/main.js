@@ -392,28 +392,33 @@ function rawItemID(item) {
 // series' *meaning* can be trusted at all.
 const KNOWN_SAFE_QUERY_PARAMETERS = new Set(["limit", "offset", "order", "is_archived", "is_starred", "hide_snorlax"]);
 
-function booleanQueryField(query, key) {
+// Recognizes one query parameter's value against an explicit allowlist of values this bridge has
+// confirmed the meaning of, distinguishing THREE states a caller must never conflate:
+//   - the key absent entirely                              -> "absent"
+//   - the key present with a value NOT in `recognizedValues` -> "unknown"
+//   - the key present with a recognized value               -> that value itself (e.g. "true")
+// This replaces an earlier `value === "true" ? true : false` fallback that silently treated any
+// unrecognized value (a typo, a future new mode, a malformed response) the same as the confirmed
+// "false" case. Never coerce "absent" or "unknown" into a recognized value's meaning downstream.
+function recognizeQueryValue(query, key, recognizedValues) {
   const entry = query.find((item) => item.key === key);
-  if (!entry) return null;
-  if (entry.value === "true") return true;
-  if (entry.value === "false") return false;
-  return null; // present but not a recognized boolean shape — treated the same as absent by callers
-}
-
-function stringQueryField(query, key) {
-  const entry = query.find((item) => item.key === key);
-  return entry ? entry.value : null;
+  if (!entry) return "absent";
+  return recognizedValues.includes(entry.value) ? entry.value : "unknown";
 }
 
 // Safe, allowlisted semantic metadata about a query — never used as pagination identity (that's
-// SeriesKey's job) and never containing an opaque/raw value. `isArchived`/`isStarred` are the two
-// query-level filter dimensions observed on this endpoint (see README Phase B); `hasUnknownParameters`
-// is the fail-closed signal for "this bridge doesn't fully understand what this query selects".
+// SeriesKey's job) and never containing an opaque/raw value. `hideSnorlax`/`isArchived`/`isStarred`/
+// `order` are each one of a small set of values this bridge has confirmed the meaning of, or
+// "absent"/"unknown" (see recognizeQueryValue) — never silently defaulted. `hasUnknownParameters`
+// is the fail-closed signal for "this bridge doesn't fully understand what this query selects" at
+// the query-shape level (an entirely unrecognized parameter name, as opposed to an unrecognized
+// value on a known one).
 function seriesDescriptorFrom(query) {
   return {
-    isArchived: booleanQueryField(query, "is_archived"),
-    isStarred: booleanQueryField(query, "is_starred"),
-    order: stringQueryField(query, "order"),
+    hideSnorlax: recognizeQueryValue(query, "hide_snorlax", ["true", "false"]),
+    isArchived: recognizeQueryValue(query, "is_archived", ["true", "false"]),
+    isStarred: recognizeQueryValue(query, "is_starred", ["true", "false"]),
+    order: recognizeQueryValue(query, "order", ["updated"]),
     hasUnknownParameters: query.some((entry) => !KNOWN_SAFE_QUERY_PARAMETERS.has(entry.key)),
   };
 }
@@ -463,8 +468,8 @@ function recordGlobalConversationsPage(url, payload) {
   // hide_snorlax=true excludes Project/gizmo-associated conversations from `items` (empirically
   // confirmed: identical account state, item-level Project association present only when this is
   // false or absent) even though it does not appear to affect the unreliable top-level `total`.
-  // Only pages where this is false/absent are valid input for Project enumeration.
-  const hideSnorlax = query.some((entry) => entry.key === "hide_snorlax" && entry.value === "true");
+  // Only pages where this is false/absent are valid input for Project enumeration. The recognized
+  // three-state value (not a bare boolean) is computed below by seriesDescriptorFrom.
   const meta = scalarMetaOf(payload);
   const rawItemCount = recognizedCollection ? items.length : 0;
   const recognizedIDs = recognizedCollection ? items.map(rawItemID).filter(Boolean) : [];
@@ -479,7 +484,6 @@ function recordGlobalConversationsPage(url, payload) {
     seriesKey: canonicalSeriesKeyFrom(url),
     query,
     ...seriesDescriptorFrom(query),
-    hideSnorlax,
     offset: integerMetaField(meta, "offset"),
     limit: integerMetaField(meta, "limit"),
     recognizedCollection,
