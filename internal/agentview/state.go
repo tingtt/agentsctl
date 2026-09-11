@@ -101,10 +101,11 @@ func NewState() State {
 // selection identity (see the DesignDoc's "selection identity は
 // session.Key"): if the previously-selected session (or, while renaming,
 // the rename target) is still present, selection stays on it regardless
-// of its new position; otherwise selection falls back to the first row
-// (rows are already sorted pinned-then-newest-first, so this is the most
-// prominent remaining row) rather than an arbitrary index that used to
-// point at the now-gone row.
+// of its new position. If it disappeared, selection moves to the first
+// surviving session after it in the previous visual order, or walks
+// backward from its previous position if none survive after it. The
+// selected session remains identified by key; visual positions are used
+// only to choose a replacement identity.
 //
 // Pending confirmations are NOT cleared here: the DesignDoc requires a
 // row notice to follow its session across a Refresh, not just a local
@@ -115,6 +116,16 @@ func (s *State) SetRows(rows []session.Session) {
 	if s.Rename.Active {
 		target, tracking = s.Rename.Target, true
 	}
+	oldRows := s.Rows
+	oldVisualIndices := visualRowIndices(oldRows)
+	targetVisualIndex := -1
+	for i, rowIndex := range oldVisualIndices {
+		if oldRows[rowIndex].Key == target {
+			targetVisualIndex = i
+			break
+		}
+	}
+
 	s.Rows = rows
 	if tracking {
 		for _, r := range rows {
@@ -124,11 +135,31 @@ func (s *State) SetRows(rows []session.Session) {
 			}
 		}
 	}
-	if len(rows) > 0 {
-		s.selectedKey, s.hasSelection = rows[0].Key, true
-	} else {
-		s.hasSelection = false
+	if tracking && targetVisualIndex >= 0 {
+		remaining := make(map[session.Key]struct{}, len(rows))
+		for _, row := range rows {
+			remaining[row.Key] = struct{}{}
+		}
+		for _, rowIndex := range oldVisualIndices[targetVisualIndex+1:] {
+			candidate := oldRows[rowIndex].Key
+			if _, ok := remaining[candidate]; ok {
+				s.selectedKey, s.hasSelection = candidate, true
+				return
+			}
+		}
+		for i := targetVisualIndex - 1; i >= 0; i-- {
+			candidate := oldRows[oldVisualIndices[i]].Key
+			if _, ok := remaining[candidate]; ok {
+				s.selectedKey, s.hasSelection = candidate, true
+				return
+			}
+		}
 	}
+	if indices := visualRowIndices(rows); len(indices) > 0 {
+		s.selectedKey, s.hasSelection = rows[indices[0]].Key, true
+		return
+	}
+	s.selectedKey, s.hasSelection = session.Key{}, false
 }
 
 // SelectedRow returns the currently-selected session, if any.

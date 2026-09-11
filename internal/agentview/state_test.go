@@ -34,18 +34,92 @@ func TestSetRowsPreservesSelectionAcrossReorder(t *testing.T) {
 	}
 }
 
-// TestSetRowsFallsBackToFirstRowWhenSelectionDisappears covers the
-// session-removed case (e.g. a successful archive): selection must not
-// silently point at an arbitrary different row that happens to now
-// occupy the old numeric index.
-func TestSetRowsFallsBackToFirstRowWhenSelectionDisappears(t *testing.T) {
+func TestSetRowsSelectsNearbySurvivingSessionWhenSelectionDisappears(t *testing.T) {
+	tests := []struct {
+		name      string
+		before    []session.Session
+		selected  int
+		after     []session.Session
+		want      session.Key
+		wantEmpty bool
+	}{
+		{
+			name:     "middle selects next",
+			before:   []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("c")}, {Key: key("d")}, {Key: key("e")}},
+			selected: 2,
+			after:    []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("d")}, {Key: key("e")}},
+			want:     key("d"),
+		},
+		{
+			name:     "last selects previous",
+			before:   []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("c")}},
+			selected: 2,
+			after:    []session.Session{{Key: key("a")}, {Key: key("b")}},
+			want:     key("b"),
+		},
+		{
+			name:     "first selects next",
+			before:   []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("c")}},
+			selected: 0,
+			after:    []session.Session{{Key: key("b")}, {Key: key("c")}},
+			want:     key("b"),
+		},
+		{
+			name:      "only clears selection",
+			before:    []session.Session{{Key: key("a")}},
+			selected:  0,
+			wantEmpty: true,
+		},
+		{
+			name:     "skips removed next sessions",
+			before:   []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("c")}, {Key: key("d")}, {Key: key("e")}},
+			selected: 2,
+			after:    []session.Session{{Key: key("a")}, {Key: key("b")}, {Key: key("e")}},
+			want:     key("e"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(tt.before)
+			s.selectIndex(tt.selected)
+			s.SetRows(tt.after)
+
+			got, ok := s.SelectedRow()
+			if tt.wantEmpty {
+				if ok || s.SelectedIndex() != -1 {
+					t.Fatalf("selection must be empty: got=%+v ok=%v index=%d", got, ok, s.SelectedIndex())
+				}
+				return
+			}
+			if !ok || got.Key != tt.want {
+				t.Fatalf("selection=%+v ok=%v, want %s", got.Key, ok, tt.want)
+			}
+		})
+	}
+}
+
+func TestSetRowsUsesVisualOrderAcrossPinnedAndDirectoryGroupsToReplaceMissingSelection(t *testing.T) {
 	s := NewState()
-	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("b")}})
-	s.selectIndex(1) // select "b"
-	s.SetRows([]session.Session{{Key: key("c")}})
+	s.SetRows([]session.Session{
+		{Key: key("P1"), CWD: "/work/repo-b", Pinned: true},
+		{Key: key("A1"), CWD: "/work/repo-a"},
+		{Key: key("B1"), CWD: "/work/repo-b"},
+		{Key: key("A2"), CWD: "/work/repo-a"},
+		{Key: key("B2"), CWD: "/work/repo-b"},
+	})
+	s.selectIndex(3) // A2; visual order is P1, A1, A2, B1, B2.
+	s.SetRows([]session.Session{
+		{Key: key("P1"), CWD: "/work/repo-b", Pinned: true},
+		{Key: key("A1"), CWD: "/work/repo-a"},
+		{Key: key("B1"), CWD: "/work/repo-b"},
+		{Key: key("B2"), CWD: "/work/repo-b"},
+	})
+
 	got, ok := s.SelectedRow()
-	if !ok || got.Key != key("c") {
-		t.Fatalf("expected fallback to the remaining row, got=%+v ok=%v", got, ok)
+	if !ok || got.Key != key("B1") {
+		t.Fatalf("selection=%+v ok=%v, want visual-next B1", got.Key, ok)
 	}
 }
 
