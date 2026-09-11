@@ -821,3 +821,112 @@ func TestMergeProjectPagesNoObservedSeriesIsIncompleteNotError(t *testing.T) {
 		t.Fatalf("got %d conversations, want 0", len(got))
 	}
 }
+
+// --- Phase 5 is_starred coverage experiment: controlled membership evidence ---
+
+func TestConversationFingerprintIsStableForSameID(t *testing.T) {
+	id := "11111111-2222-3333-4444-555555555555"
+	if conversationFingerprint(id) != conversationFingerprint(id) {
+		t.Fatal("expected the same raw ID to always produce the same fingerprint")
+	}
+}
+
+func TestConversationFingerprintDiffersForDifferentIDs(t *testing.T) {
+	a := conversationFingerprint("11111111-2222-3333-4444-555555555555")
+	b := conversationFingerprint("66666666-7777-8888-9999-000000000000")
+	if a == b {
+		t.Fatal("expected different raw IDs to produce different fingerprints")
+	}
+}
+
+func TestConversationFingerprintNeverEqualsTheRawID(t *testing.T) {
+	id := "11111111-2222-3333-4444-555555555555"
+	fp := conversationFingerprint(id)
+	if fp == id {
+		t.Fatal("fingerprint must never equal the raw ID it was derived from")
+	}
+	if strings.Contains(fp, id) || strings.Contains(id, fp) {
+		t.Fatal("fingerprint must not contain, or be contained by, the raw ID")
+	}
+	if len(fp) != 12 {
+		t.Fatalf("fingerprint length = %d, want 12 (the diagnostic-safe short form)", len(fp))
+	}
+}
+
+func TestMembershipEvidenceNeverLeaksRawIDs(t *testing.T) {
+	before := conv("11111111-2222-3333-4444-555555555555", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	after := conv("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "99999999-8888-7777-6666-555555555555")
+	ev := compareMembership(before, after)
+	rendered := fmt.Sprintf("%+v", ev)
+	for _, id := range []string{
+		"11111111-2222-3333-4444-555555555555",
+		"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		"99999999-8888-7777-6666-555555555555",
+	} {
+		if strings.Contains(rendered, id) {
+			t.Fatalf("membershipEvidence rendering leaked a raw conversation ID: %s", rendered)
+		}
+	}
+	if len(ev.DisappearedDigests) != 1 || ev.DisappearedDigests[0] != conversationFingerprint("11111111-2222-3333-4444-555555555555") {
+		t.Fatalf("DisappearedDigests = %v, want exactly the fingerprint of the removed ID", ev.DisappearedDigests)
+	}
+	if len(ev.AppearedDigests) != 1 || ev.AppearedDigests[0] != conversationFingerprint("99999999-8888-7777-6666-555555555555") {
+		t.Fatalf("AppearedDigests = %v, want exactly the fingerprint of the added ID", ev.AppearedDigests)
+	}
+	if ev.BeforeCount != 2 || ev.AfterCount != 2 {
+		t.Fatalf("BeforeCount/AfterCount = %d/%d, want 2/2", ev.BeforeCount, ev.AfterCount)
+	}
+}
+
+func TestCompareMembershipNoChangeIsOutcomeA(t *testing.T) {
+	// The Outcome A signal (README Phase D): the target series is unchanged across an observation
+	// pair, evidence that whatever happened did not exclude any previously-present member.
+	set := conv("a", "b", "c")
+	ev := compareMembership(set, set)
+	if len(ev.DisappearedDigests) != 0 || len(ev.AppearedDigests) != 0 {
+		t.Fatalf("expected no membership change, got disappeared=%v appeared=%v", ev.DisappearedDigests, ev.AppearedDigests)
+	}
+}
+
+func TestCompareMembershipBaselinePinnedRestoredCycle(t *testing.T) {
+	// Simulates the full Phase B/D/H cycle this spike's runPinExperiment drives interactively: a
+	// pin action removes one conversation from the target series (Outcome B signal), and restoring
+	// it afterward should bring the series back to exactly its original membership.
+	baseline := conv("a", "b", "c")
+	afterPin := conv("a", "c") // "b" disappeared — the pinned conversation
+	afterRestore := conv("a", "b", "c")
+
+	pinEvidence := compareMembership(baseline, afterPin)
+	if len(pinEvidence.DisappearedDigests) != 1 || pinEvidence.DisappearedDigests[0] != conversationFingerprint("b") {
+		t.Fatalf("pin evidence disappeared = %v, want exactly fingerprint(b)", pinEvidence.DisappearedDigests)
+	}
+	if len(pinEvidence.AppearedDigests) != 0 {
+		t.Fatalf("pin evidence appeared = %v, want none", pinEvidence.AppearedDigests)
+	}
+
+	restoreEvidence := compareMembership(baseline, afterRestore)
+	if len(restoreEvidence.DisappearedDigests) != 0 || len(restoreEvidence.AppearedDigests) != 0 {
+		t.Fatalf("restore evidence should match baseline exactly, got disappeared=%v appeared=%v",
+			restoreEvidence.DisappearedDigests, restoreEvidence.AppearedDigests)
+	}
+}
+
+func TestCompareMembershipAmbiguousChangeIsNotSingleAttributable(t *testing.T) {
+	// More than one member changing between two observations can't be cleanly attributed to a single
+	// controlled pin action — runPinExperiment reports this as NOT VERIFIED rather than guessing.
+	baseline := conv("a", "b", "c")
+	after := conv("a") // both "b" and "c" disappeared
+	ev := compareMembership(baseline, after)
+	if len(ev.DisappearedDigests) != 2 {
+		t.Fatalf("expected 2 disappeared entries for an ambiguous multi-member change, got %v", ev.DisappearedDigests)
+	}
+}
+
+func TestDiffConversationIDsIgnoresOrder(t *testing.T) {
+	before := conv("a", "b", "c")
+	after := conv("c", "b", "a")
+	disappeared, appeared := diffConversationIDs(before, after)
+	if len(disappeared) != 0 || len(appeared) != 0 {
+		t.Fatalf("expected no diff for a reordered but identical set, got disappeared=%v appeared=%v", disappeared, appeared)
+	}
+}
