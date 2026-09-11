@@ -4,6 +4,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,6 +35,7 @@ type config struct {
 	projectName   string
 	hold          time.Duration
 	closePTYAfter time.Duration
+	pinExperiment bool
 }
 
 type request struct {
@@ -472,6 +475,243 @@ func evaluateActiveListCompleteness(pages []conversationPage, unknownObservation
 	return items, pagination, coverage, nil
 }
 
+// conversationFingerprint returns a short, deterministic identifier for a conversation ID — SHA-256
+// hex, truncated to 12 characters — for the Phase 5 is_starred coverage experiment (README "ChatGPT
+// Phase 5: prove is_starred coverage semantics"). It exists so that experiment can report and
+// compare conversation identity across live observations (baseline / after-pin / after-restore)
+// without ever printing, logging, or writing a real conversation ID: only this fingerprint is safe
+// to surface, per the same security boundary the rest of this spike already follows.
+func conversationFingerprint(id string) string {
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// diffConversationIDs returns the raw IDs present in `before` but missing from `after`
+// (disappeared) and present in `after` but missing from `before` (appeared), both sorted for
+// determinism. Raw IDs stay in Go-process memory only — callers that need to report this evidence
+// must go through compareMembership instead, which fingerprints every ID before it is returned.
+func diffConversationIDs(before, after []conversation) (disappeared, appeared []string) {
+	beforeIDs := make(map[string]struct{}, len(before))
+	for _, c := range before {
+		beforeIDs[c.ID] = struct{}{}
+	}
+	afterIDs := make(map[string]struct{}, len(after))
+	for _, c := range after {
+		afterIDs[c.ID] = struct{}{}
+	}
+	for id := range beforeIDs {
+		if _, ok := afterIDs[id]; !ok {
+			disappeared = append(disappeared, id)
+		}
+	}
+	for id := range afterIDs {
+		if _, ok := beforeIDs[id]; !ok {
+			appeared = append(appeared, id)
+		}
+	}
+	slices.Sort(disappeared)
+	slices.Sort(appeared)
+	return disappeared, appeared
+}
+
+// membershipEvidence is the printable, digest-only report of diffConversationIDs between two
+// observations of the same target series — safe to log or record in the README's evidence trail,
+// since every ID it carries has already passed through conversationFingerprint.
+type membershipEvidence struct {
+	BeforeCount        int
+	AfterCount         int
+	DisappearedDigests []string
+	AppearedDigests    []string
+}
+
+// compareMembership is the core evidence primitive for the Phase 5 is_starred experiment's
+// decisive membership test (README Phase D). It deliberately does not require the caller to
+// pre-select which conversation to track: the operator pins/unpins ANY ONE currently active
+// Project conversation of their own choosing directly in the real ChatGPT UI (which already shows
+// them its title — nothing this program ever needs to know or print), and this function identifies
+// which conversation was affected purely from the set difference between two enumerations of the
+// active target series. A clean single-item disappearance/reappearance is exactly the signal a
+// controlled single-conversation pin/unpin should produce; anything else (zero or more than one
+// change) means the observed change cannot be cleanly attributed to the operator's action alone.
+func compareMembership(before, after []conversation) membershipEvidence {
+	disappeared, appeared := diffConversationIDs(before, after)
+	ev := membershipEvidence{BeforeCount: len(before), AfterCount: len(after)}
+	for _, id := range disappeared {
+		ev.DisappearedDigests = append(ev.DisappearedDigests, conversationFingerprint(id))
+	}
+	for _, id := range appeared {
+		ev.AppearedDigests = append(ev.AppearedDigests, conversationFingerprint(id))
+	}
+	return ev
+}
+
+// pinsSnapshot is the bridge's sanitized report of the observed, undocumented /backend-api/pins
+// endpoint (README Phase G), used as supporting evidence alongside the target-series membership
+// test. CaptureID lets the caller tell whether a later call observed a genuinely fresh response
+// (Phase E's "avoid stale/cached data" requirement) rather than the same capture as before. IDs are
+// raw conversation IDs already established elsewhere in this bridge protocol to cross the local,
+// trusted socket (e.g. conversation.ID); callers must never print them directly — only through
+// conversationFingerprint or a boolean membership check.
+type pinsSnapshot struct {
+	CaptureID         int      `json:"captureID"`
+	RawItemCount      int      `json:"rawItemCount"`
+	RecognizedIDCount int      `json:"recognizedIDCount"`
+	IDs               []string `json:"ids"`
+}
+
+func fetchPins(client net.Conn, id int) (pinsSnapshot, error) {
+	raw, err := call(client, request{ID: id, Method: "pins"})
+	if err != nil {
+		return pinsSnapshot{}, err
+	}
+	var snap pinsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return pinsSnapshot{}, fmt.Errorf("decode pins: %w", err)
+	}
+	return snap, nil
+}
+
+// runPinExperiment drives the interactive, human-in-the-loop Phase 5 is_starred coverage
+// experiment end to end (README "ChatGPT Phase 5: prove is_starred coverage semantics", Phases
+// B through H). It never asks the operator to identify a conversation by title or ID — see
+// compareMembership — and never issues a pin/star mutation itself (README's safety boundary
+// requires a human to perform that in the real UI).
+func runPinExperiment(client net.Conn, projectID string, knownIDs []string) error {
+	reader := bufio.NewReader(os.Stdin)
+	prompt := func(message string) error {
+		fmt.Println(message)
+		fmt.Print("Press Enter when done: ")
+		_, err := reader.ReadString('\n')
+		return err
+	}
+
+	fmt.Println("=== Phase 5 is_starred coverage experiment ===")
+	baseline, basePagination, baseCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	if err != nil {
+		return fmt.Errorf("baseline enumeration: %w", err)
+	}
+	fmt.Printf("baseline target series: target_count=%d pagination=%s coverage=%s\n",
+		len(baseline), basePagination.Status, baseCoverage.Status)
+	basePins, pinsErr := fetchPins(client, 500)
+	if pinsErr != nil {
+		fmt.Printf("baseline pins: NOT VERIFIED (%v)\n", pinsErr)
+	} else {
+		fmt.Printf("baseline pins: captureID=%d raw_count=%d recognized_id_count=%d\n",
+			basePins.CaptureID, basePins.RawItemCount, basePins.RecognizedIDCount)
+	}
+
+	if err := prompt("ACTION REQUIRED: in the real ChatGPT Web UI, Pin/Star/Favorite exactly ONE conversation that is currently active (non-archived) in the configured Project. Note which UI label you actually used (Pin/Star/Favorite/other). Then reload or navigate within the Project sidebar so a fresh /backend-api/conversations request fires."); err != nil {
+		return fmt.Errorf("read operator confirmation: %w", err)
+	}
+
+	after, afterPagination, afterCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	if err != nil {
+		return fmt.Errorf("post-pin enumeration: %w", err)
+	}
+	fmt.Printf("after pin target series: target_count=%d pagination=%s coverage=%s\n",
+		len(after), afterPagination.Status, afterCoverage.Status)
+	membership := compareMembership(baseline, after)
+	fmt.Printf("membership evidence (pin): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
+		membership.BeforeCount, membership.AfterCount, membership.DisappearedDigests, membership.AppearedDigests)
+
+	disappeared, _ := diffConversationIDs(baseline, after)
+	switch {
+	case len(disappeared) == 0:
+		fmt.Println("outcome: A candidate — no target-series member disappeared after the pin action")
+	case len(disappeared) == 1:
+		fmt.Println("outcome: B candidate — exactly one target-series member disappeared after the pin action")
+	default:
+		fmt.Println("outcome: NOT VERIFIED — target series changed ambiguously (more than one member disappeared); cannot attribute to the pin action alone")
+	}
+
+	afterPins, afterPinsErr := fetchPins(client, 501)
+	if afterPinsErr != nil {
+		fmt.Printf("after-pin pins: NOT VERIFIED (%v)\n", afterPinsErr)
+	} else {
+		fresh := pinsErr != nil || afterPins.CaptureID > basePins.CaptureID
+		fmt.Printf("after-pin pins: captureID=%d raw_count=%d recognized_id_count=%d fresh=%t\n",
+			afterPins.CaptureID, afterPins.RawItemCount, afterPins.RecognizedIDCount, fresh)
+		if len(disappeared) == 1 {
+			fmt.Printf("pins membership check: controlled_sample_membership_in_pins=%t\n", slices.Contains(afterPins.IDs, disappeared[0]))
+		}
+	}
+
+	reportStarredSeries(client, projectID, knownIDs, disappeared)
+
+	if err := prompt("ACTION REQUIRED: unpin/unstar the conversation you just pinned, restoring its original state. Then reload or navigate within the Project sidebar again."); err != nil {
+		return fmt.Errorf("read operator confirmation: %w", err)
+	}
+
+	restored, restoredPagination, restoredCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	if err != nil {
+		return fmt.Errorf("post-restore enumeration: %w", err)
+	}
+	fmt.Printf("after restore target series: target_count=%d pagination=%s coverage=%s\n",
+		len(restored), restoredPagination.Status, restoredCoverage.Status)
+	restoreMembership := compareMembership(baseline, restored)
+	fmt.Printf("membership evidence (restore vs baseline): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
+		restoreMembership.BeforeCount, restoreMembership.AfterCount, restoreMembership.DisappearedDigests, restoreMembership.AppearedDigests)
+	if len(restoreMembership.DisappearedDigests) == 0 && len(restoreMembership.AppearedDigests) == 0 {
+		fmt.Println("restore evidence: PASS — target series returned to its baseline membership")
+	} else {
+		fmt.Println("restore evidence: NOT VERIFIED — target series did not return to its exact baseline membership")
+	}
+	return nil
+}
+
+// reportStarredSeries investigates README Phase 5's secondary question: whether any real UI action
+// in this session ever issued an is_starred=true /backend-api/conversations request (passively
+// captured like every other observed page — see globalConversationsPages), and if so, whether it
+// includes the conversation identified as affected by the pin action above (Phase F).
+func reportStarredSeries(client net.Conn, projectID string, knownIDs []string, disappeared []string) {
+	raw, err := call(client, request{ID: 600, Method: "globalConversationsPages"})
+	if err != nil {
+		fmt.Printf("is_starred=true series: NOT VERIFIED (%v)\n", err)
+		return
+	}
+	var diagnostics []globalConversationsPageDiagnostic
+	if err := json.Unmarshal(raw, &diagnostics); err != nil {
+		fmt.Printf("is_starred=true series: NOT VERIFIED (decode: %v)\n", err)
+		return
+	}
+	var starredCaptures []globalConversationsPageDiagnostic
+	for _, d := range diagnostics {
+		if d.IsStarred == "true" {
+			starredCaptures = append(starredCaptures, d)
+		}
+	}
+	if len(starredCaptures) == 0 {
+		fmt.Println("is_starred=true series: NOT OBSERVED — no real UI action in this session issued an is_starred=true request")
+		return
+	}
+	for _, d := range starredCaptures {
+		itemsRaw, err := call(client, request{
+			ID: 601, Method: "globalConversationsCaptureItems", ProjectID: projectID,
+			CaptureID: d.CaptureID, KnownConversationIDs: knownIDs,
+		})
+		if err != nil {
+			fmt.Printf("is_starred=true series (capture %d): NOT VERIFIED (%v)\n", d.CaptureID, err)
+			continue
+		}
+		var result globalConversationsCaptureItemsResult
+		if err := json.Unmarshal(itemsRaw, &result); err != nil {
+			fmt.Printf("is_starred=true series (capture %d): NOT VERIFIED (decode: %v)\n", d.CaptureID, err)
+			continue
+		}
+		present := false
+		if len(disappeared) == 1 {
+			for _, item := range result.Items {
+				if item.ID == disappeared[0] {
+					present = true
+					break
+				}
+			}
+		}
+		fmt.Printf("is_starred=true series (capture %d): raw_count=%d configured_project_count=%d controlled_sample_present=%t\n",
+			d.CaptureID, d.RawItemCount, len(result.Items), present)
+	}
+}
+
 type globalConversationsPageResult struct {
 	Items        []conversation `json:"items"`
 	RawItemCount int            `json:"rawItemCount"`
@@ -573,6 +813,8 @@ func parseFlags() config {
 	flag.StringVar(&cfg.projectName, "project-name", "", "Project name to resolve without printing names")
 	flag.DurationVar(&cfg.hold, "hold", 0, "keep the helper alive after probes")
 	flag.DurationVar(&cfg.closePTYAfter, "close-pty-after", 0, "close the PTY after this duration for lifecycle testing")
+	flag.BoolVar(&cfg.pinExperiment, "pin-experiment", false,
+		"run the interactive Phase 5 is_starred coverage experiment (README 'ChatGPT Phase 5: prove is_starred coverage semantics'); requires an interactive terminal and a human performing pin/star actions in the real ChatGPT UI")
 	flag.Parse()
 	return cfg
 }
@@ -840,6 +1082,12 @@ func run(ctx context.Context, cfg config) error {
 			printProbe("work-like, project-scoped /g/{project}/c/{id}", probe.WorkLikeProjectScoped)
 			printProbe("chat-like, canonical /c/{id}", probe.ChatLikeCanonical)
 			printProbe("chat-like, project-scoped /g/{project}/c/{id}", probe.ChatLikeProjectScoped)
+		}
+
+		if cfg.pinExperiment {
+			if err := runPinExperiment(client, projectID, ids); err != nil {
+				return fmt.Errorf("pin experiment: %w", err)
+			}
 		}
 	}
 

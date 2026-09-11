@@ -11,6 +11,11 @@ let nextIPCRequestID = 1;
 let capturedProjects = null;
 let capturedTasks = null;
 let capturedGlobalConversations = null;
+let capturedPins = null;
+// Incremented on every fresh /backend-api/pins capture, so a caller (see the "pins" dispatch
+// handler) can tell a genuinely new observation apart from the same stale one returned twice —
+// needed for the Phase 5 is_starred experiment's before/after pins comparison (README Phase E).
+let pinsCaptureID = 0;
 const conversationIDPattern = /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i;
 // Capture identity (CaptureID) is assigned once, at capture time, and never reused or reinterpreted
 // — it is a bridge-internal reference to one observed response, nothing else. Pagination identity
@@ -50,6 +55,7 @@ function captureTarget(rawURL) {
     if (url.hostname !== "chatgpt.com") return null;
     if (url.pathname === "/backend-api/gizmos/snorlax/sidebar") return { kind: "projects" };
     if (url.pathname === "/backend-api/tasks" || url.pathname.startsWith("/backend-api/tasks/")) return { kind: "tasks" };
+    if (url.pathname === "/backend-api/pins") return { kind: "pins" };
     const match = /^\/backend-api\/gizmos\/(g-p-[A-Za-z0-9_-]+)\/conversations$/.exec(url.pathname);
     if (match) return { kind: "conversations", projectID: match[1] };
     if (url.pathname === "/backend-api/conversations") return { kind: "globalConversations" };
@@ -97,7 +103,8 @@ function attachCapture(contents) {
       else if (target.kind === "globalConversations") {
         capturedGlobalConversations = payload;
         recordGlobalConversationsPage(target.url, payload);
-      } else if (target.kind === "conversations") capturedConversations.set(target.projectID, payload);
+      } else if (target.kind === "pins") { capturedPins = payload; pinsCaptureID++; }
+      else if (target.kind === "conversations") capturedConversations.set(target.projectID, payload);
       else capturedConversationDetails.set(target.conversationID, payload);
     } catch {
       captureErrorCount++;
@@ -175,6 +182,7 @@ async function dispatch(request) {
   if (![
     "pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe",
     "globalConversationsPages", "globalConversationsPage", "globalConversationsCaptureItems", "simulateSidebarScroll",
+    "pins",
   ].includes(request.method)) {
     throw new Error(`unsupported method: ${request.method}`);
   }
@@ -233,6 +241,17 @@ async function dispatch(request) {
   if (request.method === "tasks") {
     const payload = await waitForCapture(() => capturedTasks);
     return requestPage({ method: "sanitizeTasks", payload, conversationIDs: request.conversationIDs || [] });
+  }
+  if (request.method === "pins") {
+    // Passive-only, like every other capture in this bridge: no fetch is issued here, and if
+    // /backend-api/pins was never observed yet this returns an honest empty snapshot (captureID 0)
+    // rather than blocking — the Phase 5 experiment treats a captureID that never advances as
+    // "not verified", not as evidence of anything about pin state itself.
+    if (!capturedPins) {
+      return { captureID: 0, rawItemCount: 0, recognizedIDCount: 0, ids: [] };
+    }
+    const sanitized = await requestPage({ method: "sanitizePins", payload: capturedPins });
+    return { captureID: pinsCaptureID, ...sanitized };
   }
   if (request.method === "globalConversations") {
     if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {

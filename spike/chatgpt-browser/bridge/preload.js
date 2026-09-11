@@ -135,6 +135,23 @@ function globalConversationsFrom(payload, projectID) {
   return [...candidates.values()];
 }
 
+// pinsFrom sanitizes the observed, undocumented /backend-api/pins response for the Phase 5
+// is_starred coverage experiment (README "ChatGPT Phase 5"). It recognizes only conversation-ID-
+// shaped values (the same allowlisted id/conversation_id fields and pattern used everywhere else
+// in this bridge, found via a deep object walk since the pins payload's exact shape is unconfirmed),
+// never a pin/star item's title or other content — so a pinned item's title never crosses the
+// bridge, even though its conversation ID (an already-established, non-title identity crossing
+// pattern elsewhere in this file) does.
+function pinsFrom(payload) {
+  if (!payload || typeof payload !== "object") throw new Error("pins response is not an object");
+  const ids = new Set();
+  for (const object of allObjects(payload)) {
+    const id = firstString(object, ["id", "conversation_id"]);
+    if (id && conversationIDPattern.test(id)) ids.add(id);
+  }
+  return { rawItemCount: rawTopLevelItems(payload).length, ids: [...ids] };
+}
+
 function tasksFrom(payload, knownConversationIDs) {
   if (!payload || typeof payload !== "object") throw new Error("tasks response is not an object");
   const known = new Set(knownConversationIDs.filter((id) => conversationIDPattern.test(id)));
@@ -293,6 +310,10 @@ async function dispatch(request) {
   }
   if (request.method === "sanitizeTasks") {
     return tasksFrom(request.payload, Array.isArray(request.conversationIDs) ? request.conversationIDs : []);
+  }
+  if (request.method === "sanitizePins") {
+    const { rawItemCount, ids } = pinsFrom(request.payload);
+    return { rawItemCount, recognizedIDCount: ids.length, ids };
   }
   if (request.method === "sanitizeGlobalConversations") {
     return globalConversationsFrom(request.payload, request.projectID);
