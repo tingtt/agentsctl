@@ -632,16 +632,23 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 	}
 
 	fmt.Println("=== Phase 5 is_starred coverage experiment ===")
-	baselineMaxCapture, captureErr := maxObservedCaptureID(client, 490)
-	if captureErr != nil {
-		fmt.Printf("baseline capture watermark: NOT VERIFIED (%v)\n", captureErr)
-	}
 	baseline, basePagination, baseCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
 	if err != nil {
 		return fmt.Errorf("baseline enumeration: %w", err)
 	}
-	fmt.Printf("baseline target series: target_count=%d pagination=%s coverage=%s\n",
-		len(baseline), basePagination.Status, baseCoverage.Status)
+	// The watermark is measured AFTER this phase's own enumeration settles, not before it starts:
+	// enumerateAllConversations drives its own scroll-simulation attempts, which can themselves
+	// advance the bridge's capture history independent of anything the operator does. Measuring
+	// "before" would misattribute that internal advancement to the operator's later action — exactly
+	// the bug a live run on 2026-09-11 exposed (see the README Phase 5 sixth-pass addendum), which
+	// produced a false fresh=true. Every phase below measures its watermark the same way, so each
+	// comparison reflects genuinely NEW captures observed strictly between two settled states.
+	baselineMaxCapture, captureErr := maxObservedCaptureID(client, 490)
+	if captureErr != nil {
+		fmt.Printf("baseline capture watermark: NOT VERIFIED (%v)\n", captureErr)
+	}
+	fmt.Printf("baseline target series: target_count=%d pagination=%s coverage=%s capture_watermark=%d\n",
+		len(baseline), basePagination.Status, baseCoverage.Status, baselineMaxCapture)
 	basePins, pinsErr := fetchPins(client, 500)
 	if pinsErr != nil {
 		fmt.Printf("baseline pins: NOT VERIFIED (%v)\n", pinsErr)
@@ -654,17 +661,16 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
+	after, afterPagination, afterCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	if err != nil {
+		return fmt.Errorf("post-pin enumeration: %w", err)
+	}
 	afterPinMaxCapture, afterCaptureErr := maxObservedCaptureID(client, 491)
 	if afterCaptureErr != nil {
 		fmt.Printf("after-pin capture watermark: NOT VERIFIED (%v)\n", afterCaptureErr)
 	}
 	pinCaptureFresh := captureErr == nil && afterCaptureErr == nil && afterPinMaxCapture > baselineMaxCapture
 	fmt.Printf("conversations capture watermark: baseline=%d after_pin=%d fresh=%t\n", baselineMaxCapture, afterPinMaxCapture, pinCaptureFresh)
-
-	after, afterPagination, afterCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
-	if err != nil {
-		return fmt.Errorf("post-pin enumeration: %w", err)
-	}
 	fmt.Printf("after pin target series: target_count=%d pagination=%s coverage=%s\n",
 		len(after), afterPagination.Status, afterCoverage.Status)
 	membership := compareMembership(baseline, after)
@@ -692,17 +698,16 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
+	restored, restoredPagination, restoredCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	if err != nil {
+		return fmt.Errorf("post-restore enumeration: %w", err)
+	}
 	afterRestoreMaxCapture, restoreCaptureErr := maxObservedCaptureID(client, 492)
 	if restoreCaptureErr != nil {
 		fmt.Printf("after-restore capture watermark: NOT VERIFIED (%v)\n", restoreCaptureErr)
 	}
 	restoreCaptureFresh := afterCaptureErr == nil && restoreCaptureErr == nil && afterRestoreMaxCapture > afterPinMaxCapture
 	fmt.Printf("conversations capture watermark: after_pin=%d after_restore=%d fresh=%t\n", afterPinMaxCapture, afterRestoreMaxCapture, restoreCaptureFresh)
-
-	restored, restoredPagination, restoredCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
-	if err != nil {
-		return fmt.Errorf("post-restore enumeration: %w", err)
-	}
 	fmt.Printf("after restore target series: target_count=%d pagination=%s coverage=%s\n",
 		len(restored), restoredPagination.Status, restoredCoverage.Status)
 	restoreMembership := compareMembership(baseline, restored)
