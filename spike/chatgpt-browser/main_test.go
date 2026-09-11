@@ -469,14 +469,28 @@ func describeQueryValueForTest(value string) string {
 }
 
 // pageWithDescriptor builds on page() with the coverage-layer descriptor fields
-// (IsArchived/IsStarred/HasUnknownParameters) that mergeProjectPages itself ignores but
+// (IsArchived/IsStarred/Order/HasUnknownParameters) that mergeProjectPages itself ignores but
 // evaluateTargetPagination/evaluateActiveListCompleteness use to decide which series is relevant.
+// Order defaults to "updated" (the only value ever observed live) since none of the existing
+// call sites are specifically testing order; tests that need a different Order build a
+// conversationPage literal directly.
 func pageWithDescriptor(seriesKey string, offset, limit, rawItemCount, recognizedIDCount int, digest string, isArchived, isStarred *bool, hasUnknownParameters bool, ids ...string) conversationPage {
 	p := page(seriesKey, offset, limit, rawItemCount, recognizedIDCount, digest, ids...)
-	p.IsArchived = isArchived
-	p.IsStarred = isStarred
+	p.IsArchived = recognizedBoolPtrString(isArchived)
+	p.IsStarred = recognizedBoolPtrString(isStarred)
+	p.Order = "updated"
 	p.HasUnknownParameters = hasUnknownParameters
 	return p
+}
+
+// recognizedBoolPtrString converts the *bool convenience form (nil = "absent") used throughout
+// this test file into the recognized-value string conversationPage.IsArchived/IsStarred actually
+// use.
+func recognizedBoolPtrString(b *bool) string {
+	if b == nil {
+		return "absent"
+	}
+	return recognizedBoolString(*b)
 }
 
 func TestEvaluateTargetPaginationRestrictedSeriesAloneIsIncomplete(t *testing.T) {
@@ -619,7 +633,7 @@ func TestEvaluateTargetPaginationIgnoresSchemaDriftInIrrelevantSeries(t *testing
 	// out completeness of the series that actually matters.
 	canonical := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
 	brokenIrrelevant := conversationPage{
-		SeriesKey: "archived-broken", IsArchived: boolPtr(true), IsStarred: boolPtr(false),
+		SeriesKey: "archived-broken", IsArchived: "true", IsStarred: "false",
 		Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0,
 	}
 	pages := []conversationPage{canonical, brokenIrrelevant}
@@ -635,7 +649,7 @@ func TestEvaluateTargetPaginationIgnoresSchemaDriftInIrrelevantSeries(t *testing
 func TestEvaluateTargetPaginationPropagatesSchemaDriftWithinRequiredSeries(t *testing.T) {
 	pages := []conversationPage{
 		{
-			SeriesKey: "canonical", IsArchived: boolPtr(false), IsStarred: boolPtr(false),
+			SeriesKey: "canonical", IsArchived: "false", IsStarred: "false", Order: "updated",
 			Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0, RawIdentityDigest: "d0",
 		},
 	}
@@ -651,7 +665,7 @@ func TestEvaluateActiveListCompletenessCoverageIsUnknownEvenWhenPaginationComple
 	pages := []conversationPage{
 		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
 	}
-	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, 20)
+	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, nil, 20)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -660,6 +674,138 @@ func TestEvaluateActiveListCompletenessCoverageIsUnknownEvenWhenPaginationComple
 	}
 	if coverage.Status != "UNKNOWN" {
 		t.Fatalf("coverage = %s, want UNKNOWN (is_starred semantics unconfirmed)", coverage.Status)
+	}
+}
+
+func TestClassifyForActiveListCanonicalMatch(t *testing.T) {
+	d := globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "false", Order: "updated"}
+	classification, reason := classifyForActiveList(d)
+	if classification != seriesMatch {
+		t.Fatalf("classification = %s (%s), want MATCH", classification, reason)
+	}
+}
+
+func TestClassifyForActiveListCanonicalMatchWithHideSnorlaxAbsent(t *testing.T) {
+	// Real evidence: every target-relevant capture ever observed live carries hide_snorlax absent,
+	// never explicitly "false" — this must classify identically to the explicit "false" case.
+	d := globalConversationsPageDiagnostic{HideSnorlax: "absent", IsArchived: "false", IsStarred: "false", Order: "updated"}
+	classification, reason := classifyForActiveList(d)
+	if classification != seriesMatch {
+		t.Fatalf("classification = %s (%s), want MATCH", classification, reason)
+	}
+}
+
+func TestClassifyForActiveListProjectExcluding(t *testing.T) {
+	d := globalConversationsPageDiagnostic{HideSnorlax: "true", IsArchived: "false", IsStarred: "false", Order: "updated"}
+	classification, _ := classifyForActiveList(d)
+	if classification != seriesDefinitelyIrrelevant {
+		t.Fatalf("classification = %s, want DEFINITELY_IRRELEVANT", classification)
+	}
+}
+
+func TestClassifyForActiveListDefinitelyIrrelevantMalformedSeriesIsNeverBlamed(t *testing.T) {
+	// is_archived=true is proven out of scope regardless of anything else about the response —
+	// including a malformed collection shape, which classification must not even look at.
+	d := globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "true", IsStarred: "false", Order: "updated", RecognizedCollection: false}
+	classification, _ := classifyForActiveList(d)
+	if classification != seriesDefinitelyIrrelevant {
+		t.Fatalf("classification = %s, want DEFINITELY_IRRELEVANT (recognizedCollection must be irrelevant to this decision)", classification)
+	}
+}
+
+func TestClassifyForActiveListRelevantMalformedSeriesStillMatches(t *testing.T) {
+	// The mirror-image case: a genuinely relevant series that happens to be malformed still
+	// classifies MATCH — the malformation is caught downstream (mergeProjectPages), not here.
+	d := globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "false", Order: "updated", RecognizedCollection: false}
+	classification, reason := classifyForActiveList(d)
+	if classification != seriesMatch {
+		t.Fatalf("classification = %s (%s), want MATCH", classification, reason)
+	}
+}
+
+func TestClassifyForActiveListUnknownSemanticValues(t *testing.T) {
+	tests := []struct {
+		name string
+		d    globalConversationsPageDiagnostic
+	}{
+		{"hide_snorlax unexpected", globalConversationsPageDiagnostic{HideSnorlax: "unexpected", IsArchived: "false", IsStarred: "false", Order: "updated"}},
+		{"is_archived yes", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "yes", IsStarred: "false", Order: "updated"}},
+		{"is_archived absent", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "absent", IsStarred: "false", Order: "updated"}},
+		{"is_starred 1", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "1", Order: "updated"}},
+		{"is_starred absent", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "absent", Order: "updated"}},
+		{"order alphabetical", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "false", Order: "alphabetical"}},
+		{"order absent", globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "false", Order: "absent"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			classification, reason := classifyForActiveList(test.d)
+			if classification != seriesUnknown {
+				t.Fatalf("classification = %s (%s), want UNKNOWN", classification, reason)
+			}
+		})
+	}
+}
+
+func TestClassifyForActiveListUnknownParameterIsUnknown(t *testing.T) {
+	d := globalConversationsPageDiagnostic{HideSnorlax: "false", IsArchived: "false", IsStarred: "false", Order: "updated", HasUnknownParameters: true}
+	classification, reason := classifyForActiveList(d)
+	if classification != seriesUnknown {
+		t.Fatalf("classification = %s (%s), want UNKNOWN", classification, reason)
+	}
+}
+
+func TestEvaluateTargetPaginationOrderUpdatedMatchesTarget(t *testing.T) {
+	p := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
+	_, exhausted, err := evaluateTargetPagination([]conversationPage{p}, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("order=updated must satisfy the target requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationOtherOrderDoesNotMatchTarget(t *testing.T) {
+	p := pageWithDescriptor("other-order", 0, 28, 5, 5, "d0", boolPtr(false), boolPtr(false), false, "a")
+	p.Order = "other"
+	_, exhausted, err := evaluateTargetPagination([]conversationPage{p}, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("a different order value must not satisfy the target requirement")
+	}
+}
+
+func TestEvaluateTargetPaginationAbsentOrderDoesNotMatchTarget(t *testing.T) {
+	p := pageWithDescriptor("absent-order", 0, 28, 5, 5, "d0", boolPtr(false), boolPtr(false), false, "a")
+	p.Order = "absent"
+	_, exhausted, err := evaluateTargetPagination([]conversationPage{p}, activeListRequiredSeries, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if exhausted {
+		t.Fatal("an absent order value must not be assumed safe for the target requirement")
+	}
+}
+
+func TestEvaluateActiveListCompletenessComposesUnknownObservations(t *testing.T) {
+	pages := []conversationPage{
+		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
+	}
+	extra := []string{`capture 7: hide_snorlax value not recognized ("unexpected")`}
+	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, extra, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if pagination.Status != "COMPLETE" {
+		t.Fatalf("pagination = %s, want COMPLETE", pagination.Status)
+	}
+	if coverage.Status != "UNKNOWN" {
+		t.Fatalf("coverage = %s, want UNKNOWN", coverage.Status)
+	}
+	if !strings.Contains(coverage.Reason, extra[0]) {
+		t.Fatalf("coverage.Reason = %q, want it to include the live-observed unknown-semantics note", coverage.Reason)
 	}
 }
 
