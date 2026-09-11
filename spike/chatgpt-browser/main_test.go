@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -53,19 +56,22 @@ func conv(ids ...string) []conversation {
 	return items
 }
 
-// page builds a conversationPage fixture. rawItemCount/recognizedIDCount are independent of
-// len(ids) on purpose: `ids` is the already Project-filtered subset the bridge returns, while
-// rawItemCount/recognizedIDCount describe the full raw page (this Project's items plus everyone
-// else's), which is exactly the distinction Requirement 5 cares about.
+// page builds a conversationPage fixture with a recognized collection (the common case for a
+// valid page; TestMergeProjectPagesUnrecognizedCollectionFailsClosed builds an unrecognized one
+// directly). rawItemCount/recognizedIDCount are independent of len(ids) on purpose: `ids` is the
+// already Project-filtered subset the bridge returns, while rawItemCount/recognizedIDCount describe
+// the full raw page (this Project's items plus everyone else's), which is exactly the distinction
+// Requirement 5 cares about.
 func page(seriesKey string, offset, limit, rawItemCount, recognizedIDCount int, digest string, ids ...string) conversationPage {
 	return conversationPage{
-		SeriesKey:         seriesKey,
-		Offset:            offset,
-		Limit:             limit,
-		RawItemCount:      rawItemCount,
-		RecognizedIDCount: recognizedIDCount,
-		RawIdentityDigest: digest,
-		Items:             conv(ids...),
+		SeriesKey:            seriesKey,
+		Offset:               offset,
+		Limit:                limit,
+		RecognizedCollection: true,
+		RawItemCount:         rawItemCount,
+		RecognizedIDCount:    recognizedIDCount,
+		RawIdentityDigest:    digest,
+		Items:                conv(ids...),
 	}
 }
 
@@ -239,6 +245,15 @@ func TestMergeProjectPagesMalformedLimitFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMergeProjectPagesMissingSeriesKeyFailsClosed(t *testing.T) {
+	// An empty SeriesKey means the bridge couldn't compute a pagination identity for this capture
+	// (e.g. an unparseable URL) — it must never be silently treated as belonging to some series.
+	pages := []conversationPage{page("", 0, 28, 1, 1, "d0", "a")}
+	if _, _, err := mergeProjectPages(pages, 20); err == nil {
+		t.Fatal("expected an error for a page with no pagination series identity")
+	}
+}
+
 func TestMergeProjectPagesNegativeOffsetFailsClosed(t *testing.T) {
 	pages := []conversationPage{page("s", -1, 28, 1, 1, "d0", "a")}
 	if _, _, err := mergeProjectPages(pages, 20); err == nil {
@@ -248,10 +263,38 @@ func TestMergeProjectPagesNegativeOffsetFailsClosed(t *testing.T) {
 
 func TestMergeProjectPagesMissingIdentityFailsClosed(t *testing.T) {
 	pages := []conversationPage{
-		{SeriesKey: "s", Offset: 0, Limit: 28, RawItemCount: 1, RecognizedIDCount: 1, RawIdentityDigest: "d0", Items: []conversation{{ID: ""}}},
+		{SeriesKey: "s", Offset: 0, Limit: 28, RecognizedCollection: true, RawItemCount: 1, RecognizedIDCount: 1, RawIdentityDigest: "d0", Items: []conversation{{ID: ""}}},
 	}
 	if _, _, err := mergeProjectPages(pages, 20); err == nil {
 		t.Fatal("expected an error for a conversation missing a stable identity")
+	}
+}
+
+func TestMergeProjectPagesUnrecognizedCollectionFailsClosed(t *testing.T) {
+	// The item-collection shape itself couldn't be recognized (e.g. the top-level `items`/
+	// `conversations` field was renamed). This must never be treated as an empty page, even though
+	// it looks identical to one on every other field (rawItemCount 0, well short of limit).
+	pages := []conversationPage{
+		{SeriesKey: "s", Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0, RecognizedIDCount: 0, RawIdentityDigest: "d0"},
+	}
+	if _, _, err := mergeProjectPages(pages, 20); err == nil {
+		t.Fatal("expected an error when the item-collection shape was not recognized")
+	}
+}
+
+func TestMergeProjectPagesRecognizedEmptyCollectionIsAValidShortPage(t *testing.T) {
+	// The mirror-image case: a *recognized* collection that legitimately contains zero items (e.g.
+	// `"items": []`) is a perfectly normal final page, not schema drift.
+	pages := []conversationPage{page("s", 0, 28, 0, 0, "d0")}
+	got, exhausted, err := mergeProjectPages(pages, 20)
+	if err != nil {
+		t.Fatalf("unexpected error for a recognized, legitimately empty collection: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("a recognized empty collection shorter than its limit must be treated as exhaustion")
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d conversations, want 0", len(got))
 	}
 }
 
@@ -270,10 +313,38 @@ func TestMergeProjectPagesKnownIDMismatchFailsClosed(t *testing.T) {
 	// but its association no longer resolves to the configured Project — concrete evidence the
 	// association field itself has drifted, not just an ordinary non-Project chat.
 	pages := []conversationPage{
-		{SeriesKey: "s", Offset: 0, Limit: 28, RawItemCount: 5, RecognizedIDCount: 5, RawIdentityDigest: "d0", KnownIDsMismatched: 1, Items: conv("a")},
+		{SeriesKey: "s", Offset: 0, Limit: 28, RecognizedCollection: true, RawItemCount: 5, RecognizedIDCount: 5, RawIdentityDigest: "d0", KnownIDsMismatched: 1, Items: conv("a")},
 	}
 	if _, _, err := mergeProjectPages(pages, 20); err == nil {
 		t.Fatal("expected an error when a known Project conversation ID no longer resolves to the configured Project")
+	}
+}
+
+func TestMergeProjectPagesUnrecognizedAssociationFailsClosed(t *testing.T) {
+	// Live evidence (see bridge/preload.js's sanitizeGlobalConversationsCaptureItems comment) showed
+	// every raw item, Project-associated or not, carries gizmo_id or project_id as an own property.
+	// A raw item exposing neither is schema drift, detectable even on a page containing only
+	// conversations the harness didn't already know about (unlike the known-ID cross-check above).
+	pages := []conversationPage{
+		{SeriesKey: "s", Offset: 0, Limit: 28, RecognizedCollection: true, RawItemCount: 5, RecognizedIDCount: 5, RawIdentityDigest: "d0", UnrecognizedAssociationCount: 1, Items: conv("a")},
+	}
+	if _, _, err := mergeProjectPages(pages, 20); err == nil {
+		t.Fatal("expected an error when a raw item exposed no recognizable association field at all")
+	}
+}
+
+func TestMergeProjectPagesZeroUnrecognizedAssociationIsFine(t *testing.T) {
+	// The mirror-image case: every raw item had a recognizable (even if null, or another Project's)
+	// association field, so UnrecognizedAssociationCount is 0 and the page is accepted normally.
+	pages := []conversationPage{
+		{SeriesKey: "s", Offset: 0, Limit: 28, RecognizedCollection: true, RawItemCount: 5, RecognizedIDCount: 5, RawIdentityDigest: "d0", UnrecognizedAssociationCount: 0, Items: conv("a")},
+	}
+	_, exhausted, err := mergeProjectPages(pages, 20)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !exhausted {
+		t.Fatal("a short page with no association drift should be treated as exhaustion")
 	}
 }
 
@@ -317,6 +388,84 @@ func TestMergeProjectPagesFiltersToConfiguredProjectAcrossPages(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("got %d conversations, want 3 (mergeProjectPages does not re-filter by Project)", len(got))
 	}
+}
+
+// testCanonicalSeriesKey mirrors bridge/main.js's canonicalSeriesKeyFrom exactly (offset excluded,
+// remaining pairs sorted by key then value, JSON-encoded, SHA-256'd) so the algorithm's properties
+// can be verified deterministically without a live browser. It is test-only — production Go code
+// never computes a SeriesKey itself, it only receives the digest the bridge already computed; keep
+// this in sync with canonicalSeriesKeyFrom if that changes.
+func testCanonicalSeriesKey(pairs [][2]string) string {
+	filtered := make([][2]string, 0, len(pairs))
+	for _, pair := range pairs {
+		if pair[0] == "offset" {
+			continue
+		}
+		filtered = append(filtered, pair)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i][0] != filtered[j][0] {
+			return filtered[i][0] < filtered[j][0]
+		}
+		return filtered[i][1] < filtered[j][1]
+	})
+	canonical, err := json.Marshal(filtered)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestCanonicalSeriesKeyIgnoresParameterOrder(t *testing.T) {
+	a := testCanonicalSeriesKey([][2]string{{"limit", "28"}, {"order", "updated"}, {"offset", "0"}})
+	b := testCanonicalSeriesKey([][2]string{{"offset", "0"}, {"order", "updated"}, {"limit", "28"}})
+	if a != b {
+		t.Fatalf("expected the same key regardless of parameter order, got %q and %q", a, b)
+	}
+}
+
+func TestCanonicalSeriesKeyIgnoresOffsetValue(t *testing.T) {
+	a := testCanonicalSeriesKey([][2]string{{"limit", "28"}, {"offset", "0"}})
+	b := testCanonicalSeriesKey([][2]string{{"limit", "28"}, {"offset", "28"}})
+	if a != b {
+		t.Fatalf("expected offset's own value to be irrelevant to the series key, got %q and %q", a, b)
+	}
+}
+
+func TestCanonicalSeriesKeyDiffersOnFilterChange(t *testing.T) {
+	a := testCanonicalSeriesKey([][2]string{{"is_archived", "false"}, {"limit", "28"}})
+	b := testCanonicalSeriesKey([][2]string{{"is_archived", "true"}, {"limit", "28"}})
+	if a == b {
+		t.Fatal("expected a different key when a filter parameter (is_archived) differs")
+	}
+}
+
+func TestCanonicalSeriesKeyDistinguishesSameLengthOpaqueValues(t *testing.T) {
+	// This is the exact collision the redacted diagnostics representation is vulnerable to: two
+	// different opaque values of the same length both display as "<redacted:36ch>", but the
+	// canonical series key must still tell them apart.
+	same36CharsA := strings.Repeat("a", 36)
+	same36CharsB := strings.Repeat("b", 36)
+	if describeQueryValueForTest(same36CharsA) != describeQueryValueForTest(same36CharsB) {
+		t.Fatal("test setup invalid: expected these two values to redact identically")
+	}
+	a := testCanonicalSeriesKey([][2]string{{"cursor", same36CharsA}, {"limit", "28"}})
+	b := testCanonicalSeriesKey([][2]string{{"cursor", same36CharsB}, {"limit", "28"}})
+	if a == b {
+		t.Fatal("expected different series keys for different opaque values, even though their redacted diagnostic representation collides")
+	}
+}
+
+// describeQueryValueForTest mirrors bridge/main.js's describeQueryValue redaction rule closely
+// enough to demonstrate the collision TestCanonicalSeriesKeyDistinguishesSameLengthOpaqueValues
+// guards against: any value that isn't a plain integer/boolean/short token redacts to a
+// length-only placeholder.
+func describeQueryValueForTest(value string) string {
+	if len(value) <= 20 {
+		return value
+	}
+	return fmt.Sprintf("<redacted:%dch>", len(value))
 }
 
 func TestMergeProjectPagesNoObservedSeriesIsIncompleteNotError(t *testing.T) {
