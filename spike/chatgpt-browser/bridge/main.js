@@ -184,6 +184,10 @@ async function dispatch(request) {
       seriesKey: capture.seriesKey,
       query: capture.query, // redacted, for human-readable diagnostics only — never pagination identity
       hideSnorlax: capture.hideSnorlax,
+      isArchived: capture.isArchived,
+      isStarred: capture.isStarred,
+      order: capture.order,
+      hasUnknownParameters: capture.hasUnknownParameters,
       offset: capture.offset,
       limit: capture.limit,
       recognizedCollection: capture.recognizedCollection,
@@ -376,6 +380,44 @@ function rawItemID(item) {
   return id && conversationIDPattern.test(id) ? id : null;
 }
 
+// Query parameters this bridge understands well enough to reason about which session universe a
+// series represents (see README Phase A/B/C). `limit`/`offset` are pagination shape, not filters,
+// but are included here because their presence is expected and harmless; `order` is tracked as
+// informational metadata only (it can reorder results but, as far as this bridge has observed,
+// never removes items from the set). Any OTHER parameter is unknown, and — since it could be
+// filtering the result set in a way this bridge doesn't understand — a series carrying one must
+// never be trusted as representing a known target universe. This is deliberately separate from
+// SeriesKey (an opaque identity digest): SeriesKey already safely includes unknown parameters (so
+// it never collides two different real series), but callers need this list to decide whether a
+// series' *meaning* can be trusted at all.
+const KNOWN_SAFE_QUERY_PARAMETERS = new Set(["limit", "offset", "order", "is_archived", "is_starred", "hide_snorlax"]);
+
+function booleanQueryField(query, key) {
+  const entry = query.find((item) => item.key === key);
+  if (!entry) return null;
+  if (entry.value === "true") return true;
+  if (entry.value === "false") return false;
+  return null; // present but not a recognized boolean shape — treated the same as absent by callers
+}
+
+function stringQueryField(query, key) {
+  const entry = query.find((item) => item.key === key);
+  return entry ? entry.value : null;
+}
+
+// Safe, allowlisted semantic metadata about a query — never used as pagination identity (that's
+// SeriesKey's job) and never containing an opaque/raw value. `isArchived`/`isStarred` are the two
+// query-level filter dimensions observed on this endpoint (see README Phase B); `hasUnknownParameters`
+// is the fail-closed signal for "this bridge doesn't fully understand what this query selects".
+function seriesDescriptorFrom(query) {
+  return {
+    isArchived: booleanQueryField(query, "is_archived"),
+    isStarred: booleanQueryField(query, "is_starred"),
+    order: stringQueryField(query, "order"),
+    hasUnknownParameters: query.some((entry) => !KNOWN_SAFE_QUERY_PARAMETERS.has(entry.key)),
+  };
+}
+
 // The pagination series identity: a digest of the RAW (unredacted) query with `offset` removed,
 // keys/values sorted for order-independence, JSON-encoded for unambiguous delimiting (so no
 // combination of key/value strings can be crafted to collide with a different combination), then
@@ -436,6 +478,7 @@ function recordGlobalConversationsPage(url, payload) {
     // decide whether two captures belong to the same pagination series.
     seriesKey: canonicalSeriesKeyFrom(url),
     query,
+    ...seriesDescriptorFrom(query),
     hideSnorlax,
     offset: integerMetaField(meta, "offset"),
     limit: integerMetaField(meta, "limit"),

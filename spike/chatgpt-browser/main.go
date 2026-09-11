@@ -67,6 +67,10 @@ type globalConversationsPageDiagnostic struct {
 	SeriesKey            *string        `json:"seriesKey"`
 	Query                []queryParam   `json:"query"`
 	HideSnorlax          bool           `json:"hideSnorlax"`
+	IsArchived           *bool          `json:"isArchived"`
+	IsStarred            *bool          `json:"isStarred"`
+	Order                *string        `json:"order"`
+	HasUnknownParameters bool           `json:"hasUnknownParameters"`
 	Offset               *int           `json:"offset"`
 	Limit                *int           `json:"limit"`
 	RecognizedCollection bool           `json:"recognizedCollection"`
@@ -98,6 +102,9 @@ type globalConversationsCaptureItemsResult struct {
 type conversationPage struct {
 	SeriesKey                    string
 	HideSnorlax                  bool
+	IsArchived                   *bool
+	IsStarred                    *bool
+	HasUnknownParameters         bool
 	Offset                       int
 	Limit                        int
 	RecognizedCollection         bool
@@ -227,6 +234,124 @@ func mergeProjectPages(pages []conversationPage, maxPages int) (conversations []
 	}
 	slices.SortFunc(result, func(a, b conversation) int { return strings.Compare(a.ID, b.ID) })
 	return result, allExhausted, nil
+}
+
+// seriesRequirement is one required pagination-series shape for a target session universe (see
+// evaluateTargetPagination). A nil field means "don't care about this dimension"; a non-nil field
+// requires an exact, confirmed match — a page whose corresponding descriptor field is nil (unknown/
+// unrecognized value) never satisfies a non-nil requirement, so uncertainty is never silently
+// treated as a match.
+type seriesRequirement struct {
+	RequireIsArchived       *bool
+	RequireIsStarred        *bool
+	ForbidUnknownParameters bool
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func (req seriesRequirement) matches(p conversationPage) bool {
+	if p.HideSnorlax {
+		return false
+	}
+	if req.ForbidUnknownParameters && p.HasUnknownParameters {
+		return false
+	}
+	if req.RequireIsArchived != nil && (p.IsArchived == nil || *p.IsArchived != *req.RequireIsArchived) {
+		return false
+	}
+	if req.RequireIsStarred != nil && (p.IsStarred == nil || *p.IsStarred != *req.RequireIsStarred) {
+		return false
+	}
+	return true
+}
+
+// completenessResult separates "definitely not complete" from "we don't know if our target
+// definition is even right" — see evaluateActiveListCompleteness. Status is one of "COMPLETE",
+// "INCOMPLETE", or "UNKNOWN".
+type completenessResult struct {
+	Status string
+	Reason string
+}
+
+// evaluateTargetPagination is the coverage layer's pure pagination-axis evaluation: pagination
+// completeness of an offset chain (mergeProjectPages) says nothing about which chain(s) actually
+// represent the session universe a caller needs. This partitions the observed pages by which
+// `required` series shape(s) they match — a page matching NONE of them is irrelevant to this target
+// universe and is dropped entirely before it ever reaches mergeProjectPages, so an irrelevant
+// series (even a schema-broken one) can never influence the result — then requires EVERY listed
+// requirement to be independently observed and pagination-exhausted for the overall result to be
+// exhausted.
+//
+// This never itself returns "unknown": that judgment — whether `required` correctly captures the
+// full intended universe in the first place — is a separate, higher-level question answered by the
+// caller (see evaluateActiveListCompleteness and the README's Phase A/B/C discussion of the
+// is_starred ambiguity).
+func evaluateTargetPagination(pages []conversationPage, required []seriesRequirement, maxPages int) (conversations []conversation, exhausted bool, err error) {
+	if len(required) == 0 {
+		return nil, false, nil
+	}
+	byID := make(map[string]conversation)
+	allSatisfied := true
+	for _, req := range required {
+		var matched []conversationPage
+		for _, p := range pages {
+			if req.matches(p) {
+				matched = append(matched, p)
+			}
+		}
+		items, reqExhausted, err := mergeProjectPages(matched, maxPages)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, item := range items {
+			byID[item.ID] = item
+		}
+		if !reqExhausted {
+			allSatisfied = false
+		}
+	}
+	result := make([]conversation, 0, len(byID))
+	for _, item := range byID {
+		result = append(result, item)
+	}
+	slices.SortFunc(result, func(a, b conversation) int { return strings.Compare(a.ID, b.ID) })
+	return result, allSatisfied, nil
+}
+
+// activeListRequiredSeries is this PoC's live-evidence-based definition of the target series
+// required for the "active, non-archived Project session" universe — the scope of the existing
+// production session.Provider.List(archived bool) called with archived=false (see README Phase A).
+// It is exactly the query shape the real ChatGPT UI's own default view was observed sending:
+// hide_snorlax=false (Project-inclusive; enforced structurally, not via this requirement — see
+// seriesRequirement.matches), is_archived=false, is_starred=false, and no unrecognized query
+// parameter.
+var activeListRequiredSeries = []seriesRequirement{
+	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), ForbidUnknownParameters: true},
+}
+
+// activeListCoverageCaveat documents the one dimension this PoC could not confirm or rule out: see
+// README Phase B/C.
+const activeListCoverageCaveat = "is_starred semantics unconfirmed: no real ChatGPT UI action in this session ever requested is_starred=true, so a possible separate required series for starred/pinned conversations cannot be ruled in or out; indirect evidence (a separate /backend-api/pins endpoint observed in real traffic, independent of /backend-api/conversations) suggests pin/star state does not partition the conversations list, but this was not directly tested"
+
+// evaluateActiveListCompleteness is the top-level completeness judgement for this PoC's target
+// universe. It reports Pagination (did the required series reach exhaustion) and Coverage (is the
+// required-series definition itself trustworthy as the FULL intended universe) as two independent
+// axes — see the README's Phase A/B/C for why Coverage is UNKNOWN, not COMPLETE, even when
+// Pagination succeeds: this account never exercised an is_starred=true query, so whether it
+// represents a separate required bucket was never tested. Overall completeness (decided by the
+// caller) should require BOTH axes to be COMPLETE.
+func evaluateActiveListCompleteness(pages []conversationPage, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, err error) {
+	items, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, maxPages)
+	if err != nil {
+		return nil, completenessResult{}, completenessResult{}, err
+	}
+	if exhausted {
+		pagination = completenessResult{Status: "COMPLETE", Reason: "the required active-Project series reached a contiguous, pagination-exhausted offset chain"}
+	} else {
+		pagination = completenessResult{Status: "INCOMPLETE", Reason: "the required active-Project series was not observed at all, or not yet pagination-exhausted"}
+	}
+	coverage = completenessResult{Status: "UNKNOWN", Reason: activeListCoverageCaveat}
+	return items, pagination, coverage, nil
 }
 
 type globalConversationsPageResult struct {
@@ -569,13 +694,16 @@ func run(ctx context.Context, cfg config) error {
 				result.RawItemCount, len(result.Items), result.Meta)
 		}
 
-		all, exhausted, pagesUsed, err := enumerateAllConversations(client, projectID, ids, 8, 20)
+		all, pagination, coverage, pagesUsed, err := enumerateAllConversations(client, projectID, ids, 8, 20)
 		if err != nil {
 			fmt.Printf("global conversations complete enumeration: FAIL (%v)\n", err)
-		} else if exhausted {
-			fmt.Printf("global conversations complete enumeration: COMPLETE count=%d pages_used=%d\n", len(all), pagesUsed)
 		} else {
-			fmt.Printf("global conversations complete enumeration: INCOMPLETE (exhaustion not observed within bound) count_so_far=%d pages_used=%d\n", len(all), pagesUsed)
+			overall := "INCOMPLETE"
+			if pagination.Status == "COMPLETE" && coverage.Status == "COMPLETE" {
+				overall = "COMPLETE"
+			}
+			fmt.Printf("global conversations complete enumeration: pagination=%s (%s) coverage=%s (%s) overall=%s count=%d pages_used=%d\n",
+				pagination.Status, pagination.Reason, coverage.Status, coverage.Reason, overall, len(all), pagesUsed)
 		}
 
 		raw, err = call(client, request{ID: 15, Method: "openURLProbe", ProjectID: projectID})
@@ -740,15 +868,16 @@ func shortDigest(digest string) string {
 // list and passively harvests whatever new captures that produces, tracked by CaptureID (a
 // bridge-internal reference to one observed response — not a pagination position; see
 // globalConversationsPageDiagnostic). Each newly observed capture is printed as sanitized wire
-// evidence (series/offset/limit, hide_snorlax flag, raw/recognized item counts, a shortened raw
-// identity digest — never conversation content or full IDs) before being folded into
-// mergeProjectPages, which does the actual pagination-identity and exhaustion reasoning.
+// evidence (series/offset/limit, hide_snorlax/is_archived/is_starred/unknown-parameter descriptor,
+// raw/recognized item counts, a shortened raw identity digest — never conversation content or full
+// IDs) before being folded into evaluateActiveListCompleteness, which does the actual
+// pagination-identity, target-series-coverage, and exhaustion reasoning.
 //
 // knownConversationIDs (the project-scoped endpoint's already-discovered IDs) is passed through to
 // the bridge on every capture-items fetch, so it can flag a known Project conversation whose
 // association no longer resolves to the configured Project — see mergeProjectPages's
 // KnownIDsMismatched handling.
-func enumerateAllConversations(client net.Conn, projectID string, knownConversationIDs []string, maxScrollAttempts, maxPages int) (conversations []conversation, exhausted bool, pagesUsed int, err error) {
+func enumerateAllConversations(client net.Conn, projectID string, knownConversationIDs []string, maxScrollAttempts, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, pagesUsed int, err error) {
 	seenCaptures := make(map[int]bool)
 	var pages []conversationPage
 	nextRequestID := 300
@@ -783,8 +912,18 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			for _, q := range d.Query {
 				queryParts = append(queryParts, q.Key+"="+q.Value)
 			}
-			fmt.Printf("global conversations wire capture #%d: hide_snorlax=%t series=%s query=[%s] offset=%s limit=%s recognized_collection=%t raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
-				d.CaptureID, d.HideSnorlax, seriesDisplay, strings.Join(queryParts, ","), offsetStr, limitStr, d.RecognizedCollection, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
+			isArchivedStr, isStarredStr, orderStr := "?", "?", "?"
+			if d.IsArchived != nil {
+				isArchivedStr = fmt.Sprintf("%t", *d.IsArchived)
+			}
+			if d.IsStarred != nil {
+				isStarredStr = fmt.Sprintf("%t", *d.IsStarred)
+			}
+			if d.Order != nil {
+				orderStr = *d.Order
+			}
+			fmt.Printf("global conversations wire capture #%d: hide_snorlax=%t is_archived=%s is_starred=%s order=%s unknown_parameters=%t series=%s query=[%s] offset=%s limit=%s recognized_collection=%t raw_item_count=%d recognized_id_count=%d digest=%s meta=%v\n",
+				d.CaptureID, d.HideSnorlax, isArchivedStr, isStarredStr, orderStr, d.HasUnknownParameters, seriesDisplay, strings.Join(queryParts, ","), offsetStr, limitStr, d.RecognizedCollection, d.RawItemCount, d.RecognizedIDCount, shortDigest(d.RawIdentityDigest), d.Meta)
 			if d.HideSnorlax {
 				continue // excludes Project conversations by construction; recorded above for evidence only
 			}
@@ -811,6 +950,9 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			}
 			pages = append(pages, conversationPage{
 				SeriesKey:                    *d.SeriesKey,
+				IsArchived:                   d.IsArchived,
+				IsStarred:                    d.IsStarred,
+				HasUnknownParameters:         d.HasUnknownParameters,
 				Offset:                       *d.Offset,
 				Limit:                        *d.Limit,
 				RecognizedCollection:         d.RecognizedCollection,
@@ -826,37 +968,37 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 	}
 
 	if err := fetchNewPages(); err != nil {
-		return nil, false, 0, err
+		return nil, completenessResult{}, completenessResult{}, 0, err
 	}
 	for attempt := 0; attempt < maxScrollAttempts; attempt++ {
-		conversations, exhausted, err = mergeProjectPages(pages, maxPages)
+		conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, maxPages)
 		if err != nil {
-			return nil, false, len(pages), err
+			return nil, completenessResult{}, completenessResult{}, len(pages), err
 		}
-		if exhausted {
-			return conversations, true, len(pages), nil
+		if pagination.Status == "COMPLETE" {
+			return conversations, pagination, coverage, len(pages), nil
 		}
 		nextRequestID++
 		scrollRaw, err := call(client, request{ID: nextRequestID, Method: "simulateSidebarScroll"})
 		if err != nil {
-			return conversations, false, len(pages), fmt.Errorf("simulate sidebar scroll: %w", err)
+			return conversations, pagination, coverage, len(pages), fmt.Errorf("simulate sidebar scroll: %w", err)
 		}
 		var scroll sidebarScrollResult
 		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
-			return conversations, false, len(pages), fmt.Errorf("decode sidebar scroll result: %w", err)
+			return conversations, pagination, coverage, len(pages), fmt.Errorf("decode sidebar scroll result: %w", err)
 		}
 		fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
 			attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount, scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
 		time.Sleep(1500 * time.Millisecond)
 		if err := fetchNewPages(); err != nil {
-			return conversations, false, len(pages), err
+			return conversations, pagination, coverage, len(pages), err
 		}
 	}
-	conversations, exhausted, err = mergeProjectPages(pages, maxPages)
+	conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, maxPages)
 	if err != nil {
-		return nil, false, len(pages), err
+		return nil, completenessResult{}, completenessResult{}, len(pages), err
 	}
-	return conversations, exhausted, len(pages), nil
+	return conversations, pagination, coverage, len(pages), nil
 }
 
 func origin(rawURL string) string {
