@@ -810,32 +810,6 @@ func printCaptureDiagnostics(client net.Conn, id int, label string) {
 		label, p.AttachedDebuggerCount, p.MatchedResponseCount, p.CaptureErrorCount)
 }
 
-// maxObservedCaptureID returns the highest CaptureID among ALL /backend-api/conversations captures
-// the bridge has observed so far (any query, not just MATCH-classified target-series ones), or 0 if
-// none. This is an AUXILIARY diagnostic only (see the doc comments on maxMatchCaptureID and
-// targetSnapshotAfter for why it must never gate a membership trust decision by itself): an
-// irrelevant series (e.g. hide_snorlax=true) being freshly captured advances this watermark without
-// saying anything about whether the TARGET series was refetched. It exists because a live run of
-// this experiment (2026-09-11) discovered that "the target series looks unchanged" and "no fresh
-// network response was ever observed" are indistinguishable from a membership diff alone.
-func maxObservedCaptureID(client net.Conn, id int) (int, error) {
-	raw, err := call(client, request{ID: id, Method: "globalConversationsPages"})
-	if err != nil {
-		return 0, err
-	}
-	var diagnostics []globalConversationsPageDiagnostic
-	if err := json.Unmarshal(raw, &diagnostics); err != nil {
-		return 0, fmt.Errorf("decode global conversations pages: %w", err)
-	}
-	max := 0
-	for _, d := range diagnostics {
-		if d.CaptureID > max {
-			max = d.CaptureID
-		}
-	}
-	return max, nil
-}
-
 // maxMatchCaptureID is the pure core of the TARGET-SPECIFIC freshness watermark: the highest
 // CaptureID among diagnostics classifyForActiveList recognizes as MATCH (the active-list target
 // series — hide_snorlax=false/absent, is_archived=false, is_starred=false, order=updated, no
@@ -875,16 +849,63 @@ func selectFreshMatchDiagnostics(diagnostics []globalConversationsPageDiagnostic
 	return selected
 }
 
+// restartBrowserProcess implements the Phase 5 is_starred experiment's fresh-process fallback
+// (README "Ninth pass"): three live runs proved a same-process reload does not force a fresh
+// target-series or /backend-api/pins capture. This stops the current terminal-browser process and
+// starts an entirely new one against the SAME persistent partition, hypothesizing that ChatGPT's
+// own boot sequence — not an in-page reload — performs the fresh fetch a reload does not. Login
+// state, Project membership, and any pin/unpin the operator just performed all survive (the
+// partition is what persists); only the bridge's in-memory capture history resets, which is exactly
+// what we want here — a brand-new process has no stale history to be confused with fresh data at
+// all, so targetSnapshotAfter's watermark can simply be 0 again after every restart.
+//
+// No raw conversation ID or pins ID ever needs to leave this Go process's memory across the
+// restart, and nothing is written to disk: only the CHILD terminal-browser process is replaced, not
+// the Go orchestrator itself, so the values already held in Go variables from before the restart
+// (baseline's conversations, basePins) remain valid for comparison against the new process's fresh
+// observations without any cross-process handoff.
+func restartBrowserProcess(ctx context.Context, cfg config, mainScript, preload string, old *browserProcess) (*browserProcess, net.Conn, error) {
+	if err := old.stop(); err != nil {
+		return nil, nil, fmt.Errorf("stop browser for restart: %w", err)
+	}
+	fresh, err := startBrowserProcess(ctx, cfg, mainScript, preload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("restart browser: %w", err)
+	}
+	client, err := dialBridge(ctx, cfg.socket, 20*time.Second)
+	if err != nil {
+		_ = fresh.stop()
+		return nil, nil, fmt.Errorf("dial bridge after restart: %w", err)
+	}
+	if _, err := call(client, request{ID: 1, Method: "ping"}); err != nil {
+		_ = client.Close()
+		_ = fresh.stop()
+		return nil, nil, fmt.Errorf("bridge round trip after restart: %w", err)
+	}
+	time.Sleep(3 * time.Second)
+	fmt.Println("browser process restarted: PASS (same persistent partition)")
+	return fresh, client, nil
+}
+
 // runPinExperiment drives the interactive, human-in-the-loop Phase 5 is_starred coverage
 // experiment end to end (README "ChatGPT Phase 5: prove is_starred coverage semantics", Phases
 // B through H). It never asks the operator to identify a conversation by title or ID, and never
 // issues a pin/star mutation itself (README's safety boundary requires a human to perform that in
 // the real UI). The controlled conversation is identified from the /backend-api/pins before/after
 // delta (controlledSampleFromPinsDelta) — not from target-series disappearance, which cannot
-// identify a candidate when nothing disappears (Outcome A). Every phase's target-series snapshot is
-// captured with targetSnapshotAfter, which strictly isolates each phase's own post-watermark
-// captures so a stale pre-mutation snapshot can never be merged with a fresh post-mutation one.
-func runPinExperiment(client net.Conn, projectID string, knownIDs []string) error {
+// identify a candidate when nothing disappears (Outcome A).
+//
+// Between phases, this restarts the terminal-browser process entirely (restartBrowserProcess) —
+// the fresh-process fallback — rather than asking the operator to reload the same process, since
+// three live runs proved a same-process reload does not force a fresh target-series or pins
+// capture. Every phase's target-series snapshot is still captured with targetSnapshotAfter at
+// watermark 0, which is trivially correct here: a freshly-restarted process has no prior capture
+// history to isolate from at all. After each restart, discoverConversations is called once to
+// actively navigate into the configured Project (bridge/main.js's "conversations" method navigates
+// there whenever nothing is cached yet, which is always true right after a restart) — live evidence
+// suggested the target series is only fetched when the Project view is actually visited, not merely
+// on a bare reload to ChatGPT's root.
+func runPinExperiment(ctx context.Context, cfg config, mainScript, preload string, browser *browserProcess, client net.Conn, projectID string, knownIDs []string) (*browserProcess, net.Conn, error) {
 	reader := bufio.NewReader(os.Stdin)
 	prompt := func(message string) error {
 		fmt.Println(message)
@@ -893,17 +914,13 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		return err
 	}
 
-	fmt.Println("=== Phase 5 is_starred coverage experiment ===")
+	fmt.Println("=== Phase 5 is_starred coverage experiment (fresh-process fallback) ===")
 
-	// Baseline: watermark 0 means "every MATCH capture observed so far" — there is no prior phase to
-	// isolate from yet.
 	baseline, err := targetSnapshotAfter(client, projectID, knownIDs, 0, 8, 20, 490)
 	if err != nil {
-		return fmt.Errorf("baseline target snapshot: %w", err)
+		return nil, nil, fmt.Errorf("baseline target snapshot: %w", err)
 	}
-	allSeriesWatermark, _ := maxObservedCaptureID(client, 493)
-	fmt.Printf("baseline target series: target_count=%d fresh_pages_used=%d target_capture_watermark=%d all_series_capture_watermark=%d\n",
-		len(baseline.Conversations), baseline.PagesUsed, baseline.MaxCaptureID, allSeriesWatermark)
+	fmt.Printf("baseline target series: target_count=%d fresh_pages_used=%d\n", len(baseline.Conversations), baseline.PagesUsed)
 	basePins, pinsErr := fetchPins(client, 500)
 	if pinsErr != nil {
 		fmt.Printf("baseline pins: NOT VERIFIED (%v)\n", pinsErr)
@@ -913,22 +930,28 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 	}
 	printCaptureDiagnostics(client, 494, "baseline")
 
-	if err := prompt("ACTION REQUIRED: in the real ChatGPT Web UI, Pin/Star/Favorite exactly ONE conversation that is currently active (non-archived) in the configured Project. Note which UI label you actually used (Pin/Star/Favorite/other). Then hard-reload the page (not just in-app navigation) so a fresh /backend-api/conversations request fires."); err != nil {
-		return fmt.Errorf("read operator confirmation: %w", err)
+	if err := prompt("ACTION REQUIRED: in the real ChatGPT Web UI (currently open), Pin/Star/Favorite exactly ONE conversation that is currently active (non-archived) in the configured Project. Note which UI label you actually used (Pin/Star/Favorite/other). Do NOT reload — the harness will restart the browser process itself next."); err != nil {
+		return nil, nil, fmt.Errorf("read operator confirmation: %w", err)
 	}
 
-	afterPin, err := targetSnapshotAfter(client, projectID, knownIDs, baseline.MaxCaptureID, 8, 20, 510)
+	browser, client, err = restartBrowserProcess(ctx, cfg, mainScript, preload, browser)
 	if err != nil {
-		return fmt.Errorf("post-pin target snapshot: %w", err)
+		return nil, nil, fmt.Errorf("restart after pin: %w", err)
 	}
-	allSeriesWatermarkAfterPin, _ := maxObservedCaptureID(client, 513)
-	fmt.Printf("target capture watermark: before=%d after=%d fresh=%t (all_series: before=%d after=%d)\n",
-		baseline.MaxCaptureID, afterPin.MaxCaptureID, afterPin.Fresh, allSeriesWatermark, allSeriesWatermarkAfterPin)
+	if _, err := discoverConversations(client, 511, projectID); err != nil {
+		fmt.Printf("post-restart Project navigation: NOT VERIFIED (%v)\n", err)
+	}
+
+	afterPin, err := targetSnapshotAfter(client, projectID, knownIDs, 0, 8, 20, 512)
+	if err != nil {
+		return nil, nil, fmt.Errorf("post-pin target snapshot: %w", err)
+	}
+	fmt.Printf("target capture: fresh=%t (fresh-process fallback: any MATCH capture in the new process counts as fresh, since it has no prior history at all)\n", afterPin.Fresh)
 	fmt.Printf("after pin target series: target_count=%d fresh_pages_used=%d\n", len(afterPin.Conversations), afterPin.PagesUsed)
-	printCaptureDiagnostics(client, 514, "after-pin")
+	printCaptureDiagnostics(client, 515, "after-pin")
 
 	afterPins, afterPinsErr := fetchPins(client, 501)
-	pinsFresh := pinsErr == nil && afterPinsErr == nil && afterPins.CaptureID > basePins.CaptureID
+	pinsFresh := afterPinsErr == nil && afterPins.CaptureID > 0
 	if afterPinsErr != nil {
 		fmt.Printf("after-pin pins: NOT VERIFIED (%v)\n", afterPinsErr)
 	} else {
@@ -959,12 +982,20 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 
 	reportStarredSeries(client, projectID, knownIDs, controlledID, controlledOK)
 
-	if err := prompt("ACTION REQUIRED: unpin/unstar the conversation you just pinned, restoring its original state. Then hard-reload the page again."); err != nil {
-		return fmt.Errorf("read operator confirmation: %w", err)
+	if err := prompt("ACTION REQUIRED: unpin/unstar the conversation you just pinned, restoring its original state, using the currently open browser window. Do NOT reload — the harness will restart the browser process again next."); err != nil {
+		return nil, nil, fmt.Errorf("read operator confirmation: %w", err)
+	}
+
+	browser, client, err = restartBrowserProcess(ctx, cfg, mainScript, preload, browser)
+	if err != nil {
+		return nil, nil, fmt.Errorf("restart after restore: %w", err)
+	}
+	if _, err := discoverConversations(client, 521, projectID); err != nil {
+		fmt.Printf("post-restart Project navigation: NOT VERIFIED (%v)\n", err)
 	}
 
 	afterRestorePins, restorePinsErr := fetchPins(client, 502)
-	restorePinsFresh := afterPinsErr == nil && restorePinsErr == nil && afterRestorePins.CaptureID > afterPins.CaptureID
+	restorePinsFresh := restorePinsErr == nil && afterRestorePins.CaptureID > 0
 	restoreRemovedControlled := false
 	if restorePinsFresh && controlledOK {
 		_, removed := diffStringSlices(afterPins.IDs, afterRestorePins.IDs)
@@ -977,11 +1008,11 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 			afterRestorePins.CaptureID, afterRestorePins.RawItemCount, afterRestorePins.RecognizedIDCount, restorePinsFresh, restoreRemovedControlled)
 	}
 
-	afterRestore, err := targetSnapshotAfter(client, projectID, knownIDs, afterPin.MaxCaptureID, 8, 20, 520)
+	afterRestore, err := targetSnapshotAfter(client, projectID, knownIDs, 0, 8, 20, 522)
 	if err != nil {
-		return fmt.Errorf("post-restore target snapshot: %w", err)
+		return nil, nil, fmt.Errorf("post-restore target snapshot: %w", err)
 	}
-	fmt.Printf("target capture watermark: before=%d after=%d fresh=%t\n", afterPin.MaxCaptureID, afterRestore.MaxCaptureID, afterRestore.Fresh)
+	fmt.Printf("target capture: fresh=%t\n", afterRestore.Fresh)
 	fmt.Printf("after restore target series: target_count=%d fresh_pages_used=%d\n", len(afterRestore.Conversations), afterRestore.PagesUsed)
 	printCaptureDiagnostics(client, 524, "after-restore")
 
@@ -990,7 +1021,7 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		fmt.Printf("controlled_sample_present_after_restore=%t\n", presentAfterRestore)
 	}
 	fmt.Printf("restore evidence: %s\n", pinExperimentRestoreOutcome(controlledOK, restoreRemovedControlled, afterRestore.Fresh, presentAfterRestore))
-	return nil
+	return browser, client, nil
 }
 
 // reportStarredSeries investigates README Phase 5's secondary question: whether any real UI action
@@ -1145,6 +1176,43 @@ func parseFlags() config {
 	return cfg
 }
 
+// browserProcess bundles a running terminal-browser child process with its owning pseudo-PTY, so
+// the pair can be started, stopped, and restarted as a unit. This exists for the Phase 5
+// is_starred experiment's fresh-process fallback (see restartBrowserProcess): three live runs
+// proved a same-process reload does not force a fresh target-series or /backend-api/pins capture,
+// so runPinExperiment instead stops and restarts this whole process mid-run, against the same
+// persistent partition.
+type browserProcess struct {
+	cmd  *exec.Cmd
+	ptmx *os.File
+}
+
+func startBrowserProcess(ctx context.Context, cfg config, mainScript, preload string) (*browserProcess, error) {
+	cmd := exec.CommandContext(ctx, cfg.binary,
+		"open", cfg.url,
+		"--no-merge",
+		"--partition="+cfg.partition,
+		"--main-script="+mainScript,
+		"--preload="+preload,
+	)
+	cmd.Env = append(os.Environ(),
+		"TERMINAL_BROWSER_SKIP_GRAPHICS_CHECK=1",
+		"AGENTSCTL_CHATGPT_BRIDGE_SOCKET="+cfg.socket,
+	)
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("start terminal-browser: %w", err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, ptmx) }()
+	return &browserProcess{cmd: cmd, ptmx: ptmx}, nil
+}
+
+// stop terminates the process and closes its pseudo-PTY. Safe to call on a process already exited.
+func (b *browserProcess) stop() error {
+	defer func() { _ = b.ptmx.Close() }()
+	return terminate(b.cmd)
+}
+
 func run(ctx context.Context, cfg config) error {
 	if runtime.GOOS == "windows" {
 		return errors.New("the pseudo-PTY spike requires a Unix host")
@@ -1161,37 +1229,29 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, cfg.binary,
-		"open", cfg.url,
-		"--no-merge",
-		"--partition="+cfg.partition,
-		"--main-script="+mainScript,
-		"--preload="+preload,
-	)
-	cmd.Env = append(os.Environ(),
-		"TERMINAL_BROWSER_SKIP_GRAPHICS_CHECK=1",
-		"AGENTSCTL_CHATGPT_BRIDGE_SOCKET="+cfg.socket,
-	)
-	ptmx, err := pty.Start(cmd)
+	browser, err := startBrowserProcess(ctx, cfg, mainScript, preload)
 	if err != nil {
-		return fmt.Errorf("start terminal-browser: %w", err)
+		return err
 	}
-	defer ptmx.Close()
-	go func() { _, _ = io.Copy(io.Discard, ptmx) }()
+	// A closure, not `defer browser.ptmx.Close()`: runPinExperiment may replace `browser` with a
+	// restarted process (see restartBrowserProcess), and a closure reads whatever `browser` holds
+	// at function-return time rather than freezing today's value at defer-registration time.
+	defer func() { _ = browser.ptmx.Close() }()
 
 	if cfg.closePTYAfter > 0 {
 		go func() {
 			time.Sleep(cfg.closePTYAfter)
-			_ = ptmx.Close()
+			_ = browser.ptmx.Close()
 		}()
 	}
 
 	client, err := dialBridge(ctx, cfg.socket, 20*time.Second)
 	if err != nil {
-		_ = terminate(cmd)
+		_ = terminate(browser.cmd)
 		return err
 	}
-	defer client.Close()
+	// Same reasoning as the ptmx defer above: a closure, so it always closes the latest `client`.
+	defer func() { _ = client.Close() }()
 
 	if _, err := call(client, request{ID: 1, Method: "ping"}); err != nil {
 		return err
@@ -1216,7 +1276,8 @@ func run(ctx context.Context, cfg config) error {
 	if err != nil {
 		return fmt.Errorf("reconnect bridge: %w", err)
 	}
-	defer client.Close()
+	// No second defer here: the closure-based defer registered above already closes whatever
+	// `client` holds at function-return time.
 	if _, err := call(client, request{ID: 8, Method: "ping"}); err != nil {
 		return fmt.Errorf("bridge reconnect round trip: %w", err)
 	}
@@ -1411,9 +1472,11 @@ func run(ctx context.Context, cfg config) error {
 		}
 
 		if cfg.pinExperiment {
-			if err := runPinExperiment(client, projectID, ids); err != nil {
+			newBrowser, newClient, err := runPinExperiment(ctx, cfg, mainScript, preload, browser, client, projectID, ids)
+			if err != nil {
 				return fmt.Errorf("pin experiment: %w", err)
 			}
+			browser, client = newBrowser, newClient
 		}
 	}
 
@@ -1438,7 +1501,7 @@ func run(ctx context.Context, cfg config) error {
 		}
 		fmt.Printf("helper sustained: PASS ready=%s origin=%s\n", page.ReadyState, origin(page.Href))
 	}
-	if err := terminate(cmd); err != nil {
+	if err := terminate(browser.cmd); err != nil {
 		return err
 	}
 	return nil
