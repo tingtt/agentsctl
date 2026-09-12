@@ -922,34 +922,201 @@ func TestCompareMembershipAmbiguousChangeIsNotSingleAttributable(t *testing.T) {
 	}
 }
 
-func TestMembershipOutcomeRequiresFreshCaptureForOutcomeA(t *testing.T) {
-	// The 2026-09-11 live run hit exactly this: membership looked unchanged (disappeared=nil), but
-	// the observed captureID never advanced between observations, so the honest classification is
-	// NOT VERIFIED, not "A candidate" — an unchanged result without a fresh capture proves nothing.
-	got := membershipOutcome(false, nil)
+// diag builds a minimal globalConversationsPageDiagnostic fixture. isStarred/hideSnorlax/isArchived
+// default to the values that make classifyForActiveList return MATCH; override via the returned
+// value's fields for a specific test.
+func diag(captureID int) globalConversationsPageDiagnostic {
+	return globalConversationsPageDiagnostic{
+		CaptureID: captureID, HideSnorlax: "absent", IsArchived: "false", IsStarred: "false", Order: "updated",
+	}
+}
+
+func TestMaxMatchCaptureIDIgnoresIrrelevantSeries(t *testing.T) {
+	// An irrelevant series (hide_snorlax=true) being freshly captured, even with a HIGHER CaptureID
+	// than the last real MATCH capture, must never be mistaken for the target series being refetched.
+	matchCapture := diag(5)
+	irrelevant := diag(9)
+	irrelevant.HideSnorlax = "true"
+	got := maxMatchCaptureID([]globalConversationsPageDiagnostic{matchCapture, irrelevant})
+	if got != 5 {
+		t.Fatalf("maxMatchCaptureID = %d, want 5 (the irrelevant capture's higher ID must not count)", got)
+	}
+}
+
+func TestMaxMatchCaptureIDAdvancesOnFreshMatch(t *testing.T) {
+	got := maxMatchCaptureID([]globalConversationsPageDiagnostic{diag(5), diag(9)})
+	if got != 9 {
+		t.Fatalf("maxMatchCaptureID = %d, want 9", got)
+	}
+}
+
+func TestSelectFreshMatchDiagnosticsExcludesStaleAndIrrelevant(t *testing.T) {
+	stale := diag(5)      // <= watermark: must be excluded regardless of classification
+	irrelevant := diag(9) // > watermark, but not MATCH: must be excluded
+	irrelevant.IsArchived = "true"
+	fresh := diag(12) // > watermark and MATCH: must be selected
+	got := selectFreshMatchDiagnostics([]globalConversationsPageDiagnostic{stale, irrelevant, fresh}, 5)
+	if len(got) != 1 || got[0].CaptureID != 12 {
+		t.Fatalf("selectFreshMatchDiagnostics = %+v, want exactly the fresh MATCH capture (12)", got)
+	}
+}
+
+func TestSelectFreshMatchDiagnosticsPhaseIsolation(t *testing.T) {
+	// The exact scenario the task describes: a baseline capture (SeriesKey S, offset 0, digest A)
+	// and a post-pin capture of the SAME SeriesKey+Offset (digest B) are two legitimate, different
+	// point-in-time snapshots. Treating them as one enumeration's input would trip mergeProjectPages'
+	// "same page reported a different raw identity" schema-drift check. Two SEPARATE
+	// selectFreshMatchDiagnostics calls (one per phase) must each see only their own capture, so
+	// merging each phase's own result independently never errors.
+	baselineCapture := diag(5)
+	baselineCapture.SeriesKey = stringPtr("S")
+	baselineCapture.Offset, baselineCapture.Limit = intPtr(0), intPtr(28)
+	baselineCapture.RecognizedCollection = true
+	baselineCapture.RawIdentityDigest = "digest-A"
+
+	postPinCapture := diag(9)
+	postPinCapture.SeriesKey = stringPtr("S")
+	postPinCapture.Offset, postPinCapture.Limit = intPtr(0), intPtr(28)
+	postPinCapture.RecognizedCollection = true
+	postPinCapture.RawIdentityDigest = "digest-B"
+
+	// At baseline time, the bridge has only observed the baseline capture — the post-pin one does
+	// not exist yet. all is what the bridge has accumulated BY THE TIME the after-pin phase runs
+	// (both, since capture history is never discarded).
+	all := []globalConversationsPageDiagnostic{baselineCapture, postPinCapture}
+
+	// Baseline phase: watermark 0 sees only the baseline capture (the only one observed so far).
+	baselinePhase := selectFreshMatchDiagnostics([]globalConversationsPageDiagnostic{baselineCapture}, 0)
+	if len(baselinePhase) != 1 || baselinePhase[0].RawIdentityDigest != "digest-A" {
+		t.Fatalf("baseline phase selected %+v, want exactly the baseline capture", baselinePhase)
+	}
+	baselinePage := conversationPage{
+		SeriesKey: *baselinePhase[0].SeriesKey, Offset: *baselinePhase[0].Offset, Limit: *baselinePhase[0].Limit,
+		RecognizedCollection: true, RawIdentityDigest: baselinePhase[0].RawIdentityDigest,
+	}
+	if _, _, err := mergeProjectPages([]conversationPage{baselinePage}, 20); err != nil {
+		t.Fatalf("baseline phase alone must merge without error: %v", err)
+	}
+
+	// After-pin phase: watermark 5 (baseline's own CaptureID) sees only the post-pin capture.
+	afterPinPhase := selectFreshMatchDiagnostics(all, 5)
+	if len(afterPinPhase) != 1 || afterPinPhase[0].RawIdentityDigest != "digest-B" {
+		t.Fatalf("after-pin phase selected %+v, want exactly the post-pin capture", afterPinPhase)
+	}
+	afterPinPage := conversationPage{
+		SeriesKey: *afterPinPhase[0].SeriesKey, Offset: *afterPinPhase[0].Offset, Limit: *afterPinPhase[0].Limit,
+		RecognizedCollection: true, RawIdentityDigest: afterPinPhase[0].RawIdentityDigest,
+	}
+	if _, _, err := mergeProjectPages([]conversationPage{afterPinPage}, 20); err != nil {
+		t.Fatalf("after-pin phase alone must merge without error: %v", err)
+	}
+
+	// Mixing both phases' captures into ONE mergeProjectPages call, by contrast, must still fail
+	// closed — this documents why phase isolation via the watermark is necessary, not optional.
+	if _, _, err := mergeProjectPages([]conversationPage{baselinePage, afterPinPage}, 20); err == nil {
+		t.Fatal("mixing two phases' captures of the same series+offset must fail closed (existing invariant, not weakened)")
+	}
+}
+
+func intPtr(v int) *int { return &v }
+
+func TestControlledSampleFromPinsDeltaCleanSingleAddition(t *testing.T) {
+	before := pinsSnapshot{IDs: []string{"a"}}
+	after := pinsSnapshot{IDs: []string{"a", "b"}}
+	id, ok, reason := controlledSampleFromPinsDelta(true, before, after)
+	if !ok || id != "b" {
+		t.Fatalf("controlledSampleFromPinsDelta = (%q, %t, %q), want (\"b\", true, \"\")", id, ok, reason)
+	}
+}
+
+func TestControlledSampleFromPinsDeltaAmbiguousAdditionsNotVerified(t *testing.T) {
+	before := pinsSnapshot{IDs: []string{"a"}}
+	after := pinsSnapshot{IDs: []string{"a", "b", "c"}}
+	_, ok, _ := controlledSampleFromPinsDelta(true, before, after)
+	if ok {
+		t.Fatal("expected NOT VERIFIED (ok=false) for more than one added pin")
+	}
+}
+
+func TestControlledSampleFromPinsDeltaNotFreshIsNotVerified(t *testing.T) {
+	before := pinsSnapshot{IDs: []string{"a"}}
+	after := pinsSnapshot{IDs: []string{"a", "b"}}
+	_, ok, _ := controlledSampleFromPinsDelta(false, before, after)
+	if ok {
+		t.Fatal("expected NOT VERIFIED (ok=false) when the pins capture was not confirmed fresh")
+	}
+}
+
+func TestControlledSampleFromPinsDeltaWithRemovalIsNotVerified(t *testing.T) {
+	before := pinsSnapshot{IDs: []string{"a"}}
+	after := pinsSnapshot{IDs: []string{"b"}} // "a" removed, "b" added — not a clean single addition
+	_, ok, _ := controlledSampleFromPinsDelta(true, before, after)
+	if ok {
+		t.Fatal("expected NOT VERIFIED (ok=false) when the delta also removed an existing pin")
+	}
+}
+
+func TestPinExperimentOutcomeA(t *testing.T) {
+	got := pinExperimentOutcome(true, "", true, true, true)
+	if !strings.HasPrefix(got, "A:") {
+		t.Fatalf("pinExperimentOutcome = %q, want an A result", got)
+	}
+}
+
+func TestPinExperimentOutcomeB(t *testing.T) {
+	got := pinExperimentOutcome(true, "", true, true, false)
+	if !strings.HasPrefix(got, "B:") {
+		t.Fatalf("pinExperimentOutcome = %q, want a B result", got)
+	}
+}
+
+func TestPinExperimentOutcomeNotVerifiedWithoutControlledSample(t *testing.T) {
+	got := pinExperimentOutcome(false, "no fresh pins capture", true, true, true)
 	if !strings.Contains(got, "NOT VERIFIED") {
-		t.Fatalf("membershipOutcome(false, nil) = %q, want it to report NOT VERIFIED", got)
+		t.Fatalf("pinExperimentOutcome = %q, want NOT VERIFIED", got)
 	}
 }
 
-func TestMembershipOutcomeFreshNoChangeIsOutcomeA(t *testing.T) {
-	got := membershipOutcome(true, nil)
-	if !strings.Contains(got, "A candidate") {
-		t.Fatalf("membershipOutcome(true, nil) = %q, want an A candidate result", got)
+func TestPinExperimentOutcomeNotVerifiedWhenNotPresentBefore(t *testing.T) {
+	got := pinExperimentOutcome(true, "", false, true, true)
+	if !strings.Contains(got, "NOT VERIFIED") || !strings.Contains(got, "baseline") {
+		t.Fatalf("pinExperimentOutcome = %q, want NOT VERIFIED citing baseline invalidity", got)
 	}
 }
 
-func TestMembershipOutcomeFreshOneDisappearedIsOutcomeB(t *testing.T) {
-	got := membershipOutcome(true, []string{"fingerprint-of-removed-item"})
-	if !strings.Contains(got, "B candidate") {
-		t.Fatalf("membershipOutcome(true, [1 item]) = %q, want a B candidate result", got)
-	}
-}
-
-func TestMembershipOutcomeFreshAmbiguousChangeIsNotVerified(t *testing.T) {
-	got := membershipOutcome(true, []string{"a", "b"})
+func TestPinExperimentOutcomeNotVerifiedWhenTargetStale(t *testing.T) {
+	// The exact "stale target" case: membership appears unchanged (presentAfter=true) but no fresh
+	// target capture was observed — this must never be read as Outcome A.
+	got := pinExperimentOutcome(true, "", true, false, true)
 	if !strings.Contains(got, "NOT VERIFIED") {
-		t.Fatalf("membershipOutcome(true, [2 items]) = %q, want NOT VERIFIED", got)
+		t.Fatalf("pinExperimentOutcome = %q, want NOT VERIFIED when the target snapshot is not fresh", got)
+	}
+}
+
+func TestPinExperimentRestoreOutcomePass(t *testing.T) {
+	got := pinExperimentRestoreOutcome(true, true, true, true)
+	if !strings.HasPrefix(got, "PASS") {
+		t.Fatalf("pinExperimentRestoreOutcome = %q, want PASS", got)
+	}
+}
+
+func TestPinExperimentRestoreOutcomeNotVerifiedCases(t *testing.T) {
+	tests := []struct {
+		name                                                        string
+		controlledOK, pinsRemoved, restoreTargetFresh, presentAfter bool
+	}{
+		{"no controlled sample", false, true, true, true},
+		{"pins did not confirm removal", true, false, true, true},
+		{"restore target snapshot stale", true, true, false, true},
+		{"controlled sample absent after restore", true, true, true, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := pinExperimentRestoreOutcome(test.controlledOK, test.pinsRemoved, test.restoreTargetFresh, test.presentAfter)
+			if !strings.Contains(got, "NOT VERIFIED") {
+				t.Fatalf("pinExperimentRestoreOutcome(%v) = %q, want NOT VERIFIED", test, got)
+			}
+		})
 	}
 }
 
