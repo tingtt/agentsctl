@@ -868,6 +868,14 @@ func restartBrowserProcess(ctx context.Context, cfg config, mainScript, preload 
 	if err := old.stop(); err != nil {
 		return nil, nil, fmt.Errorf("stop browser for restart: %w", err)
 	}
+	// A live run (2026-09-12) hit a new failure here: the new process answered an initial ping
+	// successfully, then the connection died ("broken pipe") within a few seconds — consistent with
+	// the new Electron instance racing the just-terminated old one for the persistent partition's
+	// own lock file (SIGTERM killing our direct child does not guarantee every resource the old
+	// process held has been released the instant terminate() returns). This settle delay gives that
+	// teardown time to finish before a new instance tries to use the same partition.
+	time.Sleep(3 * time.Second)
+
 	fresh, err := startBrowserProcess(ctx, cfg, mainScript, preload)
 	if err != nil {
 		return nil, nil, fmt.Errorf("restart browser: %w", err)
@@ -883,6 +891,15 @@ func restartBrowserProcess(ctx context.Context, cfg config, mainScript, preload 
 		return nil, nil, fmt.Errorf("bridge round trip after restart: %w", err)
 	}
 	time.Sleep(3 * time.Second)
+	// Re-check liveness after the settle sleep, rather than trusting the initial ping alone: the
+	// live failure above crashed shortly AFTER a successful first ping, so this catches that same
+	// failure mode here, with a clear diagnostic, instead of a confusing "broken pipe" surfacing
+	// from an unrelated later call several steps into the experiment.
+	if _, err := call(client, request{ID: 1, Method: "ping"}); err != nil {
+		_ = client.Close()
+		_ = fresh.stop()
+		return nil, nil, fmt.Errorf("browser process died shortly after restart, likely a partition lock conflict with the just-stopped process: %w", err)
+	}
 	fmt.Println("browser process restarted: PASS (same persistent partition)")
 	return fresh, client, nil
 }
