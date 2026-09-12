@@ -291,6 +291,14 @@ One more piece of live evidence shaped this pass: the ninth-pass run's scroll-si
 
 This is a build/test-verified implementation (`go build`, `go vet`, `go test -race`, `node --check` all pass) — it has not yet been run live. **Coverage remains UNKNOWN, `is_starred` coverage semantics remain NOT VERIFIED, and Phase 5 completeness remains CONDITIONAL** pending that live run.
 
+**Eleventh pass — first live run of the fallback crashed the restarted process (2026-09-12):** the repository owner ran the fresh-process fallback. The restart itself reported `browser process restarted: PASS`, but the very next call (`discoverConversations`, the forced Project-navigation step) failed with `write: broken pipe`, and the following step failed the same way — the new `terminal-browser` process answered its initial post-restart `ping` successfully, then the connection died within a few seconds.
+
+**Hypothesis:** `terminate()` sending SIGTERM and `cmd.Wait()` returning only confirms this program's direct child process has exited — it does not guarantee every resource the old process held (in particular, the persistent partition's own Electron/Chromium lock file) has actually been released the instant `restartBrowserProcess`'s call to `old.stop()` returns. Starting a new instance against the same partition too soon after the old one's exit is a plausible race for exactly this symptom (an initially-healthy process crashing shortly after startup). This has not been independently confirmed (e.g. from `terminal-browser`'s own logs) — it is the most likely explanation given the timing, not a proven root cause.
+
+**Mitigation:** added a 3-second settle delay after `old.stop()` returns and before starting the new process, and — since the live failure was specifically "healthy at first ping, dead a few seconds later" — a second liveness re-check after the existing post-ping settle sleep, so a repeat of this exact failure is caught immediately with a clear diagnostic (`"browser process died shortly after restart, likely a partition lock conflict..."`) rather than surfacing later as a confusing `broken pipe` from an unrelated call several steps into the experiment. This is a best-effort, evidence-based mitigation for an environment-specific process-lifecycle issue this spike cannot directly inspect (no access to `terminal-browser`'s own internals or logs) — build/test-verified, not yet re-run live.
+
+**Result: C. NOT VERIFIED**, still — this run never reached the decisive membership test at all, since the process crash happened before any post-restart target-series or pins capture could be attempted. Coverage/Phase 5 status unchanged.
+
 ### Phase 6: Chat versus Work discrimination
 
 **Hypothesis:** Sanitized list/detail metadata contains an explicit discriminator that differs between known Chat and Work samples.
