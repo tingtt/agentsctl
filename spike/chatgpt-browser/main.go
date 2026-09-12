@@ -396,14 +396,21 @@ func (c seriesClassification) String() string {
 // of the active-list scope by design (session.Provider.List(archived=false) — see README Phase A),
 // not by inference. Everything else uncertain is UNKNOWN, never silently folded into either MATCH
 // or DEFINITELY_IRRELEVANT: an unrecognized value on a known key ("unknown"), an unrecognized query
-// parameter, or an unproven "absent" state on is_archived/is_starred/order.
+// parameter, or an unproven "absent" state on is_archived/order.
 //
 // hide_snorlax's "false" and "absent" states ARE treated identically here — deliberately, not a
 // shortcut: every real capture in this account's target series carries hide_snorlax absent, never
 // explicitly "false", and item-level filtering evidence directly confirmed both states include
-// Project conversations. is_archived/is_starred/order have no equivalent direct evidence for
-// "absent" (the real UI has never been observed omitting them), so their "absent" state stays
-// UNKNOWN rather than being assumed equivalent to "false".
+// Project conversations. is_archived/order have no equivalent direct evidence for "absent" (the
+// real UI has never been observed omitting them), so their "absent" state stays UNKNOWN rather than
+// being assumed equivalent to "false".
+//
+// is_starred=true and is_starred=false are BOTH accepted here, as of a controlled live experiment
+// (README Phase 5, tenth/twelfth-pass addenda): pinning one conversation removed it from the
+// default is_starred=false series (Outcome B), directly confirmed via a fresh-process, pins-delta-
+// identified controlled sample — not merely inferred. is_starred is therefore a confirmed second
+// required series to union in, not an unconfirmed dimension; see activeListRequiredSeries. Its
+// "absent" state still has no such direct evidence and stays UNKNOWN.
 func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassification, string) {
 	switch d.HideSnorlax {
 	case "true":
@@ -424,7 +431,7 @@ func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassific
 	if d.HasUnknownParameters {
 		return seriesUnknown, "query carries a parameter this bridge does not recognize"
 	}
-	if d.IsStarred != "false" {
+	if d.IsStarred != "false" && d.IsStarred != "true" {
 		return seriesUnknown, fmt.Sprintf("is_starred value not confirmed safe for the active-list target (%q)", d.IsStarred)
 	}
 	if d.Order != "updated" {
@@ -433,45 +440,60 @@ func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassific
 	return seriesMatch, ""
 }
 
-// RequireOrder is included because "updated" is the only order value ever observed on the real
-// default view; a different value has not been shown to select the same result set (see the
-// seriesClassification doc above) — completeness stays conservative rather than assuming order is
-// purely cosmetic.
+// activeListRequiredSeries is this PoC's live-evidence-based definition of the target series
+// required for the "active, non-archived Project session" universe — the scope of the existing
+// production session.Provider.List(archived bool) called with archived=false (see README Phase A).
+// It requires BOTH is_starred=false and is_starred=true series, in union: a controlled live
+// experiment (README Phase 5, tenth/twelfth-pass addenda) confirmed Outcome B — pinning a
+// conversation removes it from the default is_starred=false series, and restoring/unpinning brings
+// it back — so is_starred=false ALONE is not the full active-list universe. Both entries share
+// is_archived=false, order=updated (the only order value ever observed on the real default view),
+// and no unrecognized query parameter.
 var activeListRequiredSeries = []seriesRequirement{
 	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), RequireOrder: stringPtr("updated"), ForbidUnknownParameters: true},
+	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(true), RequireOrder: stringPtr("updated"), ForbidUnknownParameters: true},
 }
 
-// activeListCoverageCaveat documents the one dimension this PoC could not confirm or rule out: see
-// README Phase B/C.
-const activeListCoverageCaveat = "is_starred semantics unconfirmed: no real ChatGPT UI action in this session ever requested is_starred=true, so a possible separate required series for starred/pinned conversations cannot be ruled in or out; indirect evidence (a separate /backend-api/pins endpoint observed in real traffic, independent of /backend-api/conversations) suggests pin/star state does not partition the conversations list, but this was not directly tested"
+// activeListCoverageResolvedNote records how the is_starred coverage question (previously an open
+// caveat) was resolved: see README Phase 5, tenth/twelfth-pass addenda. This is no longer an
+// unresolved caveat forcing Coverage to UNKNOWN unconditionally (contrast the earlier
+// activeListCoverageCaveat, now removed) — it is supporting evidence for why Coverage can be
+// COMPLETE once activeListRequiredSeries' two series are what the live-ingestion pipeline actually
+// validates against.
+const activeListCoverageResolvedNote = "is_starred coverage confirmed via a controlled live experiment (README Phase 5, tenth/twelfth-pass): pinning a conversation removed it from the default is_starred=false series, and unpinning restored it — Outcome B. activeListRequiredSeries now requires the union of is_starred=false and is_starred=true; Pagination (not Coverage) is what tracks whether both have actually been enumerated to exhaustion"
 
 // evaluateActiveListCompleteness is the top-level completeness judgement for this PoC's target
-// universe. It reports Pagination (did the required series reach exhaustion) and Coverage (is the
-// required-series definition itself trustworthy as the FULL intended universe) as two independent
-// axes — see the README's Phase A/B/C for why Coverage is UNKNOWN, not COMPLETE, even when
-// Pagination succeeds: this account never exercised an is_starred=true query, so whether it
-// represents a separate required bucket was never tested. Overall completeness (decided by the
-// caller) should require BOTH axes to be COMPLETE.
+// universe. It reports Pagination (did every required series in activeListRequiredSeries reach
+// exhaustion) and Coverage (is the required-series definition itself trustworthy as the FULL
+// intended universe) as two independent axes. Coverage is now COMPLETE by default (the is_starred
+// union was directly confirmed — see activeListCoverageResolvedNote), unlike the earlier
+// unconditional UNKNOWN this PoC used while is_starred was still an open question; Overall
+// completeness (decided by the caller) still requires BOTH axes COMPLETE, so an is_starred=true
+// series that was never observed at all still correctly leaves Pagination — not Coverage —
+// INCOMPLETE.
 //
 // unknownObservations is a composable list of additional reasons Coverage cannot be trusted,
 // supplied by the live-ingestion caller (see enumerateAllConversations's classification step) for
-// every capture whose semantics could not be classified MATCH or DEFINITELY_IRRELEVANT. Coverage
-// is UNKNOWN unconditionally in this PoC (activeListCoverageCaveat alone already guarantees that),
-// but a non-empty unknownObservations still forces UNKNOWN explicitly and composes into Reason, so
-// that resolving the is_starred blocker someday would not silently upgrade Coverage to COMPLETE
-// while an unrelated unknown-semantics capture was observed and ignored.
+// every capture whose semantics could not be classified MATCH or DEFINITELY_IRRELEVANT. A non-empty
+// unknownObservations still forces Coverage to UNKNOWN, composing every reason into Coverage.Reason,
+// so an unrelated unknown-semantics capture (e.g. some future new query parameter) can never be
+// silently ignored just because the is_starred question itself is now resolved.
 func evaluateActiveListCompleteness(pages []conversationPage, unknownObservations []string, maxPages int) (conversations []conversation, pagination completenessResult, coverage completenessResult, err error) {
 	items, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, maxPages)
 	if err != nil {
 		return nil, completenessResult{}, completenessResult{}, err
 	}
 	if exhausted {
-		pagination = completenessResult{Status: "COMPLETE", Reason: "the required active-Project series reached a contiguous, pagination-exhausted offset chain"}
+		pagination = completenessResult{Status: "COMPLETE", Reason: "every required active-Project series (is_starred=false and is_starred=true) reached a contiguous, pagination-exhausted offset chain"}
 	} else {
-		pagination = completenessResult{Status: "INCOMPLETE", Reason: "the required active-Project series was not observed at all, or not yet pagination-exhausted"}
+		pagination = completenessResult{Status: "INCOMPLETE", Reason: "at least one required active-Project series (is_starred=false or is_starred=true) was not observed at all, or not yet pagination-exhausted"}
 	}
-	reasons := append([]string{activeListCoverageCaveat}, unknownObservations...)
-	coverage = completenessResult{Status: "UNKNOWN", Reason: strings.Join(reasons, "; ")}
+	if len(unknownObservations) > 0 {
+		reasons := append([]string{activeListCoverageResolvedNote}, unknownObservations...)
+		coverage = completenessResult{Status: "UNKNOWN", Reason: strings.Join(reasons, "; ")}
+	} else {
+		coverage = completenessResult{Status: "COMPLETE", Reason: activeListCoverageResolvedNote}
+	}
 	return items, pagination, coverage, nil
 }
 
