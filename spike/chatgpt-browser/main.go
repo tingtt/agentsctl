@@ -1574,19 +1574,28 @@ func run(ctx context.Context, cfg config) error {
 		for _, item := range first {
 			ids = append(ids, item.ID)
 		}
+		var evidence []conversationEvidence
 		raw, err = call(client, request{ID: 11, Method: "conversationEvidence", ConversationIDs: ids})
 		if err != nil {
-			return fmt.Errorf("compare conversation evidence: %w", err)
-		}
-		var evidence []conversationEvidence
-		if err := json.Unmarshal(raw, &evidence); err != nil {
+			if !cfg.pinExperiment {
+				return fmt.Errorf("compare conversation evidence: %w", err)
+			}
+			// This older structural probe depends on a conversation-detail response being
+			// captured during Project navigation. A warm UI cache can legitimately omit that
+			// response. It is unrelated to the raw global-page membership evidence collected
+			// by the pin experiment, so do not let that cache state prevent the experiment.
+			fmt.Printf("conversation detail evidence: NOT VERIFIED (%v); continuing because -pin-experiment uses independent global-page and pins captures\n", err)
+			evidence = nil
+		} else if err := json.Unmarshal(raw, &evidence); err != nil {
 			return fmt.Errorf("decode conversation evidence: %w", err)
 		}
-		fmt.Printf("conversation detail evidence: fields=%d sessions=%d (values are structural marker labels only; conversation content, titles, and per-conversation identity mapping are never logged)\n",
-			len(evidence), len(first))
-		for _, field := range evidence {
-			fmt.Printf("evidence field: path=%s present=%d distinct_values=%d values=%s types=%s\n",
-				field.Path, field.PresentCount, field.DistinctValueCount, strings.Join(field.Values, "|"), strings.Join(field.Types, ","))
+		if err == nil {
+			fmt.Printf("conversation detail evidence: fields=%d sessions=%d (values are structural marker labels only; conversation content, titles, and per-conversation identity mapping are never logged)\n",
+				len(evidence), len(first))
+			for _, field := range evidence {
+				fmt.Printf("evidence field: path=%s present=%d distinct_values=%d values=%s types=%s\n",
+					field.Path, field.PresentCount, field.DistinctValueCount, strings.Join(field.Values, "|"), strings.Join(field.Types, ","))
+			}
 		}
 
 		raw, err = call(client, request{ID: 12, Method: "tasks", ConversationIDs: ids})
