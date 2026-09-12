@@ -63,6 +63,9 @@ func (s State) View(width, height int) string {
 				line += cwd + " "
 			}
 			line += provider
+			if selected {
+				line = styleText(line, selectedRowBackgroundCode)
+			}
 			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
 		}
 		list = append(list, displayLine{text: "", rowIndex: -1})
