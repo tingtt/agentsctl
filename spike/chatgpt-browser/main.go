@@ -571,14 +571,253 @@ func fetchPins(client net.Conn, id int) (pinsSnapshot, error) {
 	return snap, nil
 }
 
+// diffStringSlices returns the IDs present in `after` but not `before` (added) and present in
+// `before` but not `after` (removed), both sorted for determinism. Used for the pins before/after
+// delta (see controlledSampleFromPinsDelta); unlike diffConversationIDs it operates on plain ID
+// strings, since pinsSnapshot.IDs already is one.
+func diffStringSlices(before, after []string) (added, removed []string) {
+	beforeSet := make(map[string]struct{}, len(before))
+	for _, id := range before {
+		beforeSet[id] = struct{}{}
+	}
+	afterSet := make(map[string]struct{}, len(after))
+	for _, id := range after {
+		afterSet[id] = struct{}{}
+	}
+	for id := range afterSet {
+		if _, ok := beforeSet[id]; !ok {
+			added = append(added, id)
+		}
+	}
+	for id := range beforeSet {
+		if _, ok := afterSet[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	slices.Sort(added)
+	slices.Sort(removed)
+	return added, removed
+}
+
+// controlledSampleFromPinsDelta identifies the ONE conversation an operator pinned, from the
+// /backend-api/pins before/after delta alone — never from target-series disappearance. This is the
+// fix for a real evidence gap: a target-series set difference can identify the affected conversation
+// when it disappears (Outcome B), but gives NO candidate to check when it does NOT disappear
+// (Outcome A) — "disappeared=[]" alone can't say WHICH conversation was pinned and still present, so
+// Outcome A's evidence was previously weaker than Outcome B's. Requires fresh confirmed (the pins
+// capture actually advanced) AND a clean single addition (exactly one added ID, zero removed); any
+// other shape (no advance, zero added, multiple added, any removed) refuses to guess and returns
+// ok=false with a reason. The raw ID is returned only for the caller's own internal membership
+// checks — callers must never print it directly, only via conversationFingerprint.
+func controlledSampleFromPinsDelta(fresh bool, before, after pinsSnapshot) (controlledID string, ok bool, reason string) {
+	if !fresh {
+		return "", false, "no fresh /backend-api/pins capture was observed"
+	}
+	added, removed := diffStringSlices(before.IDs, after.IDs)
+	if len(added) != 1 || len(removed) != 0 {
+		return "", false, fmt.Sprintf("pins delta was not a clean single addition (added=%d removed=%d)", len(added), len(removed))
+	}
+	return added[0], true, ""
+}
+
+// containsID reports whether conversations includes one with the given raw ID.
+func containsID(conversations []conversation, id string) bool {
+	for _, c := range conversations {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// pinExperimentOutcome is the pure decision core of the Phase 5 decisive membership test (README
+// Phase D). It requires EVERY trust condition together before reporting Outcome A or B — a
+// successfully-identified controlled sample (see controlledSampleFromPinsDelta), that sample
+// confirmed present in the baseline snapshot (otherwise the experiment itself was invalid), and a
+// fresh target-series MATCH snapshot to check membership against (otherwise "still present" could
+// just mean "no new data was fetched," as a live run on 2026-09-11 demonstrated). Any missing
+// condition returns NOT VERIFIED — this function never guesses an A/B result.
+func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBefore, targetFresh, presentAfter bool) string {
+	switch {
+	case !controlledOK:
+		return "NOT VERIFIED — controlled sample could not be identified from the pins delta (" + controlledReason + ")"
+	case !presentBefore:
+		return "NOT VERIFIED — controlled sample was not present in the baseline target snapshot (experiment invalid)"
+	case !targetFresh:
+		return "NOT VERIFIED — no fresh target-series MATCH capture was observed after the pin action"
+	case presentAfter:
+		return "A: is_starred=false default series still contains the pinned conversation"
+	default:
+		return "B: pinning removes the conversation from the default is_starred=false series"
+	}
+}
+
+// pinExperimentRestoreOutcome is the equivalent decisive check for the restore (unpin) half of the
+// cycle: it requires a controlled sample, confirmation (via a fresh pins capture) that it was
+// actually removed from the pins set again, and a fresh target-series MATCH snapshot showing it
+// present once more. Any missing condition returns NOT VERIFIED.
+func pinExperimentRestoreOutcome(controlledOK, pinsRemovedControlled, restoreTargetFresh, presentAfterRestore bool) string {
+	switch {
+	case !controlledOK:
+		return "NOT VERIFIED — no controlled sample was identified to check restoration for"
+	case !pinsRemovedControlled:
+		return "NOT VERIFIED — controlled sample was not observed leaving the pins set after the restore action"
+	case !restoreTargetFresh:
+		return "NOT VERIFIED — no fresh target-series MATCH capture was observed after the restore action"
+	case presentAfterRestore:
+		return "PASS — controlled sample confirmed removed from pins and present again in a fresh target snapshot"
+	default:
+		return "NOT VERIFIED — controlled sample absent from the fresh post-restore target snapshot"
+	}
+}
+
+// targetSnapshotResult is one phase-scoped, freshness-verified observation of the active-list target
+// series, produced by targetSnapshotAfter.
+type targetSnapshotResult struct {
+	Conversations []conversation
+	Fresh         bool // true iff at least one MATCH capture strictly newer than the watermark was observed
+	MaxCaptureID  int  // running high-water mark of MATCH captures observed (becomes the next phase's watermark)
+	PagesUsed     int
+	Exhausted     bool // this phase's OWN fresh pages' pagination completeness — NOT a general completeness claim
+}
+
+// targetSnapshotAfter captures ONE phase-scoped snapshot of the active-list target series for the
+// Phase 5 is_starred pin/unpin experiment, considering ONLY captures strictly newer than
+// minCaptureIDExclusive (see selectFreshMatchDiagnostics). This is deliberately NOT
+// enumerateAllConversations reused as-is: that function folds together every capture ever observed,
+// which is exactly right for ordinary multi-page completeness enumeration (a real page can
+// legitimately take many scroll-triggered requests to reach exhaustion) but wrong here — mixing a
+// pre-mutation and a post-mutation capture of the SAME SeriesKey+Offset into one mergeProjectPages
+// call would trip its "same page reported a different raw identity" schema-drift check, when that
+// divergence is actually the exact, valid signal a controlled mutation should produce. Restricting
+// each call to one phase's own post-watermark captures makes that collision structurally impossible.
+//
+// This does not attempt general pagination completeness — this Project's target series is known
+// (prior live runs) to fit in one page, and the experiment only needs ONE trustworthy fresh snapshot
+// to test membership against. It retries a bounded number of sidebar-scroll-simulation attempts, like
+// enumerateAllConversations, but stops as soon as at least one fresh MATCH page has been observed;
+// Exhausted reports only whether THIS phase's own fresh pages reached their own offset-chain
+// exhaustion, and must never be read as "the target series' full completeness is proven."
+func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs []string, minCaptureIDExclusive int, maxScrollAttempts, maxPages, idBase int) (targetSnapshotResult, error) {
+	var pages []conversationPage
+	maxCaptureID := minCaptureIDExclusive
+	seenFresh := make(map[int]bool)
+
+	fetchFresh := func() (foundNew bool, err error) {
+		raw, err := call(client, request{ID: idBase, Method: "globalConversationsPages"})
+		if err != nil {
+			return false, fmt.Errorf("list global conversations pages: %w", err)
+		}
+		var diagnostics []globalConversationsPageDiagnostic
+		if err := json.Unmarshal(raw, &diagnostics); err != nil {
+			return false, fmt.Errorf("decode global conversations pages: %w", err)
+		}
+		if m := maxMatchCaptureID(diagnostics); m > maxCaptureID {
+			maxCaptureID = m
+		}
+		for _, d := range selectFreshMatchDiagnostics(diagnostics, minCaptureIDExclusive) {
+			if seenFresh[d.CaptureID] {
+				continue
+			}
+			seenFresh[d.CaptureID] = true
+			if d.SeriesKey == nil || !d.RecognizedCollection || d.Offset == nil || d.Limit == nil || *d.Limit <= 0 {
+				return false, fmt.Errorf("fresh MATCH capture %d has unusable pagination metadata", d.CaptureID)
+			}
+			itemsRaw, err := call(client, request{
+				ID: idBase + 1, Method: "globalConversationsCaptureItems", ProjectID: projectID,
+				CaptureID: d.CaptureID, KnownConversationIDs: knownConversationIDs,
+			})
+			if err != nil {
+				return false, fmt.Errorf("fetch items for capture %d: %w", d.CaptureID, err)
+			}
+			var result globalConversationsCaptureItemsResult
+			if err := json.Unmarshal(itemsRaw, &result); err != nil {
+				return false, fmt.Errorf("decode items for capture %d: %w", d.CaptureID, err)
+			}
+			pages = append(pages, conversationPage{
+				SeriesKey:                    *d.SeriesKey,
+				IsArchived:                   d.IsArchived,
+				IsStarred:                    d.IsStarred,
+				Order:                        d.Order,
+				HasUnknownParameters:         d.HasUnknownParameters,
+				Offset:                       *d.Offset,
+				Limit:                        *d.Limit,
+				RecognizedCollection:         d.RecognizedCollection,
+				RawItemCount:                 d.RawItemCount,
+				RecognizedIDCount:            d.RecognizedIDCount,
+				RawIdentityDigest:            d.RawIdentityDigest,
+				KnownIDsMismatched:           result.KnownIDsMismatched,
+				UnrecognizedAssociationCount: result.UnrecognizedAssociationCount,
+				Items:                        result.Items,
+			})
+			foundNew = true
+		}
+		return foundNew, nil
+	}
+
+	found, err := fetchFresh()
+	if err != nil {
+		return targetSnapshotResult{}, err
+	}
+	for attempt := 0; !found && attempt < maxScrollAttempts; attempt++ {
+		scrollRaw, err := call(client, request{ID: idBase + 2, Method: "simulateSidebarScroll"})
+		if err != nil {
+			return targetSnapshotResult{}, fmt.Errorf("simulate sidebar scroll: %w", err)
+		}
+		var scroll sidebarScrollResult
+		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
+			return targetSnapshotResult{}, fmt.Errorf("decode sidebar scroll result: %w", err)
+		}
+		fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
+			attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount, scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
+		time.Sleep(1500 * time.Millisecond)
+		found, err = fetchFresh()
+		if err != nil {
+			return targetSnapshotResult{}, err
+		}
+	}
+
+	conversations, exhausted, err := mergeProjectPages(pages, maxPages)
+	if err != nil {
+		return targetSnapshotResult{}, err
+	}
+	return targetSnapshotResult{
+		Conversations: conversations,
+		Fresh:         len(pages) > 0,
+		MaxCaptureID:  maxCaptureID,
+		PagesUsed:     len(pages),
+		Exhausted:     exhausted,
+	}, nil
+}
+
+// printCaptureDiagnostics surfaces the bridge's own low-level capture health (attached debuggers,
+// matched responses, capture errors) so a fresh=false result can be told apart between two distinct
+// causes: (A) the debugger/capture mechanism itself is not working at all, versus (B) capture is
+// healthy but the specific active-list target series just was not re-requested. No credential or
+// private data crosses this call — pingInfo is already a pure health/count summary.
+func printCaptureDiagnostics(client net.Conn, id int, label string) {
+	raw, err := call(client, request{ID: id, Method: "ping"})
+	if err != nil {
+		fmt.Printf("capture diagnostics (%s): NOT VERIFIED (%v)\n", label, err)
+		return
+	}
+	var p pingInfo
+	if err := json.Unmarshal(raw, &p); err != nil {
+		fmt.Printf("capture diagnostics (%s): NOT VERIFIED (decode: %v)\n", label, err)
+		return
+	}
+	fmt.Printf("capture diagnostics (%s): attached_debuggers=%d matched_responses=%d capture_errors=%d\n",
+		label, p.AttachedDebuggerCount, p.MatchedResponseCount, p.CaptureErrorCount)
+}
+
 // maxObservedCaptureID returns the highest CaptureID among ALL /backend-api/conversations captures
 // the bridge has observed so far (any query, not just MATCH-classified target-series ones), or 0 if
-// none. It exists because a live run of this experiment (2026-09-11) discovered that "the target
-// series looks unchanged" and "no fresh network response was ever observed" are indistinguishable
-// from compareMembership's output alone — enumerateAllConversations happily re-derives the same
-// result from the bridge's replayed capture history even when nothing new was fetched, since its own
-// seenCaptures bookkeeping is local to each call. runPinExperiment calls this before and after each
-// operator action and refuses to trust a "no change" result unless the captureID actually advanced.
+// none. This is an AUXILIARY diagnostic only (see the doc comments on maxMatchCaptureID and
+// targetSnapshotAfter for why it must never gate a membership trust decision by itself): an
+// irrelevant series (e.g. hide_snorlax=true) being freshly captured advances this watermark without
+// saying anything about whether the TARGET series was refetched. It exists because a live run of
+// this experiment (2026-09-11) discovered that "the target series looks unchanged" and "no fresh
+// network response was ever observed" are indistinguishable from a membership diff alone.
 func maxObservedCaptureID(client net.Conn, id int) (int, error) {
 	raw, err := call(client, request{ID: id, Method: "globalConversationsPages"})
 	if err != nil {
@@ -597,31 +836,54 @@ func maxObservedCaptureID(client net.Conn, id int) (int, error) {
 	return max, nil
 }
 
-// membershipOutcome classifies a membership comparison against README Phase D's Outcome A/B/C, but
-// ONLY trusts a "no change" (A) or "one member removed" (B) result when freshCapture confirms the
-// bridge actually observed a NEW /backend-api/conversations response between the two observations
-// being compared. Without that, "no change" cannot be distinguished from "no new data was ever
-// fetched" — exactly what the 2026-09-11 live run hit: membership looked unchanged, but the observed
-// captureID never advanced either, so the honest result was NOT VERIFIED, not Outcome A.
-func membershipOutcome(freshCapture bool, disappeared []string) string {
-	if !freshCapture {
-		return "NOT VERIFIED — no fresh /backend-api/conversations capture was observed between these two observations, so an unchanged membership result cannot be trusted as evidence"
+// maxMatchCaptureID is the pure core of the TARGET-SPECIFIC freshness watermark: the highest
+// CaptureID among diagnostics classifyForActiveList recognizes as MATCH (the active-list target
+// series — hide_snorlax=false/absent, is_archived=false, is_starred=false, order=updated, no
+// unknown parameter), ignoring every other series entirely. This reuses classifyForActiveList as
+// the sole source of truth rather than re-implementing the target-series definition, and exists
+// because maxObservedCaptureID alone cannot distinguish "an irrelevant series was freshly captured"
+// from "the target series was refetched" — a live run found exactly that ambiguity live.
+func maxMatchCaptureID(diagnostics []globalConversationsPageDiagnostic) int {
+	max := 0
+	for _, d := range diagnostics {
+		if classification, _ := classifyForActiveList(d); classification == seriesMatch && d.CaptureID > max {
+			max = d.CaptureID
+		}
 	}
-	switch len(disappeared) {
-	case 0:
-		return "A candidate — no target-series member disappeared, and a fresh capture confirms this reflects a real re-fetch"
-	case 1:
-		return "B candidate — exactly one target-series member disappeared, and a fresh capture confirms this reflects a real re-fetch"
-	default:
-		return "NOT VERIFIED — target series changed ambiguously (more than one member disappeared); cannot attribute to a single controlled action"
+	return max
+}
+
+// selectFreshMatchDiagnostics is the pure filtering core of targetSnapshotAfter's phase isolation:
+// it returns only the diagnostics that are BOTH classified MATCH (via classifyForActiveList, reused
+// rather than reimplemented) AND strictly newer than minCaptureIDExclusive. This is what keeps a
+// stale, pre-mutation capture of some SeriesKey+Offset from ever being merged together with a fresh
+// capture of that same SeriesKey+Offset observed after an operator's pin/unpin action — two
+// legitimate, different point-in-time snapshots that mergeProjectPages would otherwise (correctly,
+// for ordinary enumeration) treat as schema drift ("the same page reported a different raw identity
+// across observations"). By construction, a caller that only ever feeds mergeProjectPages the result
+// of one selectFreshMatchDiagnostics call per phase can never mix two phases' captures together.
+func selectFreshMatchDiagnostics(diagnostics []globalConversationsPageDiagnostic, minCaptureIDExclusive int) []globalConversationsPageDiagnostic {
+	var selected []globalConversationsPageDiagnostic
+	for _, d := range diagnostics {
+		if d.CaptureID <= minCaptureIDExclusive {
+			continue
+		}
+		if classification, _ := classifyForActiveList(d); classification == seriesMatch {
+			selected = append(selected, d)
+		}
 	}
+	return selected
 }
 
 // runPinExperiment drives the interactive, human-in-the-loop Phase 5 is_starred coverage
 // experiment end to end (README "ChatGPT Phase 5: prove is_starred coverage semantics", Phases
-// B through H). It never asks the operator to identify a conversation by title or ID — see
-// compareMembership — and never issues a pin/star mutation itself (README's safety boundary
-// requires a human to perform that in the real UI).
+// B through H). It never asks the operator to identify a conversation by title or ID, and never
+// issues a pin/star mutation itself (README's safety boundary requires a human to perform that in
+// the real UI). The controlled conversation is identified from the /backend-api/pins before/after
+// delta (controlledSampleFromPinsDelta) — not from target-series disappearance, which cannot
+// identify a candidate when nothing disappears (Outcome A). Every phase's target-series snapshot is
+// captured with targetSnapshotAfter, which strictly isolates each phase's own post-watermark
+// captures so a stale pre-mutation snapshot can never be merged with a fresh post-mutation one.
 func runPinExperiment(client net.Conn, projectID string, knownIDs []string) error {
 	reader := bufio.NewReader(os.Stdin)
 	prompt := func(message string) error {
@@ -632,23 +894,16 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 	}
 
 	fmt.Println("=== Phase 5 is_starred coverage experiment ===")
-	baseline, basePagination, baseCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+
+	// Baseline: watermark 0 means "every MATCH capture observed so far" — there is no prior phase to
+	// isolate from yet.
+	baseline, err := targetSnapshotAfter(client, projectID, knownIDs, 0, 8, 20, 490)
 	if err != nil {
-		return fmt.Errorf("baseline enumeration: %w", err)
+		return fmt.Errorf("baseline target snapshot: %w", err)
 	}
-	// The watermark is measured AFTER this phase's own enumeration settles, not before it starts:
-	// enumerateAllConversations drives its own scroll-simulation attempts, which can themselves
-	// advance the bridge's capture history independent of anything the operator does. Measuring
-	// "before" would misattribute that internal advancement to the operator's later action — exactly
-	// the bug a live run on 2026-09-11 exposed (see the README Phase 5 sixth-pass addendum), which
-	// produced a false fresh=true. Every phase below measures its watermark the same way, so each
-	// comparison reflects genuinely NEW captures observed strictly between two settled states.
-	baselineMaxCapture, captureErr := maxObservedCaptureID(client, 490)
-	if captureErr != nil {
-		fmt.Printf("baseline capture watermark: NOT VERIFIED (%v)\n", captureErr)
-	}
-	fmt.Printf("baseline target series: target_count=%d pagination=%s coverage=%s capture_watermark=%d\n",
-		len(baseline), basePagination.Status, baseCoverage.Status, baselineMaxCapture)
+	allSeriesWatermark, _ := maxObservedCaptureID(client, 493)
+	fmt.Printf("baseline target series: target_count=%d fresh_pages_used=%d target_capture_watermark=%d all_series_capture_watermark=%d\n",
+		len(baseline.Conversations), baseline.PagesUsed, baseline.MaxCaptureID, allSeriesWatermark)
 	basePins, pinsErr := fetchPins(client, 500)
 	if pinsErr != nil {
 		fmt.Printf("baseline pins: NOT VERIFIED (%v)\n", pinsErr)
@@ -656,78 +911,93 @@ func runPinExperiment(client net.Conn, projectID string, knownIDs []string) erro
 		fmt.Printf("baseline pins: captureID=%d raw_count=%d recognized_id_count=%d\n",
 			basePins.CaptureID, basePins.RawItemCount, basePins.RecognizedIDCount)
 	}
+	printCaptureDiagnostics(client, 494, "baseline")
 
-	if err := prompt("ACTION REQUIRED: in the real ChatGPT Web UI, Pin/Star/Favorite exactly ONE conversation that is currently active (non-archived) in the configured Project. Note which UI label you actually used (Pin/Star/Favorite/other). Then reload or navigate within the Project sidebar so a fresh /backend-api/conversations request fires."); err != nil {
+	if err := prompt("ACTION REQUIRED: in the real ChatGPT Web UI, Pin/Star/Favorite exactly ONE conversation that is currently active (non-archived) in the configured Project. Note which UI label you actually used (Pin/Star/Favorite/other). Then hard-reload the page (not just in-app navigation) so a fresh /backend-api/conversations request fires."); err != nil {
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
-	after, afterPagination, afterCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
+	afterPin, err := targetSnapshotAfter(client, projectID, knownIDs, baseline.MaxCaptureID, 8, 20, 510)
 	if err != nil {
-		return fmt.Errorf("post-pin enumeration: %w", err)
+		return fmt.Errorf("post-pin target snapshot: %w", err)
 	}
-	afterPinMaxCapture, afterCaptureErr := maxObservedCaptureID(client, 491)
-	if afterCaptureErr != nil {
-		fmt.Printf("after-pin capture watermark: NOT VERIFIED (%v)\n", afterCaptureErr)
-	}
-	pinCaptureFresh := captureErr == nil && afterCaptureErr == nil && afterPinMaxCapture > baselineMaxCapture
-	fmt.Printf("conversations capture watermark: baseline=%d after_pin=%d fresh=%t\n", baselineMaxCapture, afterPinMaxCapture, pinCaptureFresh)
-	fmt.Printf("after pin target series: target_count=%d pagination=%s coverage=%s\n",
-		len(after), afterPagination.Status, afterCoverage.Status)
-	membership := compareMembership(baseline, after)
-	fmt.Printf("membership evidence (pin): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
-		membership.BeforeCount, membership.AfterCount, membership.DisappearedDigests, membership.AppearedDigests)
-
-	disappeared, _ := diffConversationIDs(baseline, after)
-	fmt.Printf("outcome: %s\n", membershipOutcome(pinCaptureFresh, disappeared))
+	allSeriesWatermarkAfterPin, _ := maxObservedCaptureID(client, 513)
+	fmt.Printf("target capture watermark: before=%d after=%d fresh=%t (all_series: before=%d after=%d)\n",
+		baseline.MaxCaptureID, afterPin.MaxCaptureID, afterPin.Fresh, allSeriesWatermark, allSeriesWatermarkAfterPin)
+	fmt.Printf("after pin target series: target_count=%d fresh_pages_used=%d\n", len(afterPin.Conversations), afterPin.PagesUsed)
+	printCaptureDiagnostics(client, 514, "after-pin")
 
 	afterPins, afterPinsErr := fetchPins(client, 501)
+	pinsFresh := pinsErr == nil && afterPinsErr == nil && afterPins.CaptureID > basePins.CaptureID
 	if afterPinsErr != nil {
 		fmt.Printf("after-pin pins: NOT VERIFIED (%v)\n", afterPinsErr)
 	} else {
-		fresh := pinsErr != nil || afterPins.CaptureID > basePins.CaptureID
 		fmt.Printf("after-pin pins: captureID=%d raw_count=%d recognized_id_count=%d fresh=%t\n",
-			afterPins.CaptureID, afterPins.RawItemCount, afterPins.RecognizedIDCount, fresh)
-		if len(disappeared) == 1 {
-			fmt.Printf("pins membership check: controlled_sample_membership_in_pins=%t\n", slices.Contains(afterPins.IDs, disappeared[0]))
-		}
+			afterPins.CaptureID, afterPins.RawItemCount, afterPins.RecognizedIDCount, pinsFresh)
 	}
 
-	reportStarredSeries(client, projectID, knownIDs, disappeared)
+	controlledID, controlledOK, controlledReason := controlledSampleFromPinsDelta(pinsFresh, basePins, afterPins)
+	if controlledOK {
+		fmt.Printf("controlled_sample=%s\n", conversationFingerprint(controlledID))
+	} else {
+		fmt.Printf("controlled sample: NOT VERIFIED (%s)\n", controlledReason)
+	}
 
-	if err := prompt("ACTION REQUIRED: unpin/unstar the conversation you just pinned, restoring its original state. Then reload or navigate within the Project sidebar again."); err != nil {
+	presentBefore := controlledOK && containsID(baseline.Conversations, controlledID)
+	presentAfterPin := controlledOK && containsID(afterPin.Conversations, controlledID)
+	if controlledOK {
+		fmt.Printf("controlled_sample_present_before=%t controlled_sample_present_after_pin=%t\n", presentBefore, presentAfterPin)
+	}
+	fmt.Printf("outcome: %s\n", pinExperimentOutcome(controlledOK, controlledReason, presentBefore, afterPin.Fresh, presentAfterPin))
+
+	// Auxiliary, non-decisive diagnostic: besides the controlled sample, did anything else in the
+	// target set change? A change here would suggest uncontrolled background account activity during
+	// the experiment window, worth flagging even though it never drives the outcome above.
+	auxiliary := compareMembership(baseline.Conversations, afterPin.Conversations)
+	fmt.Printf("auxiliary membership evidence (secondary, non-decisive): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
+		auxiliary.BeforeCount, auxiliary.AfterCount, auxiliary.DisappearedDigests, auxiliary.AppearedDigests)
+
+	reportStarredSeries(client, projectID, knownIDs, controlledID, controlledOK)
+
+	if err := prompt("ACTION REQUIRED: unpin/unstar the conversation you just pinned, restoring its original state. Then hard-reload the page again."); err != nil {
 		return fmt.Errorf("read operator confirmation: %w", err)
 	}
 
-	restored, restoredPagination, restoredCoverage, _, err := enumerateAllConversations(client, projectID, knownIDs, 8, 20)
-	if err != nil {
-		return fmt.Errorf("post-restore enumeration: %w", err)
+	afterRestorePins, restorePinsErr := fetchPins(client, 502)
+	restorePinsFresh := afterPinsErr == nil && restorePinsErr == nil && afterRestorePins.CaptureID > afterPins.CaptureID
+	restoreRemovedControlled := false
+	if restorePinsFresh && controlledOK {
+		_, removed := diffStringSlices(afterPins.IDs, afterRestorePins.IDs)
+		restoreRemovedControlled = slices.Contains(removed, controlledID)
 	}
-	afterRestoreMaxCapture, restoreCaptureErr := maxObservedCaptureID(client, 492)
-	if restoreCaptureErr != nil {
-		fmt.Printf("after-restore capture watermark: NOT VERIFIED (%v)\n", restoreCaptureErr)
-	}
-	restoreCaptureFresh := afterCaptureErr == nil && restoreCaptureErr == nil && afterRestoreMaxCapture > afterPinMaxCapture
-	fmt.Printf("conversations capture watermark: after_pin=%d after_restore=%d fresh=%t\n", afterPinMaxCapture, afterRestoreMaxCapture, restoreCaptureFresh)
-	fmt.Printf("after restore target series: target_count=%d pagination=%s coverage=%s\n",
-		len(restored), restoredPagination.Status, restoredCoverage.Status)
-	restoreMembership := compareMembership(baseline, restored)
-	fmt.Printf("membership evidence (restore vs baseline): before_count=%d after_count=%d disappeared=%v appeared=%v\n",
-		restoreMembership.BeforeCount, restoreMembership.AfterCount, restoreMembership.DisappearedDigests, restoreMembership.AppearedDigests)
-	if !restoreCaptureFresh {
-		fmt.Println("restore evidence: NOT VERIFIED — no fresh /backend-api/conversations capture was observed after the restore action")
-	} else if len(restoreMembership.DisappearedDigests) == 0 && len(restoreMembership.AppearedDigests) == 0 {
-		fmt.Println("restore evidence: PASS — a fresh capture confirms the target series returned to its baseline membership")
+	if restorePinsErr != nil {
+		fmt.Printf("after-restore pins: NOT VERIFIED (%v)\n", restorePinsErr)
 	} else {
-		fmt.Println("restore evidence: NOT VERIFIED — target series did not return to its exact baseline membership")
+		fmt.Printf("after-restore pins: captureID=%d raw_count=%d recognized_id_count=%d fresh=%t removed_controlled_sample=%t\n",
+			afterRestorePins.CaptureID, afterRestorePins.RawItemCount, afterRestorePins.RecognizedIDCount, restorePinsFresh, restoreRemovedControlled)
 	}
+
+	afterRestore, err := targetSnapshotAfter(client, projectID, knownIDs, afterPin.MaxCaptureID, 8, 20, 520)
+	if err != nil {
+		return fmt.Errorf("post-restore target snapshot: %w", err)
+	}
+	fmt.Printf("target capture watermark: before=%d after=%d fresh=%t\n", afterPin.MaxCaptureID, afterRestore.MaxCaptureID, afterRestore.Fresh)
+	fmt.Printf("after restore target series: target_count=%d fresh_pages_used=%d\n", len(afterRestore.Conversations), afterRestore.PagesUsed)
+	printCaptureDiagnostics(client, 524, "after-restore")
+
+	presentAfterRestore := controlledOK && containsID(afterRestore.Conversations, controlledID)
+	if controlledOK {
+		fmt.Printf("controlled_sample_present_after_restore=%t\n", presentAfterRestore)
+	}
+	fmt.Printf("restore evidence: %s\n", pinExperimentRestoreOutcome(controlledOK, restoreRemovedControlled, afterRestore.Fresh, presentAfterRestore))
 	return nil
 }
 
 // reportStarredSeries investigates README Phase 5's secondary question: whether any real UI action
 // in this session ever issued an is_starred=true /backend-api/conversations request (passively
 // captured like every other observed page — see globalConversationsPages), and if so, whether it
-// includes the conversation identified as affected by the pin action above (Phase F).
-func reportStarredSeries(client net.Conn, projectID string, knownIDs []string, disappeared []string) {
+// includes the controlled conversation identified from the pins delta above (Phase F).
+func reportStarredSeries(client net.Conn, projectID string, knownIDs []string, controlledID string, haveControlledID bool) {
 	raw, err := call(client, request{ID: 600, Method: "globalConversationsPages"})
 	if err != nil {
 		fmt.Printf("is_starred=true series: NOT VERIFIED (%v)\n", err)
@@ -762,15 +1032,7 @@ func reportStarredSeries(client net.Conn, projectID string, knownIDs []string, d
 			fmt.Printf("is_starred=true series (capture %d): NOT VERIFIED (decode: %v)\n", d.CaptureID, err)
 			continue
 		}
-		present := false
-		if len(disappeared) == 1 {
-			for _, item := range result.Items {
-				if item.ID == disappeared[0] {
-					present = true
-					break
-				}
-			}
-		}
+		present := haveControlledID && containsID(result.Items, controlledID)
 		fmt.Printf("is_starred=true series (capture %d): raw_count=%d configured_project_count=%d controlled_sample_present=%t\n",
 			d.CaptureID, d.RawItemCount, len(result.Items), present)
 	}
