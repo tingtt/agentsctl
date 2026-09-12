@@ -97,10 +97,19 @@ type globalConversationsPageDiagnostic struct {
 // shape check (UnrecognizedAssociationCount) — see mergeProjectPages and the sanitizer comment in
 // bridge/preload.js for what each can and cannot prove.
 type globalConversationsCaptureItemsResult struct {
-	Items                        []conversation `json:"items"`
-	KnownIDsSeen                 int            `json:"knownIDsSeen"`
-	KnownIDsMismatched           int            `json:"knownIDsMismatched"`
-	UnrecognizedAssociationCount int            `json:"unrecognizedAssociationCount"`
+	Items                        []conversation  `json:"items"`
+	RawMembership                []rawPageMember `json:"rawMembership"`
+	KnownIDsSeen                 int             `json:"knownIDsSeen"`
+	KnownIDsMismatched           int             `json:"knownIDsMismatched"`
+	UnrecognizedAssociationCount int             `json:"unrecognizedAssociationCount"`
+}
+
+// rawPageMember is a diagnostic-safe identity from the raw global page. Fingerprint is the first
+// 12 hexadecimal characters of SHA-256(conversation_id); no raw ID, title, or content crosses the
+// bridge socket. ProjectAssociated records association with only the configured Project.
+type rawPageMember struct {
+	Fingerprint       string `json:"fingerprint"`
+	ProjectAssociated bool   `json:"projectAssociated"`
 }
 
 // conversationPage is one page of the Project-inclusive (hide_snorlax false/absent) view of
@@ -129,6 +138,7 @@ type conversationPage struct {
 	RawIdentityDigest            string
 	KnownIDsMismatched           int
 	UnrecognizedAssociationCount int
+	RawMembership                []rawPageMember
 	Items                        []conversation
 }
 
@@ -552,6 +562,60 @@ func compareMembership(before, after []conversation) membershipEvidence {
 	return ev
 }
 
+type rawMembershipChange struct {
+	Fingerprint       string
+	ProjectAssociated bool
+}
+
+// rawPageMembershipEvidence compares raw global-page membership using only bridge-generated
+// fingerprints. Project association comes from the phase in which the member occurs: before for a
+// disappearance and after for an appearance.
+type rawPageMembershipEvidence struct {
+	BeforeCount int
+	AfterCount  int
+	Disappeared []rawMembershipChange
+	Appeared    []rawMembershipChange
+}
+
+func compareRawPageMembership(before, after []rawPageMember) rawPageMembershipEvidence {
+	beforeByFingerprint := make(map[string]rawPageMember, len(before))
+	for _, item := range before {
+		beforeByFingerprint[item.Fingerprint] = item
+	}
+	afterByFingerprint := make(map[string]rawPageMember, len(after))
+	for _, item := range after {
+		afterByFingerprint[item.Fingerprint] = item
+	}
+	evidence := rawPageMembershipEvidence{BeforeCount: len(before), AfterCount: len(after)}
+	for fingerprint, item := range beforeByFingerprint {
+		if _, ok := afterByFingerprint[fingerprint]; !ok {
+			evidence.Disappeared = append(evidence.Disappeared, rawMembershipChange{
+				Fingerprint: fingerprint, ProjectAssociated: item.ProjectAssociated,
+			})
+		}
+	}
+	for fingerprint, item := range afterByFingerprint {
+		if _, ok := beforeByFingerprint[fingerprint]; !ok {
+			evidence.Appeared = append(evidence.Appeared, rawMembershipChange{
+				Fingerprint: fingerprint, ProjectAssociated: item.ProjectAssociated,
+			})
+		}
+	}
+	slices.SortFunc(evidence.Disappeared, func(a, b rawMembershipChange) int {
+		return strings.Compare(a.Fingerprint, b.Fingerprint)
+	})
+	slices.SortFunc(evidence.Appeared, func(a, b rawMembershipChange) int {
+		return strings.Compare(a.Fingerprint, b.Fingerprint)
+	})
+	return evidence
+}
+
+func containsRawFingerprint(members []rawPageMember, fingerprint string) bool {
+	return slices.ContainsFunc(members, func(member rawPageMember) bool {
+		return member.Fingerprint == fingerprint
+	})
+}
+
 // pinsSnapshot is the bridge's sanitized report of the observed, undocumented /backend-api/pins
 // endpoint (README Phase G), used as supporting evidence alongside the target-series membership
 // test. CaptureID lets the caller tell whether a later call observed a genuinely fresh response
@@ -687,6 +751,50 @@ type targetSnapshotResult struct {
 	MaxCaptureID  int  // running high-water mark of MATCH captures observed (becomes the next phase's watermark)
 	PagesUsed     int
 	Exhausted     bool // this phase's OWN fresh pages' pagination completeness — NOT a general completeness claim
+	Pages         []conversationPage
+}
+
+func targetOffsetZeroPage(snapshot targetSnapshotResult) (conversationPage, bool) {
+	for _, page := range snapshot.Pages {
+		if page.Offset == 0 {
+			return page, true
+		}
+	}
+	return conversationPage{}, false
+}
+
+func printRawOffsetZero(label string, snapshot targetSnapshotResult) {
+	page, ok := targetOffsetZeroPage(snapshot)
+	if !ok {
+		fmt.Printf("%s raw offset=0: NOT VERIFIED (no fresh target page)\n", label)
+		return
+	}
+	fmt.Printf("%s raw offset=0: series=%s offset=%d limit=%d raw_count=%d recognized_id_count=%d project_count=%d raw_digest=%s\n",
+		label, shortDigest(page.SeriesKey), page.Offset, page.Limit, page.RawItemCount,
+		page.RecognizedIDCount, len(page.Items), shortDigest(page.RawIdentityDigest))
+}
+
+func printRawMembershipDelta(label string, before, after targetSnapshotResult, controlledID string, controlledOK bool) {
+	beforePage, beforeOK := targetOffsetZeroPage(before)
+	afterPage, afterOK := targetOffsetZeroPage(after)
+	if !beforeOK || !afterOK {
+		fmt.Printf("%s raw membership delta: NOT VERIFIED (missing fresh offset=0 page)\n", label)
+		return
+	}
+	if beforePage.SeriesKey != afterPage.SeriesKey {
+		fmt.Printf("%s raw membership delta: NOT VERIFIED (different SeriesKey: before=%s after=%s)\n",
+			label, shortDigest(beforePage.SeriesKey), shortDigest(afterPage.SeriesKey))
+		return
+	}
+	evidence := compareRawPageMembership(beforePage.RawMembership, afterPage.RawMembership)
+	fmt.Printf("%s raw membership delta: before_count=%d after_count=%d disappeared=%v appeared=%v\n",
+		label, evidence.BeforeCount, evidence.AfterCount, evidence.Disappeared, evidence.Appeared)
+	if controlledOK {
+		fingerprint := conversationFingerprint(controlledID)
+		fmt.Printf("%s controlled raw membership: fingerprint=%s before=%t after=%t\n", label,
+			fingerprint, containsRawFingerprint(beforePage.RawMembership, fingerprint),
+			containsRawFingerprint(afterPage.RawMembership, fingerprint))
+	}
 }
 
 // targetSnapshotAfter captures ONE phase-scoped snapshot of the active-list target series for the
@@ -756,6 +864,7 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 				RawIdentityDigest:            d.RawIdentityDigest,
 				KnownIDsMismatched:           result.KnownIDsMismatched,
 				UnrecognizedAssociationCount: result.UnrecognizedAssociationCount,
+				RawMembership:                result.RawMembership,
 				Items:                        result.Items,
 			})
 			foundNew = true
@@ -768,6 +877,7 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 		return targetSnapshotResult{}, err
 	}
 	for attempt := 0; !found && attempt < maxScrollAttempts; attempt++ {
+		beforeWatermarks, beforeWatermarksErr := readCaptureWatermarks(client, idBase+20+attempt*4)
 		scrollRaw, err := call(client, request{ID: idBase + 2, Method: "simulateSidebarScroll"})
 		if err != nil {
 			return targetSnapshotResult{}, fmt.Errorf("simulate sidebar scroll: %w", err)
@@ -776,12 +886,17 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
 			return targetSnapshotResult{}, fmt.Errorf("decode sidebar scroll result: %w", err)
 		}
-		fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
-			attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount, scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
+		printScrollDiagnostics(attempt, scroll)
 		time.Sleep(1500 * time.Millisecond)
 		found, err = fetchFresh()
 		if err != nil {
 			return targetSnapshotResult{}, err
+		}
+		afterWatermarks, afterWatermarksErr := readCaptureWatermarks(client, idBase+22+attempt*4)
+		if beforeWatermarksErr != nil || afterWatermarksErr != nil {
+			fmt.Printf("scroll attempt %d capture delta: NOT VERIFIED (before=%v after=%v)\n", attempt, beforeWatermarksErr, afterWatermarksErr)
+		} else {
+			printCaptureDelta(fmt.Sprintf("scroll attempt %d", attempt), beforeWatermarks, afterWatermarks)
 		}
 	}
 
@@ -795,6 +910,7 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 		MaxCaptureID:  maxCaptureID,
 		PagesUsed:     len(pages),
 		Exhausted:     exhausted,
+		Pages:         pages,
 	}, nil
 }
 
@@ -814,8 +930,70 @@ func printCaptureDiagnostics(client net.Conn, id int, label string) {
 		fmt.Printf("capture diagnostics (%s): NOT VERIFIED (decode: %v)\n", label, err)
 		return
 	}
-	fmt.Printf("capture diagnostics (%s): attached_debuggers=%d matched_responses=%d capture_errors=%d\n",
-		label, p.AttachedDebuggerCount, p.MatchedResponseCount, p.CaptureErrorCount)
+	fmt.Printf("capture diagnostics (%s): attached_debuggers=%d matched_responses=%d conversation_capture_watermark=%d capture_errors=%d\n",
+		label, p.AttachedDebuggerCount, p.MatchedResponseCount, p.GlobalConversationsCaptureWatermark, p.CaptureErrorCount)
+}
+
+func printScrollDiagnostics(attempt int, scroll sidebarScrollResult) {
+	fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
+		attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount,
+		scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
+	for _, candidate := range scroll.Candidates {
+		fmt.Printf("scroll candidate #%d: client_height=%d scroll_height=%d scroll_top_before=%d scroll_top_after=%d conversation_links_before=%d conversation_links_after=%d project_links_before=%d project_links_after=%d\n",
+			candidate.Index, candidate.ClientHeight, candidate.ScrollHeight,
+			candidate.ScrollTopBefore, candidate.ScrollTopAfter,
+			candidate.ConversationLinksBefore, candidate.ConversationLinksAfter,
+			candidate.ProjectLinksBefore, candidate.ProjectLinksAfter)
+	}
+}
+
+type captureWatermarks struct {
+	MatchedResponses     int
+	ConversationCaptures int
+	TargetCaptures       int
+}
+
+func readCaptureWatermarks(client net.Conn, id int) (captureWatermarks, error) {
+	pingRaw, err := call(client, request{ID: id, Method: "ping"})
+	if err != nil {
+		return captureWatermarks{}, err
+	}
+	var ping pingInfo
+	if err := json.Unmarshal(pingRaw, &ping); err != nil {
+		return captureWatermarks{}, err
+	}
+	pagesRaw, err := call(client, request{ID: id + 1, Method: "globalConversationsPages"})
+	if err != nil {
+		return captureWatermarks{}, err
+	}
+	var diagnostics []globalConversationsPageDiagnostic
+	if err := json.Unmarshal(pagesRaw, &diagnostics); err != nil {
+		return captureWatermarks{}, err
+	}
+	return captureWatermarks{
+		MatchedResponses:     ping.MatchedResponseCount,
+		ConversationCaptures: ping.GlobalConversationsCaptureWatermark,
+		TargetCaptures:       maxMatchCaptureID(diagnostics),
+	}, nil
+}
+
+func classifyCaptureDelta(before, after captureWatermarks) string {
+	switch {
+	case after.TargetCaptures > before.TargetCaptures:
+		return "MATCH"
+	case after.ConversationCaptures > before.ConversationCaptures:
+		return "IRRELEVANT_CONVERSATION_SERIES"
+	case after.MatchedResponses > before.MatchedResponses:
+		return "OTHER_CAPTURED_ENDPOINT"
+	default:
+		return "NO_NETWORK_REQUEST"
+	}
+}
+
+func printCaptureDelta(label string, before, after captureWatermarks) {
+	fmt.Printf("%s captures: classification=%s matched_responses=%d->%d conversation_watermark=%d->%d target_watermark=%d->%d\n",
+		label, classifyCaptureDelta(before, after), before.MatchedResponses, after.MatchedResponses,
+		before.ConversationCaptures, after.ConversationCaptures, before.TargetCaptures, after.TargetCaptures)
 }
 
 // maxMatchCaptureID is the pure core of the TARGET-SPECIFIC freshness watermark: the highest
@@ -946,6 +1124,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 		return nil, nil, fmt.Errorf("baseline target snapshot: %w", err)
 	}
 	fmt.Printf("baseline target series: target_count=%d fresh_pages_used=%d\n", len(baseline.Conversations), baseline.PagesUsed)
+	printRawOffsetZero("baseline", baseline)
 	basePins, pinsErr := fetchPins(client, 500)
 	if pinsErr != nil {
 		fmt.Printf("baseline pins: NOT VERIFIED (%v)\n", pinsErr)
@@ -973,6 +1152,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	}
 	fmt.Printf("target capture: fresh=%t (fresh-process fallback: any MATCH capture in the new process counts as fresh, since it has no prior history at all)\n", afterPin.Fresh)
 	fmt.Printf("after pin target series: target_count=%d fresh_pages_used=%d\n", len(afterPin.Conversations), afterPin.PagesUsed)
+	printRawOffsetZero("after pin", afterPin)
 	printCaptureDiagnostics(client, 515, "after-pin")
 
 	afterPins, afterPinsErr := fetchPins(client, 501)
@@ -997,6 +1177,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 		fmt.Printf("controlled_sample_present_before=%t controlled_sample_present_after_pin=%t\n", presentBefore, presentAfterPin)
 	}
 	fmt.Printf("outcome: %s\n", pinExperimentOutcome(controlledOK, controlledReason, presentBefore, afterPin.Fresh, presentAfterPin))
+	printRawMembershipDelta("baseline -> after pin", baseline, afterPin, controlledID, controlledOK)
 
 	// Auxiliary, non-decisive diagnostic: besides the controlled sample, did anything else in the
 	// target set change? A change here would suggest uncontrolled background account activity during
@@ -1039,6 +1220,8 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	}
 	fmt.Printf("target capture: fresh=%t\n", afterRestore.Fresh)
 	fmt.Printf("after restore target series: target_count=%d fresh_pages_used=%d\n", len(afterRestore.Conversations), afterRestore.PagesUsed)
+	printRawOffsetZero("after restore", afterRestore)
+	printRawMembershipDelta("baseline -> after restore", baseline, afterRestore, controlledID, controlledOK)
 	printCaptureDiagnostics(client, 524, "after-restore")
 
 	presentAfterRestore := controlledOK && containsID(afterRestore.Conversations, controlledID)
@@ -1101,11 +1284,24 @@ type globalConversationsPageResult struct {
 }
 
 type sidebarScrollResult struct {
-	Triggered                   bool   `json:"triggered"`
-	Reason                      string `json:"reason"`
-	ContainerCount              int    `json:"containerCount"`
-	ConversationLinkCountBefore int    `json:"conversationLinkCountBefore"`
-	ConversationLinkCountAfter  int    `json:"conversationLinkCountAfter"`
+	Triggered                   bool                        `json:"triggered"`
+	Reason                      string                      `json:"reason"`
+	ContainerCount              int                         `json:"containerCount"`
+	ConversationLinkCountBefore int                         `json:"conversationLinkCountBefore"`
+	ConversationLinkCountAfter  int                         `json:"conversationLinkCountAfter"`
+	Candidates                  []scrollCandidateDiagnostic `json:"candidates"`
+}
+
+type scrollCandidateDiagnostic struct {
+	Index                   int `json:"index"`
+	ClientHeight            int `json:"clientHeight"`
+	ScrollHeight            int `json:"scrollHeight"`
+	ScrollTopBefore         int `json:"scrollTopBefore"`
+	ScrollTopAfter          int `json:"scrollTopAfter"`
+	ConversationLinksBefore int `json:"conversationLinksBefore"`
+	ConversationLinksAfter  int `json:"conversationLinksAfter"`
+	ProjectLinksBefore      int `json:"projectLinksBefore"`
+	ProjectLinksAfter       int `json:"projectLinksAfter"`
 }
 
 type response struct {
@@ -1116,11 +1312,12 @@ type response struct {
 }
 
 type pingInfo struct {
-	AttachedDebuggerCount           int  `json:"attachedDebuggerCount"`
-	MatchedResponseCount            int  `json:"matchedResponseCount"`
-	CaptureErrorCount               int  `json:"captureErrorCount"`
-	ProjectsCaptured                bool `json:"projectsCaptured"`
-	ConversationCollectionsCaptured int  `json:"conversationCollectionsCaptured"`
+	AttachedDebuggerCount               int  `json:"attachedDebuggerCount"`
+	MatchedResponseCount                int  `json:"matchedResponseCount"`
+	CaptureErrorCount                   int  `json:"captureErrorCount"`
+	GlobalConversationsCaptureWatermark int  `json:"globalConversationsCaptureWatermark"`
+	ProjectsCaptured                    bool `json:"projectsCaptured"`
+	ConversationCollectionsCaptured     int  `json:"conversationCollectionsCaptured"`
 }
 
 type pageInfo struct {
@@ -1737,6 +1934,8 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			if err := json.Unmarshal(itemsRaw, &result); err != nil {
 				return fmt.Errorf("decode items for capture %d: %w", d.CaptureID, err)
 			}
+			fmt.Printf("global conversations capture #%d membership: raw_count=%d project_filtered_count=%d raw_digest=%s\n",
+				d.CaptureID, d.RawItemCount, len(result.Items), shortDigest(d.RawIdentityDigest))
 			pages = append(pages, conversationPage{
 				SeriesKey:                    *d.SeriesKey,
 				IsArchived:                   d.IsArchived,
@@ -1751,6 +1950,7 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 				RawIdentityDigest:            d.RawIdentityDigest,
 				KnownIDsMismatched:           result.KnownIDsMismatched,
 				UnrecognizedAssociationCount: result.UnrecognizedAssociationCount,
+				RawMembership:                result.RawMembership,
 				Items:                        result.Items,
 			})
 		}
@@ -1769,6 +1969,7 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 			return conversations, pagination, coverage, len(pages), nil
 		}
 		nextRequestID++
+		beforeWatermarks, beforeWatermarksErr := readCaptureWatermarks(client, nextRequestID+1000)
 		scrollRaw, err := call(client, request{ID: nextRequestID, Method: "simulateSidebarScroll"})
 		if err != nil {
 			return conversations, pagination, coverage, len(pages), fmt.Errorf("simulate sidebar scroll: %w", err)
@@ -1777,11 +1978,16 @@ func enumerateAllConversations(client net.Conn, projectID string, knownConversat
 		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
 			return conversations, pagination, coverage, len(pages), fmt.Errorf("decode sidebar scroll result: %w", err)
 		}
-		fmt.Printf("sidebar scroll simulation (attempt %d): triggered=%t reason=%q containers=%d links_before=%d links_after=%d\n",
-			attempt, scroll.Triggered, scroll.Reason, scroll.ContainerCount, scroll.ConversationLinkCountBefore, scroll.ConversationLinkCountAfter)
+		printScrollDiagnostics(attempt, scroll)
 		time.Sleep(1500 * time.Millisecond)
 		if err := fetchNewPages(); err != nil {
 			return conversations, pagination, coverage, len(pages), err
+		}
+		afterWatermarks, afterWatermarksErr := readCaptureWatermarks(client, nextRequestID+1002)
+		if beforeWatermarksErr != nil || afterWatermarksErr != nil {
+			fmt.Printf("scroll attempt %d capture delta: NOT VERIFIED (before=%v after=%v)\n", attempt, beforeWatermarksErr, afterWatermarksErr)
+		} else {
+			printCaptureDelta(fmt.Sprintf("scroll attempt %d", attempt), beforeWatermarks, afterWatermarks)
 		}
 	}
 	conversations, pagination, coverage, err = evaluateActiveListCompleteness(pages, unknownObservations, maxPages)

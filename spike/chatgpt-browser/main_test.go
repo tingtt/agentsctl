@@ -75,8 +75,8 @@ func page(seriesKey string, offset, limit, rawItemCount, recognizedIDCount int, 
 	}
 }
 
-func TestMergeProjectPagesSinglePage(t *testing.T) {
-	pages := []conversationPage{page("s", 0, 28, 16, 16, "d0", "a", "b")}
+func TestMergeProjectPagesShortRawPageIsExhaustionCandidate(t *testing.T) {
+	pages := []conversationPage{page("s", 0, 28, 17, 17, "d0", "a", "b")}
 	got, exhausted, err := mergeProjectPages(pages, 20)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -123,11 +123,12 @@ func TestMergeProjectPagesEmptyFinalPage(t *testing.T) {
 	}
 }
 
-func TestMergeProjectPagesNotExhaustedWhenFirstPageIsFull(t *testing.T) {
-	// This is the live-observed case: a page exactly as long as its limit does not, by itself,
-	// prove no further page exists. Real ChatGPT accounts observed this shape at offset 0 with
-	// limit 28 while a genuine next page was never reachable, so this must stay incomplete.
-	pages := []conversationPage{page("s", 0, 28, 28, 28, "d0", "a", "b")}
+func TestMergeProjectPagesFullRawPageIsIncompleteEvenWhenProjectSubsetIsSmaller(t *testing.T) {
+	// This is the live-observed shape: 28 raw items but only 16 Project-associated items. The
+	// Project-filtered subset does not describe raw-page exhaustion, so it must stay incomplete.
+	pages := []conversationPage{page("s", 0, 28, 28, 28, "d0",
+		"p01", "p02", "p03", "p04", "p05", "p06", "p07", "p08",
+		"p09", "p10", "p11", "p12", "p13", "p14", "p15", "p16")}
 	_, exhausted, err := mergeProjectPages(pages, 20)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -858,6 +859,60 @@ func TestConversationFingerprintNeverEqualsTheRawID(t *testing.T) {
 	}
 	if len(fp) != 12 {
 		t.Fatalf("fingerprint length = %d, want 12 (the diagnostic-safe short form)", len(fp))
+	}
+}
+
+func TestCompareRawPageMembershipReportsFingerprintOnlyDelta(t *testing.T) {
+	before := []rawPageMember{
+		{Fingerprint: "A", ProjectAssociated: true},
+		{Fingerprint: "B", ProjectAssociated: false},
+		{Fingerprint: "C", ProjectAssociated: true},
+	}
+	after := []rawPageMember{
+		{Fingerprint: "B", ProjectAssociated: false},
+		{Fingerprint: "C", ProjectAssociated: true},
+		{Fingerprint: "D", ProjectAssociated: true},
+	}
+	evidence := compareRawPageMembership(before, after)
+	if evidence.BeforeCount != 3 || evidence.AfterCount != 3 {
+		t.Fatalf("counts = %d/%d, want 3/3", evidence.BeforeCount, evidence.AfterCount)
+	}
+	if len(evidence.Disappeared) != 1 || evidence.Disappeared[0] != (rawMembershipChange{Fingerprint: "A", ProjectAssociated: true}) {
+		t.Fatalf("disappeared = %+v, want Project-associated fingerprint A", evidence.Disappeared)
+	}
+	if len(evidence.Appeared) != 1 || evidence.Appeared[0] != (rawMembershipChange{Fingerprint: "D", ProjectAssociated: true}) {
+		t.Fatalf("appeared = %+v, want Project-associated fingerprint D", evidence.Appeared)
+	}
+}
+
+func TestCompareRawPageMembershipPreservesAppearedProjectAssociation(t *testing.T) {
+	evidence := compareRawPageMembership(
+		[]rawPageMember{{Fingerprint: "A", ProjectAssociated: false}},
+		[]rawPageMember{{Fingerprint: "B", ProjectAssociated: true}},
+	)
+	if len(evidence.Appeared) != 1 || !evidence.Appeared[0].ProjectAssociated {
+		t.Fatalf("appeared = %+v, want configured-Project association", evidence.Appeared)
+	}
+}
+
+func TestClassifyCaptureDeltaDistinguishesNoRequestWrongSeriesAndTarget(t *testing.T) {
+	baseline := captureWatermarks{MatchedResponses: 10, ConversationCaptures: 4, TargetCaptures: 2}
+	tests := []struct {
+		name  string
+		after captureWatermarks
+		want  string
+	}{
+		{"no request", baseline, "NO_NETWORK_REQUEST"},
+		{"other endpoint", captureWatermarks{MatchedResponses: 11, ConversationCaptures: 4, TargetCaptures: 2}, "OTHER_CAPTURED_ENDPOINT"},
+		{"wrong conversation series", captureWatermarks{MatchedResponses: 11, ConversationCaptures: 5, TargetCaptures: 2}, "IRRELEVANT_CONVERSATION_SERIES"},
+		{"target", captureWatermarks{MatchedResponses: 11, ConversationCaptures: 5, TargetCaptures: 5}, "MATCH"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := classifyCaptureDelta(baseline, test.after); got != test.want {
+				t.Fatalf("classifyCaptureDelta = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

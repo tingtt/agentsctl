@@ -246,6 +246,14 @@ async function simulateSidebarScroll() {
   if (containers.size === 0) {
     return { triggered: false, reason: "no scrollable sidebar container found", conversationLinkCountBefore: before, conversationLinkCountAfter: before };
   }
+  const candidateDiagnostics = [...containers].map((container, index) => ({
+    index,
+    clientHeight: container.clientHeight,
+    scrollHeight: container.scrollHeight,
+    scrollTopBefore: container.scrollTop,
+    conversationLinksBefore: container.querySelectorAll('a[href^="/c/"]').length,
+    projectLinksBefore: container.querySelectorAll('a[href^="/g/g-p-"]').length,
+  }));
   for (let i = 0; i < 6; i++) {
     for (const container of containers) {
       container.scrollTop = container.scrollHeight;
@@ -253,11 +261,18 @@ async function simulateSidebarScroll() {
     }
     await new Promise((resolve) => setTimeout(resolve, 400));
   }
+  for (const diagnostic of candidateDiagnostics) {
+    const container = [...containers][diagnostic.index];
+    diagnostic.scrollTopAfter = container.scrollTop;
+    diagnostic.conversationLinksAfter = container.querySelectorAll('a[href^="/c/"]').length;
+    diagnostic.projectLinksAfter = container.querySelectorAll('a[href^="/g/g-p-"]').length;
+  }
   return {
     triggered: true,
     containerCount: containers.size,
     conversationLinkCountBefore: before,
     conversationLinkCountAfter: document.querySelectorAll('a[href^="/c/"]').length,
+    candidates: candidateDiagnostics,
   };
 }
 

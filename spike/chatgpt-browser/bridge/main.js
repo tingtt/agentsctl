@@ -175,6 +175,7 @@ async function dispatch(request) {
       attachedDebuggerCount,
       matchedResponseCount,
       captureErrorCount,
+      globalConversationsCaptureWatermark: nextGlobalConversationCaptureID - 1,
       projectsCaptured: capturedProjects !== null,
       conversationCollectionsCaptured: capturedConversations.size,
     };
@@ -217,12 +218,16 @@ async function dispatch(request) {
       }
       throw new Error(`no captured global conversations page with capture ID ${request.captureID}`);
     }
-    return requestPage({
+    const result = await requestPage({
       method: "sanitizeGlobalConversationsCaptureItems",
       projectID: request.projectID,
       payload: capture.payload,
       knownConversationIDs: Array.isArray(request.knownConversationIDs) ? request.knownConversationIDs : [],
     });
+    return {
+      ...result,
+      rawMembership: rawMembershipOf(capture.payload, request.projectID),
+    };
   }
   if (request.method === "globalConversationsPage") {
     if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
@@ -397,6 +402,26 @@ function rawItemID(item) {
   if (!item || typeof item !== "object" || Array.isArray(item)) return null;
   const id = typeof item.id === "string" ? item.id : (typeof item.conversation_id === "string" ? item.conversation_id : null);
   return id && conversationIDPattern.test(id) ? id : null;
+}
+
+// rawMembershipOf exposes raw-page identity without exposing any raw conversation ID, title, or
+// content. Project association is evaluated while the raw item is still inside the bridge; only a
+// short SHA-256 fingerprint and a boolean cross the socket. Items with unrecognized identities are
+// omitted here and independently make the page invalid via recognizedIDCount < rawItemCount.
+function rawMembershipOf(payload, projectID) {
+  const items = itemsArrayOf(payload);
+  if (items === null) return [];
+  return items.flatMap((item) => {
+    const id = rawItemID(item);
+    if (!id) return [];
+    const association = typeof item.gizmo_id === "string"
+      ? item.gizmo_id
+      : (typeof item.project_id === "string" ? item.project_id : null);
+    return [{
+      fingerprint: crypto.createHash("sha256").update(id).digest("hex").slice(0, 12),
+      projectAssociated: association === projectID,
+    }];
+  }).sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
 }
 
 // Query parameters this bridge understands well enough to reason about which session universe a
