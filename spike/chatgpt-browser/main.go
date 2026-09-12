@@ -405,12 +405,10 @@ func (c seriesClassification) String() string {
 // real UI has never been observed omitting them), so their "absent" state stays UNKNOWN rather than
 // being assumed equivalent to "false".
 //
-// is_starred=true and is_starred=false are BOTH accepted here, as of a controlled live experiment
-// (README Phase 5, tenth/twelfth-pass addenda): pinning one conversation removed it from the
-// default is_starred=false series (Outcome B), directly confirmed via a fresh-process, pins-delta-
-// identified controlled sample — not merely inferred. is_starred is therefore a confirmed second
-// required series to union in, not an unconfirmed dimension; see activeListRequiredSeries. Its
-// "absent" state still has no such direct evidence and stays UNKNOWN.
+// is_starred=false is the only directly observed target series. A controlled pin experiment proved
+// that its first-page membership changes, but did not separate server-side exclusion from an
+// order=updated first-page displacement. is_starred=true has never been observed. Both every other
+// value and the "absent" state therefore stay UNKNOWN.
 func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassification, string) {
 	switch d.HideSnorlax {
 	case "true":
@@ -431,7 +429,7 @@ func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassific
 	if d.HasUnknownParameters {
 		return seriesUnknown, "query carries a parameter this bridge does not recognize"
 	}
-	if d.IsStarred != "false" && d.IsStarred != "true" {
+	if d.IsStarred != "false" {
 		return seriesUnknown, fmt.Sprintf("is_starred value not confirmed safe for the active-list target (%q)", d.IsStarred)
 	}
 	if d.Order != "updated" {
@@ -443,34 +441,25 @@ func classifyForActiveList(d globalConversationsPageDiagnostic) (seriesClassific
 // activeListRequiredSeries is this PoC's live-evidence-based definition of the target series
 // required for the "active, non-archived Project session" universe — the scope of the existing
 // production session.Provider.List(archived bool) called with archived=false (see README Phase A).
-// It requires BOTH is_starred=false and is_starred=true series, in union: a controlled live
-// experiment (README Phase 5, tenth/twelfth-pass addenda) confirmed Outcome B — pinning a
-// conversation removes it from the default is_starred=false series, and restoring/unpinning brings
-// it back — so is_starred=false ALONE is not the full active-list universe. Both entries share
-// is_archived=false, order=updated (the only order value ever observed on the real default view),
-// and no unrecognized query parameter.
+// It contains only the directly observed is_starred=false query shape. This is a pagination target,
+// not a claim that the series defines the full active-list universe: is_starred=true has never been
+// observed, and the pin experiment's first-page membership change is confounded by ordering and
+// pagination. evaluateActiveListCompleteness therefore keeps Coverage UNKNOWN independently.
 var activeListRequiredSeries = []seriesRequirement{
 	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(false), RequireOrder: stringPtr("updated"), ForbidUnknownParameters: true},
-	{RequireIsArchived: boolPtr(false), RequireIsStarred: boolPtr(true), RequireOrder: stringPtr("updated"), ForbidUnknownParameters: true},
 }
 
-// activeListCoverageResolvedNote records how the is_starred coverage question (previously an open
-// caveat) was resolved: see README Phase 5, tenth/twelfth-pass addenda. This is no longer an
-// unresolved caveat forcing Coverage to UNKNOWN unconditionally (contrast the earlier
-// activeListCoverageCaveat, now removed) — it is supporting evidence for why Coverage can be
-// COMPLETE once activeListRequiredSeries' two series are what the live-ingestion pipeline actually
-// validates against.
-const activeListCoverageResolvedNote = "is_starred coverage confirmed via a controlled live experiment (README Phase 5, tenth/twelfth-pass): pinning a conversation removed it from the default is_starred=false series, and unpinning restored it — Outcome B. activeListRequiredSeries now requires the union of is_starred=false and is_starred=true; Pagination (not Coverage) is what tracks whether both have actually been enumerated to exhaustion"
+// activeListCoverageCaveat records the unresolved universe definition. The earlier Outcome B
+// interpretation treated a first-page disappearance as filter exclusion; later review identified
+// order=updated pagination as a confounder. Until false-series pagination or a naturally emitted
+// true series resolves that ambiguity, coverage cannot be called complete.
+const activeListCoverageCaveat = "is_starred coverage is not verified: pinning changed is_starred=false first-page membership, but raw first-page ordering/pagination was not separated from server-side filtering; is_starred=true has never been directly observed"
 
 // evaluateActiveListCompleteness is the top-level completeness judgement for this PoC's target
-// universe. It reports Pagination (did every required series in activeListRequiredSeries reach
-// exhaustion) and Coverage (is the required-series definition itself trustworthy as the FULL
-// intended universe) as two independent axes. Coverage is now COMPLETE by default (the is_starred
-// union was directly confirmed — see activeListCoverageResolvedNote), unlike the earlier
-// unconditional UNKNOWN this PoC used while is_starred was still an open question; Overall
-// completeness (decided by the caller) still requires BOTH axes COMPLETE, so an is_starred=true
-// series that was never observed at all still correctly leaves Pagination — not Coverage —
-// INCOMPLETE.
+// universe. It reports Pagination (did the directly observed target series reach exhaustion) and
+// Coverage (is that target-series definition trustworthy as the FULL intended universe) as two
+// independent axes. Coverage stays UNKNOWN because the is_starred universe remains unresolved;
+// overall completeness requires both axes COMPLETE.
 //
 // unknownObservations is a composable list of additional reasons Coverage cannot be trusted,
 // supplied by the live-ingestion caller (see enumerateAllConversations's classification step) for
@@ -484,16 +473,12 @@ func evaluateActiveListCompleteness(pages []conversationPage, unknownObservation
 		return nil, completenessResult{}, completenessResult{}, err
 	}
 	if exhausted {
-		pagination = completenessResult{Status: "COMPLETE", Reason: "every required active-Project series (is_starred=false and is_starred=true) reached a contiguous, pagination-exhausted offset chain"}
+		pagination = completenessResult{Status: "COMPLETE", Reason: "the directly observed active-Project target series reached a contiguous, pagination-exhausted offset chain"}
 	} else {
-		pagination = completenessResult{Status: "INCOMPLETE", Reason: "at least one required active-Project series (is_starred=false or is_starred=true) was not observed at all, or not yet pagination-exhausted"}
+		pagination = completenessResult{Status: "INCOMPLETE", Reason: "the directly observed active-Project target series was not observed at all, or not yet pagination-exhausted"}
 	}
-	if len(unknownObservations) > 0 {
-		reasons := append([]string{activeListCoverageResolvedNote}, unknownObservations...)
-		coverage = completenessResult{Status: "UNKNOWN", Reason: strings.Join(reasons, "; ")}
-	} else {
-		coverage = completenessResult{Status: "COMPLETE", Reason: activeListCoverageResolvedNote}
-	}
+	reasons := append([]string{activeListCoverageCaveat}, unknownObservations...)
+	coverage = completenessResult{Status: "UNKNOWN", Reason: strings.Join(reasons, "; ")}
 	return items, pagination, coverage, nil
 }
 
@@ -652,13 +637,14 @@ func containsID(conversations []conversation, id string) bool {
 	return false
 }
 
-// pinExperimentOutcome is the pure decision core of the Phase 5 decisive membership test (README
-// Phase D). It requires EVERY trust condition together before reporting Outcome A or B — a
+// pinExperimentOutcome is the pure decision core of the Phase 5 first-page membership test. It
+// requires EVERY trust condition before reporting either stable membership or a change — a
 // successfully-identified controlled sample (see controlledSampleFromPinsDelta), that sample
 // confirmed present in the baseline snapshot (otherwise the experiment itself was invalid), and a
 // fresh target-series MATCH snapshot to check membership against (otherwise "still present" could
 // just mean "no new data was fetched," as a live run on 2026-09-11 demonstrated). Any missing
-// condition returns NOT VERIFIED — this function never guesses an A/B result.
+// condition returns NOT VERIFIED. A disappearance is deliberately not called filter exclusion:
+// order=updated may instead have displaced the conversation beyond raw page 0.
 func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBefore, targetFresh, presentAfter bool) string {
 	switch {
 	case !controlledOK:
@@ -668,9 +654,9 @@ func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBef
 	case !targetFresh:
 		return "NOT VERIFIED — no fresh target-series MATCH capture was observed after the pin action"
 	case presentAfter:
-		return "A: is_starred=false default series still contains the pinned conversation"
+		return "FIRST_PAGE_STABLE: is_starred=false first-page Project membership still contains the pinned conversation"
 	default:
-		return "B: pinning removes the conversation from the default is_starred=false series"
+		return "FIRST_PAGE_CHANGED: pinned conversation is absent from is_starred=false first-page Project membership; filter exclusion is NOT VERIFIED because ordering/pagination may have displaced it"
 	}
 }
 

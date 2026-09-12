@@ -525,10 +525,6 @@ func TestEvaluateTargetPaginationCanonicalSeriesExhausted(t *testing.T) {
 	pages := []conversationPage{
 		pageWithDescriptor("canonical", 0, 2, 2, 2, "d0", boolPtr(false), boolPtr(false), false, "a", "b"),
 		pageWithDescriptor("canonical", 2, 2, 1, 1, "d1", boolPtr(false), boolPtr(false), false, "c"),
-		// activeListRequiredSeries now requires BOTH is_starred=false and is_starred=true (README
-		// Phase 5 Outcome B); this satisfies the true-series leg too so the test still isolates
-		// what it's actually checking — the false-series' own contiguous-chain recognition.
-		pageWithDescriptor("starred", 0, 28, 0, 0, "d2", boolPtr(false), boolPtr(true), false),
 	}
 	got, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
 	if err != nil {
@@ -636,14 +632,11 @@ func TestEvaluateTargetPaginationIgnoresSchemaDriftInIrrelevantSeries(t *testing
 	// completely malformed irrelevant series (unrecognized collection, here) cannot block or error
 	// out completeness of the series that actually matters.
 	canonical := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
-	// activeListRequiredSeries now requires BOTH is_starred=false and is_starred=true; satisfy the
-	// true-series leg too so this test isolates what it's actually checking.
-	starred := pageWithDescriptor("starred", 0, 28, 0, 0, "d2", boolPtr(false), boolPtr(true), false)
 	brokenIrrelevant := conversationPage{
 		SeriesKey: "archived-broken", IsArchived: "true", IsStarred: "false",
 		Offset: 0, Limit: 28, RecognizedCollection: false, RawItemCount: 0,
 	}
-	pages := []conversationPage{canonical, starred, brokenIrrelevant}
+	pages := []conversationPage{canonical, brokenIrrelevant}
 	_, exhausted, err := evaluateTargetPagination(pages, activeListRequiredSeries, 20)
 	if err != nil {
 		t.Fatalf("schema drift in an irrelevant (archived) series must not reach the merge step: %v", err)
@@ -665,44 +658,22 @@ func TestEvaluateTargetPaginationPropagatesSchemaDriftWithinRequiredSeries(t *te
 	}
 }
 
-func TestEvaluateActiveListCompletenessTrueSeriesMissingIsPaginationIncomplete(t *testing.T) {
-	// README Phase 5 Outcome B ("If two series required" test spec): the false series alone being
-	// exhausted no longer proves completeness now that activeListRequiredSeries requires BOTH
-	// is_starred=false and is_starred=true — a missing true series must leave Pagination
-	// INCOMPLETE. Coverage, by contrast, is COMPLETE: the *definition* (both series required) is
-	// now confirmed, independent of whether every page of it has actually been gathered.
+func TestEvaluateActiveListCompletenessCoverageIsUnknownEvenWhenPaginationCompletes(t *testing.T) {
+	// The directly observed false series can be pagination-exhausted while the full active-list
+	// universe remains unknown: is_starred=true has never been observed, and the pin experiment did
+	// not separate first-page ordering from server-side filtering.
 	pages := []conversationPage{
 		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
-	}
-	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, nil, 20)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if pagination.Status != "INCOMPLETE" {
-		t.Fatalf("pagination = %s, want INCOMPLETE (is_starred=true series entirely missing)", pagination.Status)
-	}
-	if coverage.Status != "COMPLETE" {
-		t.Fatalf("coverage = %s, want COMPLETE (is_starred union confirmed via live experiment)", coverage.Status)
-	}
-}
-
-func TestEvaluateActiveListCompletenessBothSeriesExhaustedIsComplete(t *testing.T) {
-	// README Phase 5 Outcome B ("If two series required" test spec): once BOTH is_starred=false and
-	// is_starred=true are individually pagination-exhausted, target enumeration is complete overall
-	// (Pagination COMPLETE, Coverage COMPLETE).
-	pages := []conversationPage{
-		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
-		pageWithDescriptor("starred", 0, 28, 0, 0, "d1", boolPtr(false), boolPtr(true), false),
 	}
 	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, nil, 20)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if pagination.Status != "COMPLETE" {
-		t.Fatalf("pagination = %s, want COMPLETE (both required series exhausted)", pagination.Status)
+		t.Fatalf("pagination = %s, want COMPLETE", pagination.Status)
 	}
-	if coverage.Status != "COMPLETE" {
-		t.Fatalf("coverage = %s, want COMPLETE", coverage.Status)
+	if coverage.Status != "UNKNOWN" {
+		t.Fatalf("coverage = %s, want UNKNOWN", coverage.Status)
 	}
 }
 
@@ -724,14 +695,11 @@ func TestClassifyForActiveListCanonicalMatchWithHideSnorlaxAbsent(t *testing.T) 
 	}
 }
 
-func TestClassifyForActiveListStarredSeriesNowConfirmedMatch(t *testing.T) {
-	// README Phase 5 Outcome B: is_starred=true is a confirmed second required series (union with
-	// is_starred=false), not an unconfirmed dimension — classifyForActiveList must accept it as
-	// MATCH, not UNKNOWN, as of the tenth/twelfth-pass live evidence.
+func TestClassifyForActiveListStarredSeriesIsUnknownUntilObserved(t *testing.T) {
 	d := globalConversationsPageDiagnostic{HideSnorlax: "absent", IsArchived: "false", IsStarred: "true", Order: "updated"}
 	classification, reason := classifyForActiveList(d)
-	if classification != seriesMatch {
-		t.Fatalf("classification = %s (%s), want MATCH", classification, reason)
+	if classification != seriesUnknown {
+		t.Fatalf("classification = %s (%s), want UNKNOWN", classification, reason)
 	}
 }
 
@@ -796,9 +764,7 @@ func TestClassifyForActiveListUnknownParameterIsUnknown(t *testing.T) {
 
 func TestEvaluateTargetPaginationOrderUpdatedMatchesTarget(t *testing.T) {
 	p := pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a")
-	// activeListRequiredSeries now requires BOTH is_starred=false and is_starred=true.
-	starred := pageWithDescriptor("starred", 0, 28, 0, 0, "d2", boolPtr(false), boolPtr(true), false)
-	_, exhausted, err := evaluateTargetPagination([]conversationPage{p, starred}, activeListRequiredSeries, 20)
+	_, exhausted, err := evaluateTargetPagination([]conversationPage{p}, activeListRequiredSeries, 20)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -834,10 +800,6 @@ func TestEvaluateTargetPaginationAbsentOrderDoesNotMatchTarget(t *testing.T) {
 func TestEvaluateActiveListCompletenessComposesUnknownObservations(t *testing.T) {
 	pages := []conversationPage{
 		pageWithDescriptor("canonical", 0, 2, 1, 1, "d0", boolPtr(false), boolPtr(false), false, "a"),
-		// activeListRequiredSeries now requires BOTH is_starred=false and is_starred=true; satisfy
-		// the true-series leg so Pagination isolates purely on this test's actual concern —
-		// unknownObservations composing into Coverage.Reason regardless of pagination status.
-		pageWithDescriptor("starred", 0, 28, 0, 0, "d1", boolPtr(false), boolPtr(true), false),
 	}
 	extra := []string{`capture 7: hide_snorlax value not recognized ("unexpected")`}
 	_, pagination, coverage, err := evaluateActiveListCompleteness(pages, extra, 20)
@@ -1102,17 +1064,17 @@ func TestControlledSampleFromPinsDeltaWithRemovalIsNotVerified(t *testing.T) {
 	}
 }
 
-func TestPinExperimentOutcomeA(t *testing.T) {
+func TestPinExperimentOutcomeStableFirstPage(t *testing.T) {
 	got := pinExperimentOutcome(true, "", true, true, true)
-	if !strings.HasPrefix(got, "A:") {
-		t.Fatalf("pinExperimentOutcome = %q, want an A result", got)
+	if !strings.HasPrefix(got, "FIRST_PAGE_STABLE:") {
+		t.Fatalf("pinExperimentOutcome = %q, want a stable-first-page result", got)
 	}
 }
 
-func TestPinExperimentOutcomeB(t *testing.T) {
+func TestPinExperimentOutcomeChangeDoesNotConfirmFilterExclusion(t *testing.T) {
 	got := pinExperimentOutcome(true, "", true, true, false)
-	if !strings.HasPrefix(got, "B:") {
-		t.Fatalf("pinExperimentOutcome = %q, want a B result", got)
+	if !strings.HasPrefix(got, "FIRST_PAGE_CHANGED:") || !strings.Contains(got, "NOT VERIFIED") {
+		t.Fatalf("pinExperimentOutcome = %q, want a confounder-aware first-page result", got)
 	}
 }
 
