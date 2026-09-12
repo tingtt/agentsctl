@@ -16,6 +16,10 @@ const (
 	colorWhite  = "37"
 	colorCyan   = "36"
 	codeBold    = "1"
+
+	// A fixed, neutral dark gray keeps selected rows visible across terminal
+	// palettes without competing with the semantic foreground colors.
+	selectedRowBackgroundCode = "48;2;48;48;48" // #303030
 )
 
 func ansiColor(glyph, code string) string {
@@ -77,11 +81,11 @@ func providerLabel(provider session.ProviderID) string {
 }
 
 // titleStyleCodes is the single centralized mapping from a session row's
-// selection/last-attached state to its title's SGR codes. Last-attached
-// state takes priority over selection: the session most recently opened
-// from the overview is always white + bold, whether or not it is
-// currently selected. A selected-but-not-last-attached row is white +
-// normal. Every other row is gray + normal.
+// selection/last-attached state to its title's foreground and weight. The
+// session most recently opened from the overview is always white + bold,
+// whether or not it is currently selected. A selected-but-not-last-attached
+// row is white + normal. Every other row is gray + normal. Selection's row
+// background is applied independently in View.
 func titleStyleCodes(selected, lastAttached bool) []string {
 	if lastAttached {
 		return []string{codeBold, colorWhite}
@@ -129,12 +133,11 @@ func noticeColor(severity Severity) string {
 
 // styleText wraps text in a single ANSI SGR escape built from codes (e.g.
 // styleText(s, "1", "97") for bold+white), the shared style-composition
-// primitive for every foreground/weight span in a row. text may already
-// contain an embedded cursorStyle segment; that segment closes with its
-// own reset, which would otherwise wipe codes' style for anything after
-// it, so the style is re-opened immediately after every embedded reset
-// before the whole thing is closed with one final reset. Empty codes are
-// dropped, so a "no style" caller (e.g. an unknown provider) gets text
+// primitive for styled spans and rows. text may already contain styled
+// segments that close with their own resets; those resets would otherwise
+// wipe the outer style, so it is re-opened immediately after every embedded
+// reset before the whole thing is closed with one final reset. Empty codes
+// are dropped, so a "no style" caller (e.g. an unknown provider) gets text
 // back unchanged.
 func styleText(text string, codes ...string) string {
 	var active []string

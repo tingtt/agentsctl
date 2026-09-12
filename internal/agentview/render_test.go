@@ -89,7 +89,7 @@ func TestSelectedRowRendersCursorMarker(t *testing.T) {
 	lines := strings.Split(view, "\n")
 	cursorLines := 0
 	for _, line := range lines {
-		if strings.HasPrefix(line, "> ") {
+		if strings.HasPrefix(visibleText(line), "> ") {
 			cursorLines++
 			if !strings.Contains(line, "second") {
 				t.Fatalf("cursor marker on the wrong row: %q", line)
@@ -99,6 +99,122 @@ func TestSelectedRowRendersCursorMarker(t *testing.T) {
 	if cursorLines != 1 {
 		t.Fatalf("expected exactly one cursor-marked row, got %d", cursorLines)
 	}
+}
+
+func visibleText(styled string) string {
+	var plain strings.Builder
+	for i := 0; i < len(styled); {
+		if styled[i] == 0x1b {
+			i = skipANSI(styled, i)
+			continue
+		}
+		plain.WriteByte(styled[i])
+		i++
+	}
+	return plain.String()
+}
+
+func TestSelectedRowBackgroundFollowsSelection(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: "first"}, {Key: key("b"), Name: "second"}})
+	background := "\x1b[" + selectedRowBackgroundCode + "m"
+
+	view := s.View(80, 12)
+	first := renderedSessionLine(t, view, "first")
+	second := renderedSessionLine(t, view, "second")
+	if !strings.HasPrefix(first, background) || strings.Contains(second, background) {
+		t.Fatalf("background must identify only the selected first row:\n%s", view)
+	}
+
+	s.Handle(KeyEvent{Key: KeyDown})
+	view = s.View(80, 12)
+	first = renderedSessionLine(t, view, "first")
+	second = renderedSessionLine(t, view, "second")
+	if strings.Contains(first, background) || !strings.HasPrefix(second, background) {
+		t.Fatalf("background must follow selection to the second row:\n%s", view)
+	}
+
+	s.SetRows([]session.Session{{Key: key("b"), Name: "second"}, {Key: key("a"), Name: "first"}})
+	view = s.View(80, 12)
+	first = renderedSessionLine(t, view, "first")
+	second = renderedSessionLine(t, view, "second")
+	if strings.Contains(first, background) || !strings.HasPrefix(second, background) {
+		t.Fatalf("background must follow selection identity across row reordering:\n%s", view)
+	}
+}
+
+func TestSelectedRowBackgroundComposesWithLastAttachedTitle(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: "attached"}, {Key: key("b"), Name: "selected"}})
+	s.MarkAttached(key("a"))
+	s.selectIndex(1)
+	background := "\x1b[" + selectedRowBackgroundCode + "m"
+
+	view := s.View(80, 12)
+	attached := renderedSessionLine(t, view, "attached")
+	selected := renderedSessionLine(t, view, "selected")
+	if !strings.Contains(attached, "\x1b[1;37mattached") || strings.Contains(attached, background) {
+		t.Fatalf("last-attached row must stay bold white without selected background: %q", attached)
+	}
+	if !strings.Contains(selected, "\x1b[37mselected") || !strings.Contains(selected, background) {
+		t.Fatalf("selected row must be white with selected background: %q", selected)
+	}
+
+	s.selectIndex(0)
+	view = s.View(80, 12)
+	attached = renderedSessionLine(t, view, "attached")
+	if !strings.Contains(attached, "\x1b[1;37mattached") || !strings.Contains(attached, background) {
+		t.Fatalf("selected last-attached row must be bold white with selected background: %q", attached)
+	}
+}
+
+func TestSelectedRowBackgroundPreservesForegroundStyles(t *testing.T) {
+	codexKey := session.Key{Provider: session.ProviderCodex, ID: "a"}
+	s := NewState()
+	s.SetRows([]session.Session{
+		{Key: codexKey, Name: "selected", Pinned: true, Activity: session.ActivityWorking, CWD: "/work/repo-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		{Key: key("b"), Name: "other", Pinned: true, CWD: "/work/repo-b"},
+	})
+	s.Handle(KeyEvent{Key: KeyCtrlX})
+	row := renderedSessionLine(t, s.View(120, 12), "selected")
+	background := "\x1b[" + selectedRowBackgroundCode + "m"
+
+	for name, prefix := range map[string]string{
+		"selected title": "\x1b[37mselected",
+		"status":         "\x1b[32m✻",
+		"notice":         "\x1b[31mPress Ctrl+X again to archive",
+		"cwd":            "\x1b[90m/work/repo-a",
+		"provider":       "\x1b[" + providerColorCodexCodes + "m codex",
+	} {
+		if !strings.Contains(row, prefix) {
+			t.Errorf("selected row lost %s foreground style: %q", name, row)
+		}
+	}
+	if !strings.HasSuffix(row, "\x1b[0m") {
+		t.Fatalf("selected row must close its background style: %q", row)
+	}
+	body := strings.TrimSuffix(row, "\x1b[0m")
+	for rest := body; ; {
+		i := strings.Index(rest, "\x1b[0m")
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len("\x1b[0m"):]
+		if !strings.HasPrefix(rest, background) {
+			t.Fatalf("selected background was not restored after an inner reset: %q", row)
+		}
+	}
+}
+
+func renderedSessionLine(t *testing.T, view, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(view, "\n") {
+		if strings.Contains(line, name) {
+			return line
+		}
+	}
+	t.Fatalf("session row %q not found:\n%s", name, view)
+	return ""
 }
 
 // TestNarrowTerminalNeverPanics is a representative narrow-terminal
@@ -180,10 +296,10 @@ func TestUnpinnedDirectoryGroupRowDoesNotRepeatCWD(t *testing.T) {
 
 // TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI is the
 // integration-level counterpart to TestClipLineTruncationClosesDanglingStyle:
-// rendering a real multi-directory Pinned row (title -> cwd -> provider,
-// each individually styled) across a sweep of narrow widths must never
-// leave a line with an unclosed SGR sequence that would bleed color into
-// whatever renders next.
+// rendering a real selected multi-directory Pinned row (title -> cwd ->
+// provider, each individually styled beneath the selection background)
+// across a sweep of narrow widths must never leave a line with an unclosed
+// SGR sequence that would bleed color into whatever renders next.
 func TestNarrowMultiDirectoryPinnedRowNeverLeavesDanglingANSI(t *testing.T) {
 	s := NewState()
 	s.SetRows([]session.Session{
