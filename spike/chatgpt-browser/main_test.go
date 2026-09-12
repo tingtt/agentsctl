@@ -1024,6 +1024,41 @@ func TestSelectFreshMatchDiagnosticsExcludesStaleAndIrrelevant(t *testing.T) {
 	}
 }
 
+func TestHasFreshMatchOffsetZero(t *testing.T) {
+	staleOffsetZero := diag(5)
+	staleOffsetZero.Offset = intPtr(0)
+	matchOffsetZero := diag(6)
+	matchOffsetZero.Offset = intPtr(0)
+	matchOffset28 := diag(7)
+	matchOffset28.Offset = intPtr(28)
+	irrelevantOffsetZero := diag(8)
+	irrelevantOffsetZero.Offset = intPtr(0)
+	irrelevantOffsetZero.HideSnorlax = "true"
+	unknownOffsetZero := diag(9)
+	unknownOffsetZero.Offset = intPtr(0)
+	unknownOffsetZero.IsStarred = "true"
+
+	tests := []struct {
+		name        string
+		diagnostics []globalConversationsPageDiagnostic
+		want        bool
+	}{
+		{"stale target offset zero", []globalConversationsPageDiagnostic{staleOffsetZero}, false},
+		{"fresh target offset zero", []globalConversationsPageDiagnostic{matchOffsetZero}, true},
+		{"later target page only", []globalConversationsPageDiagnostic{matchOffset28}, false},
+		{"later page followed by offset zero", []globalConversationsPageDiagnostic{matchOffset28, matchOffsetZero}, true},
+		{"irrelevant offset zero", []globalConversationsPageDiagnostic{irrelevantOffsetZero}, false},
+		{"unknown offset zero", []globalConversationsPageDiagnostic{unknownOffsetZero}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := hasFreshMatchOffsetZero(test.diagnostics, 5); got != test.want {
+				t.Fatalf("hasFreshMatchOffsetZero() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestSelectFreshMatchDiagnosticsPhaseIsolation(t *testing.T) {
 	// The exact scenario the task describes: a baseline capture (SeriesKey S, offset 0, digest A)
 	// and a post-pin capture of the SAME SeriesKey+Offset (digest B) are two legitimate, different
@@ -1147,12 +1182,14 @@ func TestPinExperimentOutcomeNotVerifiedWhenNotPresentBefore(t *testing.T) {
 	}
 }
 
-func TestPinExperimentOutcomeNotVerifiedWhenTargetStale(t *testing.T) {
-	// The exact "stale target" case: membership appears unchanged (presentAfter=true) but no fresh
-	// target capture was observed — this must never be read as Outcome A.
-	got := pinExperimentOutcome(true, "", true, false, true)
+func TestPinExperimentOutcomeNotVerifiedWithOnlyFreshLaterPage(t *testing.T) {
+	laterPage := diag(6)
+	laterPage.Offset = intPtr(28)
+	freshOffsetZero := hasFreshMatchOffsetZero([]globalConversationsPageDiagnostic{laterPage}, 5)
+	// Membership appears unchanged, but a fresh offset-28 MATCH is not fresh first-page evidence.
+	got := pinExperimentOutcome(true, "", true, freshOffsetZero, true)
 	if !strings.Contains(got, "NOT VERIFIED") {
-		t.Fatalf("pinExperimentOutcome = %q, want NOT VERIFIED when the target snapshot is not fresh", got)
+		t.Fatalf("pinExperimentOutcome = %q, want NOT VERIFIED without a fresh target offset-0 page", got)
 	}
 }
 
@@ -1160,6 +1197,16 @@ func TestPinExperimentRestoreOutcomePass(t *testing.T) {
 	got := pinExperimentRestoreOutcome(true, true, true, true)
 	if !strings.HasPrefix(got, "PASS") {
 		t.Fatalf("pinExperimentRestoreOutcome = %q, want PASS", got)
+	}
+}
+
+func TestPinExperimentRestoreOutcomeNotVerifiedWithOnlyFreshLaterPage(t *testing.T) {
+	laterPage := diag(6)
+	laterPage.Offset = intPtr(28)
+	freshOffsetZero := hasFreshMatchOffsetZero([]globalConversationsPageDiagnostic{laterPage}, 5)
+	got := pinExperimentRestoreOutcome(true, true, freshOffsetZero, true)
+	if !strings.Contains(got, "NOT VERIFIED") {
+		t.Fatalf("pinExperimentRestoreOutcome = %q, want NOT VERIFIED without a fresh target offset-0 page", got)
 	}
 }
 

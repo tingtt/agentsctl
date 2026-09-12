@@ -705,18 +705,19 @@ func containsID(conversations []conversation, id string) bool {
 // requires EVERY trust condition before reporting either stable membership or a change — a
 // successfully-identified controlled sample (see controlledSampleFromPinsDelta), that sample
 // confirmed present in the baseline snapshot (otherwise the experiment itself was invalid), and a
-// fresh target-series MATCH snapshot to check membership against (otherwise "still present" could
-// just mean "no new data was fetched," as a live run on 2026-09-11 demonstrated). Any missing
-// condition returns NOT VERIFIED. A disappearance is deliberately not called filter exclusion:
-// order=updated may instead have displaced the conversation beyond raw page 0.
-func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBefore, targetFresh, presentAfter bool) string {
+// fresh target-series MATCH offset-0 snapshot to check membership against (otherwise "still
+// present" could just mean "no new first-page data was fetched," as a live run on 2026-09-11
+// demonstrated). Any missing condition returns NOT VERIFIED. A disappearance is deliberately not
+// called filter exclusion: order=updated may instead have displaced the conversation beyond raw
+// page 0.
+func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBefore, freshOffsetZero, presentAfter bool) string {
 	switch {
 	case !controlledOK:
 		return "NOT VERIFIED — controlled sample could not be identified from the pins delta (" + controlledReason + ")"
 	case !presentBefore:
 		return "NOT VERIFIED — controlled sample was not present in the baseline target snapshot (experiment invalid)"
-	case !targetFresh:
-		return "NOT VERIFIED — no fresh target-series MATCH capture was observed after the pin action"
+	case !freshOffsetZero:
+		return "NOT VERIFIED — no fresh target-series MATCH offset=0 capture was observed after the pin action"
 	case presentAfter:
 		return "FIRST_PAGE_STABLE: is_starred=false first-page Project membership still contains the pinned conversation"
 	default:
@@ -726,32 +727,32 @@ func pinExperimentOutcome(controlledOK bool, controlledReason string, presentBef
 
 // pinExperimentRestoreOutcome is the equivalent decisive check for the restore (unpin) half of the
 // cycle: it requires a controlled sample, confirmation (via a fresh pins capture) that it was
-// actually removed from the pins set again, and a fresh target-series MATCH snapshot showing it
-// present once more. Any missing condition returns NOT VERIFIED.
-func pinExperimentRestoreOutcome(controlledOK, pinsRemovedControlled, restoreTargetFresh, presentAfterRestore bool) string {
+// actually removed from the pins set again, and a fresh target-series MATCH offset-0 snapshot
+// showing it present once more. Any missing condition returns NOT VERIFIED.
+func pinExperimentRestoreOutcome(controlledOK, pinsRemovedControlled, freshOffsetZero, presentAfterRestore bool) string {
 	switch {
 	case !controlledOK:
 		return "NOT VERIFIED — no controlled sample was identified to check restoration for"
 	case !pinsRemovedControlled:
 		return "NOT VERIFIED — controlled sample was not observed leaving the pins set after the restore action"
-	case !restoreTargetFresh:
-		return "NOT VERIFIED — no fresh target-series MATCH capture was observed after the restore action"
+	case !freshOffsetZero:
+		return "NOT VERIFIED — no fresh target-series MATCH offset=0 capture was observed after the restore action"
 	case presentAfterRestore:
-		return "PASS — controlled sample confirmed removed from pins and present again in a fresh target snapshot"
+		return "PASS — controlled sample confirmed removed from pins and present again in a fresh target offset=0 snapshot"
 	default:
-		return "NOT VERIFIED — controlled sample absent from the fresh post-restore target snapshot"
+		return "NOT VERIFIED — controlled sample absent from the fresh post-restore target offset=0 snapshot"
 	}
 }
 
-// targetSnapshotResult is one phase-scoped, freshness-verified observation of the active-list target
-// series, produced by targetSnapshotAfter.
+// targetSnapshotResult is one phase-scoped observation of the active-list target series, produced
+// by targetSnapshotAfter and freshness-gated specifically on offset 0.
 type targetSnapshotResult struct {
-	Conversations []conversation
-	Fresh         bool // true iff at least one MATCH capture strictly newer than the watermark was observed
-	MaxCaptureID  int  // running high-water mark of MATCH captures observed (becomes the next phase's watermark)
-	PagesUsed     int
-	Exhausted     bool // this phase's OWN fresh pages' pagination completeness — NOT a general completeness claim
-	Pages         []conversationPage
+	Conversations   []conversation
+	FreshOffsetZero bool // true only when a MATCH offset-0 capture newer than the watermark was observed
+	MaxCaptureID    int  // running high-water mark of MATCH captures observed (becomes the next phase's watermark)
+	PagesUsed       int
+	Exhausted       bool // this phase's OWN fresh pages' pagination completeness — NOT a general completeness claim
+	Pages           []conversationPage
 }
 
 func targetOffsetZeroPage(snapshot targetSnapshotResult) (conversationPage, bool) {
@@ -766,7 +767,7 @@ func targetOffsetZeroPage(snapshot targetSnapshotResult) (conversationPage, bool
 func printRawOffsetZero(label string, snapshot targetSnapshotResult) {
 	page, ok := targetOffsetZeroPage(snapshot)
 	if !ok {
-		fmt.Printf("%s raw offset=0: NOT VERIFIED (no fresh target page)\n", label)
+		fmt.Printf("%s raw offset=0: NOT VERIFIED (no fresh target offset=0 page)\n", label)
 		return
 	}
 	fmt.Printf("%s raw offset=0: series=%s offset=%d limit=%d raw_count=%d recognized_id_count=%d project_count=%d raw_digest=%s\n",
@@ -808,10 +809,10 @@ func printRawMembershipDelta(label string, before, after targetSnapshotResult, c
 // divergence is actually the exact, valid signal a controlled mutation should produce. Restricting
 // each call to one phase's own post-watermark captures makes that collision structurally impossible.
 //
-// This does not attempt general pagination completeness — this Project's target series is known
-// (prior live runs) to fit in one page, and the experiment only needs ONE trustworthy fresh snapshot
-// to test membership against. It retries a bounded number of sidebar-scroll-simulation attempts, like
-// enumerateAllConversations, but stops as soon as at least one fresh MATCH page has been observed;
+// This does not attempt general pagination completeness. It captures a phase's fresh target pages
+// for diagnostics, but the pin experiment's first-page membership comparison is trustworthy only
+// when a fresh offset-0 page was observed. Later pages are retained in Pages and participate in the
+// phase-local merge; by themselves they neither stop the retry loop nor make FreshOffsetZero true.
 // Exhausted reports only whether THIS phase's own fresh pages reached their own offset-chain
 // exhaustion, and must never be read as "the target series' full completeness is proven."
 func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs []string, minCaptureIDExclusive int, maxScrollAttempts, maxPages, idBase int) (targetSnapshotResult, error) {
@@ -819,7 +820,7 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 	maxCaptureID := minCaptureIDExclusive
 	seenFresh := make(map[int]bool)
 
-	fetchFresh := func() (foundNew bool, err error) {
+	fetchFreshPages := func() (foundOffsetZero bool, err error) {
 		raw, err := call(client, request{ID: idBase, Method: "globalConversationsPages"})
 		if err != nil {
 			return false, fmt.Errorf("list global conversations pages: %w", err)
@@ -867,16 +868,15 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 				RawMembership:                result.RawMembership,
 				Items:                        result.Items,
 			})
-			foundNew = true
 		}
-		return foundNew, nil
+		return hasFreshMatchOffsetZero(diagnostics, minCaptureIDExclusive), nil
 	}
 
-	found, err := fetchFresh()
+	foundOffsetZero, err := fetchFreshPages()
 	if err != nil {
 		return targetSnapshotResult{}, err
 	}
-	for attempt := 0; !found && attempt < maxScrollAttempts; attempt++ {
+	for attempt := 0; !foundOffsetZero && attempt < maxScrollAttempts; attempt++ {
 		beforeWatermarks, beforeWatermarksErr := readCaptureWatermarks(client, idBase+20+attempt*4)
 		scrollRaw, err := call(client, request{ID: idBase + 2, Method: "simulateSidebarScroll"})
 		if err != nil {
@@ -888,7 +888,7 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 		}
 		printScrollDiagnostics(attempt, scroll)
 		time.Sleep(1500 * time.Millisecond)
-		found, err = fetchFresh()
+		foundOffsetZero, err = fetchFreshPages()
 		if err != nil {
 			return targetSnapshotResult{}, err
 		}
@@ -905,20 +905,20 @@ func targetSnapshotAfter(client net.Conn, projectID string, knownConversationIDs
 		return targetSnapshotResult{}, err
 	}
 	return targetSnapshotResult{
-		Conversations: conversations,
-		Fresh:         len(pages) > 0,
-		MaxCaptureID:  maxCaptureID,
-		PagesUsed:     len(pages),
-		Exhausted:     exhausted,
-		Pages:         pages,
+		Conversations:   conversations,
+		FreshOffsetZero: foundOffsetZero,
+		MaxCaptureID:    maxCaptureID,
+		PagesUsed:       len(pages),
+		Exhausted:       exhausted,
+		Pages:           pages,
 	}, nil
 }
 
 // printCaptureDiagnostics surfaces the bridge's own low-level capture health (attached debuggers,
-// matched responses, capture errors) so a fresh=false result can be told apart between two distinct
-// causes: (A) the debugger/capture mechanism itself is not working at all, versus (B) capture is
-// healthy but the specific active-list target series just was not re-requested. No credential or
-// private data crosses this call — pingInfo is already a pure health/count summary.
+// matched responses, capture errors) so a fresh-offset-0=false result can be told apart between two
+// distinct causes: (A) the debugger/capture mechanism itself is not working at all, versus (B)
+// capture is healthy but the specific active-list target first page just was not re-requested. No
+// credential or private data crosses this call — pingInfo is already a pure health/count summary.
 func printCaptureDiagnostics(client net.Conn, id int, label string) {
 	raw, err := call(client, request{ID: id, Method: "ping"})
 	if err != nil {
@@ -1035,6 +1035,18 @@ func selectFreshMatchDiagnostics(diagnostics []globalConversationsPageDiagnostic
 	return selected
 }
 
+// hasFreshMatchOffsetZero reports whether the phase has a newly observed first page of the exact
+// active-list target series. A later MATCH page is useful pagination evidence but cannot establish
+// freshness for the pin experiment's offset-0 membership comparison.
+func hasFreshMatchOffsetZero(diagnostics []globalConversationsPageDiagnostic, minCaptureIDExclusive int) bool {
+	for _, d := range selectFreshMatchDiagnostics(diagnostics, minCaptureIDExclusive) {
+		if d.Offset != nil && *d.Offset == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // restartBrowserProcess implements the Phase 5 is_starred experiment's fresh-process fallback
 // (README "Ninth pass"): three live runs proved a same-process reload does not force a fresh
 // target-series or /backend-api/pins capture. This stops the current terminal-browser process and
@@ -1102,12 +1114,13 @@ func restartBrowserProcess(ctx context.Context, cfg config, mainScript, preload 
 // the fresh-process fallback — rather than asking the operator to reload the same process, since
 // three live runs proved a same-process reload does not force a fresh target-series or pins
 // capture. Every phase's target-series snapshot is still captured with targetSnapshotAfter at
-// watermark 0, which is trivially correct here: a freshly-restarted process has no prior capture
-// history to isolate from at all. After each restart, discoverConversations is called once to
-// actively navigate into the configured Project (bridge/main.js's "conversations" method navigates
-// there whenever nothing is cached yet, which is always true right after a restart) — live evidence
-// suggested the target series is only fetched when the Project view is actually visited, not merely
-// on a bare reload to ChatGPT's root.
+// watermark 0, which is correct here because a freshly-restarted process has no prior capture
+// history to isolate. The membership verdict still requires a newly observed target offset-0 page;
+// later MATCH pages alone do not satisfy freshness. After each restart, discoverConversations is
+// called once to actively navigate into the configured Project (bridge/main.js's "conversations"
+// method navigates there whenever nothing is cached yet, which is always true right after a
+// restart) — live evidence suggested the target series is only fetched when the Project view is
+// actually visited, not merely on a bare reload to ChatGPT's root.
 func runPinExperiment(ctx context.Context, cfg config, mainScript, preload string, browser *browserProcess, client net.Conn, projectID string, knownIDs []string) (*browserProcess, net.Conn, error) {
 	reader := bufio.NewReader(os.Stdin)
 	prompt := func(message string) error {
@@ -1150,7 +1163,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	if err != nil {
 		return nil, nil, fmt.Errorf("post-pin target snapshot: %w", err)
 	}
-	fmt.Printf("target capture: fresh=%t (fresh-process fallback: any MATCH capture in the new process counts as fresh, since it has no prior history at all)\n", afterPin.Fresh)
+	fmt.Printf("target offset=0 capture: fresh=%t\n", afterPin.FreshOffsetZero)
 	fmt.Printf("after pin target series: target_count=%d fresh_pages_used=%d\n", len(afterPin.Conversations), afterPin.PagesUsed)
 	printRawOffsetZero("after pin", afterPin)
 	printCaptureDiagnostics(client, 515, "after-pin")
@@ -1176,7 +1189,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	if controlledOK {
 		fmt.Printf("controlled_sample_present_before=%t controlled_sample_present_after_pin=%t\n", presentBefore, presentAfterPin)
 	}
-	fmt.Printf("outcome: %s\n", pinExperimentOutcome(controlledOK, controlledReason, presentBefore, afterPin.Fresh, presentAfterPin))
+	fmt.Printf("outcome: %s\n", pinExperimentOutcome(controlledOK, controlledReason, presentBefore, afterPin.FreshOffsetZero, presentAfterPin))
 	printRawMembershipDelta("baseline -> after pin", baseline, afterPin, controlledID, controlledOK)
 
 	// Auxiliary, non-decisive diagnostic: besides the controlled sample, did anything else in the
@@ -1218,7 +1231,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	if err != nil {
 		return nil, nil, fmt.Errorf("post-restore target snapshot: %w", err)
 	}
-	fmt.Printf("target capture: fresh=%t\n", afterRestore.Fresh)
+	fmt.Printf("target offset=0 capture: fresh=%t\n", afterRestore.FreshOffsetZero)
 	fmt.Printf("after restore target series: target_count=%d fresh_pages_used=%d\n", len(afterRestore.Conversations), afterRestore.PagesUsed)
 	printRawOffsetZero("after restore", afterRestore)
 	printRawMembershipDelta("baseline -> after restore", baseline, afterRestore, controlledID, controlledOK)
@@ -1228,7 +1241,7 @@ func runPinExperiment(ctx context.Context, cfg config, mainScript, preload strin
 	if controlledOK {
 		fmt.Printf("controlled_sample_present_after_restore=%t\n", presentAfterRestore)
 	}
-	fmt.Printf("restore evidence: %s\n", pinExperimentRestoreOutcome(controlledOK, restoreRemovedControlled, afterRestore.Fresh, presentAfterRestore))
+	fmt.Printf("restore evidence: %s\n", pinExperimentRestoreOutcome(controlledOK, restoreRemovedControlled, afterRestore.FreshOffsetZero, presentAfterRestore))
 	return browser, client, nil
 }
 
