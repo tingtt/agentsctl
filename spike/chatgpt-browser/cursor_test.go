@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -452,6 +453,7 @@ func TestClassifyCursorExperimentOutcome(t *testing.T) {
 		{name: "no request at all", cursorPresent200: 0, cursorPresent401: 0, pagesCaptured: 0, want: outcomeNoRequest},
 		{name: "frontend itself 401s, zero pages", cursorPresent200: 0, cursorPresent401: 3, pagesCaptured: 0, want: outcomeFrontend401},
 		{name: "capture/schema error after some pages", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, chainErr: errFixture, want: outcomeCaptureFailure},
+		{name: "valid page0, no terminal, attempts exhausted", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 1, chainErr: &cursorChainIncompleteError{Reason: "WHEEL_NO_PROGRESS"}, complete: false, want: outcomeChainIncomplete},
 		{name: "pages captured, no error, not terminal", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, complete: false, want: outcomeChainIncomplete},
 		{name: "terminal reached cleanly", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, complete: true, want: outcomeComplete},
 	}
@@ -656,4 +658,128 @@ func extractFunctionBody(fromFuncKeyword string) string {
 		}
 	}
 	return fromFuncKeyword
+}
+
+func TestIsCursorChainIncompleteDistinguishesFromOrdinaryErrors(t *testing.T) {
+	if !isCursorChainIncomplete(&cursorChainIncompleteError{Reason: "WHEEL_NO_PROGRESS"}) {
+		t.Fatal("expected a *cursorChainIncompleteError to be recognized")
+	}
+	if isCursorChainIncomplete(errFixture) {
+		t.Fatal("an ordinary error must never be misidentified as chain-incomplete")
+	}
+	if isCursorChainIncomplete(nil) {
+		t.Fatal("a nil error must never be misidentified as chain-incomplete")
+	}
+	wrapped := fmt.Errorf("attempt failed: %w", &cursorChainIncompleteError{Reason: "ATTEMPTS_EXHAUSTED"})
+	if !isCursorChainIncomplete(wrapped) {
+		t.Fatal("errors.As must see through a wrapped *cursorChainIncompleteError")
+	}
+}
+
+func TestSubtractStatusCounts(t *testing.T) {
+	before := cursorResponseStatusCounts{
+		NoCursor:      map[string]int{"200": 5, "401": 0, "other": 0},
+		CursorPresent: map[string]int{"200": 90, "401": 0, "other": 0},
+	}
+	after := cursorResponseStatusCounts{
+		NoCursor:      map[string]int{"200": 5, "401": 0, "other": 0},
+		CursorPresent: map[string]int{"200": 100, "401": 0, "other": 0},
+	}
+	delta := subtractStatusCounts(after, before)
+	if delta.CursorPresent["200"] != 10 {
+		t.Fatalf("delta.CursorPresent[200] = %d, want 10", delta.CursorPresent["200"])
+	}
+	if delta.NoCursor["200"] != 0 {
+		t.Fatalf("delta.NoCursor[200] = %d, want 0 (unchanged)", delta.NoCursor["200"])
+	}
+}
+
+func TestForwardProgressObservedTrueWhenNextCursorSeenAsLaterCursorIn(t *testing.T) {
+	pages := []cursorFetchedPage{
+		{CursorIn: "0", HasNextCursor: true, NextCursor: "C1"},
+		{CursorIn: "C1", HasNextCursor: false},
+	}
+	if !forwardProgressObserved(pages, "C1") {
+		t.Fatal("expected forward progress: a later page's CursorIn matches the expected next cursor")
+	}
+}
+
+func TestForwardProgressObservedFalseWhenOnlyCursorInZeroRepeats(t *testing.T) {
+	// README Task 9: a repeated cursor_in=0 observation — however many times it recurs — is never
+	// forward progress by itself.
+	pages := []cursorFetchedPage{
+		{CursorIn: "0", HasNextCursor: true, NextCursor: "C1"},
+		{CursorIn: "0", HasNextCursor: true, NextCursor: "C1"},
+	}
+	if forwardProgressObserved(pages, "C1") {
+		t.Fatal("repeated cursor_in=0 observations must never count as forward progress")
+	}
+}
+
+func TestForwardProgressObservedFalseWhenNoExpectedCursorYet(t *testing.T) {
+	if forwardProgressObserved([]cursorFetchedPage{{CursorIn: "0"}}, "") {
+		t.Fatal("expected false when no page has declared a next cursor yet")
+	}
+}
+
+func TestClassifyWheelProgressReason(t *testing.T) {
+	tests := []struct {
+		name                                     string
+		scrollChanged, linkCountChanged, forward bool
+		want                                     string
+	}{
+		{name: "nothing observed at all", want: "WHEEL_NO_PROGRESS"},
+		{name: "scroll moved", scrollChanged: true, want: "ATTEMPTS_EXHAUSTED"},
+		{name: "link count changed", linkCountChanged: true, want: "ATTEMPTS_EXHAUSTED"},
+		{name: "forward cursor progress", forward: true, want: "ATTEMPTS_EXHAUSTED"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := classifyWheelProgressReason(test.scrollChanged, test.linkCountChanged, test.forward)
+			if got != test.want {
+				t.Fatalf("classifyWheelProgressReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestShouldAttemptCDPWheelFallback(t *testing.T) {
+	if shouldAttemptCDPWheelFallback(true) {
+		t.Fatal("CDP must not be attempted when Electron already showed progress")
+	}
+	if !shouldAttemptCDPWheelFallback(false) {
+		t.Fatal("CDP must be attempted when Electron showed zero progress")
+	}
+}
+
+func TestWheelTicksShowScrollAndLinkChange(t *testing.T) {
+	zero, ten, twenty := 0, 10, 20
+	noChange := []wheelTickDiagnostic{
+		{ScrollTopBefore: &zero, ScrollTopAfter: &zero, ProjectConversationLinksBefore: &ten, ProjectConversationLinksAfter: &ten},
+	}
+	if wheelTicksShowScrollChange(noChange) || wheelTicksShowLinkChange(noChange) {
+		t.Fatal("identical before/after values must never report a change")
+	}
+	scrollMoved := &ten
+	scrollChange := []wheelTickDiagnostic{
+		{ScrollTopBefore: &zero, ScrollTopAfter: scrollMoved, ProjectConversationLinksBefore: &ten, ProjectConversationLinksAfter: &ten},
+	}
+	if !wheelTicksShowScrollChange(scrollChange) {
+		t.Fatal("expected a scroll change to be detected")
+	}
+	if wheelTicksShowLinkChange(scrollChange) {
+		t.Fatal("link count did not change in this fixture")
+	}
+	linkChange := []wheelTickDiagnostic{
+		{ScrollTopBefore: &zero, ScrollTopAfter: &zero, ProjectConversationLinksBefore: &ten, ProjectConversationLinksAfter: &twenty},
+	}
+	if !wheelTicksShowLinkChange(linkChange) {
+		t.Fatal("expected a link-count change to be detected")
+	}
+	missingPair := []wheelTickDiagnostic{
+		{ScrollTopBefore: nil, ScrollTopAfter: &zero, ProjectConversationLinksBefore: nil, ProjectConversationLinksAfter: nil},
+	}
+	if wheelTicksShowScrollChange(missingPair) || wheelTicksShowLinkChange(missingPair) {
+		t.Fatal("a nil half of a before/after pair must never be treated as a change")
+	}
 }
