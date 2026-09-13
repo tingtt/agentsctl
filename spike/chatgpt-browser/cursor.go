@@ -675,15 +675,17 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		return pages, convs, dups, comp, nil
 	}
 
-	// expectedNextCursor/anyForwardProgress/anyScrollChanged/anyLinkCountChanged implement README
-	// Task 2/4/9: a rising cursor-present request count, or wheel ticks firing at all, is never by
-	// itself evidence of forward pagination progress — only a later capture whose CursorIn equals
-	// an earlier page's own declared NextCursor proves the frontend actually requested page 2 (or
-	// beyond), as opposed to endlessly re-requesting page 1.
+	// expectedNextCursor/expectedFromPage/anyForwardProgress/everScrolled implement README Task 2/
+	// 4/9: a rising cursor-present request count, or wheel ticks firing at all, is never by itself
+	// evidence of forward pagination progress — only a later capture whose CursorIn equals an
+	// earlier page's own declared NextCursor proves the frontend actually requested the next page,
+	// as opposed to endlessly re-requesting the same one. expectedFromPage tracks WHICH transition
+	// (0→1, 1→2, ...) is currently pending, per README Task 4/10.
 	var expectedNextCursor string
+	var expectedFromPage = -1
 	var lastConversations []cursorConversation
 	var lastDuplicates int
-	var anyForwardProgress, anyScrollChanged, anyLinkCountChanged bool
+	var anyForwardProgress, everScrolled bool
 
 	// recordPages/reportForwardProgress MUST run in this order — report, then record: a live run
 	// found that recording first (advancing expectedNextCursor to the LATEST page's own next
@@ -699,58 +701,187 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		lastConversations, lastDuplicates = convs, dups
 		if last := pages[len(pages)-1]; last.HasNextCursor {
 			expectedNextCursor = last.NextCursor
+			expectedFromPage = len(pages) - 1
 		}
 	}
-	reportForwardProgress := func(label string, pages []cursorFetchedPage) {
-		observed := forwardProgressObserved(pages, expectedNextCursor)
+	reportForwardProgress := func(pages []cursorFetchedPage) (observed bool) {
+		if expectedFromPage < 0 {
+			return false
+		}
+		observed = forwardProgressObserved(pages, expectedNextCursor)
 		if observed {
 			anyForwardProgress = true
 		}
-		fmt.Printf("expected next cursor request (%s): observed=%t\n", label, observed)
+		fmt.Printf("transition %d->%d: expected_cursor_observed=%t\n", expectedFromPage, expectedFromPage+1, observed)
+		return observed
 	}
 
 	pages, convs, dups, comp, herr := tryAccumulate(idBase + 3)
 	if herr != nil {
 		return nil, 0, false, pagesFetched, firstPageOrder, herr
 	}
-	reportForwardProgress("initial", pages)
+	reportForwardProgress(pages)
 	recordPages(pages, convs, dups)
 	if comp {
 		return convs, dups, true, pagesFetched, firstPageOrder, nil
 	}
 
-	for attempt := 0; attempt < maxWheelAttempts; attempt++ {
-		wheelResult, werr := fetchRealWheelScrollProject(client, idBase+4+attempt*2, projectID, 3)
-		if werr != nil {
-			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("real wheel scroll (attempt %d): %w", attempt, werr)
+	// The remaining walk is content-aware rather than a fixed attempt count (README Task 2/3):
+	// keep scrolling toward the scroll region's OWN bottom (recomputed every round, since it can
+	// grow once a new page loads — README Task 5/6), settle briefly once at-or-near it for any
+	// async lazy-load to fire, and stop only on one of three bounded conditions, never on wall
+	// clock alone: total wheel ticks sent, or consecutive rounds with neither a new page nor any
+	// scroll/link movement (README Task 7). maxWheelAttempts still bounds the round count itself,
+	// as a defensive backstop alongside the two content-aware bounds.
+	const maxWheelTicksTotal = 60
+	const maxConsecutiveNoProgressRounds = 6
+	const ticksPerRound = 3
+
+	ticksSent := 0
+	consecutiveNoProgress := 0
+	reachedNearBottom := false
+	previousScrollHeight := region.ScrollHeight
+
+	for round := 0; round < maxWheelAttempts*8; round++ {
+		if ticksSent >= maxWheelTicksTotal || consecutiveNoProgress >= maxConsecutiveNoProgressRounds {
+			break
 		}
-		if attempt == 0 && wheelResult.Found {
+
+		currentRegion, srerr := fetchProjectScrollRegion(client, idBase+900+round*4)
+		if srerr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("read Project scroll region (round %d): %w", round, srerr)
+		}
+		printScrollState(fmt.Sprintf("round %d", round), currentRegion, previousScrollHeight)
+		if currentRegion.Found {
+			if isNearBottom(distanceToBottom(currentRegion.ScrollHeight, currentRegion.ClientHeight, currentRegion.ScrollTop), currentRegion.ClientHeight) {
+				reachedNearBottom = true
+			}
+			previousScrollHeight = currentRegion.ScrollHeight
+		}
+
+		// README Task 13: rather than a separate one-shot "try something different at the
+		// bottom" branch, this always re-sends wheel input every round, at-or-near the bottom
+		// included — some lazy-load triggers need an actual scroll EVENT to fire, not merely a
+		// static position, so continuing to wheel at the boundary (bounded by the limits above)
+		// serves the same purpose as a deliberate re-trigger attempt without a fragile special
+		// case that only runs once.
+		wheelResult, werr := fetchRealWheelScrollProject(client, idBase+901+round*4, projectID, ticksPerRound)
+		if werr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("real wheel scroll (round %d): %w", round, werr)
+		}
+		if round == 0 && wheelResult.Found {
 			printWheelInputShape(wheelResult.InputShape)
 		}
-		printRealWheelResult(attempt, wheelResult)
+		printRealWheelResult(round, wheelResult)
+		ticksSent += len(wheelResult.Ticks)
 		if wheelTicksShowScrollChange(wheelResult.Ticks) {
-			anyScrollChanged = true
+			everScrolled = true
 		}
-		if wheelTicksShowLinkChange(wheelResult.Ticks) {
-			anyLinkCountChanged = true
-		}
-		time.Sleep(500 * time.Millisecond)
 
-		pages, convs, dups, comp, herr := tryAccumulate(idBase + 5 + attempt*2)
+		// AT_BOTTOM_WAITING gets a longer settle than plain SCROLLING, since a lazy-load fetch
+		// triggered right at the boundary is more likely to still be in flight.
+		if reachedNearBottom {
+			time.Sleep(800 * time.Millisecond)
+		} else {
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		pages, convs, dups, comp, herr := tryAccumulate(idBase + 903 + round*4)
 		if herr != nil {
 			return nil, 0, false, pagesFetched, firstPageOrder, herr
 		}
-		reportForwardProgress(fmt.Sprintf("attempt %d", attempt), pages)
+		observed := reportForwardProgress(pages)
+		pageCountBefore := len(lastConversations)
 		recordPages(pages, convs, dups)
 		if comp {
 			return convs, dups, true, pagesFetched, firstPageOrder, nil
 		}
+		if observed || len(lastConversations) > pageCountBefore || wheelTicksShowLinkChange(wheelResult.Ticks) {
+			consecutiveNoProgress = 0
+		} else {
+			consecutiveNoProgress++
+		}
 	}
 
-	fmt.Printf("pagination progress: scroll_changed=%t link_count_changed=%t expected_next_cursor_observed=%t\n",
-		anyScrollChanged, anyLinkCountChanged, anyForwardProgress)
-	reason := classifyWheelProgressReason(anyScrollChanged, anyLinkCountChanged, anyForwardProgress)
+	fmt.Printf("pagination progress: ever_scrolled=%t reached_near_bottom=%t expected_next_cursor_observed=%t\n",
+		everScrolled, reachedNearBottom, anyForwardProgress)
+	reason := classifyScrollIncompleteReason(everScrolled, reachedNearBottom)
 	return lastConversations, lastDuplicates, false, pagesFetched, firstPageOrder, &cursorChainIncompleteError{Reason: reason}
+}
+
+// distanceToBottom/scrollMaxTop are pure, clamped-to-zero calculations from a scroll region's own
+// raw dimensions (README Task 1). Computed Go-side from values the bridge already reports, rather
+// than adding new preload/JS surface for arithmetic Go already has the inputs for.
+func distanceToBottom(scrollHeight, clientHeight, scrollTop int) int {
+	d := scrollHeight - clientHeight - scrollTop
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func scrollMaxTop(scrollHeight, clientHeight int) int {
+	d := scrollHeight - clientHeight
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// isNearBottom reports whether distance is within one viewport height of the bottom. Virtualized/
+// lazy-loaded lists often trigger their own next-page fetch before the user reaches the LITERAL
+// scroll maximum (README Task 2's explicit warning not to rely on distanceToBottom==0 alone) — one
+// full viewport of margin gives whatever the frontend's real trigger threshold is room to fire
+// without this spike having to know or guess its exact pixel value.
+func isNearBottom(distance, clientHeight int) bool {
+	return distance <= clientHeight
+}
+
+// scrollHeightGrew reports whether a scrollable region's total content height increased (README
+// Task 5/6): after a new page loads, the region's own scrollHeight typically grows too, meaning the
+// "bottom" the NEXT transition needs to reach is now further away than it was — continuing to
+// scroll against a stale bottom estimate would stop too early.
+func scrollHeightGrew(before, after int) bool {
+	return after > before
+}
+
+func printScrollState(label string, region projectScrollRegion, previousScrollHeight int) {
+	if !region.Found {
+		fmt.Printf("scroll state (%s): found=false\n", label)
+		return
+	}
+	dist := distanceToBottom(region.ScrollHeight, region.ClientHeight, region.ScrollTop)
+	maxTop := scrollMaxTop(region.ScrollHeight, region.ClientHeight)
+	near := isNearBottom(dist, region.ClientHeight)
+	grew := scrollHeightGrew(previousScrollHeight, region.ScrollHeight)
+	fmt.Printf("scroll state (%s): scroll_top=%d max_scroll_top=%d distance_to_bottom=%d at_or_near_bottom=%t scroll_height=%d scroll_height_changed=%t\n",
+		label, region.ScrollTop, maxTop, dist, near, region.ScrollHeight, grew)
+}
+
+// classifyScrollIncompleteReason decides the incompleteness reason once the bounded, content-aware
+// scroll loop gives up, distinguishing three states that otherwise all manifest identically as "no
+// terminal cursor within the bound" but have very different causes and very different next steps:
+//
+//   - WHEEL_NO_PROGRESS: the wheel input itself never produced ANY observable effect (no scroll
+//     movement at all, across the whole run) — a delivery-mechanism problem, not a
+//     pagination-trigger problem.
+//   - BOTTOM_NO_REQUEST: the wheel mechanism was confirmed working (scroll did move at some point)
+//     AND the scroll region was confirmed to reach at-or-near its own bottom, yet the frontend
+//     never issued the expected forward request for the pending transition — a genuine
+//     pagination-trigger problem (e.g. an IntersectionObserver/sentinel-based lazy load needing a
+//     different UI interaction than raw wheel deltas), not a delivery problem. This is never
+//     conflated with CAPTURE_FAILURE: the page(s) already accepted remain valid.
+//   - ATTEMPTS_EXHAUSTED: bounded safety limits were reached before the region could be confirmed
+//     to reach its own bottom at all — the generic "ran out of budget, still climbing" case.
+func classifyScrollIncompleteReason(everScrolled, reachedNearBottom bool) string {
+	switch {
+	case !everScrolled:
+		return "WHEEL_NO_PROGRESS"
+	case reachedNearBottom:
+		return "BOTTOM_NO_REQUEST"
+	default:
+		return "ATTEMPTS_EXHAUSTED"
+	}
 }
 
 // wheelTicksShowScrollChange/wheelTicksShowLinkChange are the pure predicates behind the
@@ -774,18 +905,6 @@ func wheelTicksShowLinkChange(ticks []wheelTickDiagnostic) bool {
 		}
 	}
 	return false
-}
-
-// classifyWheelProgressReason is the pure decision core behind an exhausted enumeration's
-// incompleteness reason: WHEEL_NO_PROGRESS when NOTHING observable happened across every attempt
-// (no scroll movement, no link-count change, no forward-cursor progress — README Task 4), versus
-// the more generic ATTEMPTS_EXHAUSTED when at least one of those fired but a terminal cursor still
-// wasn't reached in time.
-func classifyWheelProgressReason(scrollChanged, linkCountChanged, forwardProgress bool) string {
-	if !scrollChanged && !linkCountChanged && !forwardProgress {
-		return "WHEEL_NO_PROGRESS"
-	}
-	return "ATTEMPTS_EXHAUSTED"
 }
 
 // shouldAttemptCDPWheelFallback mirrors bridge/main.js's realWheelScrollProject decision (README
