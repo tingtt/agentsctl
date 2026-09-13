@@ -1,6 +1,9 @@
 package main
 
 import (
+	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -278,4 +281,222 @@ func TestRedactedCursorNeverExposesAnOpaqueValue(t *testing.T) {
 	if got != redactedCursor(secret) {
 		t.Fatal("redactedCursor must be deterministic for the same input")
 	}
+}
+
+func TestClassifyCursorExperimentOutcome(t *testing.T) {
+	tests := []struct {
+		name                               string
+		cursorPresent200, cursorPresent401 int
+		pagesCaptured                      int
+		chainErr                           error
+		complete                           bool
+		want                               cursorExperimentOutcome
+	}{
+		{name: "no request at all", cursorPresent200: 0, cursorPresent401: 0, pagesCaptured: 0, want: outcomeNoRequest},
+		{name: "frontend itself 401s, zero pages", cursorPresent200: 0, cursorPresent401: 3, pagesCaptured: 0, want: outcomeFrontend401},
+		{name: "capture/schema error after some pages", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, chainErr: errFixture, want: outcomeCaptureFailure},
+		{name: "pages captured, no error, not terminal", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, complete: false, want: outcomeChainIncomplete},
+		{name: "terminal reached cleanly", cursorPresent200: 2, cursorPresent401: 0, pagesCaptured: 2, complete: true, want: outcomeComplete},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := classifyCursorExperimentOutcome(test.cursorPresent200, test.cursorPresent401, test.pagesCaptured, test.chainErr, test.complete)
+			if got != test.want {
+				t.Fatalf("classifyCursorExperimentOutcome() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+var errFixture = fixtureError("fixture error")
+
+type fixtureError string
+
+func (e fixtureError) Error() string { return string(e) }
+
+// testHasCursorQueryParam mirrors bridge/main.js's hasCursorQueryParam exactly (whether a URL's
+// query string carries a `cursor` key at all, regardless of value). Test-only: production Go code
+// never inspects a raw URL itself, it only receives the bridge's already-computed classification.
+// Keep in sync with hasCursorQueryParam if that changes.
+func testHasCursorQueryParam(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return parsed.Query().Has("cursor")
+}
+
+// testBucketResponseStatus mirrors bridge/main.js's bucketResponseStatus exactly. Test-only; keep
+// in sync if that changes.
+func testBucketResponseStatus(status int) string {
+	switch status {
+	case 200:
+		return "200"
+	case 401:
+		return "401"
+	default:
+		return "other"
+	}
+}
+
+func TestResponseStatusClassificationMirror(t *testing.T) {
+	tests := []struct {
+		name          string
+		url           string
+		status        int
+		wantHasCursor bool
+		wantStatusKey string
+	}{
+		{name: "no cursor, 200", url: "https://chatgpt.com/backend-api/gizmos/g-p-abc/conversations", status: 200, wantHasCursor: false, wantStatusKey: "200"},
+		{name: "cursor present, 200", url: "https://chatgpt.com/backend-api/gizmos/g-p-abc/conversations?cursor=abc123", status: 200, wantHasCursor: true, wantStatusKey: "200"},
+		{name: "cursor present, 401", url: "https://chatgpt.com/backend-api/gizmos/g-p-abc/conversations?cursor=abc123", status: 401, wantHasCursor: true, wantStatusKey: "401"},
+		{name: "unrelated endpoint, 200", url: "https://chatgpt.com/backend-api/pins", status: 200, wantHasCursor: false, wantStatusKey: "200"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := testHasCursorQueryParam(test.url); got != test.wantHasCursor {
+				t.Fatalf("testHasCursorQueryParam(%q) = %t, want %t", test.url, got, test.wantHasCursor)
+			}
+			if got := testBucketResponseStatus(test.status); got != test.wantStatusKey {
+				t.Fatalf("testBucketResponseStatus(%d) = %q, want %q", test.status, got, test.wantStatusKey)
+			}
+		})
+	}
+}
+
+// testProjectConversationLinkPattern and testIsConversationLinkHref mirror
+// bridge/preload.js's projectConversationLinkPattern/isConversationLinkHref exactly. Test-only;
+// keep in sync if those change.
+func testProjectConversationLinkPattern() *regexp.Regexp {
+	return regexp.MustCompile(`^/g/g-p-[A-Za-z0-9_-]+/c/`)
+}
+
+func testIsConversationLinkHref(href string) (any, project bool) {
+	project = testProjectConversationLinkPattern().MatchString(href)
+	any = project || strings.HasPrefix(href, "/c/")
+	return any, project
+}
+
+func TestIsConversationLinkHrefRecognizesBothURLShapes(t *testing.T) {
+	tests := []struct {
+		href        string
+		wantAny     bool
+		wantProject bool
+	}{
+		{href: "/c/6a9b1e28-dfd4-83e9-ad43-52c3ed1dcd03", wantAny: true, wantProject: false},
+		{href: "/g/g-p-6a970725a218819183e2c93af6890068/c/6a9b1e28-dfd4-83e9-ad43-52c3ed1dcd03", wantAny: true, wantProject: true},
+		{href: "/settings/general", wantAny: false, wantProject: false},
+		{href: "/g/g-p-6a970725a218819183e2c93af6890068/project", wantAny: false, wantProject: false},
+	}
+	for _, test := range tests {
+		t.Run(test.href, func(t *testing.T) {
+			any, project := testIsConversationLinkHref(test.href)
+			if any != test.wantAny || project != test.wantProject {
+				t.Fatalf("testIsConversationLinkHref(%q) = (any=%t, project=%t), want (any=%t, project=%t)",
+					test.href, any, project, test.wantAny, test.wantProject)
+			}
+		})
+	}
+}
+
+// scrollCandidateCounts mirrors one candidate scrollable container's link tallies, as computed by
+// bridge/preload.js's findProjectScrollRegion.
+type scrollCandidateCounts struct {
+	anyLinks     int
+	projectLinks int
+}
+
+// testSelectBestScrollCandidate mirrors findProjectScrollRegion's candidate-selection loop exactly
+// (prefer the most Project-scoped conversation links, tie-broken by total conversation-link
+// count): the pure decision logic behind "which scrollable region is the Project's own list",
+// separated out for unit testing without a live DOM. Returns -1 if candidates is empty. Test-only;
+// keep in sync with findProjectScrollRegion if that changes.
+func testSelectBestScrollCandidate(candidates []scrollCandidateCounts) int {
+	best := -1
+	for i, c := range candidates {
+		if best == -1 {
+			best = i
+			continue
+		}
+		bc := candidates[best]
+		if c.projectLinks > bc.projectLinks || (c.projectLinks == bc.projectLinks && c.anyLinks > bc.anyLinks) {
+			best = i
+		}
+	}
+	return best
+}
+
+func TestSelectBestScrollCandidatePrefersProjectLinks(t *testing.T) {
+	// A persistent general sidebar (many /c/ links, zero Project-scoped ones) alongside the
+	// Project's own, smaller list (fewer links overall, but Project-scoped) — the Project's own
+	// list must win despite having fewer total links.
+	candidates := []scrollCandidateCounts{
+		{anyLinks: 40, projectLinks: 0},
+		{anyLinks: 5, projectLinks: 5},
+	}
+	if got := testSelectBestScrollCandidate(candidates); got != 1 {
+		t.Fatalf("testSelectBestScrollCandidate() = %d, want 1 (the Project-scoped candidate)", got)
+	}
+}
+
+func TestSelectBestScrollCandidateTieBreaksOnTotalLinks(t *testing.T) {
+	candidates := []scrollCandidateCounts{
+		{anyLinks: 5, projectLinks: 3},
+		{anyLinks: 8, projectLinks: 3},
+	}
+	if got := testSelectBestScrollCandidate(candidates); got != 1 {
+		t.Fatalf("testSelectBestScrollCandidate() = %d, want 1 (more total links on an equal Project-link tie)", got)
+	}
+}
+
+func TestSelectBestScrollCandidateEmpty(t *testing.T) {
+	if got := testSelectBestScrollCandidate(nil); got != -1 {
+		t.Fatalf("testSelectBestScrollCandidate(nil) = %d, want -1", got)
+	}
+}
+
+// TestCursorExperimentNeverCallsTheFalsifiedSelfFetchPath is a source-structure safety net (README
+// Task 12 "passive-only invariant" — accepted there as sufficient when a live/mocked-client test
+// isn't practical): enumerateProjectConversationsByCursorPassive and runCursorExperiment must never
+// call enumerateProjectConversationsByCursorSelfFetch, since a self-issued fetch of the
+// cursor-parameterized endpoint is a confirmed HTTP 401 (see cursor.go's doc comments). This scans
+// each function's own source text (not the whole file, so an unrelated, deliberate reference
+// elsewhere — e.g. the -cursor-self-fetch-probe wiring in main.go — can never trip it).
+func TestCursorExperimentNeverCallsTheFalsifiedSelfFetchPath(t *testing.T) {
+	source, err := os.ReadFile("cursor.go")
+	if err != nil {
+		t.Fatalf("read cursor.go: %v", err)
+	}
+	forbidden := "enumerateProjectConversationsByCursorSelfFetch"
+	for _, fn := range []string{"func enumerateProjectConversationsByCursorPassive(", "func runCursorExperiment("} {
+		start := strings.Index(string(source), fn)
+		if start < 0 {
+			t.Fatalf("could not locate %s in cursor.go (has it been renamed?)", fn)
+		}
+		body := extractFunctionBody(string(source)[start:])
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("%s must never call %s (self-fetch is a confirmed HTTP 401 once a cursor parameter is present)", fn, forbidden)
+		}
+	}
+}
+
+// extractFunctionBody returns the text from the start of a function signature through its
+// matching closing brace, using simple brace counting — sufficient for this file's own,
+// gofmt-formatted source, not a general Go parser.
+func extractFunctionBody(fromFuncKeyword string) string {
+	depth := 0
+	started := false
+	for i, r := range fromFuncKeyword {
+		switch r {
+		case '{':
+			depth++
+			started = true
+		case '}':
+			depth--
+			if started && depth == 0 {
+				return fromFuncKeyword[:i+1]
+			}
+		}
+	}
+	return fromFuncKeyword
 }
