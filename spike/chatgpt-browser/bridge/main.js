@@ -27,6 +27,19 @@ const globalConversationsCaptureOrder = [];
 const evictedGlobalConversationCaptureIDs = new Set();
 const MAX_GLOBAL_CONVERSATIONS_CAPTURES = 50;
 const capturedConversations = new Map();
+// projectID -> ordered array of {captureID, cursorIn, payload}, one entry per REAL, passively
+// observed response to GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor} — see
+// recordProjectConversationsCursorCapture. Unlike capturedConversations (a single overwritten
+// slot), this preserves every distinct page the real ChatGPT client itself fetched, in arrival
+// order, for the cursor-pagination spike (README "ChatGPT Project session listing: cursor
+// pagination spike"). A self-issued fetch of the SAME path with a `cursor` query parameter was
+// found to return HTTP 401 (unlike the no-cursor request, which succeeds) — this endpoint
+// apparently requires something beyond cookies when cursor-paginating, which this bridge does not
+// have and must not try to obtain (see the security boundary). Passive capture of the real
+// client's own requests is therefore the only viable mechanism here, mirroring the global
+// endpoint's `hide_snorlax` pagination discovery above.
+const projectConversationsCursorCaptures = new Map();
+let nextProjectCursorCaptureID = 1;
 const capturedConversationDetails = new Map();
 const attachedDebuggers = new WeakSet();
 let attachedDebuggerCount = 0;
@@ -104,7 +117,10 @@ function attachCapture(contents) {
         capturedGlobalConversations = payload;
         recordGlobalConversationsPage(target.url, payload);
       } else if (target.kind === "pins") { capturedPins = payload; pinsCaptureID++; }
-      else if (target.kind === "conversations") capturedConversations.set(target.projectID, payload);
+      else if (target.kind === "conversations") {
+        capturedConversations.set(target.projectID, payload);
+        recordProjectConversationsCursorCapture(target.projectID, target.url, payload);
+      }
       else capturedConversationDetails.set(target.conversationID, payload);
     } catch {
       captureErrorCount++;
@@ -183,7 +199,8 @@ async function dispatch(request) {
   if (![
     "pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe",
     "globalConversationsPages", "globalConversationsPage", "globalConversationsCaptureItems", "simulateSidebarScroll",
-    "pins", "projectConversationsCursor", "knownSampleFingerprints",
+    "pins", "projectConversationsCursor", "knownSampleFingerprints", "projectConversationsCursorCaptures",
+    "navigateProject",
   ].includes(request.method)) {
     throw new Error(`unsupported method: ${request.method}`);
   }
@@ -291,6 +308,23 @@ async function dispatch(request) {
     }
     const cursor = request.params && typeof request.params.cursor === "string" ? request.params.cursor : "0";
     return requestPage({ method: "sanitizeProjectConversationsCursorPage", projectID: request.projectID, cursor });
+  }
+  if (request.method === "projectConversationsCursorCaptures") {
+    // Passive-only, like globalConversationsPages: reports every real, observed page of the
+    // cursor-paginated project-scoped endpoint captured so far, in arrival order. Sanitization of
+    // each raw payload happens per-capture (never a live fetch — see
+    // recordProjectConversationsCursorCapture and the "sanitizeProjectConversationsCursorPayload"
+    // preload case), so a malformed one fails closed independently rather than aborting the batch.
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
+      throw new Error("invalid Project ID");
+    }
+    const list = projectConversationsCursorCaptures.get(request.projectID) || [];
+    const results = [];
+    for (const capture of list) {
+      const sanitized = await requestPage({ method: "sanitizeProjectConversationsCursorPayload", payload: capture.payload });
+      results.push({ captureID: capture.captureID, cursorIn: capture.cursorIn, ...sanitized });
+    }
+    return results;
   }
   if (request.method === "knownSampleFingerprints") {
     // README Phase E: report SHA-256 fingerprints (never raw IDs) of one already-known Work-marked
@@ -576,6 +610,27 @@ function recordGlobalConversationsPage(url, payload) {
     globalConversationsCaptures.delete(evicted);
     evictedGlobalConversationCaptureIDs.add(evicted);
   }
+}
+
+// recordProjectConversationsCursorCapture extracts the `cursor` query parameter the REAL ChatGPT
+// client actually used for this request (absent entirely, on this endpoint's very first request,
+// is treated the same as the documented entry point "0" — README "Cursor is opaque") and appends
+// one entry to this Project's ordered capture list. Never overwrites: a benign duplicate (e.g. a
+// React re-render re-issuing the same request) and a genuine next-page request are both preserved
+// here; Go-side dedupeCapturesByCursorIn decides which is which.
+function recordProjectConversationsCursorCapture(projectID, rawURL, payload) {
+  let cursorIn = "0";
+  try {
+    const url = new URL(rawURL);
+    cursorIn = url.searchParams.get("cursor") ?? "0";
+  } catch {
+    // Keep the "0" default; this capture is still recorded rather than dropped, since Go-side
+    // validation (accumulateCursorChain) will reject it if "0" turns out to be the wrong value for
+    // its position in the chain.
+  }
+  const list = projectConversationsCursorCaptures.get(projectID) || [];
+  list.push({ captureID: nextProjectCursorCaptureID++, cursorIn, payload });
+  projectConversationsCursorCaptures.set(projectID, list);
 }
 
 function payloadHasAsyncSource(payload) {

@@ -500,6 +500,14 @@ async function dispatch(request) {
     const path = `/backend-api/gizmos/${encodeURIComponent(request.projectID)}/conversations?cursor=${encodeURIComponent(cursor)}`;
     return projectConversationsCursorFrom(await fetchJSON(path));
   }
+  if (request.method === "sanitizeProjectConversationsCursorPayload") {
+    // Same sanitizer as above, but over an already-passively-captured payload — no fetch issued.
+    // Used because a self-issued fetch of this path WITH a `cursor` query parameter was found to
+    // return HTTP 401 (unlike the no-cursor request), so real pages must be harvested from the
+    // genuine ChatGPT client's own requests instead (see bridge/main.js's
+    // recordProjectConversationsCursorCapture).
+    return projectConversationsCursorFrom(request.payload);
+  }
   throw new Error(`unsupported browser method: ${request.method}`);
 }
 

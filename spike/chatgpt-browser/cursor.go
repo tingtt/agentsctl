@@ -233,14 +233,21 @@ func fetchCursorPage(client net.Conn, id int, projectID, cursor string) (cursorP
 	return result, nil
 }
 
-// enumerateProjectConversationsByCursor drives the full cursor-chain fetch loop (README "Fetch
-// loop"), starting at cursor="0" and continuing until a page explicitly reports no next cursor,
-// or maxPages is exceeded. accumulateCursorChain (the same pure function main_test.go exercises
-// directly) is re-run after every fetched page, BEFORE the next request is issued — so a cursor
-// cycle or any other fail-closed condition stops the loop immediately rather than after an extra,
-// unnecessary round trip. firstPageOrder preserves the first page's original server-returned
-// order (un-deduplicated) for the Phase F ordering diagnostic.
-func enumerateProjectConversationsByCursor(client net.Conn, projectID string, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
+// enumerateProjectConversationsByCursorSelfFetch drives the cursor-chain fetch loop by having the
+// bridge self-issue each request (README "Fetch loop"), starting at cursor="0" and continuing
+// until a page explicitly reports no next cursor, or maxPages is exceeded.
+//
+// LIVE EVIDENCE (2026-09-13): a self-issued fetch of this endpoint WITH a `cursor` query
+// parameter returns HTTP 401, even though the existing no-cursor `conversations` method's
+// self-issued fetch of the exact same path (no query string) succeeds — see the README's
+// "self-initiated fetch of cursor-paginated endpoint: NOT AUTHORIZED" evidence. This mirrors the
+// already-documented `/backend-api/conversations` 401 (Phase 5 addendum): something beyond
+// cookies (most likely a per-request anti-automation token the real ChatGPT client computes) is
+// required once a `cursor` parameter is present, and this bridge does not have — and must not try
+// to obtain — that. This function is therefore kept ONLY as a documented negative probe (like
+// `globalConversationsPage` above), never as the primary enumeration mechanism;
+// runCursorExperiment uses enumerateProjectConversationsByCursorPassive instead.
+func enumerateProjectConversationsByCursorSelfFetch(client net.Conn, projectID string, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
 	var pages []cursorFetchedPage
 	cursor := "0"
 	for i := 0; i < maxPages; i++ {
@@ -274,6 +281,140 @@ func enumerateProjectConversationsByCursor(client net.Conn, projectID string, ma
 		cursor = wire.NextCursor
 	}
 	return nil, 0, false, len(pages), firstPageOrder, fmt.Errorf("exceeded max pages (%d) without observing a terminal cursor", maxPages)
+}
+
+// cursorCaptureWireItem is one bridge-observed, passively-captured page of the cursor-paginated
+// project-scoped endpoint (bridge/main.js's recordProjectConversationsCursorCapture). CaptureID is
+// a bridge-internal arrival-order reference, never a pagination position — CursorIn (extracted
+// bridge-side from the real request's own `cursor` query parameter, or "0" if the request omitted
+// it entirely, e.g. the endpoint's very first natural request) is the real pagination identity.
+type cursorCaptureWireItem struct {
+	CaptureID     int                          `json:"captureID"`
+	CursorIn      string                       `json:"cursorIn"`
+	Items         []cursorConversationWireItem `json:"items"`
+	RawItemCount  int                          `json:"rawItemCount"`
+	HasNextCursor bool                         `json:"hasNextCursor"`
+	NextCursor    string                       `json:"nextCursor"`
+}
+
+func fetchCursorCaptures(client net.Conn, id int, projectID string) ([]cursorCaptureWireItem, error) {
+	raw, err := call(client, request{ID: id, Method: "projectConversationsCursorCaptures", ProjectID: projectID})
+	if err != nil {
+		return nil, err
+	}
+	var result []cursorCaptureWireItem
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode cursor captures: %w", err)
+	}
+	return result, nil
+}
+
+// dedupeCapturesByCursorIn collapses passively-observed captures (which can include a benign
+// duplicate — e.g. a React re-render re-issuing the exact same request) down to one page per
+// distinct CursorIn value, keeping the first-seen (lowest CaptureID, i.e. earliest arrival) and
+// requiring every later observation of the SAME CursorIn to agree on content (item count and
+// declared next cursor). A disagreement is treated as schema drift or genuine mid-enumeration
+// account activity, not a benign duplicate, and fails closed rather than silently picking one.
+func dedupeCapturesByCursorIn(captures []cursorCaptureWireItem) ([]cursorCaptureWireItem, error) {
+	ordered := make([]cursorCaptureWireItem, len(captures))
+	copy(ordered, captures)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].CaptureID < ordered[j].CaptureID })
+	seen := make(map[string]cursorCaptureWireItem, len(ordered))
+	order := make([]string, 0, len(ordered))
+	for _, c := range ordered {
+		prev, ok := seen[c.CursorIn]
+		if !ok {
+			seen[c.CursorIn] = c
+			order = append(order, c.CursorIn)
+			continue
+		}
+		if prev.HasNextCursor != c.HasNextCursor || prev.NextCursor != c.NextCursor || prev.RawItemCount != c.RawItemCount {
+			return nil, fmt.Errorf("cursor %s was observed twice with different content (schema drift or account activity mid-enumeration)", redactedCursor(c.CursorIn))
+		}
+	}
+	result := make([]cursorCaptureWireItem, 0, len(order))
+	for _, cursorIn := range order {
+		result = append(result, seen[cursorIn])
+	}
+	return result, nil
+}
+
+// enumerateProjectConversationsByCursorPassive is the primary enumeration mechanism (see the
+// self-fetch 401 evidence on enumerateProjectConversationsByCursorSelfFetch above): it navigates
+// into the Project's own view (which is what naturally issues this endpoint's first real request),
+// then repeatedly harvests whatever the real ChatGPT client has passively been observed
+// requesting, running accumulateCursorChain after every harvest — exactly the same pure,
+// unit-tested logic exercised directly by cursor_test.go — BEFORE attempting another scroll
+// simulation. If no terminal cursor is reached within maxScrollAttempts, this returns an error
+// (never a partial result presented as complete), mirroring every other fail-closed enumeration in
+// this spike.
+func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID string, maxScrollAttempts, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
+	if _, err := call(client, request{ID: idBase, Method: "navigateProject", ProjectID: projectID}); err != nil {
+		return nil, 0, false, 0, nil, fmt.Errorf("navigate to Project view: %w", err)
+	}
+	time.Sleep(2 * time.Second)
+
+	harvest := func() (pages []cursorFetchedPage, firstOrder []cursorConversation, err error) {
+		raw, err := fetchCursorCaptures(client, idBase+1, projectID)
+		if err != nil {
+			return nil, nil, err
+		}
+		deduped, err := dedupeCapturesByCursorIn(raw)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i, c := range deduped {
+			items, perr := parseCursorWireItems(c.Items)
+			if perr != nil {
+				return nil, nil, fmt.Errorf("capture cursor_in=%s: %w", redactedCursor(c.CursorIn), perr)
+			}
+			if i == 0 {
+				firstOrder = items
+			}
+			pages = append(pages, cursorFetchedPage{
+				CursorIn: c.CursorIn, Conversations: items, HasNextCursor: c.HasNextCursor, NextCursor: c.NextCursor,
+			})
+		}
+		return pages, firstOrder, nil
+	}
+
+	for attempt := 0; attempt <= maxScrollAttempts; attempt++ {
+		pages, firstOrder, herr := harvest()
+		if herr != nil {
+			return nil, 0, false, len(pages), firstOrder, herr
+		}
+		if len(pages) > 0 {
+			for i, p := range pages {
+				outLabel := "<terminal>"
+				if p.HasNextCursor {
+					outLabel = redactedCursor(p.NextCursor)
+				}
+				fmt.Printf("page=%d conversation_count=%d cursor_in=%s cursor_out=%s\n", i, len(p.Conversations), redactedCursor(p.CursorIn), outLabel)
+			}
+			convs, dups, comp, aerr := accumulateCursorChain(pages, maxPages)
+			if aerr != nil {
+				return nil, 0, false, len(pages), firstOrder, aerr
+			}
+			if comp {
+				return convs, dups, true, len(pages), firstOrder, nil
+			}
+			pagesFetched, firstPageOrder = len(pages), firstOrder
+		}
+		if attempt == maxScrollAttempts {
+			break
+		}
+		scrollRaw, serr := call(client, request{ID: idBase + 2 + attempt, Method: "simulateSidebarScroll"})
+		if serr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("simulate scroll (attempt %d): %w", attempt, serr)
+		}
+		var scroll sidebarScrollResult
+		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("decode scroll result (attempt %d): %w", attempt, err)
+		}
+		printScrollDiagnostics(attempt, scroll)
+		time.Sleep(1500 * time.Millisecond)
+	}
+	return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("exhausted %d scroll attempts without observing a terminal cursor", maxScrollAttempts)
 }
 
 // knownSampleFingerprintsResult reports SHA-256 fingerprints (never raw IDs) of one already-known
@@ -312,7 +453,13 @@ func fetchKnownSampleFingerprints(client net.Conn, id int) (knownSampleFingerpri
 func runCursorExperiment(client net.Conn, projectID string, oldProjectScopedCount int, oldGlobalFilteredCount int, haveOldGlobalFilteredCount bool) error {
 	fmt.Println("=== Project cursor pagination experiment (Issue #7 spike) ===")
 
-	conversations, duplicates, complete, pagesFetched, firstPageOrder, err := enumerateProjectConversationsByCursor(client, projectID, 50, 700)
+	if _, _, _, _, _, err := enumerateProjectConversationsByCursorSelfFetch(client, projectID, 1, 799); err != nil {
+		fmt.Printf("self-initiated fetch of cursor-paginated endpoint: NOT AUTHORIZED (%v)\n", err)
+	} else {
+		fmt.Println("self-initiated fetch of cursor-paginated endpoint: PASS")
+	}
+
+	conversations, duplicates, complete, pagesFetched, firstPageOrder, err := enumerateProjectConversationsByCursorPassive(client, projectID, 8, 50, 700)
 	if err != nil {
 		fmt.Printf("Project session enumeration: FAIL (%v)\n", err)
 		return nil
