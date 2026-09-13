@@ -28,12 +28,13 @@ type capturedItem struct {
 }
 
 type capture struct {
-	CaptureID     int            `json:"captureID"`
-	CursorIn      string         `json:"cursorIn"`
-	SeriesKey     string         `json:"seriesKey"`
-	Items         []capturedItem `json:"items"`
-	HasNextCursor bool           `json:"hasNextCursor"`
-	NextCursor    string         `json:"nextCursor"`
+	CaptureID      int            `json:"captureID"`
+	CursorIn       string         `json:"cursorIn"`
+	SeriesKey      string         `json:"seriesKey"`
+	Items          []capturedItem `json:"items"`
+	CursorObserved bool           `json:"cursorObserved"`
+	HasNextCursor  bool           `json:"hasNextCursor"`
+	NextCursor     string         `json:"nextCursor"`
 }
 
 type page struct {
@@ -43,25 +44,7 @@ type page struct {
 }
 
 func selectSeries(captures []capture, projectLinkCount int) (string, error) {
-	if projectLinkCount <= 0 {
-		return "", fmt.Errorf("Project conversation list has no identifiable links")
-	}
-	earliest := make(map[string]capture)
-	for _, candidate := range captures {
-		if candidate.CursorIn != "0" || candidate.SeriesKey == "" {
-			continue
-		}
-		current, ok := earliest[candidate.SeriesKey]
-		if !ok || candidate.CaptureID < current.CaptureID {
-			earliest[candidate.SeriesKey] = candidate
-		}
-	}
-	var matches []string
-	for key, candidate := range earliest {
-		if len(candidate.Items) == projectLinkCount {
-			matches = append(matches, key)
-		}
-	}
+	matches := matchingSeries(captures, projectLinkCount)
 	if len(matches) != 1 {
 		return "", fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links", len(matches), projectLinkCount)
 	}
@@ -131,6 +114,9 @@ func pagesForSeries(captures []capture, seriesKey string) (map[string]page, erro
 	for _, candidate := range selected {
 		if candidate.CursorIn == "" {
 			return nil, fmt.Errorf("capture %d has an empty request cursor", candidate.CaptureID)
+		}
+		if !candidate.CursorObserved {
+			return nil, fmt.Errorf("capture %d has no explicit response cursor state", candidate.CaptureID)
 		}
 		items, err := parseItems(candidate.Items)
 		if err != nil {

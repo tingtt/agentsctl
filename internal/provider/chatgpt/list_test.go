@@ -101,6 +101,13 @@ func TestSelectSeriesFailsClosedOnAmbiguity(t *testing.T) {
 	}
 }
 
+func TestSelectSeriesAcceptsUniqueEmptyTerminalProject(t *testing.T) {
+	captures := []capture{capturePage(1, "empty-project", "0", "")}
+	if got, err := selectSeries(captures, 0); err != nil || got != "empty-project" {
+		t.Fatalf("series=%q err=%v", got, err)
+	}
+}
+
 func TestPinnedSeriesIgnoresLaterCapturesFromAnotherSeries(t *testing.T) {
 	captures := []capture{
 		capturePage(1, "project", "0", "", item(conversationA, "A", "2026-01-01T00:00:00Z")),
@@ -127,14 +134,23 @@ func TestAssembleChainRejectsMalformedItemAndMissingTerminalWithinBound(t *testi
 	}
 }
 
+func TestAssembleChainRejectsMissingResponseCursorState(t *testing.T) {
+	page := capturePage(1, "series", "0", "", item(conversationA, "A", "2026-01-01T00:00:00Z"))
+	page.CursorObserved = false
+	if _, complete, err := assembleChain([]capture{page}, "series", 10); err == nil || complete || !strings.Contains(err.Error(), "explicit response cursor") {
+		t.Fatalf("complete=%t err=%v", complete, err)
+	}
+}
+
 func capturePage(captureID int, series, cursor, next string, items ...capturedItem) capture {
 	return capture{
-		CaptureID:     captureID,
-		CursorIn:      cursor,
-		SeriesKey:     series,
-		Items:         items,
-		HasNextCursor: next != "",
-		NextCursor:    next,
+		CaptureID:      captureID,
+		CursorIn:       cursor,
+		SeriesKey:      series,
+		Items:          items,
+		CursorObserved: true,
+		HasNextCursor:  next != "",
+		NextCursor:     next,
 	}
 }
 
