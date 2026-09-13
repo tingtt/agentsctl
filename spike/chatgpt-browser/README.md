@@ -2,96 +2,542 @@
 
 ## Purpose
 
-This spike collects evidence for [Issue #7](https://github.com/tingtt/agentsctl/issues/7). It tests whether `terminal-browser` can own ChatGPT authentication and UI while a small local bridge exposes only Project and conversation metadata to Go.
+This spike collects evidence for [Issue #7](https://github.com/tingtt/agentsctl/issues/7). It evaluates a browser-backed ChatGPT integration in which `terminal-browser` owns authentication and the official ChatGPT UI, while `agentsctl` consumes only the minimum Project / conversation metadata needed for its session catalog.
 
-This is not the ChatGPT provider planned by Issue #6. It does not change the production provider interface, shared session model, capabilities, Agent View, composer, dispatch, configuration schema, or existing providers.
+This is not the production provider planned by Issue #6. It does not change the shared provider/session contracts, Agent View, composer, dispatch, or existing providers.
 
-The observed ChatGPT `/backend-api/...` endpoints are **undocumented and unstable**. They are validation targets, not supported APIs.
+All observed ChatGPT `/backend-api/...` interfaces are **undocumented and unstable**. The implementation must fail closed on schema drift and must never extract browser credentials into Go.
 
-## Architecture
+## Final status
+
+**Browser-backed direction: CONDITIONAL GO.**
+
+The spike has proven, against a real authenticated account and Project:
+
+- persistent browser-owned authentication,
+- Project discovery and stable Project-ID configuration,
+- complete Project session enumeration,
+- stable conversation identity and canonical Open behavior,
+- official-UI interaction for both normal Chat and Work,
+- `Ctrl+]` closing only the browser view while cloud Work state continues,
+- fail-closed behavior for the exercised failure cases.
+
+The Project List mechanism is now proven complete for the exercised account/session:
 
 ```text
-Go spike process
-  ├─ owns and drains a pseudo-PTY
-  ├─ starts terminal-browser with a persistent partition
-  └─ speaks newline-delimited JSON over a mode-0600 Unix socket
-                       │
-                       ▼
-terminal-browser main script
-  └─ validates methods and routes requests over Electron IPC
-                       │
-                       ▼
-isolated preload in chatgpt.com
-  ├─ performs same-origin browser fetches
-  └─ returns allowlisted, sanitized metadata only
+GET /backend-api/gizmos/{project_id}/conversations?cursor=...
+
+pages fetched: 4
+page sizes: 10, 10, 10, 5
+terminal cursor observed: true
+unique conversations: 35
+duplicates_observed: 0
+known normal Chat present: true
+known Work present: true
+Project session enumeration: COMPLETE
 ```
 
-The bridge protocol has these browser methods:
+The sole remaining acceptance blocker identified by this spike is **Chat / Work discrimination**. `messages[].metadata.async_source` is still only corroborated by one human-created Work sample (`n=1`) and is undocumented.
 
-- `pageInfo`: URL, title presence, document readiness, and a non-authoritative login UI signal.
-- `projects`: sanitized Project ID and name (no URL — see the Phase 7/Phase 5-follow-up note on Project URLs in Known limitations).
-- `conversations`: sanitized identity, title, times, archived state, Project association, selected discriminator candidates, response keys, and Open URL candidates, from the project-scoped endpoint.
-- `globalConversations`: the same shape, but sourced from the global (unscoped) conversations endpoint and filtered client-side to the requested Project — needed because the project-scoped endpoint alone under-reports (see Phase 5). Captures whichever `/backend-api/conversations` response arrives first; the Phase 5 pagination follow-up found this can non-deterministically be a `hide_snorlax=true` response that structurally excludes every Project conversation (see below), so this method's count alone is not reliable evidence of completeness.
-- `conversationEvidence`: cross-conversation field/cardinality comparison for up to 20 IDs at once, used to hunt for a Chat/Work discriminator (Phase 6) without exposing conversation content, titles, or per-conversation identity mapping — allowlisted structural values (status/type/kind/mode/origin-style labels) are ID-redacted before being returned.
-- `tasks`: sanitized evidence from the observed, undocumented `/backend-api/tasks` endpoint — investigated as a candidate Work-discovery path and rejected (see Phase 5); reports only counts and structural status-field names, never task content.
-- `openURLProbe`: internally selects one conversation showing the Chat/Work discriminator candidate and one plain conversation (the chosen IDs never cross the socket), navigates each to both `/c/{id}` and `/g/{project_id}/c/{id}`, and reports readiness/login-redirect state plus an ID-redacted URL comparison (Phase 7).
-- `globalConversationsPages`: sanitized, per-capture wire diagnostics for every `/backend-api/conversations` response seen so far, addressed by an immutable `CaptureID` (a bridge-internal reference to one observed response — never a pagination position). Each entry carries the actual pagination identity as `seriesKey` — a SHA-256 digest of the RAW, unredacted query with `offset` removed, sorted and JSON-encoded for unambiguous normalization — plus `offset`/`limit` from the response's own metadata (`null` if unusable rather than assumed to be 0). A separate, human-readable `query` array (redacted the same way as before) is included for diagnostics only and is never used to decide pagination identity, since two different opaque values of the same length would otherwise redact to the same placeholder and collide. Also carries `hideSnorlax`/`isArchived`/`isStarred`/`order` — each a recognized value (e.g. `"true"`, `"false"`, `"updated"`), or the literal `"absent"` (key not present) or `"unknown"` (present with a value outside the recognized set); never a bare boolean that could silently fold "unrecognized" into "false" — `hasUnknownParameters`, `recognizedCollection` (false if the response's item-collection shape itself couldn't be located — never treated as "0 items"), response top-level keys, a scalar-only `meta`, raw and recognized item counts, and a `rawIdentityDigest` fingerprinting the raw page's own conversation identity (not just this Project's subset). Added for the Phase 5 pagination follow-up (2026-09-11), reworked four times since for pagination-identity, schema-drift, coverage, and classifier correctness; never exposes conversation content, IDs, or raw query values.
-- `globalConversationsCaptureItems`: sanitized, Project-filtered conversation items for one already-observed capture (addressed by `CaptureID`, not array position — an evicted or unknown ID is a distinct, explicit error). Also returns privacy-safe raw-page membership as 12-hex SHA-256 conversation fingerprints plus a Project-association boolean, allowing raw before/after deltas without exposing IDs, titles, or content. Two independent schema-drift signals remain: cross-validation of a caller-supplied allowlist of already-known Project conversation IDs against their raw association data (`knownIDsMismatched`), and a universal per-item check that every raw item exposes a recognizable `gizmo_id`/`project_id` own property at all — present but `null` for an ordinary non-Project chat, absent only when the schema has actually drifted (`unrecognizedAssociationCount`; see Known limitations for what this can and cannot prove). Added for the same follow-up and extended for the thirteenth-pass raw-page experiment.
-- `globalConversationsPage`: issues its own same-origin `fetch` to `/backend-api/conversations` with caller-supplied query parameters, rather than waiting for a passive observation. Added to test whether the bridge can self-drive pagination; empirically returns HTTP 401 (see Phase 5 follow-up) — kept only as a documented negative probe, not part of the enumeration path.
-- `simulateSidebarScroll`: dispatches synthetic `scroll` events at every scrollable ancestor of the sidebar's `/c/{id}` anchors, to test whether official ChatGPT UI issues further `/backend-api/conversations` requests as a real user would trigger by scrolling. Each candidate reports only numeric dimensions, before/after scroll positions, and conversation/Project-link counts, so a generated capture can be attributed to a concrete container without exposing DOM text. Added for the same follow-up and instrumented for the thirteenth-pass experiment.
-- `pins`: passively captures and sanitizes the observed, undocumented `/backend-api/pins` endpoint — supporting evidence for the Phase 5 `is_starred` coverage experiment (see the Phase 5 fifth-pass addendum). Reports only a raw top-level item count, a recognized-conversation-ID count, and the recognized conversation IDs themselves (never titles or other content), plus a capture generation counter so a caller can tell a fresh observation from a stale one.
-- `projectConversationsCursor`: self-issued fetch of one page of `GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor}` for the cursor-pagination spike below. Live evidence (2026-09-13) found this returns HTTP 401 once `cursor` is present — kept only as a documented negative probe (now only run via the standalone `-cursor-self-fetch-probe` flag, never by `-cursor-experiment` itself), not part of the enumeration path (see `projectConversationsCursorCaptures` below for the actual mechanism).
-- `projectConversationsCursorCaptures`: passive-only, like `globalConversationsPages` — reports every real, already-observed page of the cursor-paginated project-scoped endpoint, in arrival order, each tagged with the `cursor` query parameter the real ChatGPT client itself used. Reports only conversation `id`/`create_time`/`update_time` plus the page's own opaque next-cursor state — never title or content.
-- `navigateProject`: navigates the browser to the Project's own view (`/g/{project_id}/project`), exposed directly to Go so the cursor-pagination driver can force this view before harvesting captures.
-- `projectScrollRegion`: DOM-inspection-only discovery of the scrollable container most likely to be the Project's own conversation list, recognizing both the bare `/c/{id}` and Project-scoped `/g/g-p-.../c/{id}` link shapes. Selection uses only link counts, href shape, and container dimensions — never link text or title. Reports candidate count, link counts, dimensions, and a bounding rect; never content.
-- `realWheelScrollProject`: sends real Electron `sendInputEvent` mouse-move/mouse-wheel input at the discovered Project scroll region's viewport coordinate — not a synthetic DOM scroll event — since live evidence (2026-09-13, third pass) suggested a synthetic `scrollTop` mutation plus a dispatched `scroll` Event may not reproduce whatever browser-level input-pipeline behavior the real frontend's own pagination trigger depends on. Implemented in the main process (`sendInputEvent` is unavailable from a preload/renderer context); target discovery itself stays in the preload script. Before sending input, also enables CDP `Emulation.setFocusEmulationEnabled` (the mechanism terminal-browser's own bundled source uses — real OS window-manager focus was directly disproven as sufficient by the eleventh live run) and checks `pointerInsideScrollRegion` (preload, via `document.elementFromPoint` — never DOM text) to rule out a coordinate/target mismatch. Falls back to CDP `Input.dispatchMouseEvent` only when Electron's own input showed zero progress across the whole attempt. Reports only before/after scroll position and link counts per tick, the exact wheel-event shape sent, and boolean/count diagnostics — never content.
-- `projectConversationsResponseStatus`: passive-only, privacy-safe counts of every real, observed response to the project-scoped conversations endpoint, bucketed by `cursor`-query-parameter presence and HTTP status (200/401/other) — never a URL, cursor value, header, or response body. Added to separate "the real frontend's own cursor request was rejected" from "the already-known self-fetch probe 401'd" (see the third-live-run ambiguity below).
-- `knownSampleFingerprints`: reports SHA-256 fingerprints (never raw IDs) of one already-known Work-marked conversation and one already-known plain conversation, reusing `openURLProbe`'s existing `async_source`-presence selection over already-captured conversation details — it never resolves or re-derives the Chat/Work discriminator itself.
+Other items such as background/service lifecycle, the IME defect, terminal-browser version pinning, and cross-account re-verification remain production hardening / implementation concerns.
 
-`ping` terminates in the main script and proves the Go-to-socket portion independently of page readiness. Its count-only health data includes the all-response match count and the latest global-conversation capture watermark; the Go side separately derives the target-MATCH watermark, distinguishing no network request from a request for the wrong query series. Unknown methods, malformed IDs, non-JSON responses, non-2xx responses, and unrecognized response shapes fail closed.
+## Recommended production direction
 
-## How to run
-
-Requirements:
-
-- macOS or another Unix host supported by `github.com/creack/pty`.
-- `terminal-browser` on `PATH`.
-- A terminal with kitty graphics protocol support for manual login and UI experiments.
-
-From this directory:
-
-```bash
-go test .
-go run . -hold 35s
-go run . -project-name agentsctl
-go run . -project-name agentsctl -pin-experiment
-go run . -project-name agentsctl -cursor-experiment
-go run . -project-name agentsctl -cursor-self-fetch-probe
+```text
+agentsctl
+  │
+  ├─ local session catalog / local pin state / created-at ordering
+  │
+  └─ mode-0600 Unix socket
+        │
+        ▼
+terminal-browser persistent partition
+        │
+        ├─ main script: Electron / CDP bridge
+        ├─ isolated preload: sanitize captured ChatGPT metadata
+        └─ app-mode: official ChatGPT UI for interaction
 ```
 
-`-cursor-experiment` runs the Project-scoped cursor pagination full-enumeration experiment (see "ChatGPT Project session listing: cursor pagination spike" below). It requires no human-performed mutation, but it does drive real Electron mouse-wheel input at the Project's own conversation-list view (not a synthetic DOM scroll event and not a self-issued fetch) to try to induce the real ChatGPT frontend into fetching further cursor pages, which are then harvested passively. `-cursor-self-fetch-probe` independently re-runs the already-falsified self-issued fetch of the cursor-parameterized endpoint (a confirmed HTTP 401) on its own, for anyone who wants to re-verify that specific negative directly without it cluttering a normal `-cursor-experiment` run.
+Responsibilities:
 
-`-pin-experiment` runs the interactive Phase 5 `is_starred` coverage experiment (see the Phase 5 fifth-pass addendum, and the ninth/tenth-pass addenda for the fresh-process fallback this now uses): it prompts the operator, via stdout, to pin and later unpin one conversation of their own choosing directly in the real ChatGPT UI, and reports target-series membership evidence identified from the `/backend-api/pins` before/after delta. It requires an interactive terminal (it blocks on stdin between phases) and a human performing the actual pin/star actions — this program never issues that mutation itself. Between phases, it restarts the `terminal-browser` process itself (same persistent partition) rather than asking the operator to reload — do not manually reload when prompted; just perform the pin/unpin action and press Enter.
+- `terminal-browser` owns ChatGPT authentication and page execution.
+- Raw ChatGPT responses stay browser-side.
+- Go receives only allowlisted metadata.
+- `agentsctl` owns local ordering and local pin state.
+- ChatGPT remote pin/star state is ignored.
+- Chat / Work interaction is delegated to the official ChatGPT Web UI rather than reimplemented in a native TUI.
 
-The Project name is used only for the one-time lookup in this spike. The proposed production configuration remains ID-based:
+## Configuration
+
+Project name is suitable for one-time setup / display validation, but the stable configuration key should be the Project ID:
 
 ```toml
 [chatgpt]
 project_id = "g-p-..."
 ```
 
-The harness intentionally does not print Project names, Project IDs, conversation titles, or conversation IDs. Use `-project-id` when the ID is already known and should not be printed.
+An optional `project_name` may be retained for display/validation, but must not be the resolver of record.
 
-Lifecycle probes:
+The directory containing the configuration remains the logical CWD for sessions from the configured ChatGPT Project so they can participate in existing `cwd` / `cwd/**` / `all` scopes.
 
-```bash
-go run . -hold 15s -close-pty-after 5s
-go run . -terminal-browser /definitely/missing/terminal-browser
+## Session model decisions
+
+### Identity
+
+Stable provider-qualified identity:
+
+```text
+chatgpt:<conversation_id>
 ```
 
-## Manual login
+### Open
 
-Only the human user should perform login, MFA, or OAuth steps:
+Canonical Open target:
+
+```text
+https://chatgpt.com/c/{conversation_id}
+```
+
+ChatGPT itself normalizes this to the Project-slug URL when appropriate. Production code does not need to discover or construct the Project URL slug.
+
+### Ordering
+
+The cursor endpoint is observed to return sessions in updated-time order:
+
+```text
+created_desc=false
+updated_desc=true
+```
+
+`agentsctl` must ignore server ordering and sort the final complete set locally by:
+
+```text
+created_at DESC
+```
+
+with a deterministic stable-identity tie-breaker.
+
+### Pin state
+
+ChatGPT remote pin/star state is intentionally not synchronized.
+
+```text
+ChatGPT pin/unpin
+  → ignored by agentsctl local pin state
+
+agentsctl Ctrl+T
+  → local pin state only
+  → no ChatGPT mutation
+```
+
+Local pin state is keyed by `chatgpt:<conversation_id>`.
+
+## Complete List mechanism
+
+### Endpoint
+
+The recommended List source is the Project-scoped cursor endpoint:
+
+```text
+GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor}
+```
+
+Initial entry point:
+
+```text
+cursor=0
+```
+
+The response schema observed in the real account is:
+
+```text
+items: [...]
+cursor: <opaque string | terminal value>
+
+item.id
+item.create_time
+item.update_time
+```
+
+No `total`/`count` field is used for completeness.
+
+### Cursor discipline
+
+Cursor values are opaque.
+
+The implementation may:
+
+- compare cursors for exact equality,
+- detect cycles,
+- pass a response cursor back to the next request verbatim.
+
+It must not:
+
+- parse cursor structure,
+- increment cursors,
+- compare cursor magnitude,
+- infer a missing cursor.
+
+Diagnostics expose only `cursor=0` or a short SHA-256 fingerprint, never the raw opaque value.
+
+### Why passive capture is required
+
+A browser-script self-fetch of the cursor-parameterized endpoint consistently returned HTTP 401. This is retained only as a negative probe.
+
+The real ChatGPT frontend's own requests returned HTTP 200 and successfully paginated. Therefore the working path is:
+
+```text
+navigate Project view
+  ↓
+real ChatGPT frontend issues cursor request
+  ↓
+CDP Network capture observes response
+  ↓
+browser-side sanitizer
+  ↓
+Go receives allowlisted metadata
+```
+
+No cookie, access token, authorization header, anti-CSRF value, or full request header crosses the bridge.
+
+### Series identity
+
+`cursor` alone is not enough to identify a logical request series. Live traffic showed multiple structurally different requests sharing the same explicit `cursor=0`, including 5-item and 10-item first pages.
+
+The spike therefore computes a `SeriesKey` from all query parameters **except `cursor`** and pins the selected series for the whole walk.
+
+When multiple series are observed at entry, the spike selects the unique series whose first-page item count matches the independently observed Project-list link count in the DOM; ambiguity fails closed.
+
+This eliminated the earlier false "same cursor, different conversation set" failures.
+
+### Pagination trigger
+
+Synthetic DOM `scrollTop` mutation was not reliable enough to reproduce the real frontend's pagination behavior.
+
+The working input path mirrors terminal-browser itself:
+
+- CDP `Emulation.setFocusEmulationEnabled({enabled:true})`,
+- Electron `webContents.sendInputEvent` mouse-wheel input,
+- platform wheel detent (`40px` on macOS, `120px` elsewhere),
+- `hasPreciseScrollingDeltas: false`,
+- `modifiers: []`.
+
+A CDP `Input.dispatchMouseEvent` wheel path exists only as a fallback diagnostic; the successful full walk did not need it.
+
+### Content-aware bottom tracking
+
+A fixed number of wheel attempts was insufficient because `scrollHeight` grew whenever another page loaded.
+
+Observed growth during the successful run:
+
+```text
+1133 → 1783 → 2433 → ...
+```
+
+The final driver therefore recomputes:
+
+```text
+maxScrollTop = max(scrollHeight - clientHeight, 0)
+distanceToBottom = max(scrollHeight - clientHeight - scrollTop, 0)
+```
+
+on every round, continues toward the **current** bottom, and remains bounded by total wheel ticks / no-progress rounds.
+
+This produced the full chain:
+
+```text
+transition 0→1: PASS
+transition 1→2: PASS
+transition 2→3: PASS
+page 3: terminal cursor
+```
+
+### Completeness criteria
+
+`COMPLETE` is reported only when all of the following hold:
+
+1. enumeration starts from the selected series at `cursor=0`,
+2. every continuation follows the previous response's own cursor,
+3. no cursor cycle is observed,
+4. every page passes schema validation,
+5. a terminal page explicitly reports no next cursor,
+6. every accepted page is accumulated,
+7. conversations are deduplicated by stable conversation ID.
+
+Bottom position, visible-link count, Project-filtered count, and any server `total` value are **not** completeness signals.
+
+## Final live enumeration evidence
+
+The thirteenth cursor-pagination live run on 2026-09-14 reached the spike's success condition:
+
+```text
+transition 0->1: expected_cursor_observed=true
+transition 1->2: expected_cursor_observed=true
+transition 2->3: expected_cursor_observed=true
+
+pages fetched: 4
+page 0: 10
+page 1: 10
+page 2: 10
+page 3: 5
+terminal cursor observed: true
+unique conversations: 35
+duplicates_observed: 0
+failure category: COMPLETE
+Project session enumeration: COMPLETE
+
+response ordering:
+  created_desc=false
+  updated_desc=true
+
+agentsctl ordering (creation time DESC) verified: true
+known normal Chat present: true
+known Work present: true
+```
+
+Every previously established invariant held throughout the full walk:
+
+- selected `SeriesKey` remained pinned,
+- opaque cursor discipline held,
+- zero conversation duplicates were observed,
+- cycle detection remained enabled,
+- schema validation remained fail-closed,
+- no browser credential material crossed into Go,
+- remote ChatGPT pin state remained unused.
+
+## Historical List investigation — superseded
+
+Before the Project cursor endpoint was understood, the spike investigated the global endpoint:
+
+```text
+/backend-api/conversations
+```
+
+with `offset` / `limit`, `hide_snorlax`, `is_archived`, `is_starred`, and `order` query semantics.
+
+Important evidence from that investigation remains useful as historical context:
+
+- `hide_snorlax=true` excludes Project/gizmo conversations.
+- Project-filtered item count is not a pagination exhaustion signal.
+- `total` was not trustworthy as an exhaustion signal.
+- the main sidebar drove global offset pagination, but only for the Project-excluding series.
+- self-issued global pagination fetches returned HTTP 401.
+- a pin/unpin experiment proved only that first-page membership changed; it did **not** prove `is_starred=false` globally excludes pinned conversations.
+- `is_starred=true` was never observed from real UI traffic.
+
+Those findings led to:
+
+```text
+Coverage: UNKNOWN
+Pagination: INCOMPLETE
+Overall session discovery: INCOMPLETE
+```
+
+for the global path.
+
+That path is now **superseded for production List purposes** by the Project-scoped cursor mechanism, which reached an explicit terminal cursor and returned 35 unique sessions. Do not resume the global `hide_snorlax` / `is_starred` / `offset=28` investigation unless the cursor mechanism itself regresses on a future account/session.
+
+The earlier statement that the Project-scoped endpoint "returns only 5 sessions" is also superseded. The 5-item response was a different, smaller request series sharing the same URL path; it was not the complete cursor-paginated Project list.
+
+## Chat / Work discrimination
+
+### Current evidence
+
+The primary candidate remains:
+
+```text
+messages[].metadata.async_source
+```
+
+Observed evidence:
+
+- absent from the original plain-Chat sample set,
+- present in exactly one human-created Work sample,
+- the marked conversation opens and behaves normally through the same canonical `/c/{id}` route,
+- `default_model_slug` / `messages[].metadata.model_slug` changed alongside the Work sample and may be corroborating evidence,
+- top-level `async_status` remained `null` and is not a durable discriminator.
+
+### Status
+
+```text
+Chat / Work discrimination: CONDITIONAL
+sample size: n=1 Work
+```
+
+Before production depends on this marker:
+
+- corroborate it across multiple Work sessions,
+- verify it is absent from ordinary tool-using Chats such as browsing / code-interpreter flows,
+- treat the rule as fragile/versioned because the field is undocumented.
+
+This is the remaining acceptance blocker identified by Issue #7.
+
+## Browser interaction
+
+The official ChatGPT Web UI is the attach-equivalent view.
+
+| Capability | Result |
+| --- | --- |
+| List | **PASS** — complete Project cursor enumeration |
+| Open | **PASS** — bare `/c/{conversation_id}` |
+| Read transcript | **PASS via official UI** |
+| Send message | **PASS via official UI**, IME caveat |
+| Continue Chat | **PASS via official UI** |
+| Continue Work | **PASS via official UI** |
+| Observe Work state | **UI PASS / programmatic CONDITIONAL** |
+| Rename | Out of initial provider scope / not verified |
+| Archive/delete | Out of initial provider scope / not verified |
+
+### `Ctrl+]`
+
+`Ctrl+]` was verified to close only the `terminal-browser` view. Reopening the same Work session showed its cloud execution/session state preserved rather than reset or rerun.
+
+ChatGPT therefore does not need the same provider-level detach semantics as local Claude/Codex PTYs; closing the view does not stop cloud Work.
+
+### IME caveat
+
+`terminal-browser` currently does not distinguish an IME composition-confirm `Enter` from a message-send `Enter`. Japanese IME composition can therefore submit prematurely.
+
+Compose-and-paste works as a workaround. This should be tracked/reported upstream rather than silently baked into agentsctl behavior.
+
+## Authentication
+
+A dedicated persistent partition:
+
+```text
+agentsctl-chatgpt
+```
+
+preserved authenticated ChatGPT state across helper restarts after one manual human login.
+
+Authenticated Project/sidebar fetches succeeded after restart, which is stronger evidence than DOM-only login signals.
+
+Authentication remains browser-owned. The integration must never extract or persist:
+
+- cookies,
+- authorization headers,
+- access/refresh tokens,
+- browser credential/storage databases,
+- complete credential-bearing request headers.
+
+Long-horizon refresh behavior remains an empirical browser-session dependency because ChatGPT exposes no supported public contract for this integration.
+
+## Project discovery
+
+Project discovery through the observed sidebar response is **PASS** for the exercised account:
+
+- authenticated Project enumeration worked,
+- name→ID resolution worked unambiguously,
+- stable configuration should use `g-p-...` ID.
+
+Rename-survival and duplicate-name disambiguation were not explicitly exercised.
+
+## Bridge and security boundary
+
+Transport:
+
+```text
+Go
+  ↓ mode-0600 Unix socket
+terminal-browser main script
+  ↓ Electron IPC
+isolated preload in chatgpt.com
+```
+
+Rules:
+
+- raw ChatGPT payloads stay browser-side,
+- only allowlisted/sanitized metadata crosses IPC/socket,
+- Project/conversation IDs are redacted from diagnostics unless needed internally for stable identity,
+- cursor diagnostics use fingerprints,
+- unknown response shapes fail closed,
+- no failure path falls back to credential extraction.
+
+A previous diagnostic path briefly exposed structural Project/conversation IDs when they appeared as field values. The sanitizer was corrected so reported values pass through the shared ID-redaction helper. No cookie/token/auth header was involved.
+
+## Background helper lifecycle
+
+A Go-owned pseudo-PTY can keep stock `terminal-browser` alive for the spike, but closing that PTY terminates the helper path. Stock `terminal-browser` still has no proven supported display-free/service lifecycle suitable for long-running production discovery.
+
+Status:
+
+```text
+background helper: CONDITIONAL — PoC lifecycle workaround
+```
+
+This is a production integration/hardening concern, separate from the now-proven List semantics.
+
+## Failure behavior
+
+Exercised failure cases fail closed:
+
+- missing `terminal-browser`,
+- stopped helper / broken bridge,
+- logged-out browser partition,
+- malformed/mismatched bridge responses,
+- unknown cursor schema,
+- broken cursor chain,
+- cursor cycle,
+- ambiguous series selection,
+- incomplete scroll walk without terminal cursor.
+
+A partial list must never be presented as complete.
+
+## Results
+
+| Phase | Result |
+| --- | --- |
+| 0. Baseline | CONDITIONAL |
+| 1. Persistent authentication | PASS |
+| 2. Background helper | CONDITIONAL — PoC workaround only |
+| 3. Browser bridge | PASS |
+| 4. Project discovery | PASS; rename/duplicate-name robustness NOT VERIFIED |
+| 5. Session discovery | **PASS** — Project cursor pagination reached terminal cursor; 35 unique / 0 duplicates |
+| 6. Chat / Work discrimination | **CONDITIONAL** — `async_source`, n=1 Work sample |
+| 7. Stable identity and Open | PASS |
+| 8. App-mode UX | PASS, with IME defect |
+| 9. `Ctrl+]` semantics | PASS |
+| 10. Failure behavior | PASS for exercised cases |
+
+## Known limitations
+
+- All investigated `/backend-api/...` endpoints and schemas are undocumented and can change without notice.
+- Session discovery is proven on one real account/Project; cross-account and version-window re-verification is still desirable before production rollout.
+- The List path depends on passive capture of the real frontend's cursor requests; a script-issued cursor fetch is unauthorized.
+- `terminal-browser` has no proven production-grade display-free service lifecycle; the spike uses a pseudo-PTY owner.
+- Chat / Work discrimination remains n=1 and is the remaining acceptance blocker.
+- IME composition-confirm `Enter` can submit prematurely in the embedded browser UI.
+- Project rename / duplicate-name behavior is not explicitly tested; stable ID configuration avoids relying on names at runtime.
+- The preload sanitizer deliberately rejects unknown response shapes; a ChatGPT schema change should disable discovery rather than silently misclassify data.
+- The spike tested `terminal-browser` v0.8.0 while v0.8.1 was current at the start of investigation; the production compatibility window still needs to be pinned/retested.
+
+## How to run
+
+Requirements:
+
+- macOS or another Unix host supported by `github.com/creack/pty`,
+- `terminal-browser` on `PATH`,
+- a kitty-graphics-capable terminal for manual login / visible app-mode experiments.
+
+From `spike/chatgpt-browser`:
+
+```bash
+go test .
+go run . -hold 35s
+go run . -project-name agentsctl
+go run . -project-name agentsctl -cursor-experiment
+```
+
+Historical diagnostics remain available:
+
+```bash
+go run . -project-name agentsctl -cursor-self-fetch-probe
+go run . -project-name agentsctl -pin-experiment
+```
+
+The self-fetch probe is a known-negative HTTP-401 check and is not part of normal enumeration.
+
+Manual login remains a human action:
 
 ```bash
 terminal-browser open https://chatgpt.com \
@@ -99,647 +545,38 @@ terminal-browser open https://chatgpt.com \
   --no-merge
 ```
 
-After login, quit the browser normally and run the same command again. Authentication persistence is proven only if an authenticated, non-sensitive browser request succeeds after that restart. DOM absence of a login button is not sufficient evidence.
+Do not dump cookies, inspect browser credential databases, extract bearer/refresh tokens, or reuse unrelated CLI credential stores.
 
-Do not dump cookies, inspect browser credential databases, extract bearer or refresh tokens, or reuse `~/.codex/auth.json`.
+## Verification
 
-## Experiments
+The cursor-pagination implementation was repeatedly checked with:
 
-Results below were recorded 2026-09-09 through 2026-09-11 on macOS 14.4 / Darwin 23.4.0 arm64, Go 1.26.0, and `terminal-browser` v0.8.0. The current upstream release was v0.8.1; upstream `main` was `b16b8574a026ba0ef451e7e377e12b5747c47706`. Phases 0–3 ran in a sandboxed harness terminal without kitty graphics support; Phases 1 and 4–7 were re-run by the repository owner from their own terminal, against their real ChatGPT account and a real Project, after one manual login and after creating one ChatGPT Work/Agent session for Phase 6/7 testing.
-
-### Phase 0: baseline
-
-**Hypothesis:** The repository and installed runtime can support an isolated Go spike.
-
-**Method:** Inspected Git state, tool versions, help output, dependency declarations, terminal capability, and current upstream source. Ran the existing test suite without mutation.
-
-**Observed:** The `main` worktree was clean. Go 1.26.0 and `github.com/creack/pty` v1.1.24 were available. Installed `terminal-browser` was v0.8.0 at `/Users/taku_ting/.local/bin/terminal-browser`, one release behind v0.8.1. The current Codex terminal failed the kitty graphics check. The unprivileged full suite was sandbox-blocked on Go cache and Unix socket access; this was an environment failure, not a baseline test failure.
-
-**Result: CONDITIONAL**
-
-**Implication:** Background tests can run by explicitly skipping the graphics check, but visible UI tests require a kitty-capable terminal. Version drift must be included in compatibility decisions.
-
-### Phase 1: persistent authentication
-
-**Hypothesis:** A dedicated partition preserves a safely reusable ChatGPT login across browser restarts.
-
-**Method:** Started `agentsctl-chatgpt`, stopped its owner, restarted the same partition, and requested the Project sidebar inside the browser context.
-
-**Observed (run 1, sandboxed session, no kitty terminal):** The partition was logged out: the browser request returned HTTP 401 after restart. The attempted foreground login browser could not render because the terminal lacked kitty graphics support. No credential fallback was attempted.
-
-**Observed (run 2, human-operated terminal, after manual login outside this harness):** `go run . -hold 35s` against the same `agentsctl-chatgpt` partition, in a fresh helper process, reported `page: ... login_prompt=false account_control=true` immediately on load and again after a 35s hold with `ready=complete`. Both are non-sensitive DOM signals (absence of a "Log in"/"Sign up" control and presence of an account/profile control), not a cookie or token check.
-
-**Observed (run 3, same partition, immediately following):** `go run . -project-name agentsctl -hold 10s` performed an authenticated same-origin `fetch` of the sidebar and Project-conversations endpoints and got real data back: `projects: PASS count=18`, `conversations: PASS count=5 repeated_ids_stable=true`. This is a genuine authenticated-request proof, not a DOM signal — a stale or absent session would have surfaced as HTTP 401, exactly as it did in run 1.
-
-**Result: PASS**
-
-**Implication:** Login performed once by the human in `agentsctl-chatgpt` survived a full helper stop/restart cycle and produced two successful authenticated fetches against real endpoints. Persistent authentication for this partition is proven for this session; long-term persistence (across days, token refresh boundaries) is not covered by this single restart.
-
-```text
-persistent login: PASS (manual login performed once by the human outside this harness)
-restart persistence: PASS — confirmed by authenticated fetch (projects count=18, conversations count=5) after a stop/restart cycle, not just DOM signal
-manual login required: yes — performed once
-notes: run 1 (sandboxed, no kitty terminal) was logged out (HTTP 401); runs 2-3 (human terminal, same partition, after manual login) showed authenticated DOM state and successful authenticated fetches after a fresh restart
+```bash
+go build
+go vet ./...
+go test -race ./...
+node --check bridge/main.js
+node --check bridge/preload.js
 ```
 
-### Phase 2: background helper feasibility
-
-**Hypothesis:** A Go-owned pseudo-PTY can keep stock `terminal-browser` alive without drawing its output.
-
-**Method:** Started the browser with `TERMINAL_BROWSER_SKIP_GRAPHICS_CHECK=1`, continuously copied PTY output to `io.Discard`, held it for 35 seconds, then repeated bridge and page probes. Separately closed the PTY master after 5 seconds and inspected the browser registry after owner exit.
-
-**Observed:** Browser and bridge remained alive for 35 seconds; the page reached `readyState=complete`. Closing the PTY caused the bridge to fail with `broken pipe`. Owner exit removed the browser from `terminal-browser ls --all --json`. A bridge socket client could disconnect and reconnect without ending the browser, but the terminal-browser client/PTY could not.
-
-**Result: CONDITIONAL — B. PoC workaround only**
-
-**Implication:** The pseudo-PTY is an effective experiment harness, not a production service lifecycle. A supported no-render/service mode or equivalent upstream lifecycle contract is needed.
-
-### Phase 3: browser bridge
-
-**Hypothesis:** A request can cross Go, a local socket, Electron main IPC, preload, the ChatGPT page, and return without exposing browser credentials.
-
-**Method:** Sent `ping` and `pageInfo` through the mode-0600 socket. Closed and reconnected the Go socket client. Held the helper for 35 seconds and repeated the probes.
-
-**Observed:** Initial and post-hold round trips passed. The page reported the expected origin and eventually reached `readyState=complete`. No cookie, authorization header, token, storage value, or raw API payload crossed the bridge.
-
-**Result: PASS**
-
-**Implication:** `--main-script` plus `--preload` is viable as the narrow transport. Its lifecycle still inherits the Phase 2 limitation.
-
-### Phase 4: Project discovery
-
-**Hypothesis:** The observed sidebar endpoint can resolve the configured Project by stable `g-p-...` ID.
-
-**Method (run 1, sandboxed, logged out):** Called observed, undocumented `GET /backend-api/gizmos/snorlax/sidebar` inside the browser and allowed only recognized Project metadata through the sanitizer.
-
-**Observed (run 1):** HTTP 401 in the logged-out partition. No response schema or Project metadata was accepted.
-
-**Method (run 2, human terminal, authenticated partition):** `go run . -project-name agentsctl -hold 10s`. The harness fetched the sidebar payload, sanitized it to `{id, name, url}` triples, and resolved the single Project matching the given name to its ID without printing either.
-
-**Observed (run 2):** `projects: PASS count=18 (names and IDs not logged)`. Name-to-ID resolution succeeded unambiguously (the harness errors out on 0 or >1 matches, and did neither). `capture: ... projects=true` confirmed the underlying debugger capture matched the exact endpoint path.
-
-**Result: PASS** (for existence, authenticated fetch, and unambiguous name→ID resolution). **NOT VERIFIED** for rename-survives-ID and duplicate-name-disambiguation specifically, since those require mutating an existing Project or having two Projects share a name — neither was attempted, consistent with the no-destructive-ops constraint.
-
-**Implication:** Stable ID resolution from an authenticated context is proven. Rename/duplicate-name robustness remains a documented, untested assumption rather than a proven property.
-
-### Phase 5: session discovery
-
-**Hypothesis:** The observed Project conversations endpoint yields a reproducible session list.
-
-**Method (round 1):** Called observed, undocumented `GET /backend-api/gizmos/{project_id}/conversations` twice in sequence for the resolved Project and compared the returned conversation IDs.
-
-**Observed (round 1):** `conversations: PASS count=5 repeated_ids_stable=true (titles and IDs not logged)`. Both calls returned the same 5 conversation identities (`sameIDs` requires exact set equality, ignoring order); every item carried a non-empty ID and the requested Project association, or the harness would have failed closed.
-
-**Method (round 2, after a human created one ChatGPT Work/Agent session in the same Project):** Reran the same command. The project-scoped endpoint still returned exactly 5, unchanged. To check whether that endpoint was structurally incomplete rather than just missing the new item, the harness was extended to also capture the observed, undocumented global (unscoped) `GET /backend-api/conversations` and locally filter it to entries whose `gizmo_id`/`project_id` matched the resolved Project — without ever sending the raw payload or the filtered IDs across the socket.
-
-**Observed (round 2):** `global conversations: PASS project_scoped_via_global=17 new_beyond_project_list=13`. The global, Project-filtered view found 17 conversations associated with the Project — 13 more than the project-scoped endpoint returned. The project-scoped `/backend-api/gizmos/{project_id}/conversations` endpoint is not a complete session list; it appears to return only a bounded/recent subset. A separate, undocumented `GET /backend-api/tasks` was also captured as a candidate Work-discovery endpoint and rejected: `tasks: PASS conversation_id_like=50 overlap_with_project_conversations=0 status_fields=status distinct_status_values=3` — 50 items, none of which overlap this Project's known conversations, consistent with `/backend-api/tasks` being ChatGPT's separate scheduled-automation "Tasks" feature, not Agent/Work-mode conversations.
-
-**Result: PASS, with a corrected method.** Reproducible session discovery requires the global `/backend-api/conversations` endpoint filtered client-side by Project association, not the project-scoped endpoint alone. `/backend-api/tasks` is a rejected lead, not a discovery path.
-
-**Implication:** `chatgpt:<conversation_id>` is a reproducible identity (stable across the two project-scoped reads, and the newly-discovered items were also stable IDs on inspection). The real blocker this phase surfaces is a discovery-completeness gap, not an identity-stability gap: a production adapter built only against `/backend-api/gizmos/{project_id}/conversations` would silently miss most of a Project's sessions, Work included.
-
-#### Phase 5 addendum: pagination and completeness follow-up (2026-09-11)
-
-The round-2 result above established that the global endpoint out-reports the project-scoped one (17 vs. 5), but never established that the global endpoint's own single captured response was itself complete — `/backend-api/conversations` could in principle paginate, and a single-response capture would silently under-report just like the project-scoped endpoint did. This follow-up investigated that specific gap.
-
-**Phase A (inspect the existing implementation, code-reading only):** `capturedGlobalConversations` in `bridge/main.js` is a single variable, overwritten by whichever `/backend-api/conversations` response the passive CDP capture sees first; `globalConversationsFrom` filters that one payload's nested objects by Project ID. There was no cursor, offset, or "fetch until exhausted" logic anywhere in the path — the round-2 PASS was a property of one response, not of a verified-complete one. This matched the task's warning not to judge API completeness from reading code alone, so it was treated as an open question rather than a finding.
-
-**Phase B (observe real wire behavior, live account, `-project-name agentsctl`):** Extending the CDP capture to log query keys/values (opaque values length-redacted) and response top-level keys per observed request revealed:
-
-- The endpoint takes `offset`, `limit` (28 in every observation), `order` (`updated`), `is_archived`, `is_starred`, and a previously-undocumented `hide_snorlax` flag; responses carry `items`, `limit`, `offset`, and `total`.
-- **`hide_snorlax=true` excludes every Project/gizmo-associated conversation from `items`.** Across every live observation, a `hide_snorlax=true` page's Project-filtered item count was exactly 0, regardless of how many raw items it returned; only `hide_snorlax` false-or-absent pages ever contained this Project's conversations. `gizmo_type: "snorlax"` was already known (Phase 6) as the internal label for Project/gizmo conversations, so this is very likely what the flag is named for. **This means the original Phase 5 round-2 result was not deterministically correct: the single-shot capture could just as easily have landed on a `hide_snorlax=true` response and reported 0 Project conversations from the "corrected" method, with no error to signal that.** `globalConversations`'s doc comment above now reflects this.
-- `total` is not trustworthy as an exhaustion signal: at the same point in a session it read identically (29) for both a `hide_snorlax=true` and a `hide_snorlax=false` page despite their very different item-level filtering, and after a scroll-triggered second page of the `hide_snorlax=true` series it jumped 29 → 57 with no plausible 28 new conversations having been created — evidence, not assumption, of an approximate/filter-unaware counter, not a stable upper bound.
-- Simulating sidebar scroll (dispatching synthetic `scroll` events at the sidebar's scrollable containers) did make the real ChatGPT UI issue a further request with `offset` advanced from 0 to 28 — proof that official ChatGPT Web does paginate this endpoint via further requests as a user scrolls — but only ever on the `hide_snorlax=true` series. The `hide_snorlax` false/absent series (the one that includes this Project's conversations) was never observed advancing past `offset=0` in any run, including runs where the scroll simulation successfully advanced the other series.
-- A same-origin `fetch` issued by the bridge's own script directly (not observed passively) was rejected with **HTTP 401** in every attempt. Cookies alone (`credentials: "include"`) are not sufficient for this endpoint from an arbitrary script context; whatever the real ChatGPT client attaches beyond cookies is not something this bridge has, or should try to obtain (extracting it would cross the credential boundary). This also means the bridge's dead-code direct-`fetch` branches for `projects`/`tasks`/`conversations` (never reached, because `main.js` always intercepts those methods and serves passively-captured data first) were themselves untested and would likely fail the same way if ever reached.
-
-**Phase C (pagination contract classification):** **C. offset/page pagination** for the wire mechanism itself — `offset`/`limit` plus an `items` array is an explicit, non-cursor contract, directly observed advancing under real UI action. This is *not* classified as A (single response complete) merely because a response contained N items, per the task's explicit warning.
-
-**Phase D (attempt complete enumeration):** `main.go` gained `mergeProjectPages` — a pure function (no live browser needed, fully unit-tested in `main_test.go`) that dedupes conversations by ID across observed pages and decides exhaustion only from a page whose raw item count is strictly less than its requested `limit` (never from `total`, given the instability above), and `enumerateAllConversations`, which drives the only mechanism this bridge actually has for reaching further pages — repeatedly asking the real page to scroll and passively harvesting whatever that produces — since self-issued fetches 401. It fails closed (returns an error, not a partial success) on: a `hide_snorlax`-excluding page reaching the merge step, a non-positive `limit`, a conversation missing a stable ID, the same page sequence reporting different conversations on re-observation, and more pages than a defensive bound (20).
-
-**Observed (live, three separate runs on 2026-09-11):** In every run, `global conversations complete enumeration: INCOMPLETE (exhaustion not observed within bound) count_so_far=16 pages_used=N` — the loop correctly refused to report completion, because the only page series that includes this Project's conversations was never observed advancing past `offset=0`, and a full (28-of-28) first page cannot by itself prove no second page exists.
-
-**Historical result: CONDITIONAL, method-corrected again.** The pagination *mechanism* was positively identified (offset/limit, real UI-driven advancement proven for one query variant), and the *filter* that determines Project-conversation inclusion was identified (`hide_snorlax`) where the original round-2 method didn't check it at all. This paragraph originally inferred that the Project's current size was ≤ 28 and fit in one page. The thirteenth-pass review below supersedes that inference: the observed 16 is a Project-filtered subset of a full 28-item raw global page, not the Project universe. True multi-page behavior of the Project-inclusive query was never exercised, and the bridge cannot force it: self-fetch is unauthorized, and the real UI's own scroll-driven pagination was only observed advancing the *other*, Project-excluding query series.
-
-**Historical implication, superseded:** this paragraph originally described `count_so_far=16` as reasonable completeness evidence for a small Project. Later review found that this compared unlike layers: raw global page → Project-filtered subset → agentsctl active-session universe. Neither the project-scoped endpoint's historical count nor the filtered count proves the Project's size or first-page sufficiency. A production adapter must treat this full raw first page as unexhausted; see the thirteenth- and fourteenth-pass corrections and the updated Recommendation.
-
-**Post-review hardening (2026-09-11, same day):** a review of this PoC found the first implementation's pagination identity was wrong, not just incomplete: it used the capture arrival-order index as if it were a page/offset position, so a history-buffer eviction could silently reinterpret an old index as a different page, and it never checked that two captures actually belonged to the same query filter (e.g. `is_archived`) before treating them as continuations of one series. It also compared re-observations of "the same page" using the already-Project-filtered item list rather than the raw page, which could mask a raw-page change that happened not to affect the filtered subset. This was corrected: every capture now gets an immutable CaptureID (a bridge-internal reference only, never a pagination position); the real pagination identity is an explicit `SeriesKey` (the query with `offset` removed) plus `Offset`, both taken from the response's own metadata; exhaustion requires a *contiguous* `offset=0, limit, 2×limit, ...` chain ending in a short page, not merely the highest-numbered capture seen; re-observation consistency is checked against a raw-page identity digest (all raw item IDs, not just this Project's); and a page is now rejected as schema drift if any raw item's ID can't be recognized, or if a conversation ID already known from the project-scoped endpoint no longer resolves to the configured Project. Re-running against the same account afterward reproduced the same result — `INCOMPLETE`, count 16 — confirming the hardening changed *how carefully* the PoC checks its own work, not the underlying Phase 5 conclusion.
-
-**Second post-review hardening pass (2026-09-11, same day):** a further review found three more ways the pagination PoC could still misjudge completeness. First, an unrecognized item-collection shape (e.g. a future schema renaming `items`) fell through as `rawItemCount=0`, indistinguishable from a legitimate empty final page — fixed with an explicit `recognizedCollection` flag that fails closed when false, checked before any short-page/exhaustion reasoning runs. Second, `SeriesKey` was being built from the already-redacted diagnostic query, where two different opaque values of the same length both display as `<redacted:Nch>` and could therefore collide into one (wrong) series — fixed by computing it instead as a SHA-256 digest of the raw, unredacted, offset-excluded, sorted query, so no raw value crosses the bridge but no collision is possible either. Third, the association-schema-drift check was previously limited to conversation IDs already known from the project-scoped endpoint, which could miss drift on a page containing only conversations the harness had never seen before; live evidence (multiple captures, 28 raw items each) showed every conversation item — Project-associated or not — always carries `gizmo_id` or `project_id` as an own property (present but `null` for an ordinary non-Project chat), so this was safely strengthened into a universal per-item check, kept alongside (not instead of) the known-ID cross-check. All three are unit-tested in `main_test.go`. Live re-verification (three runs) reproduced the same `INCOMPLETE`, count 16 result — Phase 5 remains CONDITIONAL.
-
-**Third post-review hardening pass — pagination completeness vs. coverage completeness (2026-09-11, same day):** a further review found that even a fully pagination-exhausted `SeriesKey` proves nothing about *which* universe of sessions it represents — `is_starred=true` observed to be short and complete only proves "all starred conversations are enumerated," not "all Project conversations are." `SeriesKey` is an opaque identity digest by design (see above); it was never meant to carry meaning, so completeness judgments built directly on it were conflating "this page-series is exhausted" with "this is the page-series agentsctl needs."
-
-This is now two explicit, separately-reported axes: **Pagination** (is the required series' offset chain exhausted) and **Coverage** (is the required-series *definition* itself trustworthy as the full intended universe). The intended universe was determined from the existing production code, not guessed: `session.Provider.List(ctx, archived bool)` already exists and `Controller.Load` always calls it with `archived=false` — "the normal List" is the active, non-archived session set, and archived is production's own separate, explicit dimension (there is no "starred" concept anywhere in agentsctl). Each capture now also carries a `seriesDescriptor` — allowlisted, safe semantic metadata (`isArchived`, `isStarred`, `order`, `hasUnknownParameters`) — kept deliberately separate from `SeriesKey`: the descriptor is used only to classify which universe a series belongs to, never as pagination identity, and any query parameter this bridge doesn't recognize sets `hasUnknownParameters`, excluding that series from being trusted as a known target regardless of how its other fields look.
-
-The one required series for "active Project sessions" — `hide_snorlax=false`, `is_archived=false`, `is_starred=false`, no unrecognized parameter — matches exactly what the real ChatGPT UI's default view was observed sending every time. An irrelevant series (e.g. a hypothetical `is_archived=true` observation) is now excluded *before* it ever reaches schema/pagination validation, so it can never block or corrupt completeness of the series that actually matters — unit-tested directly, including the case where the irrelevant series is itself malformed.
-
-One dimension could not be confirmed or ruled out: whether `is_starred=true` conversations sit in a separate bucket excluded from the default view. No real UI action in this account ever requested `is_starred=true` to test directly. Indirect evidence — a separate `/backend-api/pins` endpoint, observed independently in real traffic — suggests pin/star state is handled apart from list membership, but this was not directly tested. Coverage is therefore reported as **UNKNOWN**, not COMPLETE, even in every live run where Pagination reached exhaustion for the (as it happens, still-incomplete) target series. Overall completeness requires both axes COMPLETE; live re-verification (three runs) reproduced `pagination=INCOMPLETE coverage=UNKNOWN overall=INCOMPLETE count=16` every time — Phase 5 remains CONDITIONAL, and its remaining gap is now stated precisely as two separate open questions rather than one.
-
-**Fourth post-review hardening pass — classifier hardening and live ingestion (2026-09-11, same day):** the third pass's claim that "an irrelevant series is excluded before it ever reaches schema/pagination validation" was only true of the pure `evaluateTargetPagination` function — the live-ingestion path (`enumerateAllConversations`) still ran collection/offset/limit validation and fetched/sanitized items for *every* non-`hide_snorlax` capture before any coverage-layer filtering happened, so a malformed but genuinely irrelevant capture (e.g. `is_archived=true` with an unrecognized collection shape) could fail the whole enumeration — a false FAIL, the mirror image of the false COMPLETE this hardening series has been closing off. Fixed by classifying every capture (`classifyForActiveList`) immediately after computing its descriptor and *before* any of that validation: **MATCH** proceeds to the existing pipeline; **DEFINITELY_IRRELEVANT** is recorded as evidence and skipped entirely, with no collection/offset/limit check and no item fetch; **UNKNOWN** is also skipped from pagination, but is never treated as harmless — it's collected and composed into `Coverage.Reason`, so an unclassifiable capture can never be silently ignored the way "irrelevant" is allowed to be.
-
-This pass also closed two related gaps. First, `hide_snorlax`/`is_archived`/`is_starred`/`order` previously fell back to a plain `value == "true" ? true : false`-style boolean, silently treating any unrecognized value (a typo, a future new mode) the same as the confirmed "false" case; each is now one of a small recognized-value set, or the literal string `"absent"` (key not present) or `"unknown"` (present but unrecognized) — never coerced into a recognized value's meaning. `hide_snorlax`'s `"false"` and `"absent"` states are deliberately still treated alike (real evidence directly supports it — see above); `is_archived`/`is_starred`/`order` are not given the same benefit, since their `"absent"` state has never been directly observed on the real target series. Second, `order=updated` — previously tracked but not required — is now part of `activeListRequiredSeries` (`RequireOrder`): a different or absent order value no longer silently matches the target.
-
-Live re-verification (three runs) reproduced the identical `pagination=INCOMPLETE coverage=UNKNOWN overall=INCOMPLETE count=16` result, with every real capture correctly classified `MATCH` (`hide_snorlax=absent is_archived=false is_starred=false order=updated`) — the classifier hardening changed how carefully captures are screened before validation, not the underlying Phase 5 conclusion.
-
-**Fifth pass — is_starred coverage experiment tooling (2026-09-11, same day):** the classifier hardening pass above left one deliberate gap open: `activeListCoverageCaveat` states that whether `is_starred=false` excludes starred/pinned conversations was never directly tested, only inferred from indirect evidence (a separate `/backend-api/pins` endpoint observed in real traffic). This pass adds the spike tooling needed to test it directly, per the task that requested it: pin/star one active Project conversation via the real ChatGPT UI (a human-performed, reversible metadata mutation — this spike never issues that mutation itself, consistent with the security/mutation boundary above) and observe whether it disappears from the default `is_starred=false` target series.
-
-A pre-selection design problem had to be solved first: the security boundary forbids this program from ever printing a conversation's title or real ID, but the operator needs to know *which* conversation to pin, and the program needs to know *which one was affected* to check its membership before and after. Asking the operator to identify a conversation by an ID or title this program prints would violate that boundary from the wrong direction (this program would have to display it first). The chosen design avoids identifying a conversation at all: the operator pins/unpins **any one** conversation of their own choosing directly in their own authenticated ChatGPT UI (which already shows them its title — this program never needs to), and the *affected* conversation is identified purely from the set difference between two enumerations of the active target series, reported only as a `conversationFingerprint` (SHA-256, truncated to 12 hex characters) — never a raw ID. This is implemented as:
-
-- `conversationFingerprint`/`diffConversationIDs`/`compareMembership` (`main.go`) — pure, unit-tested functions. `compareMembership` safely reports Project-filtered first-page membership changes. A later correction established that even a clean single-item disappearance is not a semantic Outcome B proof until raw-page ordering/pagination is separated from filtering.
-- A new bridge method, `pins`, passively captures the observed, undocumented `/backend-api/pins` endpoint the same way every other endpoint in this bridge is captured (`bridge/main.js`'s `captureTarget`/`attachCapture`), sanitized by a new `pinsFrom` (`bridge/preload.js`) that recognizes only conversation-ID-shaped values via a deep object walk (the pins payload's exact shape was unconfirmed at design time) — never a pinned item's title. A `pinsCaptureID` counter lets the caller distinguish a genuinely fresh observation from a stale one, addressing the "avoid stale/cached data" requirement (Phase E) for the pins side of the evidence.
-- `runPinExperiment` (`main.go`, behind a new `-pin-experiment` flag) drives the full interactive cycle end to end: baseline enumeration + pins snapshot → prompt the operator to pin one conversation and refresh the real UI → re-enumerate and compare → look for any passively-observed `is_starred=true` capture and check whether the affected conversation appears there (the secondary question, Phase F) → prompt the operator to unpin/restore → re-enumerate once more and confirm the series returned to its exact baseline membership. It never issues a pin/star mutation itself; every mutation step is an explicit human action via the real ChatGPT UI, as the safety boundary requires.
-
-All of the above was implemented and verified structurally (`go build`, `go vet`, `go test -race`, `node --check` on both bridge files — see Verification below) in this same environment, which lacks kitty graphics support and therefore cannot itself drive `terminal-browser --app-mode` interactively. **The live experiment itself (`go run . -project-name agentsctl -pin-experiment`, run interactively by the repository owner from a kitty-capable terminal, performing the pin/unpin steps in the real ChatGPT UI as prompted) has not yet been executed** — consistent with this spike's established methodology (Phases 1, 4-9 all required the same human hand-off) and with the safety boundary's requirement that pin/star mutations only ever happen via explicit human UI action. Until that live run happens, `activeListCoverageCaveat` and `Coverage: UNKNOWN` remain exactly as the classifier hardening pass left them — this pass adds the capability to resolve the caveat, it does not itself resolve it.
-
-**Implication:** The `is_starred` blocker's resolution now depends only on one interactive live run, not on further design or implementation work. Whoever performs it should record, in addition to the program's own output: the exact UI label used to pin (Pin/Star/Favorite/other — the program cannot observe UI semantics beyond DOM structure it already checks for unrelated purposes, so this is an operator observation), and should update the Results table below and re-run the classifier/coverage tests if the live evidence changes what `activeListRequiredSeries`/`classifyForActiveList` should treat as safe.
-
-**Sixth pass — first live run was inconclusive; added an explicit freshness gate (2026-09-11, same day):** the repository owner ran `go run . -project-name agentsctl -pin-experiment` against the real account and performed both prompted actions (pin, then unpin, each followed by a UI reload/navigation as instructed). The raw output showed `membership evidence (pin): disappeared=[] appeared=[]` and `restore evidence: PASS`, which at first glance reads as Outcome A. It is not: the tool's own `after-pin pins: ... fresh=false` line (the pins freshness flag added in the fifth pass) showed the `/backend-api/pins` capture never advanced past its pre-experiment `captureID`, and closer inspection of the printed `global conversations wire capture` lines showed the *same* `series`/`digest` pair (`ea86234cf48d` / `b9220daa9e59`) repeated identically across the baseline, after-pin, and after-restore phases — no new `/backend-api/conversations` response was ever captured for the rest of the run after the page's initial settle. `enumerateAllConversations`'s own `seenCaptures` bookkeeping is local to each call, so it silently re-derives the same result from the bridge's replayed capture history even when nothing new was fetched; a "no membership change" result under those conditions is not evidence of anything — it is indistinguishable from "no new data was ever fetched," which is exactly what happened.
-
-This was a real gap in the fifth pass's tooling, not just an unlucky run: only the pins side had a freshness check, the target-series side did not. Fixed by adding `maxObservedCaptureID` (queries the bridge's full `/backend-api/conversations` capture history and returns the highest `CaptureID` observed, across any query shape — not just MATCH-classified target-series ones) and `membershipOutcome` (pure, unit-tested), which now refuses to report Outcome A or B unless the captureID watermark actually advanced between the two observations being compared; otherwise it reports `NOT VERIFIED` explicitly, with the reason. `runPinExperiment` now prints an explicit `conversations capture watermark: baseline=... after_pin=... fresh=...` line before every membership verdict, and the restore-phase PASS/NOT VERIFIED verdict is gated the same way.
-
-**Why the refresh likely failed:** the prompt's "reload or navigate within the Project sidebar" instruction does not, on its own, guarantee a network refetch of this specific query — ChatGPT's sidebar is a client-rendered SPA that may serve cached in-memory state for a view it already has data for, and the debugger capture only sees what the browser actually sends over the network. A follow-up run should use a more forceful refresh: a hard reload (not just in-app navigation), or navigating away to an entirely different Project/route and back, to force a genuine re-fetch — and should confirm the tool's own `fresh=true` line before trusting any membership verdict it prints.
-
-**Result: C. NOT VERIFIED** (unchanged from the fifth pass, now for a directly-observed reason instead of "not yet run"). The live run this pass performed did not produce trustworthy evidence either way, and the tool itself now says so explicitly rather than reporting a misleading Outcome A. A re-run with a more forceful refresh action is still needed.
-
-**Seventh pass — second live run exposed a watermark-timing bug in the sixth pass's own fix (2026-09-11, same day):** a second live run (same account, same command) printed `conversations capture watermark: baseline=14 after_pin=15 fresh=true` and `outcome: A candidate`. That reading was itself a false positive. `runPinExperiment` measured `baselineMaxCapture` *before* calling `enumerateAllConversations` for the baseline phase — but `enumerateAllConversations` drives its own scroll-simulation attempts internally, which can advance the bridge's capture history on their own, independent of anything the operator does. In this run, exactly that happened: the baseline enumeration's own scrolling produced a new capture (watermark 14→15) *during* the baseline phase, before the operator had even been prompted to pin anything. Because the "after pin" watermark was measured after the operator's action while the "baseline" comparison value was frozen from *before* baseline's own work, the comparison spuriously read as advancement caused by the pin action. Direct evidence this was spurious: the "after pin" phase's own printed capture list topped out at capture #15 — the same capture baseline's own scrolling had already produced — with no capture #16 anywhere, i.e. zero new captures were observed as a result of the operator's actual pin+reload action.
-
-Fixed by measuring each phase's watermark *after* that phase's own `enumerateAllConversations` call returns (once its internal scrolling has already settled), rather than before the next call starts, so every comparison reflects genuinely new captures observed strictly between two settled states, not an enumeration's own internal probing misattributed to the operator's action. The `baseline target series` line now also prints its own `capture_watermark` for direct inspection. This is a build-vs-runtime-verified fix (`go build`, `go vet`, `go test -race`, `node --check` all pass) — the corrected code has not yet been re-run live.
-
-**Second live run, corrected interpretation:** with the bug now understood, the second run's *restore* phase comparison (`after_pin=15 after_restore=15 fresh=false`, correctly reported `NOT VERIFIED`) was measured consistently on both sides (both watermarks taken before their respective next enumeration started, and neither side's own scrolling happened to move the needle) and remains valid: no fresh capture was observed after the restore action. The *pin*-phase comparison is unusable due to the bug above and must be disregarded — it does not support Outcome A, contrary to what it printed at the time.
-
-**Result: C. NOT VERIFIED**, still. Two live runs so far have each surfaced a genuine bug in this experiment's own evidence-gathering rather than producing trustworthy membership evidence either way; both bugs are now fixed. A third live run, with the corrected watermark timing, is needed before this decision can change.
-
-**Eighth pass — three remaining evidence-isolation gaps found on review, before a third live run (2026-09-12):** a review of the sixth/seventh-pass fix, ahead of running it live again, found three more ways this experiment's evidence could still be untrustworthy even with the timing bug fixed:
-
-1. **The freshness watermark was not target-specific.** `maxObservedCaptureID` (all-series) advances when ANY `/backend-api/conversations` query is freshly captured — including an irrelevant one, e.g. `hide_snorlax=true` or `is_archived=true`. A `fresh=true` reading from it never actually proved the *active-list target series itself* (`hide_snorlax=false/absent`, `is_archived=false`, `is_starred=false`, `order=updated`) was refetched. Fixed with `maxMatchCaptureID` and `selectFreshMatchDiagnostics`, both pure functions that reuse `classifyForActiveList` — the existing, already-proven source of truth for the target-series definition — rather than re-implementing the filter. `maxObservedCaptureID` is retained only as an auxiliary diagnostic printed alongside, never as the freshness signal a decision is based on.
-
-2. **Phase history was not isolated.** The general-purpose `enumerateAllConversations` folds together every capture the bridge has EVER observed for a series into one `mergeProjectPages` call. That is exactly correct for ordinary multi-page completeness enumeration (a real page can legitimately take many further scroll-triggered requests to reach exhaustion), but wrong for this experiment: a pre-mutation and a post-mutation capture of the *same* `SeriesKey`+`Offset` are two legitimate, different point-in-time snapshots, and folding them into one enumeration call trips `mergeProjectPages`'s "same page reported a different raw identity across observations" schema-drift check — treating the exact signal a controlled mutation should produce as if it were corruption. Fixed with a new, experiment-specific primitive, `targetSnapshotAfter`, which only ever considers captures strictly newer than an explicit `minCaptureIDExclusive` watermark (via `selectFreshMatchDiagnostics`), so two different phases' captures can never reach the same `mergeProjectPages` call together. It does not attempt general pagination completeness: it captures fresh phase-local pages for diagnostics, while first-page membership comparison requires a newly observed target `offset=0` page. Its own `Exhausted` field describes only that phase's fresh pages, never general completeness. `enumerateAllConversations` itself, and its existing consistency invariants, are unchanged; `runPinExperiment` no longer calls it at all.
-
-3. **The controlled conversation was identified the wrong way for the important case.** The previous design inferred which conversation was affected from the target-series set difference — but a target-series set difference identifies a candidate only when something *disappears* (Outcome B). When nothing disappears (Outcome A — the actual hypothesis this experiment is trying to confirm or refute), "disappeared=[]" gives no candidate ID to check membership against; it is not really evidence of anything specific. Fixed by identifying the controlled conversation from the `/backend-api/pins` before/after delta instead (`controlledSampleFromPinsDelta`): it requires a confirmed-fresh pins capture and a clean single addition (exactly one added ID, zero removed) before it will name a controlled ID at all; any other shape (no advance, zero or multiple additions, any removal) returns `NOT VERIFIED` rather than guessing. The old set-difference-based `compareMembership` is retained only as an auxiliary, non-decisive diagnostic ("did anything else in the target set change") — never the basis for an A/B verdict.
-
-The decisive test itself is now two pure functions, `pinExperimentOutcome` and `pinExperimentRestoreOutcome`, each requiring every trust condition together (a successfully-identified controlled sample, that sample confirmed present in the baseline snapshot, and a fresh target-series MATCH `offset=0` snapshot to check it against) before returning anything but `NOT VERIFIED` — unit-tested for every combination the task specified (target watermark ignoring irrelevant series, phase isolation via two independent `mergeProjectPages` calls that individually succeed while a deliberately-mixed call still fails closed, clean/ambiguous/non-fresh/removal-present pins deltas, and both outcome functions' A/B/PASS/NOT VERIFIED branches).
-
-`runPinExperiment` also now prints, at every phase transition: the target-specific watermark (`before=... after=... fresh=...`) alongside the auxiliary all-series watermark for comparison, and `printCaptureDiagnostics` (attached debugger count, matched response count, capture error count) — specifically so a `fresh=false` result can be told apart between "the debugger/capture mechanism itself is not working" and "capture is healthy but the target series specifically was not re-requested," per the task's diagnostic requirement. No credential or private data crosses any of these — `pingInfo` was already a pure health/count summary.
-
-None of this changes the decision: **Coverage remains UNKNOWN, `is_starred` coverage semantics remain NOT VERIFIED, and Phase 5 completeness remains CONDITIONAL** until a third live run, with all of these fixes in place, actually produces a confirmed controlled sample and a fresh target-series snapshot to test it against. If that live run still shows `target fresh=false` after a real hard reload, the task's own guidance is followed: this is recorded as `same-process UI refresh cannot currently force a fresh target-series observation`, and the next step is a fallback experiment (a fresh `terminal-browser` process against the same persistent partition, hypothesizing that ChatGPT's own boot sequence — not an in-page reload — would force a fresh target-series fetch), not another repetition of the same reload cycle.
-
-**Ninth pass — third live run: clean, bug-free NOT VERIFIED; same-process reload does not force a fresh target-series or pins capture (2026-09-12):** the repository owner ran the corrected harness (`go run . -project-name agentsctl -pin-experiment`), performing the pin action followed by a hard reload, then the unpin action followed by another hard reload, exactly as prompted. Unlike the two prior runs, this one triggered no bug and no false reading:
-
-- `target capture watermark: before=5 after=5 fresh=false` for the pin phase, and `before=5 after=5 fresh=false` again for the restore phase — the active-list target series (`hide_snorlax=false/absent`, `is_archived=false`, `is_starred=false`, `order=updated`) was never freshly captured after either action.
-- `after pin target series: target_count=0 fresh_pages_used=0` — this is the corrected, honest behavior from the eighth-pass phase-isolation fix: with zero fresh MATCH captures, the phase-scoped snapshot is genuinely empty rather than silently falling back to baseline's stale data (which is exactly what made the earlier, buggy runs misleadingly look like "no change").
-- `after-pin pins: captureID=5 ... fresh=false` and `after-restore pins: captureID=5 ... fresh=false` — no fresh `/backend-api/pins` capture was observed after either action either.
-- Because neither the pins nor the target watermark ever advanced, `controlledSampleFromPinsDelta` correctly refused to name a controlled sample, and both `pinExperimentOutcome`/`pinExperimentRestoreOutcome` correctly returned `NOT VERIFIED` — the harness did exactly what it was built to do.
-- The `all_series_capture_watermark` DID advance during the same window (17→25, then further during the restore phase's own scroll attempts) and `printCaptureDiagnostics` confirmed the capture pipeline was healthy and active throughout (`attached_debuggers=1`, `matched_responses` climbing 72→80→85, `capture_errors` flat at a pre-existing 8, not increasing) — ruling out cause (A) "the debugger/capture mechanism itself is not working." Every one of those newly-advancing captures was `classification=DEFINITELY_IRRELEVANT hide_snorlax=true`, continuing that OTHER series' own pagination (`offset` climbing 340→368→...→536, then further after restore) — i.e., this session's sidebar-scroll simulation kept advancing the Project-*excluding* series, exactly as every prior phase of this spike observed, and never touched the target series at all. This is cause (B): capture is healthy, but the active-list target series specifically was never re-requested.
-
-**A plausible, evidence-based root cause, not yet tested as its own variable:** the scrolled series being `hide_snorlax=true` (the general/global chat list) rather than the Project-scoped target series suggests the visible, scrollable sidebar view after the operator's hard reload was ChatGPT's general home view, not the Project's own conversation list — a hard reload alone may return to `https://chatgpt.com/` rather than staying inside the Project. If so, the missing variable is not "reload vs. no reload" but "does the operator explicitly re-enter the Project view afterward," which was listed in the original task's Phase E candidates ("Project を一度離れて戻る", "Project navigation") but not isolated as its own test in this run.
-
-**Result: C. NOT VERIFIED**, unchanged, but now for the first time from a run with no known bug in the harness itself. Per the task's explicit instruction, this same pin→hard-reload cycle is not being repeated again automatically. `same-process UI refresh cannot currently force a fresh target-series observation` is recorded as the finding from this run. Two paths forward were identified and left as an explicit decision for the repository owner rather than assumed: (1) one more, differently-targeted live action — explicitly navigating into the Project view (not just reloading) before checking freshness, which is a cheap variation of the existing harness, not a new one; or (2) the fallback experiment named in the task (start a fresh `terminal-browser` process against the same persistent partition, hypothesizing that ChatGPT's own boot sequence forces a fresh target-series fetch that an in-page reload does not) — not implemented this pass, per the task's explicit "does not need to be implemented/executed right away" allowance.
-
-**Tenth pass — fresh-process fallback implemented (2026-09-12):** the repository owner chose to proceed with the fallback rather than trying one more same-process variant. Implemented as `browserProcess` (bundles the `terminal-browser` child process with its owning pseudo-PTY as a unit that can be started, stopped, and restarted — `startBrowserProcess`/`(*browserProcess).stop`) and `restartBrowserProcess`, which stops the current process and starts an entirely new one against the *same persistent partition* mid-run. `runPinExperiment` now calls this between phases instead of asking the operator to reload: pin (operator action, browser left running) → restart → fresh snapshot; unpin (operator action) → restart → fresh snapshot.
-
-This is deliberately simpler than a cross-process design: only the *child* `terminal-browser` process is replaced, not the Go orchestrator (`go run .`) itself, which stays alive for the whole experiment. That means baseline's conversation list and pins snapshot — already held in ordinary Go variables — remain valid for comparison against the new process's fresh observations with no serialization, no disk, and no cross-process handoff at all; the task's concern about not persisting a controlled conversation's raw ID to disk/log is satisfied by construction, not by an explicit fingerprint-only protocol, since nothing ever leaves this one process's memory. `targetSnapshotAfter` uses watermark 0 against a freshly-restarted process because that process has no prior capture history. Its freshness gate still requires a newly observed target `offset=0` page; an `offset=28` or later MATCH capture alone is not valid first-page membership evidence. `maxObservedCaptureID`, which only made sense for comparing watermarks *within* one continuously-running process, became dead code under this design and was removed along with the same-process watermark-comparison prints; `printCaptureDiagnostics` (attached debugger count, matched responses, capture errors) is kept and printed once per fresh process instead, for the same "is the capture pipeline itself healthy" diagnostic purpose.
-
-One more piece of live evidence shaped this pass: the ninth-pass run's scroll-simulation captures kept advancing the `hide_snorlax=true` (general/global chat list) series' own pagination and never touched the target series at all, suggesting the visible view after a plain reload was ChatGPT's general home view, not the Project's own list. So after every restart, `runPinExperiment` now also calls the existing `conversations` bridge method for the configured Project once (`discoverConversations`) — which `bridge/main.js` already navigates to the Project page for whenever nothing is cached yet, true by construction right after a restart — to actively force the app into the Project view before checking for a fresh target-series capture, rather than relying on a bare reload alone.
-
-This is a build/test-verified implementation (`go build`, `go vet`, `go test -race`, `node --check` all pass) — it has not yet been run live. **Coverage remains UNKNOWN, `is_starred` coverage semantics remain NOT VERIFIED, and Phase 5 completeness remains CONDITIONAL** pending that live run.
-
-**Eleventh pass — first live run of the fallback crashed the restarted process (2026-09-12):** the repository owner ran the fresh-process fallback. The restart itself reported `browser process restarted: PASS`, but the very next call (`discoverConversations`, the forced Project-navigation step) failed with `write: broken pipe`, and the following step failed the same way — the new `terminal-browser` process answered its initial post-restart `ping` successfully, then the connection died within a few seconds.
-
-**Hypothesis:** `terminate()` sending SIGTERM and `cmd.Wait()` returning only confirms this program's direct child process has exited — it does not guarantee every resource the old process held (in particular, the persistent partition's own Electron/Chromium lock file) has actually been released the instant `restartBrowserProcess`'s call to `old.stop()` returns. Starting a new instance against the same partition too soon after the old one's exit is a plausible race for exactly this symptom (an initially-healthy process crashing shortly after startup). This has not been independently confirmed (e.g. from `terminal-browser`'s own logs) — it is the most likely explanation given the timing, not a proven root cause.
-
-**Mitigation:** added a 3-second settle delay after `old.stop()` returns and before starting the new process, and — since the live failure was specifically "healthy at first ping, dead a few seconds later" — a second liveness re-check after the existing post-ping settle sleep, so a repeat of this exact failure is caught immediately with a clear diagnostic (`"browser process died shortly after restart, likely a partition lock conflict..."`) rather than surfacing later as a confusing `broken pipe` from an unrelated call several steps into the experiment. This is a best-effort, evidence-based mitigation for an environment-specific process-lifecycle issue this spike cannot directly inspect (no access to `terminal-browser`'s own internals or logs) — build/test-verified, not yet re-run live.
-
-**Result: C. NOT VERIFIED**, still — this run never reached the decisive membership test at all, since the process crash happened before any post-restart target-series or pins capture could be attempted. Coverage/Phase 5 status unchanged.
-
-**Twelfth pass — is_starred coverage DECIDED: Outcome B, confirmed (2026-09-12/13):** the repository owner re-ran the hardened fresh-process fallback. This time the restart survived (the settle-delay mitigation held), and the full experiment completed end to end with every trust condition satisfied:
-
-```text
-baseline pins: captureID=14 recognized_id_count=6
-[operator pins one conversation; harness restarts the browser process]
-after-pin pins: captureID=1 recognized_id_count=7 fresh=true   (new process's own counter — genuinely fresh)
-controlled_sample=4ca902c42cfb   (identified from the pins delta: exactly one added ID, zero removed)
-controlled_sample_present_before=true controlled_sample_present_after_pin=false
-target capture: fresh=true   (a genuine MATCH capture observed in the new process)
-outcome: B: pinning removes the conversation from the default is_starred=false series
-
-[operator unpins; harness restarts the browser process again]
-after-restore pins: captureID=1 recognized_id_count=6 fresh=true removed_controlled_sample=true
-target capture: fresh=true
-controlled_sample_present_after_restore=true
-restore evidence: PASS — controlled sample confirmed removed from pins and present again in a fresh target snapshot
-```
-
-Every condition `pinExperimentOutcome`/`pinExperimentRestoreOutcome` require before returning anything but `NOT VERIFIED` was independently satisfied: the controlled sample was identified from a confirmed-fresh `/backend-api/pins` delta (a clean single addition, never inferred from target-series disappearance — see the eighth-pass design rationale), confirmed present in the baseline snapshot, confirmed absent from a confirmed-fresh post-pin snapshot (a genuine `MATCH` capture observed in a brand-new process with no prior history to be stale against), and confirmed to return after a confirmed-fresh post-restore snapshot with the pins delta separately confirming the unpin action itself. A secondary, non-decisive auxiliary check (`compareMembership`) additionally noted one unrelated conversation entering the target set's top-16 window at the same time (`appeared=[cd1c0280d309]`) — expected and harmless: removing one conversation from a limit-bounded, most-recently-updated-ordered list naturally admits whichever conversation was previously 17th.
-
-**Interpretation recorded at the time:** this was reported as Outcome B: `is_starred=false` excludes pinned conversations, so completeness requires a union with `is_starred=true`. The later evidence correction below supersedes that conclusion without deleting the observation: the experiment compared only the Project-filtered subset of the raw first page, so it could not distinguish filter exclusion from an `order=updated` first-page displacement.
-
-**Secondary question (Phase F) remains unanswered:** no real UI action in this session ever issued an `is_starred=true` request, so this spike still has no direct observation of that series' own shape, item contents, or pagination behavior — only indirect proof (via the pins delta and the false-series exclusion) that such conversations must exist somewhere. `reportStarredSeries` still reports `NOT OBSERVED`.
-
-**Model change recorded at the time:** `activeListRequiredSeries` was changed to require the `is_starred=false` + `is_starred=true` union, and Coverage was changed to `COMPLETE`. The later evidence correction below reverts that model because the true series was never observed and the first-page displacement was not a semantic proof.
-
-**Historical result (superseded): Coverage = COMPLETE; Pagination = INCOMPLETE.** Overall session discovery remained incomplete and Phase 5 remained conditional even under that interpretation.
-
-**Thirteenth pass — evidence correction before Project-inclusive pagination work (2026-09-13):** later review found that the twelfth-pass result compared the Project-filtered subset, not raw global page membership. Because the observed target series is `order=updated`, pinning may have changed ranking and displaced the controlled conversation beyond raw page 0 while another Project conversation entered the page. The observation remains valid — `is_starred=false` first-page membership changed on pin and restored on unpin — but it does not uniquely prove server-side filter exclusion. No `is_starred=true` request, response shape, or content has ever been directly observed.
-
-The conservative starting state for the pagination experiment is therefore:
-
-```text
-is_starred=false first-page membership changes on pin: PROVEN
-is_starred=true series semantics/content: NOT VERIFIED
-full active-list coverage definition: NOT VERIFIED
-Pagination: INCOMPLETE
-Phase 5: CONDITIONAL
-```
-
-`activeListRequiredSeries` again contains only the directly observed `is_starred=false` target shape, `classifyForActiveList` treats `is_starred=true` as `UNKNOWN`, and Coverage remains `UNKNOWN` even if that observed series becomes pagination-exhausted. This is not a claim that `false` alone is sufficient; it is a fail-closed representation of the evidence currently available.
-
-**Fourteenth pass — Project-inclusive pagination experiment and architectural blocker (2026-09-13):** a fresh authenticated process captured the Project-inclusive active target series with `SeriesKey=ea86234cf48d`, `offset=0`, `limit=28`, `raw_item_count=28`, `recognized_id_count=28`, `project_filtered_count=16`, and `RawIdentityDigest=b9220daa9e59`. The IDs underlying both digests remained inside the bridge/process; only 12-hex SHA-256 fingerprints were exposed. Because the raw page is full, the filtered count of 16 says nothing about exhaustion or total Project membership.
-
-The UI-pagination search separated target-series progress from unrelated traffic with three watermarks: all matched responses, all `/backend-api/conversations` captures, and target-MATCH captures. The following ordinary UI paths were exercised:
-
-- In the configured Project view, the diagnosed sidebar container moved from `scrollTop=0` to its end while Project links appeared, but its conversation-link count stayed at 4. The first action produced other captured endpoint traffic with no new conversation capture; subsequent actions produced no network request. Fresh Project navigation, Project conversation route changes, and process restarts likewise emitted either the target `offset=0` page or no target request.
-- On the main sidebar, real wheel input grew visible conversation links from 32 to 452 and made the ChatGPT client issue contiguous `offset=28,56,...,420` pages. Every advanced page belonged to `SeriesKey=081c13c268a6` with `hide_snorlax=true`: valid pagination, but structurally Project-excluding and therefore not a continuation of the target series.
-- Updating the pinned area by pinning one configured-Project conversation changed `/backend-api/pins` from 4 to 5 recognized IDs. After the harness restarted into the Project, capture remained healthy (`attached_debuggers=1`, `matched_responses=8`) but the conversation and target watermarks both remained 0: no conversation-list request occurred, rather than a request for the wrong series. The controlled sample was identified only as fingerprint `877a0808b76d`; it was then unpinned by the normal UI control, and a second fresh process confirmed the pins set returned from 5 to 4 (`removed_controlled_sample=true`). No `is_starred=true` request appeared naturally. The post-pin and post-restore raw-page deltas are `NOT VERIFIED`, because neither fresh process emitted the target page; the earlier twelfth-pass raw-page membership therefore cannot be reconstructed or upgraded.
-
-This establishes a user-driven pagination mechanism for the global endpoint, but no proven user-driven mechanism for the Project-inclusive target series. It also does **not** prove that a configured-Project conversation exists beyond raw page 0: the full mixed raw page makes overflow possible, while the absence of a target `offset=28` capture prevents direct proof. The result is consequently:
-
-```text
-First-page overflow evidence: NOT VERIFIED
-Highest observed Project-inclusive target offset: 0
-Target short final raw page observed: false
-is_starred reinterpretation: C (false pagination incomplete; true unobserved)
-Project-inclusive pagination: CONDITIONAL
-Coverage: UNKNOWN
-Pagination: INCOMPLETE
-Overall session discovery: INCOMPLETE
-Phase 5: CONDITIONAL
-```
-
-The harness now reports raw offset-0 identity, fingerprint-only raw membership deltas with each appeared sample's Project association, numeric scroll-target diagnostics, and the three capture watermarks above. It also treats a missing cached conversation-detail response as a non-fatal diagnostic only under `-pin-experiment`; that older Phase 6 probe is independent of the global-page and pins evidence and remains strict in normal runs.
-
-### ChatGPT Project session listing: cursor pagination spike (2026-09-13)
-
-**Hypothesis:** `GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor}` has its own, independent cursor-based pagination that can enumerate a Project's sessions completely, replacing the offset/`hide_snorlax`-based global-endpoint path above.
-
-**Phase A — schema, from a real captured response (source of truth, not guessed):**
-
-```text
-response:
-  items_field=items
-  conversation_id_field=id
-  created_field=create_time
-  updated_field=update_time
-  cursor_field=cursor (top-level, sibling of items — a single opaque string, not per-item)
-  cursor_type=opaque string
-  terminal_cursor=NOT YET OBSERVED (the captured example was a non-terminal page)
-  total/count_field=none present
-```
-
-No `total`/`count` field exists in this endpoint's response at all, unlike the global endpoint — there is nothing to be tempted to (mis)use as a completeness signal here. Chat/Work-relevant metadata observed at the list-item level (not used to resolve the discriminator — see "Important" below): `is_automation_conversation` (boolean), `conversation_origin` (seen both `null` and a non-null value across items), `async_status` (null on every item seen). `is_starred`/`pinned_time` (ChatGPT's own remote pin state) are also present at the list-item level — per the design decision below, these are never read by this spike's ordering or completeness logic.
-
-**Phase B — implementation (build/test-verified in this environment; no live authenticated browser or kitty-capable terminal available here):** Added `cursor.go` (pure logic: `cursorConversation`, `accumulateCursorChain`, `sortConversationsByCreatedDesc`, `isNonIncreasingByCreated`/`isNonIncreasingByUpdated`, `parseCursorWireItems`) and its live drivers, gated behind a new `-cursor-experiment` flag. `go build`, `go vet`, `go test -race`, and `node --check` on both bridge files all pass throughout (see Verification).
-
-**First live run (2026-09-13) — self-fetch hypothesis falsified:** the repository owner ran `go run . -project-name agentsctl -cursor-experiment` against the real account. The initial hypothesis — that this project-scoped endpoint tolerates a script-issued fetch the same way the existing no-cursor `conversations` method does (proven since Phase 1/4/5) — was wrong specifically once a `cursor` query parameter is present: `enumerateProjectConversationsByCursorSelfFetch`'s self-issued fetch of `?cursor=0` returned **HTTP 401**, in the very same run where the plain no-cursor `conversations` call to the identical path succeeded (`conversations: PASS count=5`). This exactly mirrors the already-documented `/backend-api/conversations` 401 (Phase 5 addendum): cookies alone are not sufficient once a `cursor` parameter is added, and whatever the real ChatGPT client attaches beyond cookies for a cursor-paginated request is not something this bridge has, or should try to obtain (security boundary). `enumerateProjectConversationsByCursorSelfFetch` is kept only as a documented negative probe (mirroring `globalConversationsPage`), never as the enumeration mechanism.
-
-**Pivot to passive capture:** since self-fetch is unauthorized for this request shape, `bridge/main.js` now records every REAL response the ChatGPT client itself receives for this endpoint (`recordProjectConversationsCursorCapture`, keyed by the `cursor` query parameter the real request actually used, defaulting to `"0"` when the request omitted it — e.g. the endpoint's very first natural request) into an ordered, per-Project capture list, exposed via a new passive-only `projectConversationsCursorCaptures` bridge method — the same pattern already proven for the global endpoint's `hide_snorlax` series. `enumerateProjectConversationsByCursorPassive` drives this: it navigates into the Project's own view (`navigateProject`, newly exposed to Go), harvests whatever has been captured, and — if the chain isn't yet terminal — repeats the existing `simulateSidebarScroll` simulation to try to induce the real client into fetching further pages, up to a bounded number of attempts. A new pure function, `dedupeCapturesByCursorIn`, collapses a benign duplicate observation of the same cursor (e.g. a re-render re-issuing the same request) down to one page, while failing closed if two observations of the same cursor actually disagree on content. `runCursorExperiment` now runs the self-fetch probe first (for the diagnostic record) and then the passive mechanism for real enumeration.
-
-**Cursor discipline (design decision, enforced in code, not just documentation):** `accumulateCursorChain` only ever compares a cursor value for exact string equality against previously-used values (cycle detection) and passes a response's cursor back to the next request verbatim. Nothing in this code parses, increments, or numerically compares a cursor. `redactedCursor` shows only `"0"` (the documented, non-sensitive entry point) or a 12-hex SHA-256 fingerprint in every diagnostic and error message — no opaque cursor value is ever printed or logged.
-
-**Safety against infinite loops:** `enumerateProjectConversationsByCursorPassive` re-runs `accumulateCursorChain` over every captured page after each harvest, before attempting another scroll simulation — so a cursor cycle, a broken chain, a missing ID, or exceeding `maxPages`/the scroll-attempt bound stops the loop immediately. None of these conditions are ever silently downgraded to "incomplete" only; they are reported as errors (README Phase H fail-closed).
-
-**Second live run (2026-09-13) — mechanism confirmed reachable; a freshness bug found and fixed:** the repository owner ran the passive-capture build and confirmed, from direct observation of the real UI, that **scrolling `https://chatgpt.com/g/{project_id}/project` does load further pages via `GET .../conversations?cursor=...`** — resolving the open question above: the Project's own dedicated view does use scroll-triggered cursor pagination, the same way the main sidebar uses scroll-triggered offset pagination for the unrelated global endpoint. The run itself still failed, but with a different, more informative error: `Project session enumeration: FAIL (cursor 0 was observed twice with different content (schema drift or account activity mid-enumeration))`.
-
-Root cause: `enumerateProjectConversationsByCursorPassive` considered every capture ever observed for this Project's cursor endpoint, including one from a completely unrelated, much-earlier navigation near the top of `run()` (the existing `conversations` bridge method's own cache-miss navigation, which happens unconditionally before any experiment-specific code runs). By the time this function performed its OWN fresh navigation and scroll many seconds later — after the global-conversations investigation, 8 sidebar-scroll simulations, and 4 `openURLProbe` navigations had all run in between — the two independent real fetches of the logical first page (`cursor` absent/`"0"`) were not required to be byte-identical (README "Cursor is opaque" already forbids assuming an opaque token is idempotent), and `dedupeCapturesByCursorIn` correctly, but unhelpfully, flagged them as conflicting. This is the exact same class of bug this spike's pin experiment already found and fixed once for the global endpoint ("sixth pass — added an explicit freshness gate"): mixing a stale, pre-existing capture with a fresh one produces a false conflict/false-negative signal.
-
-**Fix:** a `filterCapturesNewerThan` pure function (mirroring the pin experiment's `selectFreshMatchDiagnostics`) plus a baseline-CaptureID watermark taken immediately before this function's own `navigateProject` call — only captures strictly newer than that watermark are ever considered, so a stale pre-existing capture from earlier in the same run can never be compared against this function's own fresh ones. Covered by two new pure unit tests (`TestFilterCapturesNewerThanExcludesStaleCaptures`, plus `TestDedupeCapturesByCursorInCollapsesABenignDuplicate`/`...FailsClosedOnConflictingContent` for the dedupe function itself, which had no direct test coverage before this pass). Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`).
-
-**Third live run (2026-09-13) — still failed with HTTP 401 before trustworthy full enumeration.** The repository owner re-ran `go run . -project-name agentsctl -cursor-experiment` with the freshness fix in place. The run still failed, showing an HTTP 401. **This does not overturn the second run's direct observation that manually scrolling the real Project view causes the ChatGPT frontend itself to issue further cursor requests** — that observation was made independently, by the operator's own manual interaction, and stands on its own regardless of this run's outcome.
-
-The exact per-page/per-capture diagnostic values from this specific run were not independently captured for this record (unlike the first and second runs, whose full stdout was pasted into this session) — only the operator's own summary that it "still failed with 401." That gap is itself the diagnostic finding: at the time of this run, `runCursorExperiment` unconditionally executed the already-falsified `enumerateProjectConversationsByCursorSelfFetch` probe FIRST, on every invocation, printing its own known-negative 401 line before the passive mechanism ran at all — making it genuinely ambiguous, from the printed output alone, whether the reported 401 was (a) that already-known, harmless self-fetch probe, (b) a NEW 401 from the real frontend's own cursor-present request, or (c) something else entirely. The task's own diagnosis is accepted here without further live re-interpretation of that ambiguous run: **the harness itself, not the endpoint, was the source of the ambiguity.**
-
-**Fourth pass (2026-09-13) — stop running the known-negative probe by default; separate self-fetch from real-frontend 401; replace synthetic DOM scroll with real Electron wheel input:** three changes address the third run's root ambiguity and the standing "New hypothesis" that a synthetic DOM scroll event may not reproduce whatever browser-level input-pipeline behavior the real frontend's own pagination trigger depends on:
-
-1. **The self-fetch probe no longer runs as part of `-cursor-experiment`.** `runCursorExperiment` now prints `known self-fetch probe: skipped (known negative: HTTP 401 ...)` instead of executing `enumerateProjectConversationsByCursorSelfFetch`. A new, independent `-cursor-self-fetch-probe` flag re-runs it standalone for anyone who wants to re-verify that specific negative directly. This removes the ambiguity the third run hit: any 401 a normal `-cursor-experiment` run reports from here on is real-frontend evidence, not the already-known probe.
-2. **Response-status counting distinguishes the real frontend's own request shape from everything else.** `bridge/main.js`'s CDP capture now records `Network.responseReceived` for the project-scoped conversations endpoint at EVERY status (not only 200, which is all the existing body-capture pipeline needed), bucketed privacy-safely by `cursor`-query-parameter presence and status (`recordProjectConversationsResponseStatus`/`projectConversationsStatusCounts`) — never a URL, cursor value, header, or response body. `runCursorExperiment` prints these counts (`cursor response status: no-cursor 200=N 401=N other=N | cursor-present 200=N 401=N other=N`) every run, so a cursor-present 401 from the real frontend is now directly visible and separable from the known self-fetch probe's own (no-longer-run-by-default) 401.
-3. **Real Electron `sendInputEvent` mouseWheel input replaces the synthetic DOM scroll** as the cursor experiment's trigger mechanism (`bridge/main.js`'s new `realWheelScrollProject`, driven from the main process since `sendInputEvent` is not available from a preload/renderer context at all — DOM inspection to locate the target region stays in the preload script, per the task's preferred split of responsibilities). Target-region discovery (`findProjectScrollRegion`) now also recognizes the Project-scoped conversation-link shape (`/g/g-p-.../c/{id}`), not only the bare `/c/{id}` shape, selecting the scrollable container with the most Project-scoped links (tie-broken by total links) — using only link counts/href shape/dimensions, never link text or title. `simulateSidebarScroll` is unchanged and still used by the unrelated global-endpoint diagnostics elsewhere in this file; the cursor experiment no longer depends on it at all.
-
-A new five-way outcome classifier, `classifyCursorExperimentOutcome` (`NO_REQUEST` / `FRONTEND_401` / `CAPTURE_FAILURE` / `CHAIN_INCOMPLETE` / `COMPLETE` — README "Failure categories"), makes the distinction the third run's ambiguity called for structural rather than left to reading prose: `NO_REQUEST` (the wheel input triggered no cursor-endpoint traffic at all — a trigger failure, not an authorization failure) is checked before `FRONTEND_401` (the real frontend issued at least one cursor-present request and every one so far came back 401 with zero successful pages), which is checked before the existing `CAPTURE_FAILURE`/`CHAIN_INCOMPLETE`/`COMPLETE` distinctions.
-
-**Fourth live run (2026-09-14) — real wheel input PASSES, real frontend returns 200 (not 401), and a new capture-layer bug is found and fixed:** the repository owner ran the fourth-pass build. Direct, decisive results:
-
-- `target region: found=true candidate_count=2 project_conversation_links=10 conversation_links=10 client_height=706 scroll_height=1133 scroll_top=0` — the Project's own conversation list was correctly discovered (distinguished from a second, irrelevant scrollable candidate) purely from link counts/dimensions, with 10 Project-scoped conversation links already visible before any scrolling.
-- Real wheel input worked: `real wheel (attempt 1, tick 2): ... project_links_before=10 project_links_after=20` — the visible conversation-link count DOUBLED mid-scroll, direct evidence that real Electron `sendInputEvent` mouseWheel input caused the real ChatGPT frontend to load and render more of this Project's conversations.
-- `cursor response status: no-cursor 200=0 401=0 other=0 | cursor-present 200=42 401=0 other=0` — **the real frontend's own cursor-present requests all returned HTTP 200, zero 401s.** This conclusively answers the third run's central ambiguity: the earlier 401s were always the known self-fetch probe, never the real frontend's own request path. `FRONTEND_401` is ruled out for this account/session.
-
-The run still failed — `Project session enumeration: FAIL (cursor 0 was observed twice with different content (schema drift or account activity mid-enumeration))`, classified `failure category: CAPTURE_FAILURE` — but for a new, well-understood reason: 42 real cursor-present 200 responses arrived from just two short wheel bursts, meaning the real frontend re-fetched `cursor_in="0"` (the first page) many times in quick succession rather than only fetching it once. Two of those observations reported a *different* declared next-cursor token for what should have been the same first page. `dedupeCapturesByCursorIn` compared the raw next-cursor token for exact equality across repeated observations of the same `CursorIn` — but nothing in this endpoint's observed behavior, or in this task's own "opaque cursor" discipline (which forbids assuming a token is idempotent), guarantees the SAME logical page returns the SAME continuation token on every fetch. The `project_links_before=10 project_links_after=20` evidence above strongly suggests real forward pagination (a genuine second page) *did* load during that same window — but it was never examined, because dedupe failed closed on the `cursor_in="0"` conflict before reaching it.
-
-**Fix:** `dedupeCapturesByCursorIn` now judges two observations of the same `CursorIn` as "the same page" by comparing the actual **set of conversation IDs** returned (`conversationIDSet`), not the raw next-cursor token or item count — the token itself may legitimately vary between repeated fetches of unchanged data. When the ID set matches, the LATEST (highest `CaptureID`) observation's own `HasNextCursor`/`NextCursor` is kept, so the walk always continues from the freshest continuation pointer rather than a possibly-since-invalidated older one. A genuinely different ID set for the same `CursorIn` still fails closed exactly as before (renamed to `TestDedupeCapturesByCursorInFailsClosedOnADifferentConversationSet`), plus a new test for the tolerated case (`TestDedupeCapturesByCursorInToleratesANonIdempotentNextCursorToken`). Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`); **not yet re-run live.**
-
-**Fifth live run (2026-09-14) — the token-instability fix works, but exposes a deeper, likely-structural instability: the first page's actual CONTENT (not just its continuation token) changed between two automatic fetches, before any wheel input at all.** The repository owner re-ran the fourth-pass build with the dedupe fix in place. `cursor response status: cursor-present 200=34 401=0 other=0` — still zero 401s, reconfirming `FRONTEND_401` remains ruled out. But this run failed at the very FIRST harvest — before printing a single `page=N ...` line, before any `real wheel (attempt N, tick M)` line at all: `Project session enumeration: FAIL (cursor 0 was observed twice with a different conversation set (schema drift or account activity mid-enumeration))`, `failure category: CAPTURE_FAILURE`.
-
-This is a different, more fundamental finding than the fourth run's token instability: two of the 34 cursor-present responses, both requesting `cursor_in="0"`, both arriving automatically (the Project view's own initial load, before this harness ever sent a wheel event), returned **genuinely different sets of conversation IDs** — not merely a different continuation token for the same 10 conversations. The most likely explanation, given this Project's own conversation list already shows evidence of ongoing, concurrent multi-session activity (conversations created and updated minutes apart during this very investigation), is that the endpoint orders its first page by recency (most-recently-updated-first, consistent with the `order=updated` behavior already established for the unrelated global endpoint), and a real, concurrent update to some other conversation in this Project — entirely independent of this harness's own actions — shifted which conversations qualify for the first page between the two automatic fetches. This was NOT investigated further this pass: distinguishing "genuine concurrent-activity churn on an actively-used Project" from "an actual schema-drift or capture bug" is not something this spike can determine from the evidence gathered so far, and doing so safely requires a design decision this spike has not been authorized to make on its own (see below).
-
-**Open design question, not resolved this pass:** the current `dedupeCapturesByCursorIn` fails closed on ANY conversation-set difference for the same `CursorIn`, per the task's original "cursor cycle detected → FAIL CLOSED" instruction and its explicit prohibition on unilaterally declaring completeness. That is almost certainly still the right behavior for genuine schema drift. But if this Project's real, ongoing concurrent activity means its first page routinely shifts within the seconds a full enumeration run takes, strict byte-for-byte first-page stability may be **structurally unachievable** while the Project remains in active use — in which case every future run would fail the same way regardless of any further capture-layer fixes, and the real fix would have to be a semantic one (e.g. tolerating first-page churn specifically, unioning observed IDs instead of requiring exact-match, or re-running during a quiet window) rather than another dedupe correction. This spike deliberately did not make that call unilaterally; it is recorded here as the next decision point.
-
-**Decision (2026-09-14):** the repository owner chose to keep `dedupeCapturesByCursorIn` fail-closed exactly as implemented — no union/loosening of the conversation-set comparison — and to re-run `-cursor-experiment` during a quiet window (no other concurrent session/activity in the configured Project) instead. This preserves the task's original strict completeness bar; it is a scheduling choice for the next live run, not a code change.
-
-**Sixth live run (2026-09-14) — a quiet-window attempt reproduced the identical failure, with an EVEN LARGER burst, weakening the concurrent-activity hypothesis.** The repository owner re-ran `-cursor-experiment` intending a quiet window. Result: `cursor response status: cursor-present 200=64 401=0 other=0` (up from 34 in the fifth run) and the identical `Project session enumeration: FAIL (cursor 0 was observed twice with a different conversation set ...)`, again failing at the very first harvest before any wheel input. If genuine, external, concurrent Project activity were the cause, a deliberately quieter window should have reduced or eliminated the churn, not increased the request volume that exhibits it. This does not rule out concurrent activity entirely (the "quiet window" was not independently verified free of other sessions), but it is evidence against it being the primary or sole explanation, and raises a real possibility that most of these 34-64 cursor-present requests per run are not caused by, or even related to, this harness's own actions at all — e.g. a background polling/prefetch mechanism intrinsic to the ChatGPT frontend or a persistent service worker in the partition, independent of Project activity.
-
-**New diagnostic:** rather than guess further, `summarizeCursorInVariants`/`printCursorInVariants` were added: when `dedupeCapturesByCursorIn` fails closed, the harvest now prints, per conflicting `CursorIn`, a privacy-safe forensic summary — `observations` (how many captures shared this `CursorIn`), `distinct_id_sets` (how many genuinely different conversation sets appeared), `distinct_next_cursors`, and the min/max item count — never a raw ID or cursor value. Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`).
-
-**Seventh live run (2026-09-14) — root cause found: two structurally different real requests were being conflated into one `CursorIn` bucket, not genuine drift.** The repository owner re-ran `-cursor-experiment` with the new diagnostic in place. The forensic summary was decisive: `cursor_in=0 variants: observations=2 distinct_id_sets=2 distinct_next_cursors=2 item_count_range=5-10`. **`item_count_range=5-10` is the key evidence: 5 is exactly the item count the existing, unrelated no-cursor `conversations` method already returns for this account (`conversations: PASS count=5`, printed earlier in the same run), and 10 is the cursor-paginated list's own actual first-page size (already established in the fourth/fifth/sixth runs' `target region: ... project_conversation_links=10` line).** These are not two observations of the same logical page drifting apart — they are two different real requests to the identical URL path, one carrying no `cursor` query parameter at all (a smaller, structurally different response — most likely a separate summary/recent-activity UI component sharing the same endpoint) and one carrying an explicit `cursor=0` (the real paginated list's own entry point).
-
-Root cause: `recordProjectConversationsCursorCapture` (bridge/main.js) computed `cursorIn = url.searchParams.get("cursor") ?? "0"` — treating a request with NO `cursor` parameter at all as an alias for `cursor="0"`. This silently merged the unrelated no-cursor request into the same bucket as the real cursor-pagination entry point, so `dedupeCapturesByCursorIn` correctly (but for the wrong underlying reason) flagged them as "the same `CursorIn` observed with a different conversation set" every single time both requests happened to fire in the same run — which explains why this failure was 100% reproducible across the fifth, sixth, and seventh live runs regardless of "quiet window" timing: it was never about timing or concurrent activity at all.
-
-**Fix:** a request with no `cursor` query parameter is no longer recorded into the cursor-pagination capture list at all — only a request carrying an EXPLICIT `cursor` parameter is treated as part of this chain. This is a one-line behavioral change with a large effect: it should eliminate the false conflict entirely, since the two previously-conflated request shapes are now correctly kept apart at the point of capture, before dedupe/accumulation ever sees them. Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`).
-
-**Eighth live run (2026-09-14) — the seventh run's diagnosis was WRONG; corrected root cause found and fixed.** The repository owner re-ran with the seventh pass's fix in place. The identical failure reproduced: `cursor_in=0 variants: observations=2 distinct_id_sets=2 distinct_next_cursors=2 item_count_range=5-10` — the exact same signature as the seventh run, with `cursor response status: cursor-present 200=99` (climbing further still). Critically, `printCursorInVariants` labels this `cursor_in=0` — meaning `redactedCursor` printed the literal, documented `"0"` value, which it only ever does for the EXACT string `"0"` (see `redactedCursor`'s own logic). **Both conflicting observations therefore carried an explicitly present `cursor=0` parameter — neither was the no-cursor request the seventh pass's fix excluded.** That fix was real and correct (a no-cursor request is a genuinely different, now-excluded request shape), but it was not the cause of this specific conflict, which persisted unchanged after it shipped.
-
-Corrected root cause: this endpoint's own `?cursor=0` explicit entry point is issued by at least TWO structurally different real requests that both explicitly set `cursor=0` — most likely distinguished by a `limit` or similar query parameter this bridge did not otherwise track — one returning 5 items, one returning 10 (matching, respectively, the seventh run's mistaken "no-cursor" size and the already-established real first-page size). Grouping captures by `CursorIn` alone, as every version of this code had done since the second live run, cannot distinguish two request shapes that happen to share the same `cursor` value but differ only in some OTHER parameter.
-
-**Fix:** a proper series-identity concept, mirroring the one already proven for the unrelated global endpoint's offset pagination (`canonicalSeriesKeyFrom`/`SeriesKey`): `canonicalCursorSeriesKeyFrom` (bridge/main.js) computes a SHA-256 digest of every query parameter EXCEPT `cursor`, recorded alongside `CursorIn` on every capture. `enumerateProjectConversationsByCursorPassive` now groups fresh captures by this `SeriesKey` before ever comparing two captures' conversation sets: if only one series is present, it is used directly; if more than one is present, `selectSeriesMatchingObservedLinkCount` picks the one whose first page's item count matches the Project scroll region's own independently-observed DOM link count (`project_conversation_links`, read once before any pagination begins — a signal that comes from the DOM, not from network captures, so it cannot itself be contaminated by the same conflation). If that match is ambiguous (zero or more than one series matches), this fails closed with a diagnostic listing every series' fingerprint, observation count, and first-page item count, rather than guessing which series is the real Project conversation list — silently picking the wrong one would produce a false COMPLETE that under-counts the real list, which is worse than reporting nothing. Once a series is selected it is pinned for the rest of the walk. Covered by five new pure unit tests (`TestCanonicalCursorSeriesKeyExcludesCursorAndIsOrderIndependent`, `TestGroupCapturesBySeriesKey`, `TestSelectSeriesMatchingObservedLinkCountPicksTheUniqueMatch`/`...FailsClosedWhenAmbiguous`, `TestFilterCapturesBySeriesKey`). Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`); **not yet re-run live.**
-
-**Ninth live run (2026-09-14) — the SeriesKey fix worked completely; a new, unrelated wheel-input flakiness blocked further progress.** The repository owner re-ran with the `SeriesKey` fix in place. Direct confirmation the fix worked: `selected series: 4f53cda18c2b (matches the 10-link Project view observed in the DOM; 1 other series excluded)` — the decoy 5-item series was correctly identified and excluded on sight, before it could ever conflict with anything. Every one of the 8 harvest attempts thereafter printed the IDENTICAL, consistent `page=0 conversation_count=10 cursor_in=0 cursor_out=cursor:ab9eac2d8174` — zero conflicts, zero drift, for the entire run. The `CursorIn`-alone bug and its `SeriesKey` fix are considered resolved.
-
-The run still failed, but for an entirely different, unrelated reason: `Project session enumeration: FAIL (exhausted 8 real-wheel attempts without observing a terminal cursor)`. Every one of the 24 individual wheel ticks across all 8 attempts reported `scroll_top_before=0 scroll_top_after=0` and `project_links_before=10 project_links_after=10` — the wheel input had ZERO measurable effect this entire run, despite the target region's reported dimensions (`candidate_count=2 project_conversation_links=10 client_height=706 scroll_height=1133`) being IDENTICAL to the fourth live run, where the same code, the same deltaY, and the same tick sequence DID move `scrollTop` and DID double the visible link count. Nothing about the region or the input code differed between the two runs; the most likely explanation is that Electron silently does not deliver synthetic `sendInputEvent` mouse-wheel input to a window/view the OS does not currently consider focused or active — a known class of flakiness for this style of synthetic input automation, independent of anything this harness's own logic controls.
-
-**Fix (diagnostic-first):** `realWheelScrollProject` now explicitly focuses both the owning `BrowserWindow` (restoring it first if minimized) and the `WebContents` immediately before sending any input, and reports whether the window reports itself focused afterward (`windowFocused`) in its own result — printed as `real wheel (attempt N): window_focused=true/false/n/a` — so the next run can tell whether this focus step is actually succeeding, rather than guessing again if wheel input still has no effect. Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`).
-
-**Tenth live run (2026-09-14) — `window_focused=false` on every single attempt (8/8), confirming the focus step itself was not succeeding.** The repository owner re-ran with the focus diagnostic in place. `real wheel (attempt N): window_focused=false` printed identically for all 8 attempts — the `ownerWindow.focus()` call was not achieving what `BrowserWindow.isFocused()` considers real focus, every single time, with the exact same `scroll_top_before=0 scroll_top_after=0` inertness as the ninth run. This is real, reproducible evidence, but it is worth stating precisely what it does and does not prove: `sendInputEvent` is Chromium's synthetic-input injection path, and is normally expected to work regardless of true OS window-manager focus — it is routinely used by headless/background browser automation tools that never hold real window focus at all. `window_focused=false` is therefore strong evidence of *a* real problem (the focus call is not working as intended), but not yet proof that focus itself is *the* cause of the inert wheel input, since the two could be independent symptoms of the same underlying condition (e.g. `terminal-browser`'s window being rendered off-screen or specially for kitty-graphics-protocol capture rather than as a normal focusable OS window).
-
-**Strengthened fix + new diagnostics (not yet live-verified):** three changes, aimed at both trying harder and gathering evidence that can tell these possibilities apart on the next run: (1) `ownerWindow.show()` before `.focus()`, plus `app.focus({ steal: true })` (macOS-specific; harmlessly a no-op elsewhere) in addition to the existing window/contents focus calls; (2) a 150ms settle delay before re-checking `windowFocused`, in case focus is asynchronous; (3) `findProjectScrollRegion` (bridge/preload.js) now also reports `devicePixelRatio` and `document.hasFocus()` in the `target region` line — a coordinate/DPI-scaling mismatch (the DOM rect is in CSS pixels; an off-screen-rendered or scaled window could need a different mapping to `sendInputEvent`'s coordinate space) would be a completely different, unrelated explanation for the same "zero effect" symptom, and this is now directly observable rather than assumed away. Build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`); **not yet re-run live.**
-
-**Eleventh live run (2026-09-14) — `window_focused=true` this time, but the wheel remained completely inert anyway.** The repository owner re-ran with the strengthened focus attempt in place. This time `real wheel (attempt 7): window_focused=true` — the focus step succeeded, unlike the tenth run — yet every tick still showed `scroll_top_before=0 scroll_top_after=0` and `project_links_before=10 project_links_after=10`, identically to both prior runs. **Correction, not deletion, of the tenth-pass framing:** that entry's own text already flagged this possibility ("not yet proof that focus itself is *the* cause"), and this run confirms it directly — real OS-level window focus, once actually obtained, made no observable difference at all. `focus-only explanation: DISPROVEN` as a complete account of the inert wheel input; whatever `window_focused` was measuring was never the (or not the only) blocking factor. Everything else from this run stayed healthy: `page=0 conversation_count=10 cursor_in=0 cursor_out=cursor:ab9eac2d8174` (page 0 captured correctly, using the already-fixed SeriesKey selection), and `cursor-present 200=100 401=0` (frontend authorization remains fine). The blocker is specifically the UI trigger for page 1 and beyond, not auth, capture, schema, or the SeriesKey/dedupe logic already fixed in prior passes.
-
-**Root-cause investigation — reading terminal-browser's own bundled source directly, rather than guessing further:** since window-manager focus was now proven insufficient, this pass inspected `terminal-browser`'s actual installed application bundle (`~/.local/share/terminal-browser/app/browser/dist/main.js`) for its real manual-wheel input implementation, instead of continuing to guess at Electron/Chromium behavior from the outside. Two concrete, verified discrepancies were found:
-
-1. **terminal-browser's own `focus()` method does not rely on real OS window-manager focus at all.** Alongside `window.focus()`/`webContents.focus()`, it also calls CDP `Emulation.setFocusEmulationEnabled({ enabled: true })` — a Chrome DevTools Protocol command that forces Chromium's renderer to consider itself focused (document-level focus state, and any input handling that depends on it) independent of whatever the OS window manager reports. This is very likely why real OS focus (`window_focused=true`, confirmed this run) still produced zero effect: the renderer itself may never have believed it was focused, regardless of what the owning `BrowserWindow` reported.
-2. **The wheel event shape itself differed from the real one.** terminal-browser's non-precise (tick-based) wheel path sends `hasPreciseScrollingDeltas: false` and `modifiers: []` — both previously omitted from this spike's `sendInputEvent` call — and its delta magnitude is a platform-specific "detent": **40px on macOS, 120px elsewhere** (`WHEEL_DETENT_PX = process.platform === "darwin" ? 40 : 120`), not a hardcoded 120 sent unconditionally on every platform.
-
-**Fix:** `realWheelScrollProject` (bridge/main.js) now calls `contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true })` (the existing CDP debugger session, already attached for passive capture, reused — no new credential-adjacent surface) before sending any input, and reports whether this succeeded (`focusEmulationEnabled`). The wheel event shape now matches terminal-browser's own exactly: `deltaY: ±40` on macOS (`±120` elsewhere), `hasPreciseScrollingDeltas: false`, `modifiers: []`. The exact shape is also reported once per run (`wheel input: x=... y=... delta_y=... wheel_ticks_y=... precise=... device_pixel_ratio=...`) for direct comparison against the manual path (README Task 6).
-
-**CDP wheel fallback (README Task 7):** if Electron `sendInputEvent` still shows zero progress across a whole attempt (no scroll movement, no link-count change), the SAME attempt now also tries the identical wheel input via raw CDP `Input.dispatchMouseEvent`, reported separately (`electron wheel: progress=...` / `cdp wheel: attempted=... progress=...`) — a fallback diagnostic, not assumed as the production mechanism from the outset. If CDP succeeds where Electron's own API does not, that is itself strong, actionable evidence (`sendInputEvent` delivery is what's unreliable, not the pagination trigger or the target region).
-
-**Pointer-target verification (README Task 8):** `pointerInsideScrollRegion` (bridge/preload.js) now checks, via `document.elementFromPoint(x, y)` and an ancestor walk, whether the exact coordinate the wheel input is sent to actually lands inside the selected scroll region — reported once as `pointer_inside_selected_scroll_region=true/false` — directly ruling out (or confirming) a coordinate/target-selection mismatch as a completely different explanation for the same symptom, rather than assuming the region/coordinate math is correct.
-
-**Failure classification fix (README Task 1):** the ninth/tenth/eleventh runs' `exhausted N real-wheel attempts without observing a terminal cursor` failure was being classified `CAPTURE_FAILURE` — the category reserved for schema/validation failures — purely because `classifyCursorExperimentOutcome` treated "any non-nil error" as a capture failure, without distinguishing an expected "ran out of attempts, nothing is actually wrong with the data" condition from a genuine one. Fixed with a dedicated `*cursorChainIncompleteError` type (never matched by error-string content) that the classifier now checks before the generic error branch, correctly producing `CHAIN_INCOMPLETE` and `Project session enumeration: INCOMPLETE` for this exact case — with an additional `reason` (`WHEEL_NO_PROGRESS` when literally nothing observable happened across every attempt, `ATTEMPTS_EXHAUSTED` otherwise) computed by a small, separately unit-tested classifier (`classifyWheelProgressReason`). The accumulated (though incomplete) conversation set from the last successful harvest is now also returned and reported in this case, instead of being discarded.
-
-**Expected-next-cursor diagnostic (README Task 2/9):** after any page is accepted, this pass now tracks that page's own declared next cursor and checks, on every later harvest, whether a fresh capture's `CursorIn` actually equals it (`forwardProgressObserved`, pure and unit-tested) — printed as `expected next cursor request (label): observed=true/false`. A rising `cursor-present` request count is deliberately never treated as forward progress by itself: only an observed `CursorIn` transition from page 0's own next cursor proves the frontend requested page 2, as opposed to endlessly re-requesting page 1 (which is exactly what the ninth/tenth/eleventh runs' 90-100 cumulative cursor-present requests turned out to be, now made explicit rather than inferred).
-
-**Experiment-local status delta (README Task 3):** `projectConversationsStatusCounts` is cumulative for the whole browser process's lifetime, so a raw reading (e.g. the `cursor-present 200=100` seen in the ninth through eleventh runs) conflates earlier-in-run traffic (project discovery, `conversationEvidence`, the global-endpoint investigation) with what the cursor experiment's own wheel input actually caused. `runCursorExperiment` now snapshots the counters immediately before and after `enumerateProjectConversationsByCursorPassive` and reports (and classifies on) the delta (`subtractStatusCounts`, pure and unit-tested) instead of the cumulative total.
-
-All of the above is build/test-verified (`go build`, `go vet`, `go test -race`, `node --check`); **not yet re-run live.**
-
-**Twelfth live run (2026-09-14) — the wheel fix works completely: forward cursor pagination trigger PROVEN.** The repository owner re-ran with the CDP focus-emulation and corrected wheel-shape fixes in place. Direct confirmation, on every single attempt: `electron wheel (attempt N): progress=true`, with `scroll_top_before`/`scroll_top_after` advancing cleanly by exactly 40px per tick (the matched macOS detent) from 0 all the way to 960 — CDP fallback was never even needed (`cdp wheel: attempted=false` throughout). At attempt 3, a second page appeared: `page=1 conversation_count=10 cursor_in=cursor:ab9eac2d8174 cursor_out=cursor:4aaec5d76d2d` — its `cursor_in` fingerprint is EXACTLY page 0's own declared `cursor_out` (`cursor:ab9eac2d8174`), direct, unambiguous proof that the real ChatGPT frontend requested page 2 using the exact cursor this harness's page-0 read expected it to. `duplicates_observed=0` across all 20 accumulated conversations; `known normal Chat present=true` and `known Work present=true` — both already covered within the first 20. This satisfies the task's explicit **partial success condition**: `page0.NextCursor` observed as a later `CursorIn` → **forward cursor pagination trigger: PASS**, full enumeration: INCOMPLETE.
-
-**Diagnostic bug found and fixed in the same run:** the run's own `expected next cursor request (attempt N): observed=false` line was WRONG on the very same snapshot where page 1 had, in fact, just been captured under the exactly-expected cursor (directly visible by comparing the two printed fingerprints above) — the diagnostic's own evidence contradicted its own conclusion. Root cause: `recordPages` (which advances `expectedNextCursor` to the newest page's own declared next cursor) was called BEFORE `reportForwardProgress` checked whether the PREVIOUS `expectedNextCursor` had just been observed, so by the time the check ran, it was always comparing against a cursor one step further ahead than anything the current batch could contain yet — a self-defeating check on every single call. Fixed by swapping the order (report first, then record) at both call sites. This was a bug in this pass's own new diagnostic, not in the underlying enumeration/dedupe/accumulation logic, which used the full page list directly and was unaffected.
-
-**What happened after page 1:** further scrolling (attempts 4-7, `scroll_top` climbing steadily from 480 to 960) never produced a page 2. `project_conversation_links` plateaued at exactly 20 for the rest of the run, unlike the earlier 10→20 growth that accompanied page 1 arriving. Per the task's explicit stop condition for this exact situation, this is recorded as a known, separate follow-up — NOT chased further in that pass — rather than continuing to iterate on the wheel mechanism now that its job (triggering the first forward-pagination step) is proven to work.
-
-**Content-aware bottom-detection follow-up:** the twelfth run's own fixed bound (8 attempts × 3 ticks × 40px) was itself a plausible reason page 2 was never reached — `scroll_top=960` may simply not yet have been close enough to the region's actual bottom, especially since a virtualized/lazy-loaded list's own `scrollHeight` typically grows once page 1 renders, meaning "the bottom" page 1 needed to reach was already further away than page 0's initial reading suggested. Rather than continue widening a fixed attempt count blindly, the scroll loop was made content-aware: `distanceToBottom`/`scrollMaxTop` (pure, clamped-to-zero, computed Go-side from dimensions the bridge already reports) and `isNearBottom` (within one viewport height of the bottom) replace the fixed attempt count as the stopping signal; `scrollHeightGrew` detects when a newly-loaded page extends the scrollable content, so continued scrolling always targets the CURRENT bottom, not a stale one. Per-transition tracking (`transition N->N+1: expected_cursor_observed=...`) reports each pending transition individually, and a `BOTTOM_NO_REQUEST` classification stands ready, distinct from `ATTEMPTS_EXHAUSTED`/`WHEEL_NO_PROGRESS`, for the case where reaching the bottom does NOT trigger a forward request — which, as the thirteenth run below shows, turned out not to be needed.
-
-**Thirteenth live run (2026-09-14) — SUCCESS: full enumeration COMPLETE.** The repository owner re-ran with the content-aware scroll loop in place. The twelfth run's working hypothesis was exactly right: `scroll_height` kept growing as each new page loaded (`1133 → 1783 → 2433`, growing again after page 2), and continuing to scroll toward the CURRENT bottom — rather than stopping at a fixed attempt count — let every remaining transition fire in turn:
-
-```text
-transition 0->1: expected_cursor_observed=true  (round 3)
-transition 1->2: expected_cursor_observed=true  (round 8)
-transition 2->3: expected_cursor_observed=true  (round 13, page 3 explicitly terminal: cursor_out=<terminal>)
-
-pages fetched: 4  (page 0: 10, page 1: 10, page 2: 10, page 3: 5)
-terminal cursor observed: true
-unique conversations: 35   duplicates_observed: 0
-Project session enumeration: COMPLETE
-failure category: COMPLETE
-response ordering (first page, server order): created_desc=false updated_desc=true
-agentsctl ordering (creation time DESC) verified: true
-known normal Chat present: true
-known Work present: true
-comparison vs old project-scoped (no cursor) count=5: cursor_set_count=35 (>= old: true)
-```
-
-Every invariant held throughout the full 4-page walk: zero duplicates across all 35 conversations, `window_focused=true`/`focus_emulation_enabled=true`/`pointer_inside_selected_scroll_region=true` on every single attempt, `electron wheel: progress=true` throughout (CDP fallback never needed), and the `SeriesKey` selection made at page 0 (`4f53cda18c2b`, excluding the decoy 5-item series) stayed correctly pinned for all four pages — none of the eleven previously-resolved blockers regressed. `35` far exceeds both the old no-cursor project-scoped count (5) and the previously-recorded Project-filtered global-endpoint subset (~16-17), directly confirming Phase D's superseded interpretation from a position of full enumeration, not just a partial one.
-
-**Phase C — live full enumeration: COMPLETE.** Thirteen live runs total — the self-fetch 401, the stale-capture freshness bug, the self-fetch/real-frontend 401 ambiguity, the non-idempotent-next-cursor-token dedupe bug, the no-cursor/cursor="0" conflation fix, the SeriesKey fix, the CDP focus-emulation/wheel-shape fix (informed directly by terminal-browser's own bundled source), a diagnostic-ordering bug, and a fixed-attempt-count limitation — each found and fixed with live evidence, never guessed, culminating in a full, terminal-cursor-confirmed enumeration of the configured Project's cursor-paginated session list. This is the spike's stated success condition; per the task's own instruction, no further live iteration is needed on this mechanism.
-
-Historical fifth-run status (superseded by the twelfth run below — kept for the record, not deleted):
-
-```text
-initial cursor: 0
-pages fetched: 0 confirmed this run (failed at the first harvest, before any page could be accepted or any wheel input was sent)
-terminal cursor observed: NOT YET RUN
-cursor cycle: NOT YET RUN (not reached)
-failure category: CAPTURE_FAILURE (fifth run, for a different, more fundamental reason than the fourth) — NOT fixed; open design question
-frontend cursor-request authorization: CONFIRMED WORKING (200, not 401) across two independent live runs — FRONTEND_401 ruled out
-first-page content stability: NOT CONFIRMED — a real conversation-set change was observed between two automatic fetches with zero wheel input, most likely explained by genuine concurrent Project activity
-```
-
-Current status, as of the twelfth live run:
-
-```text
-initial cursor: 0
-pages fetched: 2 (page 0: 10 items, page 1: 10 items)
-terminal cursor observed: false
-cursor cycle: none observed
-failure category: CHAIN_INCOMPLETE (reason: ATTEMPTS_EXHAUSTED at the time; the page1→page2 follow-up spike below narrows this further)
-frontend cursor-request authorization: CONFIRMED WORKING (200, not 401) across every live run since the fourth — FRONTEND_401 ruled out
-first-page content stability: RESOLVED — the earlier apparent instability was the SeriesKey conflation bug (fixed at the ninth pass), not genuine concurrent-activity churn; zero conflicts observed since
-```
-
-**Completeness criteria (per the task, restated as this implementation's actual checks):** `enumerateProjectConversationsByCursorPassive`/`accumulateCursorChain` together satisfy all seven conditions in code — starts at `cursor=0` (or whatever the real client's first natural request used); follows only the response's own returned cursor; fails closed on any cycle; validates every page's item shape (non-empty ID) before accepting it; requires an explicit terminal (`HasNextCursor=false`) page to declare COMPLETE; accumulates every page's conversations; and dedupes by ID with a reported count (both across pages and across a benign duplicate observation of the same cursor). **Total is never consulted** because this endpoint's response has no such field to begin with (Phase A). None of this substitutes for the live run: `Project session enumeration` is `COMPLETE`/`INCOMPLETE`/`FAIL` only after `-cursor-experiment` is actually executed against the real account.
-
-**Phase D — re-evaluating the earlier under-report interpretation:** **SUPERSEDED, confirmed by live evidence — and by a specific mechanism, not just a larger count.** `~~Project-scoped endpoint under-reports sessions.~~` The earlier ~5-item project-scoped result was never a partial read of the SAME list — the SeriesKey investigation (eighth live run) proved it was a structurally different request (a distinct, smaller decoy series sharing the same URL path), and the current cursor-pagination path has since obtained 20 unique conversations across 2 pages with zero duplicates, already exceeding it. Corrected interpretation: **the earlier ~5-item result was not a complete Project listing — it represented a different, smaller-limit first-page request shape, not this endpoint's real paginated list.**
-
-**Phase E — known Chat/Work inclusion:** confirmed by live evidence (twelfth run) — both were present within just the first 20 conversations obtained.
-
-```text
-known normal Chat present: true
-known Work present: true
-```
-
-**Phase F — creation vs. update order:** confirmed by live evidence (twelfth run) — the first page's server-returned order is monotonically non-increasing by `update_time`, not by `create_time`, consistent with the "most-recently-updated-first" ordering already established for the unrelated global endpoint.
-
-```text
-response ordering (first page, server order):
-  created_desc=false
-  updated_desc=true
-```
-
-**agentsctl ordering:** `sortConversationsByCreatedDesc` sorts by `CreatedAt` descending with a deterministic ID-ascending tie-break, entirely independent of server-returned order — verified by `TestSortConversationsByCreatedDescOrdersNewestFirst`/`TestSortConversationsByCreatedDescIsStableAndDeterministicOnTies` in `cursor_test.go`. `cursorConversation` structurally carries no pin/star or server-order field at all (see `TestCursorConversationHasNoPinOrStarField`), so no remote pin or server ordering signal can reach this sort even by accident.
-
-**Phase G — dedupe behavior:** `accumulateCursorChain` dedupes by conversation ID across page boundaries and reports a count; covered by `TestAccumulateCursorChainDeduplicatesAcrossPages` (no live duplicates observed yet, since no live run has happened).
-
-**Phase H — schema fail-closed:** `parseCursorWireItems`/`accumulateCursorChain`/`bridge/preload.js`'s `projectConversationsCursorFrom` together fail closed (return an error, never a partial result presented as complete) on: an unrecognized top-level collection shape, a missing conversation ID, an unparseable `create_time`/`update_time`, a `cursor` field of an unrecognized type, a broken cursor chain, and a cursor cycle. None of these are reachable from a live run yet, but each has a dedicated unit test (`cursor_test.go`).
-
-**Phase I — local pin design confirmation (decision, not yet implemented in production code):**
-
-```text
-ChatGPT remote pin/star state (is_starred, pinned_time):
-ignored — never read by any function in cursor.go
-
-agentsctl pin:
-local-only, keyed by chatgpt:<conversation_id>
-
-server response ordering:
-ignored — agentsctl always re-sorts by CreatedAt DESC locally (sortConversationsByCreatedDesc)
-```
-
-Reasoning: agentsctl's pin is a provider-independent local UX concept, not a mirror of any one provider's remote pin semantics; it must not depend on ChatGPT's `is_starred`/`pinned_time` fields, and agentsctl must never issue a ChatGPT pin/unpin mutation on the user's behalf. Keeping pin state and list ordering fully separate from server-reported ordering also means a future ChatGPT response-order change (e.g. `updated` vs `created`) cannot silently change what the user sees as "recently pinned" versus "recently created." This mirrors, and is consistent with, the identical local-pin design already documented for the offset-based path's `is_starred` investigation above — it is restated here because the cursor endpoint surfaces the same `is_starred`/`pinned_time` fields at the list-item level and a future implementer must not be tempted to wire them up differently just because the endpoint is different.
-
-**Compare with the old global path:** confirmed by live evidence (twelfth run) against that same run's own no-cursor `conversations` count. The global-filtered comparison was not meaningfully available in that specific run (`global conversations: PASS project_scoped_via_global=0` — likely a `hide_snorlax=true` capture arrived first for that check in that run, consistent with the already-documented non-determinism of which series a passive capture lands on; not re-investigated here, per the task's explicit instruction not to reopen that question).
-
-```text
-project cursor set count: 20
-previously-observed old project-scoped (no cursor) count: 5 (cursor_set_count >= old: true)
-previously-observed global-filtered subset count this run: 0 (not meaningfully available this run — see above)
-```
-
-**Result: PASS — full Project session enumeration via cursor pagination is directly proven COMPLETE, with a terminal cursor observed and zero duplicates across all 35 conversations.** Thirteen live runs, each surfacing and fixing one real, evidence-grounded problem — never a guess accepted without live confirmation — brought this from "cannot even authenticate a cursor-present request" to a full, walked, terminal-confirmed enumeration: self-fetch 401 (documented negative, moved to an opt-in probe), a stale-capture freshness bug, a real-frontend-401 ambiguity (resolved: never happened), a non-idempotent-next-cursor-token dedupe bug, a no-cursor/cursor="0" request conflation, the actual root cause (`SeriesKey` — two structurally different requests sharing `cursor=0`), a wheel-input delivery problem resolved by reading terminal-browser's own bundled source (CDP focus emulation, the correct platform-specific wheel detent), and finally a fixed-attempt-count limitation resolved by making the scroll loop content-aware (`distanceToBottom`/`isNearBottom`/`scrollHeightGrew`). Every previously-established invariant — opaque-cursor discipline, `SeriesKey` pinning, ID-based dedupe, cycle detection, schema fail-closed, local `CreatedAt` DESC ordering, ChatGPT remote pin ignored — held throughout the full walk. **Project-inclusive pagination: COMPLETE for this account/session.** Phase 5's original CONDITIONAL status is superseded by this endpoint: the Project-scoped cursor-paginated `GET /backend-api/gizmos/{project_id}/conversations?cursor=...` is now a proven, working List mechanism, and per the task's explicit instruction, the historical `hide_snorlax`/`is_starred`/global-`offset=28` investigation lines are retained only as historical evidence, not continued.
-
-**Effect on old blockers (pending the live PASS):** if the live run reaches `Project session enumeration: COMPLETE` with a count at or above the previously-observed ~16-17, the following historical investigations (Phase 5's `hide_snorlax` pagination, `is_starred` coverage experiment, and the global `offset=28` Project-inclusive trigger search) are superseded as the production List path and retained only as historical evidence, per the task's explicit instruction not to continue that research once this endpoint is COMPLETE. Until that live run happens, none of the historical Phase 5 CONDITIONAL status changes.
-
-### Phase 6: Chat versus Work discrimination
-
-**Hypothesis:** Sanitized list/detail metadata contains an explicit discriminator that differs between known Chat and Work samples.
-
-**Method:** With a human-created Work/Agent session now confirmed to exist in the Project (found via the Phase 5 correction), ran the same field/cardinality comparison across all 18 known conversations (5 from the project-scoped list + 13 newly discovered), then extended the sanitizer to also report the redacted distinct *values* for marker fields (still never conversation content, titles, or per-conversation identity mapping — see Known limitations for a mid-run correction to this).
-
-**Observed:** Two fields changed shape only once the 13 newly-discovered conversations were included:
-- `messages.[].metadata.async_source` — absent from all 27 fields observed in the original 5-sample evidence; present in exactly 1 of the 18 combined conversations, holding an internal backend worker/server identifier (`saserver-<region>-prod...:conversation-turn-...`). The field name itself denotes asynchronous/agentic execution infrastructure.
-- `default_model_slug` / `messages.[].metadata.model_slug` — `distinct_values` rose from 1 (`gpt-5-6-thinking` in all 5) to 2, with the second value present outside the original 5. The naming (`sol-wm`) is consistent with a distinct backend/model variant for agentic work.
-
-A weaker, ambiguous third signal: `conversation_origin` also gained a second value (`tpp`) outside the original 5, but that label doesn't obviously mean "Work" (more likely "third-party plugin" or similar) and shouldn't be relied on without independent confirmation. The originally-hypothesized `async_status` field stayed `null` across all 18 samples, including whichever one carries `async_source` — it is very likely a transient "currently executing" flag that resets once a Work session finishes, not a durable discriminator.
-
-An Open-URL probe (Phase 7) further confirmed that navigating to the specific conversation ID carrying `async_source` behaves identically (readiness, no login redirect) to navigating to a known plain Chat ID, which is consistent with — though does not by itself prove — that ID being the created Work session.
-
-**Result: CONDITIONAL — B. A discriminator candidate exists but is undocumented and fragile.** `messages.[].metadata.async_source` presence is the primary candidate; `model_slug`/`default_model_slug` value is a corroborating secondary signal. This is evidence from a single Work sample (n=1) against an internal, unstable field name — not the "A. stable explicit discriminator" bar this phase set out to clear.
-
-**Implication:** This is the primary remaining acceptance blocker, but it moved from "cannot distinguish" to "a plausible undocumented discriminator, needs corroboration." Before this is production-ready: confirm `async_source` presence (or absence) across more than one Work sample, confirm it does not also appear on ordinary tool-using Chats (e.g. browsing/code-interpreter turns, which already use several of the same marker-named fields), and treat any adapter built on it as versioned/fragile per the security boundary (ChatGPT can rename or remove it without notice).
-
-### Phase 7: canonical Open behavior
-
-**Hypothesis:** Conversation identity maps to one stable Project-preserving URL for both Chat and Work.
-
-**Method:** Extended the harness with an `openURLProbe` bridge method that, without ever transmitting the chosen conversation ID across the socket, selects one conversation already showing the `async_source` marker (Phase 6) and one plain conversation from the original 5, then navigates to both `/c/{id}` (canonical) and `/g/{project_id}/c/{id}` (project-scoped) for each and reports readiness, login-redirect state, and an ID-redacted comparison of the resulting URL against the requested one.
-
-**Observed:** All four navigations reached `ready=complete` with `login_prompt=false` — no login-redirect in any case, for either conversation kind or either starting URL shape. The exact-string comparison against the requested path initially reported `false` in all four cases; the ID-redacted diagnostic showed why: every navigation — including the plain `/c/{id}` canonical form — resolved to the same `/g/g-p-<redacted>/c/<conversation-id>` shape. Cross-checked against the Project URL the human originally shared for this spike (`https://chatgpt.com/g/g-p-<redacted>-<project-name-slug>/c/<conversation-id>`), the harness's own candidate Project URL (`https://chatgpt.com/g/{id}`, built from the bare `g-p-...` ID only) was itself incomplete — ChatGPT's real canonical form appends a human-readable Project-name slug after the ID. The exact-match probe was comparing against that incomplete candidate, not evidence that Open failed.
-
-**Result: PASS**, with a resolved strategy: **bare `/c/{conversation_id}` is the canonical Open URL for both Chat and Work.** ChatGPT itself resolves/redirects a bare conversation ID (and even an ID-only, slug-less project-scoped guess) to the fully-qualified, Project-slug-including URL, uniformly for the plain Chat sample and the `async_source`-marked sample, with no login redirect in either case.
-
-**Implication:** Production code does not need to resolve or track the Project's URL slug at all — `https://chatgpt.com/c/{conversation_id}` is sufficient as the Open target and lets ChatGPT's own routing normalize the rest. This removes a category of URL-construction fragility the original candidate list assumed.
-
-### Phase 8: app-mode session view
-
-**Hypothesis:** Official ChatGPT Web UI is usable as the attach-equivalent view.
-
-**Method (sandboxed harness):** Attempted a foreground `terminal-browser` launch in the current terminal; app-mode requires the same graphics path.
-
-**Observed (sandboxed harness):** The terminal was rejected as unable to show images. Not exercised further here.
-
-**Method (human terminal, iTerm2 with Kitty graphics protocol support):** `terminal-browser open --app-mode --partition=agentsctl-chatgpt https://chatgpt.com`, against the same authenticated partition used throughout. The human viewed both a normal Chat and the Work session created for Phase 6/7, then sent a real message through the in-browser composer.
-
-**Observed:** Both Chat and Work sessions rendered and were browsable normally. A message was sent successfully through the composer. One concrete UX defect surfaced: `terminal-browser`'s key handling does not distinguish an IME composition-confirm `Enter` from a send `Enter` — composing a prompt with an IME (e.g. Japanese) and pressing `Enter` to confirm the conversion submits the message prematurely instead of confirming the conversion. The workaround is to compose the message elsewhere and paste it in.
-
-**Result: PASS, with a known UX defect.** Transcript rendering, browsing between Chat and Work, and message sending all work. IME-based composition does not work correctly in the terminal-embedded browser.
-
-**Implication:** Official ChatGPT Web UI is usable as the attach-equivalent view for both Chat and Work. The IME defect is a real usability blocker for any user who composes in an IME-dependent language directly inside the terminal-embedded window — it should be reported upstream to `zenbu-labs/terminal-browser` and tracked as a UX caveat in any production design, not silently accepted.
-
-### Phase 9: return with Ctrl+]
-
-**Hypothesis:** A preload handler can close only the browser view while cloud execution continues.
-
-**Method (sandboxed harness):** Added an opt-in capture handler using the documented `globalThis.terminalBrowser.quit()` API when `AGENTSCTL_CHATGPT_CLOSE_KEY=1`. No visible authenticated Work execution was available for an end-to-end test in that environment.
-
-**Method (human terminal, iTerm2):** `AGENTSCTL_CHATGPT_CLOSE_KEY=1 terminal-browser open --app-mode --partition=agentsctl-chatgpt --preload=$(pwd)/bridge/preload.js https://chatgpt.com`, navigated to the Work session, pressed `Ctrl+]`, then reopened and reselected the same session.
-
-**Observed:** `Ctrl+]` closed only the `terminal-browser` view; control returned to the shell with no other apparent side effects. On reselecting the same Work session afterward, its running/completed state was preserved exactly as before the view was closed — nothing was reset or re-run. (An initial reopen against the bare `https://chatgpt.com` root URL showed a new-chat screen, as expected for that URL — that was a methodology artifact, not evidence of lost state; reselecting the specific session from the sidebar showed the true, preserved state.)
-
-**Result: PASS**
-
-**Implication:** The `Ctrl+]`-closes-view-only, cloud-Work-continues semantics that Issue #7 wants for ChatGPT (as opposed to Claude/Codex's PTY-detach semantics) are achievable with a small opt-in preload handler over the documented `terminalBrowser.quit()` API, and cloud continuity was directly observed, not just inferred.
-
-### Phase 10: failure behavior
-
-**Hypothesis:** Missing dependencies, stopped lifecycle owners, logged-out state, bridge errors, and malformed responses fail closed.
-
-**Method:** Used a nonexistent binary, closed the PTY during a hold, queried while logged out, and ran response-validation tests for remote rejection, missing results, and mismatched response IDs.
-
-**Observed:** Each case returned an error. The harness did not emit partial Project/session data and did not attempt credential extraction or another authentication route.
-
-**Result: PASS for exercised cases; other endpoint/schema cases remain NOT VERIFIED live**
-
-**Implication:** The boundary can fail closed, but authenticated invalid-ID and live schema-change probes remain to be run.
-
-## Results
-
-| Phase | Result |
-| --- | --- |
-| 0. Baseline | CONDITIONAL |
-| 1. Persistent authentication | PASS (proven by authenticated fetch after restart) |
-| 2. Background helper | CONDITIONAL — PoC workaround only |
-| 3. Browser bridge | PASS |
-| 4. Project discovery | PASS (name→ID resolution); rename/duplicate-name robustness NOT VERIFIED |
-| 5. Session discovery | **PASS (superseded method)** — the global `/backend-api/conversations`/`hide_snorlax`/`is_starred` investigation below this row is retained as historical evidence only. The Project-scoped `?cursor=` pagination path (see "ChatGPT Project session listing: cursor pagination spike") is now live-proven: full enumeration reached a terminal cursor with 35 unique, zero-duplicate conversations, exceeding every earlier partial count. This is now the recommended List mechanism for Issue #6. |
-| 6. Chat / Work discrimination | CONDITIONAL — B. `async_source` field presence is a plausible undocumented discriminator (n=1 Work sample) |
-| 7. Stable identity and Open | PASS — bare `/c/{conversation_id}` is sufficient; ChatGPT normalizes to the full Project-slug URL itself |
-| 8. App-mode UX | PASS, with a known UX defect — Chat/Work both render and are usable; IME composition (e.g. Japanese) submits prematurely on the conversion-confirm `Enter` |
-| 9. Ctrl+] semantics | PASS — view closes cleanly; reselecting the Work session shows state preserved exactly, not reset |
-| 10. Failure behavior | PASS for exercised cases |
-
-## Capability matrix
-
-`Proven` means observed in this run. `Prepared` means the PoC has a guarded path that could not be exercised due to missing authentication.
-
-| Capability | Programmatic | Browser UI | Stability | Notes |
-| --- | --- | --- | --- | --- |
-| List | **Proven** — Project-scoped `?cursor=` pagination reached a terminal cursor with a full, zero-duplicate enumeration | N/A | Undocumented, but a full live walk (13 live runs, 4 pages, terminal cursor observed) held every invariant (opaque cursor, `SeriesKey`, dedupe, cycle detection, schema fail-closed) | Self-fetch of a cursor-parameterized request is unauthorized (HTTP 401) — enumeration requires passive capture of the real frontend's own requests, driven by real Electron wheel input (CDP `Emulation.setFocusEmulationEnabled` plus the platform-specific wheel detent, matched from `terminal-browser`'s own source) toward the scroll region's own, content-aware bottom. The earlier global-endpoint/`hide_snorlax`/`is_starred` investigation (below) is superseded for List purposes; `/backend-api/tasks` investigated and rejected as unrelated |
-| Open | Proven | N/A (delegates to browser UI) | Undocumented navigation behavior, but consistent across 4 probes | Bare `/c/{id}` normalizes correctly for both Chat and a Work-marked sample; no login redirect |
-| Read transcript | Out of scope | Proven | Stable enough for delegation | Rendered correctly for both Chat and Work in app-mode |
-| Send message | Out of scope | Proven, with a caveat | IME input does not work correctly | A real message was sent successfully; IME composition (e.g. Japanese) submits prematurely on the conversion-confirm `Enter` — compose-and-paste is the workaround |
-| Continue Chat | Out of scope | Proven | Stable enough for delegation | Reopened and continued normally |
-| Continue Work | Out of scope | Proven | Stable enough for delegation | Reselecting the Work session after a `Ctrl+]` close showed state preserved exactly |
-| Observe Work state | Conditional — B (undocumented) | Proven (visually, via UI) | Fragile programmatically; fine via UI delegation | `messages.[].metadata.async_source` presence is a plausible programmatic marker (n=1 sample); top-level `async_status` stayed null and is likely transient. Visually, the UI itself shows Work progress/state correctly, so UI delegation does not depend on solving the programmatic discriminator |
-| Rename | Out of scope | Not verified | Unknown | No destructive or mutating probe |
-| Archive/delete | Out of scope | Not verified | Unknown | No destructive probe |
-
-## Known limitations
-
-- Stock `terminal-browser` has no proven display-free service lifecycle. The PTY is a required liveness owner.
-- The sandboxed harness's terminal cannot display terminal-browser graphics; Phases 8 and 9 were exercised instead from the repository owner's iTerm2 (Kitty graphics protocol support) and passed. `terminal-browser`'s key handling does not distinguish an IME composition-confirm `Enter` from a send `Enter`, so IME-based composition (e.g. Japanese) submits prematurely; this should be reported upstream and treated as a known UX caveat, not solved by this spike.
-- Authentication, Project discovery, and session discovery (Phases 1, 4, 5) are proven against the human's real account and real Project via a human-operated terminal, after one manual login. Session discovery required correcting the method mid-run: the project-scoped conversations endpoint returns an incomplete list (5 of ~16-17), so a production adapter needs the global, Project-filtered endpoint too.
-- **Session discovery completeness (Phase 5 pagination follow-up, 2026-09-11; corrected 2026-09-13):** the global endpoint's own pagination was never verified in the original Phase 5 round-2 result — that result was one unverified response, not a proven-complete one. Live investigation found: (1) `hide_snorlax` must be false/absent for Project conversations to appear; (2) `total` is not trustworthy as an exhaustion signal; (3) bridge self-fetch returns HTTP 401; and (4) real-UI pagination had advanced only a Project-excluding series. `mergeProjectPages`/`enumerateAllConversations` therefore fail closed unless a contiguous raw offset chain ends in `RawItemCount < Limit`. An earlier statement that "this account: 16, within page size 28" proved the Project fit one page was wrong: 16 was only the Project-filtered subset of a full 28-item raw global page mixed with non-Project conversations. Project-filtered count is never an exhaustion signal. Pagination remains INCOMPLETE.
-- **Association schema-drift guarantee (2026-09-11, second pagination hardening pass):** the enumeration fails closed if a raw conversation item exposes neither `gizmo_id` nor `project_id` as an own property, based on live evidence (several captures, 28 raw items each, this account) that every item — Project-associated or not — always carries one of these keys, present but `null` for an ordinary non-Project chat. This is an empirical observation from one account's current schema, not a documented ChatGPT API guarantee; it is deliberately kept alongside, not instead of, the narrower and more concretely-grounded known-ID cross-check (a conversation ID already confirmed to belong to the configured Project whose association no longer resolves to it). Both are undocumented-schema assumptions that ChatGPT could change without notice, consistent with everything else in this section.
-- Chat/Work discrimination (Phase 6) has moved from "no evidence" to "one undocumented candidate field (`async_source`) confirmed on a single human-created Work sample." It is not yet confirmed absent from ordinary tool-using Chats, and is not a documented, stable API guarantee.
-- **Mid-run correction:** the field-value reporting added for Phase 6 initially printed unredacted `g-p-...` Project IDs and full conversation/turn UUIDs when they appeared as a structural field's *value* (e.g. `conversation_template_id`, `working_turn_id`) rather than as a key. The existing ID-redaction (already applied to `observedBackendPaths` and the Open-URL diagnostic) was not applied to this path. This was caught during the same session, before any further extraction, and fixed by routing all reported values through the shared redaction helper while still computing distinct-value counts from the raw (unredacted) values, so per-item uniqueness signals aren't lost. No cookie, token, or authorization header was ever involved; the exposed values were structural identifiers already visible to the operator from ChatGPT's own URLs. Any adapter built on this pattern must route every value that might contain an ID through the same redaction before logging.
-- **Project URL cleanup (2026-09-11):** the `projects` sanitizer previously returned a `url` field built as `https://chatgpt.com/g/{project_id}` (a bare-ID guess). Phase 7 already showed ChatGPT's real Project URLs carry a human-readable name slug this harness never resolves, so that field was never canonical. It has been removed rather than renamed, since nothing downstream (Go's `project` struct never had a matching field) ever consumed it. The conversation Open strategy (`https://chatgpt.com/c/{conversation_id}`, Phase 7) is unchanged.
-- All investigated `/backend-api/...` endpoints and schemas are observed, undocumented, and unstable.
-- The preload sanitizer deliberately rejects unknown shapes; ChatGPT changes will disable discovery until the adapter is reviewed.
-- v0.8.0 was tested while v0.8.1 was current.
-
-## Security boundary
-
-The browser partition is the sole owner of ChatGPT authentication. The Go process and socket protocol must never receive or log cookies, authorization headers, access tokens, refresh tokens, browser storage credentials, or complete request headers. Raw endpoint responses remain inside the preload; only explicitly selected Project/conversation metadata can cross IPC.
-
-The socket is local and changed to mode `0600`. Requests are size-limited and method allowlisted. Fetches are same-origin, credential-preserving browser calls to fixed path shapes. Failure never falls back to credential extraction.
-
-Structural field values (status/type/kind/mode/origin-style labels used for Chat/Work discrimination evidence) are permitted to cross the bridge, but only after ID-redaction — see the Phase 6 mid-run correction in Known limitations. Conversation content, titles, and per-conversation identity mapping are never logged, by design of the aggregate-only evidence comparison.
+Live evidence, not those local checks alone, is what establishes the final List result.
 
 ## Recommendation
 
 **Current decision: CONDITIONAL GO.**
 
-The bridge mechanism, persistent authentication, Project discovery, canonical Open URL, app-mode UI delegation, `Ctrl+]` view-close-without-stopping-Work semantics, and — as of the thirteenth cursor-pagination live run — full Project session discovery are all proven against a real account and a real, human-created Work sample. **The session-discovery gap this Recommendation previously called the second acceptance blocker is resolved:** the Project-scoped `?cursor=` endpoint, driven by real Electron wheel input toward its own content-aware scroll bottom, reached a terminal cursor with a complete, zero-duplicate 35-conversation enumeration (see "ChatGPT Project session listing: cursor pagination spike"). One acceptance-blocking gap remains: the Chat/Work discriminator (`async_source` was confirmed on only one Work sample). The background helper lifecycle also remains a PTY workaround, though app-mode itself does not need the pseudo-PTY.
+The browser-backed architecture and complete Project List mechanism are proven sufficiently for Issue #6 to reuse the spike's design evidence. Do not copy the spike verbatim into production; Issue #6 still needs production lifecycle/error/provider-interface design.
 
-```text
-#6 implementation before blocker resolution: no (one gap remains — see item 1)
-```
+Before relying on Chat/Work-specific programmatic behavior, resolve the remaining discriminator blocker:
 
-Before starting Issue #6:
+1. corroborate `async_source` across multiple Work samples,
+2. confirm it does not appear on ordinary tool-using Chats.
 
-0. ~~Run the new cursor-pagination experiment live~~ — **DONE.** `go run . -project-name agentsctl -cursor-experiment` reached `Project session enumeration: COMPLETE` (35 unique conversations, terminal cursor observed, zero duplicates), directly exceeding the previously-observed ~16-17. This replaces the entire global-endpoint/`hide_snorlax`/`is_starred` investigation as the production List source; item 3 (below) is superseded, kept only as historical evidence per the task's explicit instruction.
-1. Corroborate the `async_source`-presence discriminator against more than one Work sample, and confirm it does not also appear on ordinary tool-using Chats (browsing, code interpreter, etc., which already share several marker field names). Do not ship a heuristic confirmed on n=1. **This is now the sole remaining acceptance blocker.**
-2. Obtain a supported `terminal-browser` no-render/service lifecycle, or an explicit upstream commitment, suitable for production; the current pseudo-PTY is a PoC workaround only (Phase 2) and is needed for background discovery even though app-mode UI delegation itself works without it.
-3. ~~Resolve session-discovery completeness before relying on it in production~~ — **SUPERSEDED by item 0.** The `hide_snorlax`/`is_starred`/global-`offset=28` investigation this item described is retained only as historical evidence (README "Phase 5" and its addendum); a production adapter should use the Project-scoped `?cursor=` mechanism instead. If a future account/session shows the cursor mechanism itself regressing (e.g. `BOTTOM_NO_REQUEST`), re-open this item rather than reverting to the offset-based path, which was never proven complete even once.
-4. Report the IME composition-confirm-`Enter`-sends-prematurely defect to `zenbu-labs/terminal-browser` upstream, and track it as a known UX caveat for any user who composes in an IME-dependent language.
-5. Re-run against the selected/pinned `terminal-browser` version (v0.8.0 tested vs. v0.8.1 current at spike time) and document its compatibility window.
-6. **New, from the cursor-pagination spike:** before adapting this mechanism into Issue #6's production provider, re-verify it holds across at least one more account/session and one more `terminal-browser` restart, since every live confirmation so far comes from a single account in a single spike process per run. The spike's own passive-capture/`SeriesKey`/content-aware-scroll implementation (`spike/chatgpt-browser/cursor.go`) is a validated reference design, not itself production code — Issue #6 must still design its own production integration (background lifecycle, error surfaces, provider interface) rather than embedding the spike verbatim.
+Production hardening should additionally cover:
 
-Items 1, 2, 4, and 5 remain scoped hardening and verification steps, consistent with CONDITIONAL GO. Do not add a production ChatGPT provider or change shared provider/session contracts from this spike alone.
+- a supported `terminal-browser` background/service lifecycle,
+- upstream tracking for the IME bug,
+- pinning/retesting a supported terminal-browser version,
+- re-verifying cursor enumeration on another account/session or compatibility run.
+
+The historical global `/backend-api/conversations` / `hide_snorlax` / `is_starred` / offset-pagination path is retained as investigation evidence only. It is **not** the recommended production List path.
