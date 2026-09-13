@@ -40,6 +40,16 @@ const capturedConversations = new Map();
 // endpoint's `hide_snorlax` pagination discovery above.
 const projectConversationsCursorCaptures = new Map();
 let nextProjectCursorCaptureID = 1;
+// Privacy-safe response-status counts for the project-scoped conversations endpoint, split by
+// whether the request carried a `cursor` query parameter (README Task 3): a `cursor`-present 401
+// is architecturally significant new evidence (the real ChatGPT frontend's own pagination request
+// was rejected), while a `cursor`-absent request is this endpoint's ordinary, already-proven-to-
+// work no-cursor shape (the existing `conversations` method). Never records a URL, header, or
+// response body — only which of two request shapes it was, and a coarse status bucket.
+const projectConversationsStatusCounts = {
+  noCursor: { 200: 0, 401: 0, other: 0 },
+  cursorPresent: { 200: 0, 401: 0, other: 0 },
+};
 const capturedConversationDetails = new Map();
 const attachedDebuggers = new WeakSet();
 let attachedDebuggerCount = 0;
@@ -92,6 +102,13 @@ function attachCapture(contents) {
   contents.debugger.on("message", async (_event, method, params) => {
     if (method === "Network.responseReceived") {
       const target = captureTarget(params.response?.url || "");
+      if (target && target.kind === "conversations") {
+        // Recorded for EVERY status, not just 200 — the cursor-pagination spike's Task 3 needs to
+        // distinguish "the real frontend's own cursor request returned 401" from "no request was
+        // ever made" and from "the known, already-falsified self-fetch path 401s", none of which
+        // are visible if only 200 responses are counted.
+        recordProjectConversationsResponseStatus(params.response.url, params.response.status);
+      }
       if (target && params.response.status === 200) {
         matchedResponseCount++;
         responses.set(params.requestId, { ...target, url: params.response.url });
@@ -200,7 +217,7 @@ async function dispatch(request) {
     "pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe",
     "globalConversationsPages", "globalConversationsPage", "globalConversationsCaptureItems", "simulateSidebarScroll",
     "pins", "projectConversationsCursor", "knownSampleFingerprints", "projectConversationsCursorCaptures",
-    "navigateProject",
+    "navigateProject", "projectScrollRegion", "realWheelScrollProject", "projectConversationsResponseStatus",
   ].includes(request.method)) {
     throw new Error(`unsupported method: ${request.method}`);
   }
@@ -325,6 +342,61 @@ async function dispatch(request) {
       results.push({ captureID: capture.captureID, cursorIn: capture.cursorIn, ...sanitized });
     }
     return results;
+  }
+  if (request.method === "projectConversationsResponseStatus") {
+    // Passive-only, privacy-safe counts (README Task 3) — no URL, cursor value, header, or
+    // response body ever crosses this call.
+    return {
+      noCursor: { ...projectConversationsStatusCounts.noCursor },
+      cursorPresent: { ...projectConversationsStatusCounts.cursorPresent },
+    };
+  }
+  if (request.method === "realWheelScrollProject") {
+    // Real Electron input, not a synthetic DOM scroll event (README "New hypothesis" — a
+    // synthetic `scrollTop` mutation plus a dispatched `scroll` Event may not reproduce whatever
+    // browser-level input-pipeline behavior the real ChatGPT frontend's pagination trigger
+    // actually depends on). Target discovery (DOM-only: link counts/href shape/dimensions, never
+    // link text) happens in the preload script; only the resulting viewport coordinate and the
+    // WebContents' own sendInputEvent are used here in the main process, since sendInputEvent is
+    // not available from a renderer/preload context at all.
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
+      throw new Error("invalid Project ID");
+    }
+    const contents = chatGPTContents();
+    if (!contents) throw new Error("ChatGPT page is unavailable");
+    const region = await requestPage({ method: "projectScrollRegion" });
+    if (!region.found) {
+      return { found: false, candidateCount: region.candidateCount, ticks: [] };
+    }
+    const x = Math.round(region.rect.x + region.rect.width / 2);
+    const y = Math.round(region.rect.y + Math.min(region.rect.height / 2, Math.max(region.rect.height - 4, 0)));
+    const tickCount = Number.isInteger(request.ticks) && request.ticks > 0 ? Math.min(request.ticks, 8) : 3;
+    contents.sendInputEvent({ type: "mouseMove", x, y });
+    const ticks = [];
+    let previous = region;
+    for (let i = 0; i < tickCount; i++) {
+      contents.sendInputEvent({
+        type: "mouseWheel",
+        x,
+        y,
+        deltaX: 0,
+        deltaY: -120,
+        wheelTicksX: 0,
+        wheelTicksY: -1,
+        canScroll: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const snapshot = await requestPage({ method: "projectScrollRegion" });
+      ticks.push({
+        index: i,
+        scrollTopBefore: previous.found ? previous.scrollTop : null,
+        scrollTopAfter: snapshot.found ? snapshot.scrollTop : null,
+        projectConversationLinksBefore: previous.found ? previous.projectConversationLinks : null,
+        projectConversationLinksAfter: snapshot.found ? snapshot.projectConversationLinks : null,
+      });
+      previous = snapshot;
+    }
+    return { found: true, candidateCount: region.candidateCount, initial: region, ticks, final: previous };
   }
   if (request.method === "knownSampleFingerprints") {
     // README Phase E: report SHA-256 fingerprints (never raw IDs) of one already-known Work-marked
@@ -631,6 +703,36 @@ function recordProjectConversationsCursorCapture(projectID, rawURL, payload) {
   const list = projectConversationsCursorCaptures.get(projectID) || [];
   list.push({ captureID: nextProjectCursorCaptureID++, cursorIn, payload });
   projectConversationsCursorCaptures.set(projectID, list);
+}
+
+// hasCursorQueryParam reports whether a request URL to the project-scoped conversations endpoint
+// carried an explicit `cursor` query parameter. Mirrored for testing only as
+// testHasCursorQueryParam in cursor_test.go — keep the two in sync if this changes (same pattern
+// already used for canonicalSeriesKeyFrom above).
+function hasCursorQueryParam(rawURL) {
+  try {
+    return new URL(rawURL).searchParams.has("cursor");
+  } catch {
+    return false;
+  }
+}
+
+// bucketResponseStatus buckets an HTTP status into one of three privacy-safe categories. Mirrored
+// for testing only as testBucketResponseStatus in cursor_test.go.
+function bucketResponseStatus(status) {
+  if (status === 200) return "200";
+  if (status === 401) return "401";
+  return "other";
+}
+
+// recordProjectConversationsResponseStatus tallies a real, observed response to the project-scoped
+// conversations endpoint into a privacy-safe count, split by request shape (cursor-present vs.
+// no-cursor) and status bucket (README Task 3). Never records a URL, cursor value, header, or
+// response body.
+function recordProjectConversationsResponseStatus(rawURL, status) {
+  const bucket = hasCursorQueryParam(rawURL) ? projectConversationsStatusCounts.cursorPresent : projectConversationsStatusCounts.noCursor;
+  const key = bucketResponseStatus(status);
+  bucket[key] = (bucket[key] || 0) + 1;
 }
 
 function payloadHasAsyncSource(payload) {

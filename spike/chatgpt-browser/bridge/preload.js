@@ -286,6 +286,70 @@ function findScrollableAncestor(element) {
   return null;
 }
 
+// projectConversationLinkPattern recognizes a Project-scoped conversation link
+// (/g/g-p-.../c/{id}), distinct from a bare /c/{id} link — a Project's own dedicated view can use
+// either shape, and only checking for /c/ would miss the Project-scoped form entirely (this was
+// the gap the cursor-pagination spike's Task 5 fixed).
+function projectConversationLinkPattern() {
+  return /^\/g\/g-p-[A-Za-z0-9_-]+\/c\//;
+}
+
+// isConversationLinkHref classifies one anchor href, recognizing both the bare canonical shape and
+// the Project-scoped shape. Never inspects link text/title — only the href shape, per the
+// "Do not use DOM text for target selection" requirement.
+function isConversationLinkHref(href) {
+  if (typeof href !== "string") return { any: false, project: false };
+  const project = projectConversationLinkPattern().test(href);
+  const any = project || href.startsWith("/c/");
+  return { any, project };
+}
+
+// findProjectScrollRegion locates the scrollable container most likely to be the Project's own
+// conversation list — DOM inspection only (no input dispatch here; see bridge/main.js's
+// realWheelScrollProject for the input-sending half of this split). Selection uses only link
+// counts, href shape, and container dimensions/scrollability (never link text or title), per the
+// cursor-pagination spike's "Do not use DOM text for target selection" requirement. Among
+// candidate scrollable ancestors, the one with the most Project-scoped conversation links wins,
+// tie-broken by total conversation-link count — preferring a container that clearly belongs to the
+// Project's own list over one that merely happens to contain some /c/ links (e.g. a persistent
+// sidebar rendered alongside the Project page).
+function findProjectScrollRegion() {
+  const anchors = [...document.querySelectorAll('a[href^="/c/"], a[href^="/g/g-p-"]')];
+  const counts = new Map(); // container -> {any, project}
+  for (const anchor of anchors) {
+    const classification = isConversationLinkHref(anchor.getAttribute("href"));
+    if (!classification.any) continue;
+    const container = findScrollableAncestor(anchor);
+    if (!container) continue;
+    const entry = counts.get(container) || { any: 0, project: 0 };
+    entry.any++;
+    if (classification.project) entry.project++;
+    counts.set(container, entry);
+  }
+  if (counts.size === 0) {
+    return { found: false, candidateCount: 0 };
+  }
+  let best = null;
+  let bestEntry = null;
+  for (const [container, entry] of counts) {
+    if (!best || entry.project > bestEntry.project || (entry.project === bestEntry.project && entry.any > bestEntry.any)) {
+      best = container;
+      bestEntry = entry;
+    }
+  }
+  const rect = best.getBoundingClientRect();
+  return {
+    found: true,
+    candidateCount: counts.size,
+    conversationLinks: bestEntry.any,
+    projectConversationLinks: bestEntry.project,
+    scrollTop: best.scrollTop,
+    scrollHeight: best.scrollHeight,
+    clientHeight: best.clientHeight,
+    rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+  };
+}
+
 async function simulateSidebarScroll() {
   const anchors = [...document.querySelectorAll('a[href^="/c/"]')];
   const before = anchors.length;
@@ -423,6 +487,9 @@ async function dispatch(request) {
   }
   if (request.method === "simulateSidebarScroll") {
     return simulateSidebarScroll();
+  }
+  if (request.method === "projectScrollRegion") {
+    return findProjectScrollRegion();
   }
   if (request.method === "sanitizeGlobalConversationsPage") {
     if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");

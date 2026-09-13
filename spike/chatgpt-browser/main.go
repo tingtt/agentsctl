@@ -27,16 +27,17 @@ import (
 const protocolVersion = 1
 
 type config struct {
-	binary           string
-	partition        string
-	url              string
-	socket           string
-	projectID        string
-	projectName      string
-	hold             time.Duration
-	closePTYAfter    time.Duration
-	pinExperiment    bool
-	cursorExperiment bool
+	binary               string
+	partition            string
+	url                  string
+	socket               string
+	projectID            string
+	projectName          string
+	hold                 time.Duration
+	closePTYAfter        time.Duration
+	pinExperiment        bool
+	cursorExperiment     bool
+	cursorSelfFetchProbe bool
 }
 
 type request struct {
@@ -1410,6 +1411,8 @@ func parseFlags() config {
 		"run the interactive Phase 5 is_starred coverage experiment (README 'ChatGPT Phase 5: prove is_starred coverage semantics'); requires an interactive terminal and a human performing pin/star actions in the real ChatGPT UI")
 	flag.BoolVar(&cfg.cursorExperiment, "cursor-experiment", false,
 		"run the Project-scoped cursor pagination full-enumeration experiment (README 'ChatGPT Project session listing: cursor pagination spike')")
+	flag.BoolVar(&cfg.cursorSelfFetchProbe, "cursor-self-fetch-probe", false,
+		"independently re-verify the already-falsified self-issued fetch of the cursor-parameterized project-scoped endpoint (known negative: HTTP 401); not run by -cursor-experiment itself")
 	flag.Parse()
 	return cfg
 }
@@ -1726,6 +1729,14 @@ func run(ctx context.Context, cfg config) error {
 				return fmt.Errorf("pin experiment: %w", err)
 			}
 			browser, client = newBrowser, newClient
+		}
+
+		if cfg.cursorSelfFetchProbe {
+			if _, _, _, _, _, err := enumerateProjectConversationsByCursorSelfFetch(client, projectID, 1, 799); err != nil {
+				fmt.Printf("self-initiated fetch of cursor-paginated endpoint: NOT AUTHORIZED (%v)\n", err)
+			} else {
+				fmt.Println("self-initiated fetch of cursor-paginated endpoint: PASS")
+			}
 		}
 
 		if cfg.cursorExperiment {

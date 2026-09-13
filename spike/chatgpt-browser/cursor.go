@@ -361,24 +361,28 @@ func filterCapturesNewerThan(captures []cursorCaptureWireItem, minCaptureIDExclu
 // live evidence 2026-09-13 confirmed scrolling that view does load further cursor pages), then
 // repeatedly harvests whatever the real ChatGPT client has passively been observed requesting,
 // running accumulateCursorChain after every harvest — exactly the same pure, unit-tested logic
-// exercised directly by cursor_test.go — BEFORE attempting another scroll simulation. If no
-// terminal cursor is reached within maxScrollAttempts, this returns an error (never a partial
-// result presented as complete), mirroring every other fail-closed enumeration in this spike.
+// exercised directly by cursor_test.go — BEFORE sending another real wheel input. If no terminal
+// cursor is reached within maxWheelAttempts, this returns an error (never a partial result
+// presented as complete), mirroring every other fail-closed enumeration in this spike.
 //
-// A live run (2026-09-13) hit exactly the same class of bug this spike's pin experiment already
-// found and fixed once for the global endpoint (README "sixth pass — added an explicit freshness
-// gate"): earlier code considered EVERY capture ever observed for this Project, including one from
-// this endpoint's very first, unrelated navigation near the top of run() (via the existing
-// `conversations` bridge method's own cache-miss navigation) — long before this function's own
-// `navigateProject` call. Two independent real fetches of the logical first page, observed many
-// seconds apart with intervening account/session activity, are not guaranteed to be byte-identical
-// (the opaque cursor token itself is not proven idempotent — README "Cursor is opaque" forbids
-// assuming otherwise), so dedupeCapturesByCursorIn correctly, but unhelpfully, flagged them as
-// conflicting. Fixed with the same watermark pattern already proven elsewhere in this spike: a
-// baseline max CaptureID is read BEFORE this function's own navigation, and only captures strictly
-// newer than that watermark are ever considered — so a stale, pre-existing capture from earlier in
-// the same run can never be compared against this function's own fresh ones.
-func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID string, maxScrollAttempts, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
+// A second live run (2026-09-13) hit exactly the same class of bug this spike's pin experiment
+// already found and fixed once for the global endpoint (README "sixth pass — added an explicit
+// freshness gate"): earlier code considered EVERY capture ever observed for this Project,
+// including one from this endpoint's very first, unrelated navigation near the top of run() (via
+// the existing `conversations` bridge method's own cache-miss navigation) — long before this
+// function's own `navigateProject` call. Fixed with the same watermark pattern already proven
+// elsewhere in this spike: a baseline max CaptureID is read BEFORE this function's own navigation,
+// and only captures strictly newer than that watermark are ever considered.
+//
+// A third live run confirmed the trigger mechanism itself needed to change: synthetic DOM scroll
+// (`container.scrollTop = ...` plus a dispatched `scroll` Event, via simulateSidebarScroll) does
+// not reliably reproduce whatever browser-level input-pipeline behavior the real ChatGPT
+// frontend's own pagination trigger depends on — the operator's manual, real mouse-wheel input
+// was directly observed to work. This now sends real Electron `sendInputEvent` mouseWheel input
+// (bridge/main.js's realWheelScrollProject) at the Project's own conversation-list viewport
+// coordinate, instead of any synthetic DOM event, and never a self-issued fetch of the cursor
+// endpoint (README Task 7).
+func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID string, maxWheelAttempts, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
 	baseline, err := fetchCursorCaptures(client, idBase, projectID)
 	if err != nil {
 		return nil, 0, false, 0, nil, fmt.Errorf("read baseline cursor captures: %w", err)
@@ -393,10 +397,17 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 	if _, err := call(client, request{ID: idBase + 1, Method: "navigateProject", ProjectID: projectID}); err != nil {
 		return nil, 0, false, 0, nil, fmt.Errorf("navigate to Project view: %w", err)
 	}
+	fmt.Println("navigate Project: PASS")
 	time.Sleep(2 * time.Second)
 
-	harvest := func() (pages []cursorFetchedPage, firstOrder []cursorConversation, err error) {
-		raw, err := fetchCursorCaptures(client, idBase+2, projectID)
+	region, rerr := fetchProjectScrollRegion(client, idBase+2)
+	if rerr != nil {
+		return nil, 0, false, 0, nil, fmt.Errorf("read initial Project scroll region: %w", rerr)
+	}
+	printProjectScrollRegion("target region", region)
+
+	harvest := func(id int) (pages []cursorFetchedPage, firstOrder []cursorConversation, err error) {
+		raw, err := fetchCursorCaptures(client, id, projectID)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -419,43 +430,214 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		return pages, firstOrder, nil
 	}
 
-	for attempt := 0; attempt <= maxScrollAttempts; attempt++ {
-		pages, firstOrder, herr := harvest()
+	tryAccumulate := func(id int) (done bool, retConvs []cursorConversation, retDups int, retErr error) {
+		pages, firstOrder, herr := harvest(id)
 		if herr != nil {
-			return nil, 0, false, len(pages), firstOrder, herr
+			return true, nil, 0, herr
 		}
-		if len(pages) > 0 {
-			for i, p := range pages {
-				outLabel := "<terminal>"
-				if p.HasNextCursor {
-					outLabel = redactedCursor(p.NextCursor)
-				}
-				fmt.Printf("page=%d conversation_count=%d cursor_in=%s cursor_out=%s\n", i, len(p.Conversations), redactedCursor(p.CursorIn), outLabel)
+		if len(pages) == 0 {
+			return false, nil, 0, nil
+		}
+		for i, p := range pages {
+			outLabel := "<terminal>"
+			if p.HasNextCursor {
+				outLabel = redactedCursor(p.NextCursor)
 			}
-			convs, dups, comp, aerr := accumulateCursorChain(pages, maxPages)
-			if aerr != nil {
-				return nil, 0, false, len(pages), firstOrder, aerr
-			}
-			if comp {
-				return convs, dups, true, len(pages), firstOrder, nil
-			}
-			pagesFetched, firstPageOrder = len(pages), firstOrder
+			fmt.Printf("page=%d conversation_count=%d cursor_in=%s cursor_out=%s\n", i, len(p.Conversations), redactedCursor(p.CursorIn), outLabel)
 		}
-		if attempt == maxScrollAttempts {
-			break
+		convs, dups, comp, aerr := accumulateCursorChain(pages, maxPages)
+		if aerr != nil {
+			return true, nil, 0, aerr
 		}
-		scrollRaw, serr := call(client, request{ID: idBase + 3 + attempt, Method: "simulateSidebarScroll"})
-		if serr != nil {
-			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("simulate scroll (attempt %d): %w", attempt, serr)
+		pagesFetched, firstPageOrder = len(pages), firstOrder
+		if comp {
+			return true, convs, dups, nil
 		}
-		var scroll sidebarScrollResult
-		if err := json.Unmarshal(scrollRaw, &scroll); err != nil {
-			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("decode scroll result (attempt %d): %w", attempt, err)
-		}
-		printScrollDiagnostics(attempt, scroll)
-		time.Sleep(1500 * time.Millisecond)
+		return false, nil, 0, nil
 	}
-	return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("exhausted %d scroll attempts without observing a terminal cursor", maxScrollAttempts)
+
+	if done, convs, dups, herr := tryAccumulate(idBase + 3); done {
+		if herr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, herr
+		}
+		return convs, dups, true, pagesFetched, firstPageOrder, nil
+	}
+
+	for attempt := 0; attempt < maxWheelAttempts; attempt++ {
+		wheelResult, werr := fetchRealWheelScrollProject(client, idBase+4+attempt*2, projectID, 3)
+		if werr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("real wheel scroll (attempt %d): %w", attempt, werr)
+		}
+		printRealWheelResult(attempt, wheelResult)
+		time.Sleep(500 * time.Millisecond)
+
+		if done, convs, dups, herr := tryAccumulate(idBase + 5 + attempt*2); done {
+			if herr != nil {
+				return nil, 0, false, pagesFetched, firstPageOrder, herr
+			}
+			return convs, dups, true, pagesFetched, firstPageOrder, nil
+		}
+	}
+	return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("exhausted %d real-wheel attempts without observing a terminal cursor", maxWheelAttempts)
+}
+
+// projectScrollRegion mirrors bridge/preload.js's findProjectScrollRegion result: the scrollable
+// container currently judged most likely to be the Project's own conversation list, selected by
+// link counts/href shape/dimensions only — never link text or title.
+type projectScrollRegion struct {
+	Found                    bool `json:"found"`
+	CandidateCount           int  `json:"candidateCount"`
+	ConversationLinks        int  `json:"conversationLinks"`
+	ProjectConversationLinks int  `json:"projectConversationLinks"`
+	ScrollTop                int  `json:"scrollTop"`
+	ScrollHeight             int  `json:"scrollHeight"`
+	ClientHeight             int  `json:"clientHeight"`
+}
+
+func fetchProjectScrollRegion(client net.Conn, id int) (projectScrollRegion, error) {
+	raw, err := call(client, request{ID: id, Method: "projectScrollRegion"})
+	if err != nil {
+		return projectScrollRegion{}, err
+	}
+	var result projectScrollRegion
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return projectScrollRegion{}, fmt.Errorf("decode project scroll region: %w", err)
+	}
+	return result, nil
+}
+
+// wheelTickDiagnostic is one before/after observation within a single realWheelScrollProject call.
+// Pointer fields distinguish "the region was not found for this tick" (nil) from a genuine zero.
+type wheelTickDiagnostic struct {
+	Index                          int  `json:"index"`
+	ScrollTopBefore                *int `json:"scrollTopBefore"`
+	ScrollTopAfter                 *int `json:"scrollTopAfter"`
+	ProjectConversationLinksBefore *int `json:"projectConversationLinksBefore"`
+	ProjectConversationLinksAfter  *int `json:"projectConversationLinksAfter"`
+}
+
+// realWheelScrollResult mirrors the bridge's realWheelScrollProject response: real Electron
+// mouseWheel input sent to the ChatGPT WebContents (README "New hypothesis" — a synthetic DOM
+// scroll event may not reproduce whatever browser-level input-pipeline behavior the real
+// frontend's pagination trigger depends on), never a self-issued fetch of the cursor endpoint.
+type realWheelScrollResult struct {
+	Found          bool                  `json:"found"`
+	CandidateCount int                   `json:"candidateCount"`
+	Initial        projectScrollRegion   `json:"initial"`
+	Ticks          []wheelTickDiagnostic `json:"ticks"`
+	Final          projectScrollRegion   `json:"final"`
+}
+
+func fetchRealWheelScrollProject(client net.Conn, id int, projectID string, ticks int) (realWheelScrollResult, error) {
+	raw, err := call(client, request{ID: id, Method: "realWheelScrollProject", ProjectID: projectID, Params: map[string]any{"ticks": ticks}})
+	if err != nil {
+		return realWheelScrollResult{}, err
+	}
+	var result realWheelScrollResult
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return realWheelScrollResult{}, fmt.Errorf("decode real wheel scroll result: %w", err)
+	}
+	return result, nil
+}
+
+// cursorResponseStatusCounts mirrors the bridge's privacy-safe response-status tally (README Task
+// 3): every real, observed response to the project-scoped conversations endpoint, bucketed by
+// whether the request carried a `cursor` query parameter and by HTTP status. Never carries a URL,
+// cursor value, header, or response body.
+type cursorResponseStatusCounts struct {
+	NoCursor      map[string]int `json:"noCursor"`
+	CursorPresent map[string]int `json:"cursorPresent"`
+}
+
+func fetchProjectConversationsResponseStatus(client net.Conn, id int) (cursorResponseStatusCounts, error) {
+	raw, err := call(client, request{ID: id, Method: "projectConversationsResponseStatus"})
+	if err != nil {
+		return cursorResponseStatusCounts{}, err
+	}
+	var result cursorResponseStatusCounts
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return cursorResponseStatusCounts{}, fmt.Errorf("decode response status counts: %w", err)
+	}
+	return result, nil
+}
+
+func printProjectScrollRegion(label string, r projectScrollRegion) {
+	if !r.Found {
+		fmt.Printf("%s: found=false candidate_count=%d\n", label, r.CandidateCount)
+		return
+	}
+	fmt.Printf("%s: found=true candidate_count=%d project_conversation_links=%d conversation_links=%d client_height=%d scroll_height=%d scroll_top=%d\n",
+		label, r.CandidateCount, r.ProjectConversationLinks, r.ConversationLinks, r.ClientHeight, r.ScrollHeight, r.ScrollTop)
+}
+
+func intOrNil(p *int) string {
+	if p == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%d", *p)
+}
+
+func printRealWheelResult(attempt int, w realWheelScrollResult) {
+	if !w.Found {
+		fmt.Printf("real wheel (attempt %d): NOT TRIGGERED (no scroll target found, candidate_count=%d)\n", attempt, w.CandidateCount)
+		return
+	}
+	for _, tick := range w.Ticks {
+		fmt.Printf("real wheel (attempt %d, tick %d): scroll_top_before=%s scroll_top_after=%s project_links_before=%s project_links_after=%s\n",
+			attempt, tick.Index, intOrNil(tick.ScrollTopBefore), intOrNil(tick.ScrollTopAfter),
+			intOrNil(tick.ProjectConversationLinksBefore), intOrNil(tick.ProjectConversationLinksAfter))
+	}
+}
+
+func printResponseStatusCounts(counts cursorResponseStatusCounts) {
+	fmt.Printf("cursor response status: no-cursor 200=%d 401=%d other=%d | cursor-present 200=%d 401=%d other=%d\n",
+		counts.NoCursor["200"], counts.NoCursor["401"], counts.NoCursor["other"],
+		counts.CursorPresent["200"], counts.CursorPresent["401"], counts.CursorPresent["other"])
+}
+
+// cursorExperimentOutcome is the five-way failure/success classification the task requires
+// (README "Failure categories"), so a caller never has to infer which situation occurred from a
+// bare error string.
+type cursorExperimentOutcome string
+
+const (
+	// outcomeNoRequest: the wheel input never caused the real ChatGPT frontend to issue ANY cursor
+	// endpoint request at all (neither a successful page nor a 401) — a wheel-trigger failure, NOT
+	// an authorization failure. Must never be confused with outcomeFrontend401.
+	outcomeNoRequest cursorExperimentOutcome = "NO_REQUEST"
+	// outcomeFrontend401: the real frontend DID issue at least one cursor-present request, and
+	// every one observed came back 401, with zero successful (200) cursor-present pages ever
+	// captured — new architectural evidence distinct from the already-known, no-longer-executed
+	// self-fetch 401.
+	outcomeFrontend401 cursorExperimentOutcome = "FRONTEND_401"
+	// outcomeCaptureFailure: a network response was captured, but body/schema validation
+	// (accumulateCursorChain, parseCursorWireItems, dedupeCapturesByCursorIn) failed closed.
+	outcomeCaptureFailure cursorExperimentOutcome = "CAPTURE_FAILURE"
+	// outcomeChainIncomplete: pages were captured with no error, but no terminal cursor was
+	// observed within the bounded number of wheel attempts.
+	outcomeChainIncomplete cursorExperimentOutcome = "CHAIN_INCOMPLETE"
+	// outcomeComplete: a terminal cursor was reached with no error anywhere in the chain.
+	outcomeComplete cursorExperimentOutcome = "COMPLETE"
+)
+
+// classifyCursorExperimentOutcome is the pure decision core behind the five failure/success
+// categories (README "Failure categories"), evaluated in the priority order the task specifies:
+// an total absence of any cursor-present traffic (success or failure) means the wheel input never
+// triggered a request at all, which is a distinct, more basic problem than an authorization
+// failure and must be reported as such rather than silently falling through to a later category.
+func classifyCursorExperimentOutcome(cursorPresent200, cursorPresent401 int, pagesCaptured int, chainErr error, complete bool) cursorExperimentOutcome {
+	switch {
+	case cursorPresent200 == 0 && cursorPresent401 == 0 && pagesCaptured == 0:
+		return outcomeNoRequest
+	case cursorPresent200 == 0 && cursorPresent401 > 0:
+		return outcomeFrontend401
+	case chainErr != nil:
+		return outcomeCaptureFailure
+	case !complete:
+		return outcomeChainIncomplete
+	default:
+		return outcomeComplete
+	}
 }
 
 // knownSampleFingerprintsResult reports SHA-256 fingerprints (never raw IDs) of one already-known
@@ -493,20 +675,35 @@ func fetchKnownSampleFingerprints(client net.Conn, id int) (knownSampleFingerpri
 // criteria" / "Do not use total as completeness proof").
 func runCursorExperiment(client net.Conn, projectID string, oldProjectScopedCount int, oldGlobalFilteredCount int, haveOldGlobalFilteredCount bool) error {
 	fmt.Println("=== Project cursor pagination experiment (Issue #7 spike) ===")
+	// The self-fetch path is a confirmed, historical negative (HTTP 401 once a `cursor` parameter
+	// is present — see README) and is no longer executed by the normal experiment (README Task 2):
+	// running it every time added a misleading 401 to every report without adding new evidence,
+	// and made it hard to tell a "known, expected" 401 apart from a genuinely new one on the real
+	// frontend's own request path. Run with `-cursor-self-fetch-probe` to re-verify it independently.
+	fmt.Println("known self-fetch probe: skipped (known negative: HTTP 401 once a cursor parameter is present; use -cursor-self-fetch-probe to re-verify)")
 
-	if _, _, _, _, _, err := enumerateProjectConversationsByCursorSelfFetch(client, projectID, 1, 799); err != nil {
-		fmt.Printf("self-initiated fetch of cursor-paginated endpoint: NOT AUTHORIZED (%v)\n", err)
+	conversations, duplicates, complete, pagesFetched, firstPageOrder, enumErr := enumerateProjectConversationsByCursorPassive(client, projectID, 8, 50, 700)
+
+	statusCounts, serr := fetchProjectConversationsResponseStatus(client, 780)
+	cursorPresent200, cursorPresent401 := 0, 0
+	if serr != nil {
+		fmt.Printf("cursor response status: NOT VERIFIED (%v)\n", serr)
 	} else {
-		fmt.Println("self-initiated fetch of cursor-paginated endpoint: PASS")
+		printResponseStatusCounts(statusCounts)
+		cursorPresent200 = statusCounts.CursorPresent["200"]
+		cursorPresent401 = statusCounts.CursorPresent["401"]
 	}
 
-	conversations, duplicates, complete, pagesFetched, firstPageOrder, err := enumerateProjectConversationsByCursorPassive(client, projectID, 8, 50, 700)
-	if err != nil {
-		fmt.Printf("Project session enumeration: FAIL (%v)\n", err)
+	outcome := classifyCursorExperimentOutcome(cursorPresent200, cursorPresent401, pagesFetched, enumErr, complete)
+	fmt.Printf("failure category: %s\n", outcome)
+
+	if enumErr != nil {
+		fmt.Printf("Project session enumeration: FAIL (%v)\n", enumErr)
 		return nil
 	}
 
 	fmt.Printf("pages fetched: %d\n", pagesFetched)
+	fmt.Printf("terminal cursor observed: %t\n", complete)
 	fmt.Printf("unique conversations: %d duplicates_observed: %d\n", len(conversations), duplicates)
 	if complete {
 		fmt.Println("Project session enumeration: COMPLETE")
