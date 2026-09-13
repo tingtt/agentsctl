@@ -370,16 +370,24 @@ async function dispatch(request) {
     }
     // Live evidence (README ninth live run) found sendInputEvent mouseWheel intermittently has NO
     // effect at all (scrollTop never moves across an entire attempt) even with identical target
-    // region metrics to a run where it worked — consistent with Electron sometimes not delivering
-    // synthetic input to a window/view that the OS does not consider focused/active. Explicitly
-    // focus both the owning BrowserWindow and the WebContents before sending input; windowFocused
-    // is reported so a future run can tell whether this focus step itself is succeeding.
+    // region metrics to a run where it worked, and window.isFocused() reported false throughout.
+    // sendInputEvent is normally expected to work regardless of true OS window-manager focus (it
+    // injects directly into Chromium's own input pipeline — the whole point of the mechanism for
+    // headless/background browser automation), so a tenth-pass strengthening tries harder to
+    // obtain real focus (app.focus({steal:true}) in addition to window/contents focus, plus a
+    // settle delay before re-checking) while ALSO reporting devicePixelRatio/documentHasFocus
+    // (bridge/preload.js's findProjectScrollRegion) so a future run's evidence can distinguish a
+    // genuine focus problem from an unrelated coordinate/DPI-scaling mismatch, rather than
+    // assuming focus is the cause a second time without checking.
     const ownerWindow = BrowserWindow.fromWebContents(contents);
     if (ownerWindow) {
       if (typeof ownerWindow.isMinimized === "function" && ownerWindow.isMinimized()) ownerWindow.restore();
+      ownerWindow.show();
       ownerWindow.focus();
     }
+    if (typeof app.focus === "function") app.focus({ steal: true });
     contents.focus();
+    await new Promise((resolve) => setTimeout(resolve, 150));
     const windowFocused = ownerWindow ? ownerWindow.isFocused() : null;
     const x = Math.round(region.rect.x + region.rect.width / 2);
     const y = Math.round(region.rect.y + Math.min(region.rect.height / 2, Math.max(region.rect.height - 4, 0)));

@@ -347,6 +347,15 @@ function findProjectScrollRegion() {
     scrollHeight: best.scrollHeight,
     clientHeight: best.clientHeight,
     rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+    // Diagnostic only (README ninth/tenth live run): real Electron sendInputEvent input had zero
+    // measurable effect in one run despite identical target-region dimensions to a run where it
+    // worked, and window.isFocused() reported false throughout. devicePixelRatio and
+    // document.hasFocus() are reported so a future run can distinguish a coordinate/DPI-scaling
+    // mismatch (getBoundingClientRect returns CSS pixels; a scaled/off-screen-rendered window could
+    // need a different mapping) from a genuine page-level focus problem, without exposing any page
+    // content.
+    devicePixelRatio: window.devicePixelRatio || 1,
+    documentHasFocus: document.hasFocus(),
   };
 }
 

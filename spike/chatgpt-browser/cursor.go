@@ -700,13 +700,15 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 // container currently judged most likely to be the Project's own conversation list, selected by
 // link counts/href shape/dimensions only — never link text or title.
 type projectScrollRegion struct {
-	Found                    bool `json:"found"`
-	CandidateCount           int  `json:"candidateCount"`
-	ConversationLinks        int  `json:"conversationLinks"`
-	ProjectConversationLinks int  `json:"projectConversationLinks"`
-	ScrollTop                int  `json:"scrollTop"`
-	ScrollHeight             int  `json:"scrollHeight"`
-	ClientHeight             int  `json:"clientHeight"`
+	Found                    bool    `json:"found"`
+	CandidateCount           int     `json:"candidateCount"`
+	ConversationLinks        int     `json:"conversationLinks"`
+	ProjectConversationLinks int     `json:"projectConversationLinks"`
+	ScrollTop                int     `json:"scrollTop"`
+	ScrollHeight             int     `json:"scrollHeight"`
+	ClientHeight             int     `json:"clientHeight"`
+	DevicePixelRatio         float64 `json:"devicePixelRatio"`
+	DocumentHasFocus         bool    `json:"documentHasFocus"`
 }
 
 func fetchProjectScrollRegion(client net.Conn, id int) (projectScrollRegion, error) {
@@ -782,8 +784,8 @@ func printProjectScrollRegion(label string, r projectScrollRegion) {
 		fmt.Printf("%s: found=false candidate_count=%d\n", label, r.CandidateCount)
 		return
 	}
-	fmt.Printf("%s: found=true candidate_count=%d project_conversation_links=%d conversation_links=%d client_height=%d scroll_height=%d scroll_top=%d\n",
-		label, r.CandidateCount, r.ProjectConversationLinks, r.ConversationLinks, r.ClientHeight, r.ScrollHeight, r.ScrollTop)
+	fmt.Printf("%s: found=true candidate_count=%d project_conversation_links=%d conversation_links=%d client_height=%d scroll_height=%d scroll_top=%d device_pixel_ratio=%.2f document_has_focus=%t\n",
+		label, r.CandidateCount, r.ProjectConversationLinks, r.ConversationLinks, r.ClientHeight, r.ScrollHeight, r.ScrollTop, r.DevicePixelRatio, r.DocumentHasFocus)
 }
 
 func intOrNil(p *int) string {
