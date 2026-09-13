@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -309,32 +310,63 @@ func fetchCursorCaptures(client net.Conn, id int, projectID string) ([]cursorCap
 	return result, nil
 }
 
+// conversationIDSet returns a canonical, sorted, comma-joined form of a page's conversation IDs —
+// used only to compare whether two observations of the same page returned the same underlying
+// data, never printed or logged (raw IDs stay in-process, same as everywhere else in this bridge
+// protocol).
+func conversationIDSet(items []cursorConversationWireItem) string {
+	ids := make([]string, len(items))
+	for i, item := range items {
+		ids[i] = item.ID
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, ",")
+}
+
 // dedupeCapturesByCursorIn collapses passively-observed captures (which can include a benign
 // duplicate — e.g. a React re-render re-issuing the exact same request) down to one page per
-// distinct CursorIn value, keeping the first-seen (lowest CaptureID, i.e. earliest arrival) and
-// requiring every later observation of the SAME CursorIn to agree on content (item count and
-// declared next cursor). A disagreement is treated as schema drift or genuine mid-enumeration
-// account activity, not a benign duplicate, and fails closed rather than silently picking one.
+// distinct CursorIn value, keeping the LATEST-arriving (highest CaptureID) observation for each.
+//
+// Live evidence (2026-09-14): real-wheel-triggered traffic observed the SAME CursorIn ("0")
+// fetched many times in quick succession (42 cursor-present 200 responses across two short wheel
+// bursts), and two of those observations reported a different declared next-cursor token for an
+// otherwise-unchanged page. Comparing the raw NextCursor token for equality (the original
+// implementation) is therefore too strict: nothing in this endpoint's observed behavior — or in
+// the task's own "opaque cursor" discipline, which forbids assuming a token is idempotent —
+// guarantees the SAME logical page returns the SAME next-cursor token on every fetch. What matters
+// for correctness is whether the returned CONVERSATION SET actually changed, not whether the
+// opaque continuation token happened to differ.
+//
+// Equality is therefore judged by conversationIDSet (the sorted set of conversation IDs a page
+// actually returned): two observations of the same CursorIn with the SAME ID set are treated as
+// the same page, keeping the freshest (highest CaptureID) one's own HasNextCursor/NextCursor to
+// continue the walk from — never an older, possibly-since-invalidated token. Two observations of
+// the same CursorIn with a DIFFERENT ID set is genuine schema drift or account activity
+// mid-enumeration, and still fails closed exactly as before.
 func dedupeCapturesByCursorIn(captures []cursorCaptureWireItem) ([]cursorCaptureWireItem, error) {
 	ordered := make([]cursorCaptureWireItem, len(captures))
 	copy(ordered, captures)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].CaptureID < ordered[j].CaptureID })
-	seen := make(map[string]cursorCaptureWireItem, len(ordered))
+	latest := make(map[string]cursorCaptureWireItem, len(ordered))
+	firstIDSet := make(map[string]string, len(ordered))
 	order := make([]string, 0, len(ordered))
 	for _, c := range ordered {
-		prev, ok := seen[c.CursorIn]
+		idSet := conversationIDSet(c.Items)
+		prevIDSet, ok := firstIDSet[c.CursorIn]
 		if !ok {
-			seen[c.CursorIn] = c
+			firstIDSet[c.CursorIn] = idSet
 			order = append(order, c.CursorIn)
+			latest[c.CursorIn] = c
 			continue
 		}
-		if prev.HasNextCursor != c.HasNextCursor || prev.NextCursor != c.NextCursor || prev.RawItemCount != c.RawItemCount {
-			return nil, fmt.Errorf("cursor %s was observed twice with different content (schema drift or account activity mid-enumeration)", redactedCursor(c.CursorIn))
+		if prevIDSet != idSet {
+			return nil, fmt.Errorf("cursor %s was observed twice with a different conversation set (schema drift or account activity mid-enumeration)", redactedCursor(c.CursorIn))
 		}
+		latest[c.CursorIn] = c
 	}
 	result := make([]cursorCaptureWireItem, 0, len(order))
 	for _, cursorIn := range order {
-		result = append(result, seen[cursorIn])
+		result = append(result, latest[cursorIn])
 	}
 	return result, nil
 }
