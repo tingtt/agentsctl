@@ -371,6 +371,67 @@ func dedupeCapturesByCursorIn(captures []cursorCaptureWireItem) ([]cursorCapture
 	return result, nil
 }
 
+// cursorInVariantSummary is a privacy-safe forensic summary of every observation of ONE CursorIn
+// value within a single harvest, computed only when dedupeCapturesByCursorIn's fail-closed check
+// fires (README fifth/sixth live run: cursor_in="0" observed with a genuinely different
+// conversation set, even in a run intended to be free of concurrent Project activity). It exists
+// to distinguish, from evidence rather than guessing: flickering between a small, stable number of
+// alternating states (e.g. two backend replicas or cache layers disagreeing) versus continuous
+// drift (e.g. genuine ongoing account activity) versus a capture-pipeline bug — without ever
+// exposing a raw conversation ID or cursor value.
+type cursorInVariantSummary struct {
+	Observations        int
+	DistinctIDSets      int
+	DistinctNextCursors int
+	MinItemCount        int
+	MaxItemCount        int
+}
+
+// summarizeCursorInVariants groups captures by CursorIn and computes cursorInVariantSummary for
+// each. Pure and unit-tested; the live driver calls this only for diagnostics when a conflict has
+// already been detected, never to decide completeness itself.
+func summarizeCursorInVariants(captures []cursorCaptureWireItem) map[string]cursorInVariantSummary {
+	byCursorIn := make(map[string][]cursorCaptureWireItem, len(captures))
+	for _, c := range captures {
+		byCursorIn[c.CursorIn] = append(byCursorIn[c.CursorIn], c)
+	}
+	summaries := make(map[string]cursorInVariantSummary, len(byCursorIn))
+	for cursorIn, group := range byCursorIn {
+		idSets := make(map[string]bool, len(group))
+		nextCursors := make(map[string]bool, len(group))
+		minCount, maxCount := -1, -1
+		for _, c := range group {
+			idSets[conversationIDSet(c.Items)] = true
+			nextCursors[c.NextCursor] = true
+			if minCount == -1 || c.RawItemCount < minCount {
+				minCount = c.RawItemCount
+			}
+			if c.RawItemCount > maxCount {
+				maxCount = c.RawItemCount
+			}
+		}
+		summaries[cursorIn] = cursorInVariantSummary{
+			Observations: len(group), DistinctIDSets: len(idSets),
+			DistinctNextCursors: len(nextCursors), MinItemCount: minCount, MaxItemCount: maxCount,
+		}
+	}
+	return summaries
+}
+
+func printCursorInVariants(captures []cursorCaptureWireItem) {
+	summaries := summarizeCursorInVariants(captures)
+	cursorIns := make([]string, 0, len(summaries))
+	for cursorIn := range summaries {
+		cursorIns = append(cursorIns, cursorIn)
+	}
+	sort.Strings(cursorIns)
+	for _, cursorIn := range cursorIns {
+		s := summaries[cursorIn]
+		fmt.Printf("cursor_in=%s variants: observations=%d distinct_id_sets=%d distinct_next_cursors=%d item_count_range=%d-%d\n",
+			redactedCursor(cursorIn), s.Observations, s.DistinctIDSets, s.DistinctNextCursors, s.MinItemCount, s.MaxItemCount)
+	}
+}
+
 // filterCapturesNewerThan returns only the captures strictly newer than minCaptureIDExclusive —
 // the pure filtering core of enumerateProjectConversationsByCursorPassive's freshness watermark
 // (see that function's doc comment for the live bug this fixes). Mirrors the same pattern already
@@ -443,8 +504,10 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		if err != nil {
 			return nil, nil, err
 		}
-		deduped, err := dedupeCapturesByCursorIn(filterCapturesNewerThan(raw, watermark))
+		fresh := filterCapturesNewerThan(raw, watermark)
+		deduped, err := dedupeCapturesByCursorIn(fresh)
 		if err != nil {
+			printCursorInVariants(fresh)
 			return nil, nil, err
 		}
 		for i, c := range deduped {
