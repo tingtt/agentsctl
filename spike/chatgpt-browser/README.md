@@ -2,15 +2,15 @@
 
 ## Purpose
 
-This spike collects evidence for [Issue #7](https://github.com/tingtt/agentsctl/issues/7). It evaluates a browser-backed ChatGPT integration in which `terminal-browser` owns authentication and the official ChatGPT UI, while `agentsctl` consumes only the minimum Project / conversation metadata needed for its session catalog.
+This spike collects evidence for [Issue #7](https://github.com/tingtt/agentsctl/issues/7). It validates a browser-backed ChatGPT integration in which `terminal-browser` owns authentication and the official ChatGPT UI, while `agentsctl` consumes only the minimum Project / conversation metadata needed for its session catalog.
 
 This is not the production provider planned by Issue #6. It does not change the shared provider/session contracts, Agent View, composer, dispatch, or existing providers.
 
-All observed ChatGPT `/backend-api/...` interfaces are **undocumented and unstable**. The implementation must fail closed on schema drift and must never extract browser credentials into Go.
+All observed ChatGPT `/backend-api/...` interfaces are **undocumented and unstable**. Production code must fail closed on schema drift and must never extract browser credentials into Go.
 
-## Final status
+## Final decision
 
-**Browser-backed direction: CONDITIONAL GO.**
+**GO for Issue #6 implementation.**
 
 The spike has proven, against a real authenticated account and Project:
 
@@ -22,7 +22,7 @@ The spike has proven, against a real authenticated account and Project:
 - `Ctrl+]` closing only the browser view while cloud Work state continues,
 - fail-closed behavior for the exercised failure cases.
 
-The Project List mechanism is now proven complete for the exercised account/session:
+The Project List mechanism is proven complete for the exercised account/session:
 
 ```text
 GET /backend-api/gizmos/{project_id}/conversations?cursor=...
@@ -37,9 +37,11 @@ known Work present: true
 Project session enumeration: COMPLETE
 ```
 
-The sole remaining acceptance blocker identified by this spike is **Chat / Work discrimination**. `messages[].metadata.async_source` is still only corroborated by one human-created Work sample (`n=1`) and is undocumented.
+~~The remaining acceptance blocker is Chat / Work discrimination (`messages[].metadata.async_source`, n=1 Work sample).~~
 
-Other items such as background/service lifecycle, the IME defect, terminal-browser version pinning, and cross-account re-verification remain production hardening / implementation concerns.
+**Chat / Work discrimination is not required by the selected integration behavior.** Both normal Chat and Work are listed/opened as ChatGPT sessions through the same agentsctl catalog path, while interaction and state rendering are delegated to the official ChatGPT UI. The spike therefore has no remaining acceptance blocker before Issue #6 implementation.
+
+Background/service lifecycle, the IME defect, terminal-browser version pinning, and cross-account re-verification remain production hardening / implementation concerns.
 
 ## Recommended production direction
 
@@ -66,6 +68,7 @@ Responsibilities:
 - `agentsctl` owns local ordering and local pin state.
 - ChatGPT remote pin/star state is ignored.
 - Chat / Work interaction is delegated to the official ChatGPT Web UI rather than reimplemented in a native TUI.
+- Chat / Work are not required to be represented as distinct provider/session types inside agentsctl.
 
 ## Configuration
 
@@ -99,6 +102,22 @@ https://chatgpt.com/c/{conversation_id}
 ```
 
 ChatGPT itself normalizes this to the Project-slug URL when appropriate. Production code does not need to discover or construct the Project URL slug.
+
+### Chat / Work type
+
+~~Use `messages[].metadata.async_source` to distinguish Work from normal Chat before implementation can proceed.~~
+
+**No programmatic distinction is required.** The List/Open/attach-equivalent behavior is the same for both session kinds:
+
+```text
+Project conversation
+  → agentsctl ChatGPT session
+  → open official ChatGPT UI
+```
+
+Any ChatGPT-specific state or Work progress remains owned and rendered by ChatGPT itself.
+
+The existing `async_source` investigation remains historical evidence only; it is not part of the production contract.
 
 ### Ordering
 
@@ -148,7 +167,7 @@ Initial entry point:
 cursor=0
 ```
 
-The response schema observed in the real account is:
+Observed response fields used by the spike:
 
 ```text
 items: [...]
@@ -315,7 +334,7 @@ Before the Project cursor endpoint was understood, the spike investigated the gl
 
 with `offset` / `limit`, `hide_snorlax`, `is_archived`, `is_starred`, and `order` query semantics.
 
-Important evidence from that investigation remains useful as historical context:
+Important historical evidence:
 
 - `hide_snorlax=true` excludes Project/gizmo conversations.
 - Project-filtered item count is not a pagination exhaustion signal.
@@ -339,38 +358,19 @@ That path is now **superseded for production List purposes** by the Project-scop
 
 The earlier statement that the Project-scoped endpoint "returns only 5 sessions" is also superseded. The 5-item response was a different, smaller request series sharing the same URL path; it was not the complete cursor-paginated Project list.
 
-## Chat / Work discrimination
+## Historical Chat / Work discriminator investigation — not required
 
-### Current evidence
-
-The primary candidate remains:
+The spike investigated:
 
 ```text
 messages[].metadata.async_source
 ```
 
-Observed evidence:
+as a possible durable Work marker. It was present in one human-created Work sample (`n=1`) and absent from the original plain-Chat sample set. `default_model_slug` / `messages[].metadata.model_slug` also changed alongside that sample; top-level `async_status` remained `null`.
 
-- absent from the original plain-Chat sample set,
-- present in exactly one human-created Work sample,
-- the marked conversation opens and behaves normally through the same canonical `/c/{id}` route,
-- `default_model_slug` / `messages[].metadata.model_slug` changed alongside the Work sample and may be corroborating evidence,
-- top-level `async_status` remained `null` and is not a durable discriminator.
+~~Before production, corroborate `async_source` across multiple Work sessions and prove it absent from ordinary tool-using Chats.~~
 
-### Status
-
-```text
-Chat / Work discrimination: CONDITIONAL
-sample size: n=1 Work
-```
-
-Before production depends on this marker:
-
-- corroborate it across multiple Work sessions,
-- verify it is absent from ordinary tool-using Chats such as browsing / code-interpreter flows,
-- treat the rule as fragile/versioned because the field is undocumented.
-
-This is the remaining acceptance blocker identified by Issue #7.
+That follow-up is no longer required because the selected product behavior does not branch on Chat-vs-Work type. Both are ordinary ChatGPT sessions from agentsctl's point of view, and the official UI owns their interaction/state differences.
 
 ## Browser interaction
 
@@ -384,7 +384,7 @@ The official ChatGPT Web UI is the attach-equivalent view.
 | Send message | **PASS via official UI**, IME caveat |
 | Continue Chat | **PASS via official UI** |
 | Continue Work | **PASS via official UI** |
-| Observe Work state | **UI PASS / programmatic CONDITIONAL** |
+| Observe state | **PASS via official UI**; no normalized Chat/Work type required |
 | Rename | Out of initial provider scope / not verified |
 | Archive/delete | Out of initial provider scope / not verified |
 
@@ -465,7 +465,9 @@ Status:
 background helper: CONDITIONAL — PoC lifecycle workaround
 ```
 
-This is a production integration/hardening concern, separate from the now-proven List semantics.
+~~Resolve this before Issue #6 can begin.~~
+
+Treat this as production integration/hardening while implementing #6; it is not an unresolved fundamental decision from the spike.
 
 ## Failure behavior
 
@@ -493,90 +495,44 @@ A partial list must never be presented as complete.
 | 3. Browser bridge | PASS |
 | 4. Project discovery | PASS; rename/duplicate-name robustness NOT VERIFIED |
 | 5. Session discovery | **PASS** — Project cursor pagination reached terminal cursor; 35 unique / 0 duplicates |
-| 6. Chat / Work discrimination | **CONDITIONAL** — `async_source`, n=1 Work sample |
+| ~~6. Chat / Work discrimination — CONDITIONAL (`async_source`, n=1)~~ | **NOT REQUIRED by selected product behavior** |
 | 7. Stable identity and Open | PASS |
 | 8. App-mode UX | PASS, with IME defect |
 | 9. `Ctrl+]` semantics | PASS |
 | 10. Failure behavior | PASS for exercised cases |
 
-## Known limitations
+## Known limitations / implementation hardening
 
 - All investigated `/backend-api/...` endpoints and schemas are undocumented and can change without notice.
-- Session discovery is proven on one real account/Project; cross-account and version-window re-verification is still desirable before production rollout.
+- Session discovery is proven on one real account/Project; cross-account and version-window re-verification is still desirable before broad rollout.
 - The List path depends on passive capture of the real frontend's cursor requests; a script-issued cursor fetch is unauthorized.
-- `terminal-browser` has no proven production-grade display-free service lifecycle; the spike uses a pseudo-PTY owner.
-- Chat / Work discrimination remains n=1 and is the remaining acceptance blocker.
-- IME composition-confirm `Enter` can submit prematurely in the embedded browser UI.
-- Project rename / duplicate-name behavior is not explicitly tested; stable ID configuration avoids relying on names at runtime.
-- The preload sanitizer deliberately rejects unknown response shapes; a ChatGPT schema change should disable discovery rather than silently misclassify data.
-- The spike tested `terminal-browser` v0.8.0 while v0.8.1 was current at the start of investigation; the production compatibility window still needs to be pinned/retested.
+- `terminal-browser` has no proven supported display-free service lifecycle; the spike uses a pseudo-PTY owner.
+- IME composition can submit prematurely in app-mode.
+- v0.8.0 was tested while v0.8.1 was current at spike time.
+- Project rename / duplicate-name behavior was not explicitly exercised.
 
-## How to run
+These are implementation/compatibility concerns, not blockers to starting #6.
 
-Requirements:
+## Security boundary
 
-- macOS or another Unix host supported by `github.com/creack/pty`,
-- `terminal-browser` on `PATH`,
-- a kitty-graphics-capable terminal for manual login / visible app-mode experiments.
+The browser partition is the sole owner of ChatGPT authentication. Go and the socket protocol must never receive or log cookies, authorization headers, access tokens, refresh tokens, browser storage credentials, or complete request headers.
 
-From `spike/chatgpt-browser`:
+The socket is local and mode `0600`. Requests are size-limited and method-allowlisted. Raw endpoint responses remain browser-side. Failure never falls back to credential extraction.
 
-```bash
-go test .
-go run . -hold 35s
-go run . -project-name agentsctl
-go run . -project-name agentsctl -cursor-experiment
+## Issue #6 handoff
+
+Issue #7 is complete. The implementation handoff is:
+
+```text
+authentication        → persistent terminal-browser partition
+configured Project    → stable g-p-... project_id
+List                  → Project-scoped cursor pagination via passive real-frontend capture
+session key           → chatgpt:<conversation_id>
+ordering              → local created_at DESC
+pin                    → agentsctl-local only
+Open / interaction    → official ChatGPT UI in terminal-browser app-mode
+Chat vs Work type     → not required
+Ctrl+]                → close browser view only; cloud state continues
 ```
 
-Historical diagnostics remain available:
-
-```bash
-go run . -project-name agentsctl -cursor-self-fetch-probe
-go run . -project-name agentsctl -pin-experiment
-```
-
-The self-fetch probe is a known-negative HTTP-401 check and is not part of normal enumeration.
-
-Manual login remains a human action:
-
-```bash
-terminal-browser open https://chatgpt.com \
-  --partition=agentsctl-chatgpt \
-  --no-merge
-```
-
-Do not dump cookies, inspect browser credential databases, extract bearer/refresh tokens, or reuse unrelated CLI credential stores.
-
-## Verification
-
-The cursor-pagination implementation was repeatedly checked with:
-
-```bash
-go build
-go vet ./...
-go test -race ./...
-node --check bridge/main.js
-node --check bridge/preload.js
-```
-
-Live evidence, not those local checks alone, is what establishes the final List result.
-
-## Recommendation
-
-**Current decision: CONDITIONAL GO.**
-
-The browser-backed architecture and complete Project List mechanism are proven sufficiently for Issue #6 to reuse the spike's design evidence. Do not copy the spike verbatim into production; Issue #6 still needs production lifecycle/error/provider-interface design.
-
-Before relying on Chat/Work-specific programmatic behavior, resolve the remaining discriminator blocker:
-
-1. corroborate `async_source` across multiple Work samples,
-2. confirm it does not appear on ordinary tool-using Chats.
-
-Production hardening should additionally cover:
-
-- a supported `terminal-browser` background/service lifecycle,
-- upstream tracking for the IME bug,
-- pinning/retesting a supported terminal-browser version,
-- re-verifying cursor enumeration on another account/session or compatibility run.
-
-The historical global `/backend-api/conversations` / `hide_snorlax` / `is_starred` / offset-pagination path is retained as investigation evidence only. It is **not** the recommended production List path.
+Issue #6 can proceed without further spike work. Production hardening can happen as implementation details are resolved.
