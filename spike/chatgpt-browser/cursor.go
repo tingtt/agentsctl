@@ -287,8 +287,12 @@ func enumerateProjectConversationsByCursorSelfFetch(client net.Conn, projectID s
 // cursorCaptureWireItem is one bridge-observed, passively-captured page of the cursor-paginated
 // project-scoped endpoint (bridge/main.js's recordProjectConversationsCursorCapture). CaptureID is
 // a bridge-internal arrival-order reference, never a pagination position — CursorIn (extracted
-// bridge-side from the real request's own `cursor` query parameter, or "0" if the request omitted
-// it entirely, e.g. the endpoint's very first natural request) is the real pagination identity.
+// bridge-side from the real request's own, EXPLICITLY PRESENT `cursor` query parameter) is the
+// real pagination identity. A request with no `cursor` parameter at all is never recorded here —
+// live evidence (README sixth/seventh live run) found it is a structurally different real request
+// (a smaller, differently-sized response, matching the existing no-cursor `conversations` method's
+// own known page size), not this endpoint's cursor-pagination entry point; treating it as an alias
+// for cursor="0" previously produced a false "conversation set changed" conflict.
 type cursorCaptureWireItem struct {
 	CaptureID     int                          `json:"captureID"`
 	CursorIn      string                       `json:"cursorIn"`

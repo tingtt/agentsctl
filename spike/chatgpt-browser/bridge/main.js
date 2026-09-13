@@ -685,21 +685,30 @@ function recordGlobalConversationsPage(url, payload) {
 }
 
 // recordProjectConversationsCursorCapture extracts the `cursor` query parameter the REAL ChatGPT
-// client actually used for this request (absent entirely, on this endpoint's very first request,
-// is treated the same as the documented entry point "0" — README "Cursor is opaque") and appends
-// one entry to this Project's ordered capture list. Never overwrites: a benign duplicate (e.g. a
-// React re-render re-issuing the same request) and a genuine next-page request are both preserved
-// here; Go-side dedupeCapturesByCursorIn decides which is which.
+// client actually used for this request. A request with NO `cursor` query parameter at all is a
+// DIFFERENT request shape, not this endpoint's cursor-pagination entry point — live evidence
+// (README sixth/seventh live run) found the Project view issues two structurally different real
+// requests to this same URL path: one with no `cursor` param at all (a smaller, 5-item response —
+// matching the existing no-cursor `conversations` method's own known page size) and one with an
+// explicit `cursor=0` (the real paginated list's own first page, 10 items in that account). Treating
+// the no-cursor request as an alias for cursor="0" (the previous behavior) silently merged these
+// two unrelated requests into one CursorIn bucket and produced a false "conversation set changed"
+// conflict downstream. A no-cursor request is therefore skipped entirely here — not merged, not
+// recorded under any cursor value — leaving only genuinely cursor-bearing requests in this
+// Project's ordered capture list. Never overwrites: a benign duplicate (e.g. a React re-render
+// re-issuing the same request) and a genuine next-page request are both preserved here; Go-side
+// dedupeCapturesByCursorIn decides which is which.
 function recordProjectConversationsCursorCapture(projectID, rawURL, payload) {
-  let cursorIn = "0";
+  let url;
   try {
-    const url = new URL(rawURL);
-    cursorIn = url.searchParams.get("cursor") ?? "0";
+    url = new URL(rawURL);
   } catch {
-    // Keep the "0" default; this capture is still recorded rather than dropped, since Go-side
-    // validation (accumulateCursorChain) will reject it if "0" turns out to be the wrong value for
-    // its position in the chain.
+    return; // cannot classify this request's shape; skip rather than guess
   }
+  if (!url.searchParams.has("cursor")) {
+    return; // a different request shape (see above), not part of the cursor-pagination chain
+  }
+  const cursorIn = url.searchParams.get("cursor");
   const list = projectConversationsCursorCaptures.get(projectID) || [];
   list.push({ captureID: nextProjectCursorCaptureID++, cursorIn, payload });
   projectConversationsCursorCaptures.set(projectID, list);
