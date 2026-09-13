@@ -200,6 +200,10 @@ async function dispatch(request) {
   contents.focus();
   if (!contents.debugger.isAttached()) contents.debugger.attach("1.3");
   await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+  // Let Chromium observe the focus-emulation transition before delivering
+  // the first real wheel detent. The validated terminal-browser path needs
+  // this focus state for wheel input to reach the offscreen-rendered page.
+  await new Promise((resolve) => setTimeout(resolve, 150));
   const x = Math.round(initial.rect.x + initial.rect.width / 2);
   const y = Math.round(initial.rect.y + Math.min(initial.rect.height / 2, Math.max(initial.rect.height - 4, 0)));
   const detent = process.platform === "darwin" ? 40 : 120;
