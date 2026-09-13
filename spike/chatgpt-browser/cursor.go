@@ -685,6 +685,13 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 	var lastDuplicates int
 	var anyForwardProgress, anyScrollChanged, anyLinkCountChanged bool
 
+	// recordPages/reportForwardProgress MUST run in this order — report, then record: a live run
+	// found that recording first (advancing expectedNextCursor to the LATEST page's own next
+	// cursor) before checking whether the PREVIOUS expectedNextCursor had just been observed always
+	// self-defeated the check, since by the time it ran, expectedNextCursor already pointed at a
+	// cursor one step further ahead than what this batch could possibly contain yet. This produced
+	// a false "observed=false" on the very same snapshot where page 1 had, in fact, just been
+	// captured under exactly page 0's declared next cursor.
 	recordPages := func(pages []cursorFetchedPage, convs []cursorConversation, dups int) {
 		if len(pages) == 0 {
 			return
@@ -706,8 +713,8 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 	if herr != nil {
 		return nil, 0, false, pagesFetched, firstPageOrder, herr
 	}
-	recordPages(pages, convs, dups)
 	reportForwardProgress("initial", pages)
+	recordPages(pages, convs, dups)
 	if comp {
 		return convs, dups, true, pagesFetched, firstPageOrder, nil
 	}
@@ -733,8 +740,8 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		if herr != nil {
 			return nil, 0, false, pagesFetched, firstPageOrder, herr
 		}
-		recordPages(pages, convs, dups)
 		reportForwardProgress(fmt.Sprintf("attempt %d", attempt), pages)
+		recordPages(pages, convs, dups)
 		if comp {
 			return convs, dups, true, pagesFetched, firstPageOrder, nil
 		}
