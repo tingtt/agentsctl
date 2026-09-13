@@ -304,16 +304,16 @@ function isConversationLinkHref(href) {
   return { any, project };
 }
 
-// findProjectScrollRegion locates the scrollable container most likely to be the Project's own
-// conversation list — DOM inspection only (no input dispatch here; see bridge/main.js's
-// realWheelScrollProject for the input-sending half of this split). Selection uses only link
-// counts, href shape, and container dimensions/scrollability (never link text or title), per the
-// cursor-pagination spike's "Do not use DOM text for target selection" requirement. Among
-// candidate scrollable ancestors, the one with the most Project-scoped conversation links wins,
-// tie-broken by total conversation-link count — preferring a container that clearly belongs to the
-// Project's own list over one that merely happens to contain some /c/ links (e.g. a persistent
-// sidebar rendered alongside the Project page).
-function findProjectScrollRegion() {
+// selectBestScrollRegionElement is the shared selection core behind findProjectScrollRegion and
+// pointerInsideScrollRegion — factored out so a later pointer-target check re-derives the SAME
+// candidate (by identical selection criteria), not a stale reference to a possibly-since-replaced
+// DOM node. Selection uses only link counts, href shape, and container dimensions/scrollability
+// (never link text or title), per the cursor-pagination spike's "Do not use DOM text for target
+// selection" requirement. Among candidate scrollable ancestors, the one with the most
+// Project-scoped conversation links wins, tie-broken by total conversation-link count —
+// preferring a container that clearly belongs to the Project's own list over one that merely
+// happens to contain some /c/ links (e.g. a persistent sidebar rendered alongside the Project page).
+function selectBestScrollRegionElement() {
   const anchors = [...document.querySelectorAll('a[href^="/c/"], a[href^="/g/g-p-"]')];
   const counts = new Map(); // container -> {any, project}
   for (const anchor of anchors) {
@@ -327,7 +327,7 @@ function findProjectScrollRegion() {
     counts.set(container, entry);
   }
   if (counts.size === 0) {
-    return { found: false, candidateCount: 0 };
+    return { element: null, candidateCount: 0, entry: null };
   }
   let best = null;
   let bestEntry = null;
@@ -337,10 +337,37 @@ function findProjectScrollRegion() {
       bestEntry = entry;
     }
   }
+  return { element: best, candidateCount: counts.size, entry: bestEntry };
+}
+
+// pointerInsideScrollRegion answers README Task 8: does the viewport coordinate the wheel input is
+// actually sent to land inside the currently-selected scroll region, or some other element
+// entirely (a direct, cheap way to rule out a coordinate/target-selection mismatch as the cause of
+// inert wheel input)? Walks up from document.elementFromPoint(x, y) checking only element
+// identity — never inspects or returns any DOM text/tag/attribute.
+function pointerInsideScrollRegion(x, y) {
+  const { element: best } = selectBestScrollRegionElement();
+  if (!best) return { inside: false };
+  let el = document.elementFromPoint(x, y);
+  while (el) {
+    if (el === best) return { inside: true };
+    el = el.parentElement;
+  }
+  return { inside: false };
+}
+
+// findProjectScrollRegion locates the scrollable container most likely to be the Project's own
+// conversation list — DOM inspection only (no input dispatch here; see bridge/main.js's
+// realWheelScrollProject for the input-sending half of this split).
+function findProjectScrollRegion() {
+  const { element: best, candidateCount, entry: bestEntry } = selectBestScrollRegionElement();
+  if (!best) {
+    return { found: false, candidateCount };
+  }
   const rect = best.getBoundingClientRect();
   return {
     found: true,
-    candidateCount: counts.size,
+    candidateCount,
     conversationLinks: bestEntry.any,
     projectConversationLinks: bestEntry.project,
     scrollTop: best.scrollTop,
@@ -499,6 +526,12 @@ async function dispatch(request) {
   }
   if (request.method === "projectScrollRegion") {
     return findProjectScrollRegion();
+  }
+  if (request.method === "pointerInsideScrollRegion") {
+    const x = Number(request.x);
+    const y = Number(request.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error("invalid pointer coordinates");
+    return pointerInsideScrollRegion(x, y);
   }
   if (request.method === "sanitizeGlobalConversationsPage") {
     if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");

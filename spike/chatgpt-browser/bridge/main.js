@@ -368,17 +368,19 @@ async function dispatch(request) {
     if (!region.found) {
       return { found: false, candidateCount: region.candidateCount, ticks: [] };
     }
-    // Live evidence (README ninth live run) found sendInputEvent mouseWheel intermittently has NO
-    // effect at all (scrollTop never moves across an entire attempt) even with identical target
-    // region metrics to a run where it worked, and window.isFocused() reported false throughout.
-    // sendInputEvent is normally expected to work regardless of true OS window-manager focus (it
-    // injects directly into Chromium's own input pipeline — the whole point of the mechanism for
-    // headless/background browser automation), so a tenth-pass strengthening tries harder to
-    // obtain real focus (app.focus({steal:true}) in addition to window/contents focus, plus a
-    // settle delay before re-checking) while ALSO reporting devicePixelRatio/documentHasFocus
-    // (bridge/preload.js's findProjectScrollRegion) so a future run's evidence can distinguish a
-    // genuine focus problem from an unrelated coordinate/DPI-scaling mismatch, rather than
-    // assuming focus is the cause a second time without checking.
+    // Live evidence (README ninth/tenth live run) found sendInputEvent mouseWheel intermittently
+    // has NO effect at all (scrollTop never moves across an entire attempt) even after window/
+    // contents focus() and app.focus({steal:true}), with window.isFocused() reporting false every
+    // time. Inspecting terminal-browser's OWN bundled source (the real manual-wheel path this
+    // spike is trying to reproduce) found it does not rely on real OS window-manager focus at all:
+    // its `focus()` calls window.focus()/webContents.focus() AND CDP `Emulation.
+    // setFocusEmulationEnabled({enabled:true})` — which forces Chromium's renderer to consider
+    // itself focused independent of true window-manager focus, which this offscreen/kitty-
+    // graphics-rendered window may never actually obtain. It also found the real wheel-tick shape
+    // differs from what this spike had been sending: a non-precise (tick-based) wheel event needs
+    // `hasPreciseScrollingDeltas: false` and `modifiers: []` (both previously omitted), and the
+    // delta magnitude is a platform-specific "detent" — 40px on macOS, 120px elsewhere — not a
+    // hardcoded 120 on every platform.
     const ownerWindow = BrowserWindow.fromWebContents(contents);
     if (ownerWindow) {
       if (typeof ownerWindow.isMinimized === "function" && ownerWindow.isMinimized()) ownerWindow.restore();
@@ -387,11 +389,32 @@ async function dispatch(request) {
     }
     if (typeof app.focus === "function") app.focus({ steal: true });
     contents.focus();
+    let focusEmulationEnabled = false;
+    try {
+      if (!contents.debugger.isAttached()) contents.debugger.attach("1.3");
+      await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+      focusEmulationEnabled = true;
+    } catch {
+      focusEmulationEnabled = false;
+    }
     await new Promise((resolve) => setTimeout(resolve, 150));
     const windowFocused = ownerWindow ? ownerWindow.isFocused() : null;
+
     const x = Math.round(region.rect.x + region.rect.width / 2);
     const y = Math.round(region.rect.y + Math.min(region.rect.height / 2, Math.max(region.rect.height - 4, 0)));
+    // README Task 8: does this coordinate actually land inside the selected scroll region, or
+    // somewhere else entirely (a direct, cheap way to rule out a coordinate/target-selection
+    // mismatch as the cause of inert wheel input)?
+    const pointerCheck = await requestPage({ method: "pointerInsideScrollRegion", x, y });
+
+    const wheelDetentPx = process.platform === "darwin" ? 40 : 120;
     const tickCount = Number.isInteger(request.ticks) && request.ticks > 0 ? Math.min(request.ticks, 8) : 3;
+    const hasProgress = (tickList) => tickList.some((t) =>
+      (t.scrollTopBefore !== null && t.scrollTopAfter !== null && t.scrollTopBefore !== t.scrollTopAfter) ||
+      (t.projectConversationLinksBefore !== null && t.projectConversationLinksAfter !== null &&
+        t.projectConversationLinksBefore !== t.projectConversationLinksAfter)
+    );
+
     contents.sendInputEvent({ type: "mouseMove", x, y });
     const ticks = [];
     let previous = region;
@@ -401,15 +424,18 @@ async function dispatch(request) {
         x,
         y,
         deltaX: 0,
-        deltaY: -120,
+        deltaY: -wheelDetentPx,
         wheelTicksX: 0,
         wheelTicksY: -1,
+        hasPreciseScrollingDeltas: false,
         canScroll: true,
+        modifiers: [],
       });
       await new Promise((resolve) => setTimeout(resolve, 250));
       const snapshot = await requestPage({ method: "projectScrollRegion" });
       ticks.push({
         index: i,
+        via: "electron",
         scrollTopBefore: previous.found ? previous.scrollTop : null,
         scrollTopAfter: snapshot.found ? snapshot.scrollTop : null,
         projectConversationLinksBefore: previous.found ? previous.projectConversationLinks : null,
@@ -417,7 +443,62 @@ async function dispatch(request) {
       });
       previous = snapshot;
     }
-    return { found: true, candidateCount: region.candidateCount, windowFocused, initial: region, ticks, final: previous };
+    const electronProgress = hasProgress(ticks);
+
+    // README Task 7: only if Electron sendInputEvent showed ZERO progress across the whole
+    // attempt, try the same wheel input via raw CDP Input.dispatchMouseEvent as a fallback
+    // diagnostic — never assumed as the production mechanism from the outset.
+    let cdpAttempted = false;
+    let cdpProgress = null;
+    if (!electronProgress) {
+      cdpAttempted = true;
+      const cdpTicks = [];
+      try {
+        for (let i = 0; i < tickCount; i++) {
+          await contents.debugger.sendCommand("Input.dispatchMouseEvent", {
+            type: "mouseWheel",
+            x,
+            y,
+            deltaX: 0,
+            deltaY: -wheelDetentPx,
+            pointerType: "mouse",
+          });
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          const snapshot = await requestPage({ method: "projectScrollRegion" });
+          cdpTicks.push({
+            index: i,
+            via: "cdp",
+            scrollTopBefore: previous.found ? previous.scrollTop : null,
+            scrollTopAfter: snapshot.found ? snapshot.scrollTop : null,
+            projectConversationLinksBefore: previous.found ? previous.projectConversationLinks : null,
+            projectConversationLinksAfter: snapshot.found ? snapshot.projectConversationLinks : null,
+          });
+          previous = snapshot;
+        }
+        cdpProgress = hasProgress(cdpTicks);
+      } catch {
+        cdpProgress = false;
+      }
+      ticks.push(...cdpTicks);
+    }
+
+    return {
+      found: true,
+      candidateCount: region.candidateCount,
+      windowFocused,
+      focusEmulationEnabled,
+      pointerInsideSelectedScrollRegion: pointerCheck.inside,
+      inputShape: {
+        x, y, deltaY: -wheelDetentPx, wheelTicksY: -1,
+        hasPreciseScrollingDeltas: false, devicePixelRatio: region.devicePixelRatio,
+      },
+      electronProgress,
+      cdpAttempted,
+      cdpProgress,
+      initial: region,
+      ticks,
+      final: previous,
+    };
   }
   if (request.method === "knownSampleFingerprints") {
     // README Phase E: report SHA-256 fingerprints (never raw IDs) of one already-known Work-marked
