@@ -286,16 +286,21 @@ func enumerateProjectConversationsByCursorSelfFetch(client net.Conn, projectID s
 
 // cursorCaptureWireItem is one bridge-observed, passively-captured page of the cursor-paginated
 // project-scoped endpoint (bridge/main.js's recordProjectConversationsCursorCapture). CaptureID is
-// a bridge-internal arrival-order reference, never a pagination position — CursorIn (extracted
-// bridge-side from the real request's own, EXPLICITLY PRESENT `cursor` query parameter) is the
-// real pagination identity. A request with no `cursor` parameter at all is never recorded here —
-// live evidence (README sixth/seventh live run) found it is a structurally different real request
-// (a smaller, differently-sized response, matching the existing no-cursor `conversations` method's
-// own known page size), not this endpoint's cursor-pagination entry point; treating it as an alias
-// for cursor="0" previously produced a false "conversation set changed" conflict.
+// a bridge-internal arrival-order reference, never a pagination position. A request with no
+// `cursor` parameter at all is never recorded here (a structurally different request shape).
+//
+// CursorIn alone is NOT sufficient pagination identity: live evidence (README seventh/eighth live
+// run) found this endpoint's own `?cursor=0` explicit entry point is issued by at least TWO
+// structurally different real requests (a 5-item one and a 10-item one, both explicitly
+// cursor="0"), most likely distinguished by a `limit` or similar parameter this bridge does not
+// otherwise track. SeriesKey (canonicalCursorSeriesKeyFrom — everything but `cursor`, digested)
+// is the real series identity, mirroring the same SeriesKey concept already used for the global
+// endpoint's offset pagination; captures must be grouped by SeriesKey FIRST, then by CursorIn
+// within one series, before ever comparing two captures' conversation sets for equality.
 type cursorCaptureWireItem struct {
 	CaptureID     int                          `json:"captureID"`
 	CursorIn      string                       `json:"cursorIn"`
+	SeriesKey     string                       `json:"seriesKey"`
 	Items         []cursorConversationWireItem `json:"items"`
 	RawItemCount  int                          `json:"rawItemCount"`
 	HasNextCursor bool                         `json:"hasNextCursor"`
@@ -452,6 +457,76 @@ func filterCapturesNewerThan(captures []cursorCaptureWireItem, minCaptureIDExclu
 	return fresh
 }
 
+// groupCapturesBySeriesKey partitions captures by SeriesKey (README seventh/eighth live run: two
+// structurally different real requests were found sharing the same CursorIn but different other
+// query parameters). Pure and unit-tested.
+func groupCapturesBySeriesKey(captures []cursorCaptureWireItem) map[string][]cursorCaptureWireItem {
+	groups := make(map[string][]cursorCaptureWireItem)
+	for _, c := range captures {
+		groups[c.SeriesKey] = append(groups[c.SeriesKey], c)
+	}
+	return groups
+}
+
+// selectSeriesMatchingObservedLinkCount picks, among possibly-multiple distinct real request
+// series sharing the same endpoint, the one whose EARLIEST (lowest CaptureID) capture's item count
+// exactly matches expectedFirstPageSize — an independent signal (the Project scroll region's own
+// DOM-observed conversation-link count, read once via fetchProjectScrollRegion before any
+// pagination begins), not derived from network captures at all. This deliberately fails closed
+// (ok=false) rather than guess when zero or more than one series matches: silently picking "the
+// biggest" or "the most common" series risks walking a decoy/secondary UI widget's own cursor
+// chain to a false COMPLETE while under-counting the real Project conversation list — a wrong
+// answer that looks like a right one, which is worse than reporting NOT VERIFIED.
+func selectSeriesMatchingObservedLinkCount(groups map[string][]cursorCaptureWireItem, expectedFirstPageSize int) (seriesKey string, ok bool) {
+	var matched []string
+	for key, group := range groups {
+		earliest := group[0]
+		for _, c := range group {
+			if c.CaptureID < earliest.CaptureID {
+				earliest = c
+			}
+		}
+		if len(earliest.Items) == expectedFirstPageSize {
+			matched = append(matched, key)
+		}
+	}
+	if len(matched) != 1 {
+		return "", false
+	}
+	return matched[0], true
+}
+
+// filterCapturesBySeriesKey keeps only captures belonging to one selected series — the pure
+// counterpart to filterCapturesNewerThan, applied after series selection so a pinned series is
+// never contaminated by another real request shape sharing the same endpoint.
+func filterCapturesBySeriesKey(captures []cursorCaptureWireItem, seriesKey string) []cursorCaptureWireItem {
+	var selected []cursorCaptureWireItem
+	for _, c := range captures {
+		if c.SeriesKey == seriesKey {
+			selected = append(selected, c)
+		}
+	}
+	return selected
+}
+
+func printSeriesGroups(groups map[string][]cursorCaptureWireItem) {
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		group := groups[key]
+		earliest := group[0]
+		for _, c := range group {
+			if c.CaptureID < earliest.CaptureID {
+				earliest = c
+			}
+		}
+		fmt.Printf("series=%s observations=%d first_page_item_count=%d\n", shortDigest(key), len(group), len(earliest.Items))
+	}
+}
+
 // enumerateProjectConversationsByCursorPassive is the primary enumeration mechanism (see the
 // self-fetch 401 evidence on enumerateProjectConversationsByCursorSelfFetch above): it navigates
 // into the Project's own view (which is what naturally issues this endpoint's first real request —
@@ -479,6 +554,21 @@ func filterCapturesNewerThan(captures []cursorCaptureWireItem, minCaptureIDExclu
 // (bridge/main.js's realWheelScrollProject) at the Project's own conversation-list viewport
 // coordinate, instead of any synthetic DOM event, and never a self-issued fetch of the cursor
 // endpoint (README Task 7).
+//
+// A seventh/eighth live run found CursorIn alone is not sufficient pagination identity: this
+// endpoint's own `?cursor=0` explicit entry point was issued by at least TWO structurally
+// different real requests (a 5-item one and a 10-item one), which dedupeCapturesByCursorIn
+// correctly (but for the wrong underlying reason) flagged as "the same page reporting a different
+// conversation set" every time both happened to appear in the same run — explaining why this
+// failed identically and reproducibly across three separate live runs regardless of timing. Fixed
+// by grouping fresh captures by SeriesKey (canonicalCursorSeriesKeyFrom, mirroring the same concept
+// already used for the global endpoint's offset pagination) before ever comparing two captures'
+// conversation sets, and selecting the one series whose first page's item count matches the
+// Project scroll region's own independently-observed DOM link count — never guessing when that
+// match is ambiguous (selectSeriesMatchingObservedLinkCount fails closed rather than picking "the
+// biggest" or "the most common" series, which risks walking a decoy widget's own chain to a false
+// COMPLETE while under-counting the real list). The selected series is pinned for the rest of the
+// walk once chosen, so a later capture of the excluded series can never contaminate it.
 func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID string, maxWheelAttempts, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
 	baseline, err := fetchCursorCaptures(client, idBase, projectID)
 	if err != nil {
@@ -503,12 +593,38 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 	}
 	printProjectScrollRegion("target region", region)
 
+	var pinnedSeriesKey string
+	var seriesPinned bool
+
 	harvest := func(id int) (pages []cursorFetchedPage, firstOrder []cursorConversation, err error) {
 		raw, err := fetchCursorCaptures(client, id, projectID)
 		if err != nil {
 			return nil, nil, err
 		}
 		fresh := filterCapturesNewerThan(raw, watermark)
+
+		if !seriesPinned && len(fresh) > 0 {
+			groups := groupCapturesBySeriesKey(fresh)
+			if len(groups) == 1 {
+				for key := range groups {
+					pinnedSeriesKey = key
+				}
+				seriesPinned = true
+			} else {
+				key, ok := selectSeriesMatchingObservedLinkCount(groups, region.ProjectConversationLinks)
+				if !ok {
+					printSeriesGroups(groups)
+					return nil, nil, fmt.Errorf("%d distinct real request series observed for this endpoint and none uniquely matched the %d-link Project view observed in the DOM (see series diagnostics above) — refusing to guess which is the real Project conversation list", len(groups), region.ProjectConversationLinks)
+				}
+				pinnedSeriesKey = key
+				seriesPinned = true
+				fmt.Printf("selected series: %s (matches the %d-link Project view observed in the DOM; %d other series excluded)\n", shortDigest(pinnedSeriesKey), region.ProjectConversationLinks, len(groups)-1)
+			}
+		}
+		if seriesPinned {
+			fresh = filterCapturesBySeriesKey(fresh, pinnedSeriesKey)
+		}
+
 		deduped, err := dedupeCapturesByCursorIn(fresh)
 		if err != nil {
 			printCursorInVariants(fresh)

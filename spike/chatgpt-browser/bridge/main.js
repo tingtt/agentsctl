@@ -339,7 +339,7 @@ async function dispatch(request) {
     const results = [];
     for (const capture of list) {
       const sanitized = await requestPage({ method: "sanitizeProjectConversationsCursorPayload", payload: capture.payload });
-      results.push({ captureID: capture.captureID, cursorIn: capture.cursorIn, ...sanitized });
+      results.push({ captureID: capture.captureID, cursorIn: capture.cursorIn, seriesKey: capture.seriesKey, ...sanitized });
     }
     return results;
   }
@@ -627,6 +627,31 @@ function canonicalSeriesKeyFrom(rawURL) {
   }
 }
 
+// canonicalCursorSeriesKeyFrom is canonicalSeriesKeyFrom's counterpart for the project-scoped
+// cursor endpoint, excluding `cursor` instead of `offset`. Live evidence (README seventh/eighth
+// live run) found the endpoint's own `?cursor=0` explicit entry point is issued by at least TWO
+// structurally different real requests (a 5-item one and a 10-item one) that this bridge had no
+// way to tell apart while grouping captures by CursorIn alone — most likely distinguished by a
+// `limit` or similar parameter this bridge does not otherwise track. Grouping captures by this key
+// FIRST, then by CursorIn within one series, prevents two different real request shapes from ever
+// being compared against each other as if they were the same logical page.
+//
+// Mirrored (for testing only — this is the real implementation) in cursor_test.go's
+// testCanonicalCursorSeriesKey; keep the two in sync if this changes.
+function canonicalCursorSeriesKeyFrom(rawURL) {
+  try {
+    const url = new URL(rawURL);
+    const pairs = [...url.searchParams.entries()].filter(([key]) => key !== "cursor");
+    pairs.sort(([keyA, valueA], [keyB, valueB]) => {
+      if (keyA !== keyB) return keyA < keyB ? -1 : 1;
+      return valueA < valueB ? -1 : valueA > valueB ? 1 : 0;
+    });
+    return crypto.createHash("sha256").update(JSON.stringify(pairs)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
 // Response-reported offset/limit (from scalarMetaOf), not the request's own query string — this is
 // what the server actually says it applied. Missing or non-integer is reported as null, not 0,
 // so a page whose pagination metadata cannot be trusted is never silently treated as offset 0.
@@ -687,15 +712,15 @@ function recordGlobalConversationsPage(url, payload) {
 // recordProjectConversationsCursorCapture extracts the `cursor` query parameter the REAL ChatGPT
 // client actually used for this request. A request with NO `cursor` query parameter at all is a
 // DIFFERENT request shape, not this endpoint's cursor-pagination entry point — live evidence
-// (README sixth/seventh live run) found the Project view issues two structurally different real
-// requests to this same URL path: one with no `cursor` param at all (a smaller, 5-item response —
-// matching the existing no-cursor `conversations` method's own known page size) and one with an
-// explicit `cursor=0` (the real paginated list's own first page, 10 items in that account). Treating
-// the no-cursor request as an alias for cursor="0" (the previous behavior) silently merged these
-// two unrelated requests into one CursorIn bucket and produced a false "conversation set changed"
-// conflict downstream. A no-cursor request is therefore skipped entirely here — not merged, not
-// recorded under any cursor value — leaving only genuinely cursor-bearing requests in this
-// Project's ordered capture list. Never overwrites: a benign duplicate (e.g. a React re-render
+// (README sixth/seventh/eighth live run) found this endpoint's own `?cursor=0` explicit entry
+// point is issued by at least TWO structurally different real requests (a 5-item one and a 10-item
+// one, both carrying an explicit `cursor=0` — a no-cursor request is a SEPARATE, third shape, also
+// excluded below, though live evidence later showed it was not the cause of the CursorIn conflict).
+// SeriesKey (canonicalCursorSeriesKeyFrom, everything but `cursor`) is recorded alongside CursorIn
+// so Go-side grouping can tell these apart — see cursor.go's selectSeriesMatchingObservedLinkCount
+// — before ever comparing two captures' conversation sets for equality. A no-cursor request is
+// still skipped entirely here — not merged into any series — since it is not part of the
+// cursor-pagination chain at all. Never overwrites: a benign duplicate (e.g. a React re-render
 // re-issuing the same request) and a genuine next-page request are both preserved here; Go-side
 // dedupeCapturesByCursorIn decides which is which.
 function recordProjectConversationsCursorCapture(projectID, rawURL, payload) {
@@ -709,8 +734,9 @@ function recordProjectConversationsCursorCapture(projectID, rawURL, payload) {
     return; // a different request shape (see above), not part of the cursor-pagination chain
   }
   const cursorIn = url.searchParams.get("cursor");
+  const seriesKey = canonicalCursorSeriesKeyFrom(rawURL);
   const list = projectConversationsCursorCaptures.get(projectID) || [];
-  list.push({ captureID: nextProjectCursorCaptureID++, cursorIn, payload });
+  list.push({ captureID: nextProjectCursorCaptureID++, cursorIn, seriesKey, payload });
   projectConversationsCursorCaptures.set(projectID, list);
 }
 
