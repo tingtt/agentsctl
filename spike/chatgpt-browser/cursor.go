@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -645,13 +646,19 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		return pages, firstOrder, nil
 	}
 
-	tryAccumulate := func(id int) (done bool, retConvs []cursorConversation, retDups int, retErr error) {
+	// tryAccumulate harvests one snapshot and, if any pages were found, prints the per-page
+	// diagnostic lines and runs accumulateCursorChain. It always returns whatever pages/
+	// conversations it found — including a non-terminal (incomplete) result — so the caller can
+	// track forward-pagination progress (README Task 2/9) and report a partial conversation set on
+	// eventual exhaustion, rather than discarding everything just because this snapshot alone
+	// wasn't yet complete.
+	tryAccumulate := func(id int) (pages []cursorFetchedPage, convs []cursorConversation, dups int, comp bool, err error) {
 		pages, firstOrder, herr := harvest(id)
 		if herr != nil {
-			return true, nil, 0, herr
+			return nil, nil, 0, false, herr
 		}
 		if len(pages) == 0 {
-			return false, nil, 0, nil
+			return nil, nil, 0, false, nil
 		}
 		for i, p := range pages {
 			outLabel := "<terminal>"
@@ -662,19 +669,46 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		}
 		convs, dups, comp, aerr := accumulateCursorChain(pages, maxPages)
 		if aerr != nil {
-			return true, nil, 0, aerr
+			return pages, nil, 0, false, aerr
 		}
 		pagesFetched, firstPageOrder = len(pages), firstOrder
-		if comp {
-			return true, convs, dups, nil
-		}
-		return false, nil, 0, nil
+		return pages, convs, dups, comp, nil
 	}
 
-	if done, convs, dups, herr := tryAccumulate(idBase + 3); done {
-		if herr != nil {
-			return nil, 0, false, pagesFetched, firstPageOrder, herr
+	// expectedNextCursor/anyForwardProgress/anyScrollChanged/anyLinkCountChanged implement README
+	// Task 2/4/9: a rising cursor-present request count, or wheel ticks firing at all, is never by
+	// itself evidence of forward pagination progress — only a later capture whose CursorIn equals
+	// an earlier page's own declared NextCursor proves the frontend actually requested page 2 (or
+	// beyond), as opposed to endlessly re-requesting page 1.
+	var expectedNextCursor string
+	var lastConversations []cursorConversation
+	var lastDuplicates int
+	var anyForwardProgress, anyScrollChanged, anyLinkCountChanged bool
+
+	recordPages := func(pages []cursorFetchedPage, convs []cursorConversation, dups int) {
+		if len(pages) == 0 {
+			return
 		}
+		lastConversations, lastDuplicates = convs, dups
+		if last := pages[len(pages)-1]; last.HasNextCursor {
+			expectedNextCursor = last.NextCursor
+		}
+	}
+	reportForwardProgress := func(label string, pages []cursorFetchedPage) {
+		observed := forwardProgressObserved(pages, expectedNextCursor)
+		if observed {
+			anyForwardProgress = true
+		}
+		fmt.Printf("expected next cursor request (%s): observed=%t\n", label, observed)
+	}
+
+	pages, convs, dups, comp, herr := tryAccumulate(idBase + 3)
+	if herr != nil {
+		return nil, 0, false, pagesFetched, firstPageOrder, herr
+	}
+	recordPages(pages, convs, dups)
+	reportForwardProgress("initial", pages)
+	if comp {
 		return convs, dups, true, pagesFetched, firstPageOrder, nil
 	}
 
@@ -683,17 +717,77 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		if werr != nil {
 			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("real wheel scroll (attempt %d): %w", attempt, werr)
 		}
+		if attempt == 0 && wheelResult.Found {
+			printWheelInputShape(wheelResult.InputShape)
+		}
 		printRealWheelResult(attempt, wheelResult)
+		if wheelTicksShowScrollChange(wheelResult.Ticks) {
+			anyScrollChanged = true
+		}
+		if wheelTicksShowLinkChange(wheelResult.Ticks) {
+			anyLinkCountChanged = true
+		}
 		time.Sleep(500 * time.Millisecond)
 
-		if done, convs, dups, herr := tryAccumulate(idBase + 5 + attempt*2); done {
-			if herr != nil {
-				return nil, 0, false, pagesFetched, firstPageOrder, herr
-			}
+		pages, convs, dups, comp, herr := tryAccumulate(idBase + 5 + attempt*2)
+		if herr != nil {
+			return nil, 0, false, pagesFetched, firstPageOrder, herr
+		}
+		recordPages(pages, convs, dups)
+		reportForwardProgress(fmt.Sprintf("attempt %d", attempt), pages)
+		if comp {
 			return convs, dups, true, pagesFetched, firstPageOrder, nil
 		}
 	}
-	return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("exhausted %d real-wheel attempts without observing a terminal cursor", maxWheelAttempts)
+
+	fmt.Printf("pagination progress: scroll_changed=%t link_count_changed=%t expected_next_cursor_observed=%t\n",
+		anyScrollChanged, anyLinkCountChanged, anyForwardProgress)
+	reason := classifyWheelProgressReason(anyScrollChanged, anyLinkCountChanged, anyForwardProgress)
+	return lastConversations, lastDuplicates, false, pagesFetched, firstPageOrder, &cursorChainIncompleteError{Reason: reason}
+}
+
+// wheelTicksShowScrollChange/wheelTicksShowLinkChange are the pure predicates behind the
+// "pagination progress" diagnostic (README Task 4): did ANY tick (Electron or CDP) in this attempt
+// show a genuine before/after change? Pointer fields are compared only when both sides are present
+// (a nil pair — the region was not found for that tick — is never treated as "no change").
+func wheelTicksShowScrollChange(ticks []wheelTickDiagnostic) bool {
+	for _, t := range ticks {
+		if t.ScrollTopBefore != nil && t.ScrollTopAfter != nil && *t.ScrollTopBefore != *t.ScrollTopAfter {
+			return true
+		}
+	}
+	return false
+}
+
+func wheelTicksShowLinkChange(ticks []wheelTickDiagnostic) bool {
+	for _, t := range ticks {
+		if t.ProjectConversationLinksBefore != nil && t.ProjectConversationLinksAfter != nil &&
+			*t.ProjectConversationLinksBefore != *t.ProjectConversationLinksAfter {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyWheelProgressReason is the pure decision core behind an exhausted enumeration's
+// incompleteness reason: WHEEL_NO_PROGRESS when NOTHING observable happened across every attempt
+// (no scroll movement, no link-count change, no forward-cursor progress — README Task 4), versus
+// the more generic ATTEMPTS_EXHAUSTED when at least one of those fired but a terminal cursor still
+// wasn't reached in time.
+func classifyWheelProgressReason(scrollChanged, linkCountChanged, forwardProgress bool) string {
+	if !scrollChanged && !linkCountChanged && !forwardProgress {
+		return "WHEEL_NO_PROGRESS"
+	}
+	return "ATTEMPTS_EXHAUSTED"
+}
+
+// shouldAttemptCDPWheelFallback mirrors bridge/main.js's realWheelScrollProject decision (README
+// Task 7): the CDP Input.dispatchMouseEvent fallback is attempted only when Electron's own
+// sendInputEvent showed zero progress across the WHOLE attempt, never unconditionally and never
+// assumed as the production mechanism from the outset. Test-only; the real decision is made
+// bridge-side, in the same process and request that performs the Electron ticks.
+func shouldAttemptCDPWheelFallback(electronProgress bool) bool {
+	return !electronProgress
 }
 
 // projectScrollRegion mirrors bridge/preload.js's findProjectScrollRegion result: the scrollable
@@ -725,25 +819,52 @@ func fetchProjectScrollRegion(client net.Conn, id int) (projectScrollRegion, err
 
 // wheelTickDiagnostic is one before/after observation within a single realWheelScrollProject call.
 // Pointer fields distinguish "the region was not found for this tick" (nil) from a genuine zero.
+// Via distinguishes an Electron sendInputEvent tick from a CDP Input.dispatchMouseEvent fallback
+// tick (README Task 7) — never a self-issued fetch of the cursor endpoint either way.
 type wheelTickDiagnostic struct {
-	Index                          int  `json:"index"`
-	ScrollTopBefore                *int `json:"scrollTopBefore"`
-	ScrollTopAfter                 *int `json:"scrollTopAfter"`
-	ProjectConversationLinksBefore *int `json:"projectConversationLinksBefore"`
-	ProjectConversationLinksAfter  *int `json:"projectConversationLinksAfter"`
+	Index                          int    `json:"index"`
+	Via                            string `json:"via"`
+	ScrollTopBefore                *int   `json:"scrollTopBefore"`
+	ScrollTopAfter                 *int   `json:"scrollTopAfter"`
+	ProjectConversationLinksBefore *int   `json:"projectConversationLinksBefore"`
+	ProjectConversationLinksAfter  *int   `json:"projectConversationLinksAfter"`
+}
+
+// wheelInputShape is the exact shape of the Electron wheel event this bridge sends, reported once
+// for direct comparison against terminal-browser's own manual-wheel input shape (README Task 6).
+// Never carries page content.
+type wheelInputShape struct {
+	X                         int     `json:"x"`
+	Y                         int     `json:"y"`
+	DeltaY                    int     `json:"deltaY"`
+	WheelTicksY               int     `json:"wheelTicksY"`
+	HasPreciseScrollingDeltas bool    `json:"hasPreciseScrollingDeltas"`
+	DevicePixelRatio          float64 `json:"devicePixelRatio"`
 }
 
 // realWheelScrollResult mirrors the bridge's realWheelScrollProject response: real Electron
 // mouseWheel input sent to the ChatGPT WebContents (README "New hypothesis" — a synthetic DOM
 // scroll event may not reproduce whatever browser-level input-pipeline behavior the real
 // frontend's pagination trigger depends on), never a self-issued fetch of the cursor endpoint.
+// FocusEmulationEnabled reports whether CDP `Emulation.setFocusEmulationEnabled` — the mechanism
+// terminal-browser's own bundled source actually uses, found by inspecting it directly, since real
+// OS window-manager focus (WindowFocused) may be unobtainable for this offscreen/kitty-graphics-
+// rendered window regardless of how hard this bridge tries. ElectronProgress/CDPAttempted/
+// CDPProgress report README Task 7's fallback sequence: CDP is attempted only when Electron input
+// showed zero measurable effect across the whole attempt.
 type realWheelScrollResult struct {
-	Found          bool                  `json:"found"`
-	CandidateCount int                   `json:"candidateCount"`
-	WindowFocused  *bool                 `json:"windowFocused"`
-	Initial        projectScrollRegion   `json:"initial"`
-	Ticks          []wheelTickDiagnostic `json:"ticks"`
-	Final          projectScrollRegion   `json:"final"`
+	Found                             bool                  `json:"found"`
+	CandidateCount                    int                   `json:"candidateCount"`
+	WindowFocused                     *bool                 `json:"windowFocused"`
+	FocusEmulationEnabled             bool                  `json:"focusEmulationEnabled"`
+	PointerInsideSelectedScrollRegion bool                  `json:"pointerInsideSelectedScrollRegion"`
+	InputShape                        wheelInputShape       `json:"inputShape"`
+	ElectronProgress                  bool                  `json:"electronProgress"`
+	CDPAttempted                      bool                  `json:"cdpAttempted"`
+	CDPProgress                       *bool                 `json:"cdpProgress"`
+	Initial                           projectScrollRegion   `json:"initial"`
+	Ticks                             []wheelTickDiagnostic `json:"ticks"`
+	Final                             projectScrollRegion   `json:"final"`
 }
 
 func fetchRealWheelScrollProject(client net.Conn, id int, projectID string, ticks int) (realWheelScrollResult, error) {
@@ -779,6 +900,25 @@ func fetchProjectConversationsResponseStatus(client net.Conn, id int) (cursorRes
 	return result, nil
 }
 
+// subtractStatusCounts computes an experiment-local delta from two cumulative snapshots (README
+// Task 3): the bridge's own counters are cumulative for the whole browser process's lifetime, so a
+// raw "after" reading conflates traffic from earlier in the same run (project discovery,
+// conversationEvidence, the global-endpoint investigation, etc.) with what THIS experiment's own
+// wheel input actually caused. Pure and unit-tested.
+func subtractStatusCounts(after, before cursorResponseStatusCounts) cursorResponseStatusCounts {
+	sub := func(a, b map[string]int) map[string]int {
+		result := make(map[string]int, len(a))
+		for key, value := range a {
+			result[key] = value - b[key]
+		}
+		return result
+	}
+	return cursorResponseStatusCounts{
+		NoCursor:      sub(after.NoCursor, before.NoCursor),
+		CursorPresent: sub(after.CursorPresent, before.CursorPresent),
+	}
+}
+
 func printProjectScrollRegion(label string, r projectScrollRegion) {
 	if !r.Found {
 		fmt.Printf("%s: found=false candidate_count=%d\n", label, r.CandidateCount)
@@ -807,12 +947,24 @@ func printRealWheelResult(attempt int, w realWheelScrollResult) {
 		fmt.Printf("real wheel (attempt %d): NOT TRIGGERED (no scroll target found, candidate_count=%d)\n", attempt, w.CandidateCount)
 		return
 	}
-	fmt.Printf("real wheel (attempt %d): window_focused=%s\n", attempt, boolOrNil(w.WindowFocused))
+	fmt.Printf("real wheel (attempt %d): window_focused=%s focus_emulation_enabled=%t pointer_inside_selected_scroll_region=%t\n",
+		attempt, boolOrNil(w.WindowFocused), w.FocusEmulationEnabled, w.PointerInsideSelectedScrollRegion)
 	for _, tick := range w.Ticks {
-		fmt.Printf("real wheel (attempt %d, tick %d): scroll_top_before=%s scroll_top_after=%s project_links_before=%s project_links_after=%s\n",
-			attempt, tick.Index, intOrNil(tick.ScrollTopBefore), intOrNil(tick.ScrollTopAfter),
+		fmt.Printf("real wheel (attempt %d, tick %d, via=%s): scroll_top_before=%s scroll_top_after=%s project_links_before=%s project_links_after=%s\n",
+			attempt, tick.Index, tick.Via, intOrNil(tick.ScrollTopBefore), intOrNil(tick.ScrollTopAfter),
 			intOrNil(tick.ProjectConversationLinksBefore), intOrNil(tick.ProjectConversationLinksAfter))
 	}
+	fmt.Printf("electron wheel (attempt %d): progress=%t\n", attempt, w.ElectronProgress)
+	if w.CDPAttempted {
+		fmt.Printf("cdp wheel (attempt %d): attempted=true progress=%s\n", attempt, boolOrNil(w.CDPProgress))
+	} else {
+		fmt.Printf("cdp wheel (attempt %d): attempted=false\n", attempt)
+	}
+}
+
+func printWheelInputShape(s wheelInputShape) {
+	fmt.Printf("wheel input: x=%d y=%d delta_y=%d wheel_ticks_y=%d precise=%t device_pixel_ratio=%.2f\n",
+		s.X, s.Y, s.DeltaY, s.WheelTicksY, s.HasPreciseScrollingDeltas, s.DevicePixelRatio)
 }
 
 func printResponseStatusCounts(counts cursorResponseStatusCounts) {
@@ -846,17 +998,43 @@ const (
 	outcomeComplete cursorExperimentOutcome = "COMPLETE"
 )
 
+// cursorChainIncompleteError is returned by enumerateProjectConversationsByCursorPassive when at
+// least one valid page was accepted (schema-validated, series-selected, no dedupe conflict) but no
+// terminal cursor was observed within the bounded number of wheel/CDP attempts. This is
+// deliberately a DISTINCT type from an ordinary error string: a live run (README "Task 1" fix)
+// found the classifier's original string-blind `chainErr != nil` check misclassified this exact,
+// expected "ran out of attempts, nothing is actually wrong with the data" condition as
+// CAPTURE_FAILURE (reserved for schema/validation failures), when it should be CHAIN_INCOMPLETE.
+type cursorChainIncompleteError struct {
+	Reason string
+}
+
+func (e *cursorChainIncompleteError) Error() string {
+	return fmt.Sprintf("cursor chain incomplete: %s", e.Reason)
+}
+
+// isCursorChainIncomplete reports whether err is (or wraps) a *cursorChainIncompleteError, never
+// by matching its error string.
+func isCursorChainIncomplete(err error) bool {
+	var incomplete *cursorChainIncompleteError
+	return errors.As(err, &incomplete)
+}
+
 // classifyCursorExperimentOutcome is the pure decision core behind the five failure/success
 // categories (README "Failure categories"), evaluated in the priority order the task specifies:
 // an total absence of any cursor-present traffic (success or failure) means the wheel input never
 // triggered a request at all, which is a distinct, more basic problem than an authorization
 // failure and must be reported as such rather than silently falling through to a later category.
+// A *cursorChainIncompleteError is checked BEFORE the generic "any error at all" branch, so
+// exhausting wheel/CDP attempts with valid data is never misreported as CAPTURE_FAILURE.
 func classifyCursorExperimentOutcome(cursorPresent200, cursorPresent401 int, pagesCaptured int, chainErr error, complete bool) cursorExperimentOutcome {
 	switch {
 	case cursorPresent200 == 0 && cursorPresent401 == 0 && pagesCaptured == 0:
 		return outcomeNoRequest
 	case cursorPresent200 == 0 && cursorPresent401 > 0:
 		return outcomeFrontend401
+	case isCursorChainIncomplete(chainErr):
+		return outcomeChainIncomplete
 	case chainErr != nil:
 		return outcomeCaptureFailure
 	case !complete:
@@ -864,6 +1042,24 @@ func classifyCursorExperimentOutcome(cursorPresent200, cursorPresent401 int, pag
 	default:
 		return outcomeComplete
 	}
+}
+
+// forwardProgressObserved reports whether any page in `pages` (already series-filtered) has
+// CursorIn equal to expectedNextCursor — i.e. whether the frontend has actually been observed
+// requesting the NEXT page, not merely repeating the first one (README Task 9: a rising
+// cursor-present request COUNT alone is never forward progress if every one of those requests
+// still carries CursorIn="0"). expectedNextCursor == "" (no page has declared a next cursor yet)
+// always reports false.
+func forwardProgressObserved(pages []cursorFetchedPage, expectedNextCursor string) bool {
+	if expectedNextCursor == "" {
+		return false
+	}
+	for _, p := range pages {
+		if p.CursorIn == expectedNextCursor {
+			return true
+		}
+	}
+	return false
 }
 
 // knownSampleFingerprintsResult reports SHA-256 fingerprints (never raw IDs) of one already-known
@@ -908,22 +1104,34 @@ func runCursorExperiment(client net.Conn, projectID string, oldProjectScopedCoun
 	// frontend's own request path. Run with `-cursor-self-fetch-probe` to re-verify it independently.
 	fmt.Println("known self-fetch probe: skipped (known negative: HTTP 401 once a cursor parameter is present; use -cursor-self-fetch-probe to re-verify)")
 
+	// README Task 3: the bridge's response-status counters are cumulative for the whole browser
+	// process, not scoped to this experiment — a raw reading conflates earlier-in-run traffic
+	// (project discovery, conversationEvidence, the global-endpoint investigation) with what THIS
+	// experiment's own wheel input actually caused. Snapshot before/after and classify on the delta.
+	statusBefore, beforeErr := fetchProjectConversationsResponseStatus(client, 779)
+	if beforeErr != nil {
+		fmt.Printf("cursor response status baseline: NOT VERIFIED (%v)\n", beforeErr)
+	}
+
 	conversations, duplicates, complete, pagesFetched, firstPageOrder, enumErr := enumerateProjectConversationsByCursorPassive(client, projectID, 8, 50, 700)
 
-	statusCounts, serr := fetchProjectConversationsResponseStatus(client, 780)
+	statusAfter, afterErr := fetchProjectConversationsResponseStatus(client, 780)
 	cursorPresent200, cursorPresent401 := 0, 0
-	if serr != nil {
-		fmt.Printf("cursor response status: NOT VERIFIED (%v)\n", serr)
+	if beforeErr != nil || afterErr != nil {
+		if afterErr != nil {
+			fmt.Printf("cursor response status delta: NOT VERIFIED (%v)\n", afterErr)
+		}
 	} else {
-		printResponseStatusCounts(statusCounts)
-		cursorPresent200 = statusCounts.CursorPresent["200"]
-		cursorPresent401 = statusCounts.CursorPresent["401"]
+		delta := subtractStatusCounts(statusAfter, statusBefore)
+		printResponseStatusCounts(delta)
+		cursorPresent200 = delta.CursorPresent["200"]
+		cursorPresent401 = delta.CursorPresent["401"]
 	}
 
 	outcome := classifyCursorExperimentOutcome(cursorPresent200, cursorPresent401, pagesFetched, enumErr, complete)
 	fmt.Printf("failure category: %s\n", outcome)
 
-	if enumErr != nil {
+	if enumErr != nil && !isCursorChainIncomplete(enumErr) {
 		fmt.Printf("Project session enumeration: FAIL (%v)\n", enumErr)
 		return nil
 	}
@@ -931,9 +1139,16 @@ func runCursorExperiment(client net.Conn, projectID string, oldProjectScopedCoun
 	fmt.Printf("pages fetched: %d\n", pagesFetched)
 	fmt.Printf("terminal cursor observed: %t\n", complete)
 	fmt.Printf("unique conversations: %d duplicates_observed: %d\n", len(conversations), duplicates)
-	if complete {
+	switch {
+	case complete:
 		fmt.Println("Project session enumeration: COMPLETE")
-	} else {
+	case enumErr != nil:
+		// isCursorChainIncomplete(enumErr) is true here (the FAIL branch above already returned
+		// otherwise) — valid pages were accepted but no terminal cursor was reached within the
+		// bounded attempts. This is a distinct, expected outcome, never conflated with a schema/
+		// capture failure (README Task 1).
+		fmt.Printf("Project session enumeration: INCOMPLETE (%v)\n", enumErr)
+	default:
 		fmt.Println("Project session enumeration: INCOMPLETE")
 	}
 
