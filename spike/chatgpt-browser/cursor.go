@@ -339,27 +339,68 @@ func dedupeCapturesByCursorIn(captures []cursorCaptureWireItem) ([]cursorCapture
 	return result, nil
 }
 
+// filterCapturesNewerThan returns only the captures strictly newer than minCaptureIDExclusive —
+// the pure filtering core of enumerateProjectConversationsByCursorPassive's freshness watermark
+// (see that function's doc comment for the live bug this fixes). Mirrors the same pattern already
+// proven for the pin experiment's selectFreshMatchDiagnostics: keeping this as a small, separately
+// testable pure function is what makes the watermark logic unit-testable at all, since the
+// surrounding function itself needs a live bridge connection.
+func filterCapturesNewerThan(captures []cursorCaptureWireItem, minCaptureIDExclusive int) []cursorCaptureWireItem {
+	var fresh []cursorCaptureWireItem
+	for _, c := range captures {
+		if c.CaptureID > minCaptureIDExclusive {
+			fresh = append(fresh, c)
+		}
+	}
+	return fresh
+}
+
 // enumerateProjectConversationsByCursorPassive is the primary enumeration mechanism (see the
 // self-fetch 401 evidence on enumerateProjectConversationsByCursorSelfFetch above): it navigates
-// into the Project's own view (which is what naturally issues this endpoint's first real request),
-// then repeatedly harvests whatever the real ChatGPT client has passively been observed
-// requesting, running accumulateCursorChain after every harvest — exactly the same pure,
-// unit-tested logic exercised directly by cursor_test.go — BEFORE attempting another scroll
-// simulation. If no terminal cursor is reached within maxScrollAttempts, this returns an error
-// (never a partial result presented as complete), mirroring every other fail-closed enumeration in
-// this spike.
+// into the Project's own view (which is what naturally issues this endpoint's first real request —
+// live evidence 2026-09-13 confirmed scrolling that view does load further cursor pages), then
+// repeatedly harvests whatever the real ChatGPT client has passively been observed requesting,
+// running accumulateCursorChain after every harvest — exactly the same pure, unit-tested logic
+// exercised directly by cursor_test.go — BEFORE attempting another scroll simulation. If no
+// terminal cursor is reached within maxScrollAttempts, this returns an error (never a partial
+// result presented as complete), mirroring every other fail-closed enumeration in this spike.
+//
+// A live run (2026-09-13) hit exactly the same class of bug this spike's pin experiment already
+// found and fixed once for the global endpoint (README "sixth pass — added an explicit freshness
+// gate"): earlier code considered EVERY capture ever observed for this Project, including one from
+// this endpoint's very first, unrelated navigation near the top of run() (via the existing
+// `conversations` bridge method's own cache-miss navigation) — long before this function's own
+// `navigateProject` call. Two independent real fetches of the logical first page, observed many
+// seconds apart with intervening account/session activity, are not guaranteed to be byte-identical
+// (the opaque cursor token itself is not proven idempotent — README "Cursor is opaque" forbids
+// assuming otherwise), so dedupeCapturesByCursorIn correctly, but unhelpfully, flagged them as
+// conflicting. Fixed with the same watermark pattern already proven elsewhere in this spike: a
+// baseline max CaptureID is read BEFORE this function's own navigation, and only captures strictly
+// newer than that watermark are ever considered — so a stale, pre-existing capture from earlier in
+// the same run can never be compared against this function's own fresh ones.
 func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID string, maxScrollAttempts, maxPages, idBase int) (conversations []cursorConversation, duplicatesObserved int, complete bool, pagesFetched int, firstPageOrder []cursorConversation, err error) {
-	if _, err := call(client, request{ID: idBase, Method: "navigateProject", ProjectID: projectID}); err != nil {
+	baseline, err := fetchCursorCaptures(client, idBase, projectID)
+	if err != nil {
+		return nil, 0, false, 0, nil, fmt.Errorf("read baseline cursor captures: %w", err)
+	}
+	watermark := 0
+	for _, c := range baseline {
+		if c.CaptureID > watermark {
+			watermark = c.CaptureID
+		}
+	}
+
+	if _, err := call(client, request{ID: idBase + 1, Method: "navigateProject", ProjectID: projectID}); err != nil {
 		return nil, 0, false, 0, nil, fmt.Errorf("navigate to Project view: %w", err)
 	}
 	time.Sleep(2 * time.Second)
 
 	harvest := func() (pages []cursorFetchedPage, firstOrder []cursorConversation, err error) {
-		raw, err := fetchCursorCaptures(client, idBase+1, projectID)
+		raw, err := fetchCursorCaptures(client, idBase+2, projectID)
 		if err != nil {
 			return nil, nil, err
 		}
-		deduped, err := dedupeCapturesByCursorIn(raw)
+		deduped, err := dedupeCapturesByCursorIn(filterCapturesNewerThan(raw, watermark))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -403,7 +444,7 @@ func enumerateProjectConversationsByCursorPassive(client net.Conn, projectID str
 		if attempt == maxScrollAttempts {
 			break
 		}
-		scrollRaw, serr := call(client, request{ID: idBase + 2 + attempt, Method: "simulateSidebarScroll"})
+		scrollRaw, serr := call(client, request{ID: idBase + 3 + attempt, Method: "simulateSidebarScroll"})
 		if serr != nil {
 			return nil, 0, false, pagesFetched, firstPageOrder, fmt.Errorf("simulate scroll (attempt %d): %w", attempt, serr)
 		}
