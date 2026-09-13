@@ -42,6 +42,21 @@ func TestAssembleChainForwardsOpaqueCursorsAndSortsByCreation(t *testing.T) {
 	}
 }
 
+func TestAssembleChainDoesNotUseUpdateTimeForOrdering(t *testing.T) {
+	older := item(conversationA, "A", "2026-01-01T00:00:00Z")
+	older.UpdatedAt = "2026-04-01T00:00:00Z"
+	newer := item(conversationB, "B", "2026-02-01T00:00:00Z")
+	newer.UpdatedAt = "2026-03-01T00:00:00Z"
+
+	got, complete, err := assembleChain([]capture{capturePage(1, "series", "0", "", older, newer)}, "series", 10)
+	if err != nil || !complete {
+		t.Fatalf("complete=%t err=%v", complete, err)
+	}
+	if len(got) != 2 || got[0].ID != conversationB || got[1].ID != conversationA {
+		t.Fatalf("creation order=%+v", got)
+	}
+}
+
 func TestAssembleChainRejectsCycleAndBrokenChain(t *testing.T) {
 	cycle := []capture{
 		capturePage(1, "series", "0", "opaque", item(conversationA, "A", "2026-01-01T00:00:00Z")),
