@@ -183,7 +183,7 @@ async function dispatch(request) {
   if (![
     "pageInfo", "projects", "tasks", "conversations", "globalConversations", "conversationEvidence", "openURLProbe",
     "globalConversationsPages", "globalConversationsPage", "globalConversationsCaptureItems", "simulateSidebarScroll",
-    "pins",
+    "pins", "projectConversationsCursor", "knownSampleFingerprints",
   ].includes(request.method)) {
     throw new Error(`unsupported method: ${request.method}`);
   }
@@ -279,6 +279,33 @@ async function dispatch(request) {
       payload = await waitForCapture(() => capturedConversations.get(request.projectID));
     }
     return requestPage({ method: "sanitizeConversations", projectID: request.projectID, payload });
+  }
+  if (request.method === "projectConversationsCursor") {
+    // Self-issued fetch, not passive capture: the existing "conversations" method above already
+    // proves this project-scoped endpoint (unlike the global /backend-api/conversations endpoint,
+    // which 401s on a script-issued fetch — see the README Phase 5 addendum) tolerates a
+    // same-origin, credential-including fetch issued directly by this preload script. cursor
+    // defaults to "0", the documented entry point (README "Cursor is opaque").
+    if (!/^g-p-[A-Za-z0-9_-]+$/.test(request.projectID || "")) {
+      throw new Error("invalid Project ID");
+    }
+    const cursor = request.params && typeof request.params.cursor === "string" ? request.params.cursor : "0";
+    return requestPage({ method: "sanitizeProjectConversationsCursorPage", projectID: request.projectID, cursor });
+  }
+  if (request.method === "knownSampleFingerprints") {
+    // README Phase E: report SHA-256 fingerprints (never raw IDs) of one already-known Work-marked
+    // conversation and one already-known plain conversation, reusing openURLProbe's exact
+    // async_source-presence selection over capturedConversationDetails — never resolving or
+    // re-deriving the Chat/Work discriminator itself. Returns null fields if conversationEvidence
+    // has not yet captured any matching sample in this run.
+    const detailIDs = [...capturedConversationDetails.keys()];
+    const workLikeID = detailIDs.find((id) => payloadHasAsyncSource(capturedConversationDetails.get(id)));
+    const chatLikeID = detailIDs.find((id) => id !== workLikeID && !payloadHasAsyncSource(capturedConversationDetails.get(id)));
+    const fingerprintOf = (id) => (id ? crypto.createHash("sha256").update(id).digest("hex").slice(0, 12) : null);
+    return {
+      workFingerprint: fingerprintOf(workLikeID),
+      chatFingerprint: fingerprintOf(chatLikeID),
+    };
   }
   if (request.method === "conversationEvidence") {
     const ids = request.conversationIDs;

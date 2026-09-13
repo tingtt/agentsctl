@@ -90,6 +90,57 @@ function conversationsFrom(payload, projectID) {
   return [...candidates.values()];
 }
 
+// projectConversationsCursorFrom sanitizes one page of the Project-scoped cursor-paginated
+// endpoint (GET /backend-api/gizmos/{project_id}/conversations?cursor=...) for the Issue #7
+// cursor-pagination spike. Schema per a real captured response: the collection field is `items`,
+// per-item identity is `id`, and the two timestamps are `create_time`/`update_time` — never
+// guessed. Deliberately narrower than conversationsFrom/globalConversationsFrom: only ID and the
+// two timestamps needed for local creation-time ordering cross the bridge, never title or other
+// content, since this spike's scope is List completeness only.
+//
+// The response's own `cursor` field is opaque and its terminal representation was not known in
+// advance (README Phase A instructs recording, not guessing, what a live response actually shows).
+// This treats an absent key, an explicit `null`, or an empty string as "no next page" and any
+// non-empty string as "more pages follow" — deliberately covering multiple plausible terminal
+// shapes rather than assuming one, and failing closed if `cursor` is present with some other type
+// (e.g. a number or object), which would be schema drift this spike has not seen before.
+function projectConversationsCursorFrom(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error("project cursor conversation response is not an object");
+  }
+  if (!Array.isArray(payload.items)) {
+    throw new Error("project cursor conversation response has no recognized item collection");
+  }
+  const items = [];
+  for (const raw of payload.items) {
+    if (!raw || typeof raw !== "object") {
+      throw new Error("project cursor conversation item is not an object");
+    }
+    const id = firstString(raw, ["id", "conversation_id"]);
+    if (!id || !conversationIDPattern.test(id)) {
+      throw new Error("project cursor conversation item missing recognizable identity");
+    }
+    const createdAt = typeof raw.create_time === "string" ? raw.create_time : null;
+    if (!createdAt) throw new Error("project cursor conversation item missing create_time");
+    const updatedAt = typeof raw.update_time === "string" ? raw.update_time : "";
+    items.push({ id, createdAt, updatedAt });
+  }
+  let hasNextCursor = false;
+  let nextCursor = "";
+  if (Object.prototype.hasOwnProperty.call(payload, "cursor")) {
+    const cursor = payload.cursor;
+    if (cursor === null) {
+      hasNextCursor = false;
+    } else if (typeof cursor === "string") {
+      hasNextCursor = cursor.length > 0;
+      nextCursor = cursor;
+    } else {
+      throw new Error("project cursor conversation response cursor field has an unrecognized type");
+    }
+  }
+  return { items, rawItemCount: payload.items.length, hasNextCursor, nextCursor };
+}
+
 function rawTopLevelItems(payload) {
   if (Array.isArray(payload)) return payload;
   if (payload && Array.isArray(payload.items)) return payload.items;
@@ -442,6 +493,12 @@ async function dispatch(request) {
     if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
     const path = `/backend-api/gizmos/${encodeURIComponent(request.projectID)}/conversations`;
     return conversationsFrom(await fetchJSON(path), request.projectID);
+  }
+  if (request.method === "sanitizeProjectConversationsCursorPage") {
+    if (!projectIDPattern.test(request.projectID || "")) throw new Error("invalid Project ID");
+    const cursor = typeof request.cursor === "string" ? request.cursor : "0";
+    const path = `/backend-api/gizmos/${encodeURIComponent(request.projectID)}/conversations?cursor=${encodeURIComponent(cursor)}`;
+    return projectConversationsCursorFrom(await fetchJSON(path));
   }
   throw new Error(`unsupported browser method: ${request.method}`);
 }

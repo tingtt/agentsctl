@@ -27,15 +27,16 @@ import (
 const protocolVersion = 1
 
 type config struct {
-	binary        string
-	partition     string
-	url           string
-	socket        string
-	projectID     string
-	projectName   string
-	hold          time.Duration
-	closePTYAfter time.Duration
-	pinExperiment bool
+	binary           string
+	partition        string
+	url              string
+	socket           string
+	projectID        string
+	projectName      string
+	hold             time.Duration
+	closePTYAfter    time.Duration
+	pinExperiment    bool
+	cursorExperiment bool
 }
 
 type request struct {
@@ -1407,6 +1408,8 @@ func parseFlags() config {
 	flag.DurationVar(&cfg.closePTYAfter, "close-pty-after", 0, "close the PTY after this duration for lifecycle testing")
 	flag.BoolVar(&cfg.pinExperiment, "pin-experiment", false,
 		"run the interactive Phase 5 is_starred coverage experiment (README 'ChatGPT Phase 5: prove is_starred coverage semantics'); requires an interactive terminal and a human performing pin/star actions in the real ChatGPT UI")
+	flag.BoolVar(&cfg.cursorExperiment, "cursor-experiment", false,
+		"run the Project-scoped cursor pagination full-enumeration experiment (README 'ChatGPT Project session listing: cursor pagination spike')")
 	flag.Parse()
 	return cfg
 }
@@ -1624,6 +1627,7 @@ func run(ctx context.Context, cfg config) error {
 				strings.Join(tasks.StatusFieldCandidates, ","), tasks.DistinctStatusValueCount)
 		}
 
+		globalConversationsCount := -1
 		raw, err = call(client, request{ID: 13, Method: "globalConversations", ProjectID: projectID})
 		if err != nil {
 			fmt.Printf("global conversations: NOT VERIFIED (%v)\n", err)
@@ -1632,6 +1636,7 @@ func run(ctx context.Context, cfg config) error {
 			if err := json.Unmarshal(raw, &global); err != nil {
 				return fmt.Errorf("decode global conversations: %w", err)
 			}
+			globalConversationsCount = len(global)
 			known := make(map[string]struct{}, len(first))
 			for _, item := range first {
 				known[item.ID] = struct{}{}
@@ -1721,6 +1726,12 @@ func run(ctx context.Context, cfg config) error {
 				return fmt.Errorf("pin experiment: %w", err)
 			}
 			browser, client = newBrowser, newClient
+		}
+
+		if cfg.cursorExperiment {
+			if err := runCursorExperiment(client, projectID, len(first), globalConversationsCount, globalConversationsCount >= 0); err != nil {
+				return fmt.Errorf("cursor experiment: %w", err)
+			}
 		}
 	}
 
