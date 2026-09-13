@@ -215,8 +215,8 @@ func TestRuntimeDispatchFallsBackToStartupCWDWithEmptyCatalog(t *testing.T) {
 // intent end to end: it must reach the provider's Open, mark the session
 // last-attached, and reload.
 func TestRuntimeOpenMarksLastAttachedAndReloads(t *testing.T) {
-	target := session.Key{Provider: session.ProviderCodex, ID: "s1"}
-	p := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{{Key: target, CWD: "/work", Actions: session.Actions{session.ActionOpen: {Available: true}}}}}
+	target := session.Key{Provider: session.ProviderChatGPT, ID: "s1"}
+	p := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{{Key: target, CWD: "/work", Actions: session.Actions{session.ActionOpen: {Available: true}}}}}
 	rt := newTestRuntime(p)
 	rt.State.selectIndex(0)
 	intent := rt.State.Handle(KeyEvent{Key: KeyEnter})

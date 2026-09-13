@@ -52,9 +52,9 @@ func providerColor(provider session.ProviderID) string {
 }
 
 // providerFieldWidth is the fixed visible-cell width every provider label
-// is padded to -- long enough for "claude" (6 cells) -- so a field built
+// is padded to -- long enough for current provider identities -- so a field built
 // from it never shifts whatever follows it when the provider changes.
-const providerFieldWidth = 6
+const providerFieldWidth = 7
 
 // providerName is the plain-text, unpadded provider identity -- e.g. for
 // the composer footer/usage lines, which (unlike a session row's provider
