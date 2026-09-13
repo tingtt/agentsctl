@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -304,6 +308,98 @@ func TestSummarizeCursorInVariantsDistinguishesFlickeringFromStable(t *testing.T
 	c1, ok := got["C1"]
 	if !ok || c1.Observations != 1 || c1.DistinctIDSets != 1 {
 		t.Fatalf("unexpected summary for cursor_in=C1: %+v (ok=%t)", c1, ok)
+	}
+}
+
+// testCanonicalCursorSeriesKey mirrors bridge/main.js's canonicalCursorSeriesKeyFrom exactly
+// (cursor excluded, remaining pairs sorted by key then value, JSON-encoded, SHA-256'd) — the same
+// pattern as the existing testCanonicalSeriesKey for the global endpoint's offset exclusion.
+// Test-only; keep in sync with canonicalCursorSeriesKeyFrom if that changes.
+func testCanonicalCursorSeriesKey(pairs [][2]string) string {
+	filtered := make([][2]string, 0, len(pairs))
+	for _, pair := range pairs {
+		if pair[0] == "cursor" {
+			continue
+		}
+		filtered = append(filtered, pair)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i][0] != filtered[j][0] {
+			return filtered[i][0] < filtered[j][0]
+		}
+		return filtered[i][1] < filtered[j][1]
+	})
+	canonical, err := json.Marshal(filtered)
+	if err != nil {
+		panic(err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestCanonicalCursorSeriesKeyExcludesCursorAndIsOrderIndependent(t *testing.T) {
+	a := testCanonicalCursorSeriesKey([][2]string{{"limit", "5"}, {"cursor", "abc"}})
+	b := testCanonicalCursorSeriesKey([][2]string{{"cursor", "xyz"}, {"limit", "5"}})
+	if a != b {
+		t.Fatalf("keys with only cursor differing should match: %q vs %q", a, b)
+	}
+	c := testCanonicalCursorSeriesKey([][2]string{{"limit", "10"}, {"cursor", "abc"}})
+	if a == c {
+		t.Fatal("keys with a different limit must not collide")
+	}
+}
+
+func TestGroupCapturesBySeriesKey(t *testing.T) {
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", SeriesKey: "S1", Items: wireItems("A")},
+		{CaptureID: 2, CursorIn: "0", SeriesKey: "S2", Items: wireItems("X", "Y")},
+		{CaptureID: 3, CursorIn: "C1", SeriesKey: "S1", Items: wireItems("B")},
+	}
+	groups := groupCapturesBySeriesKey(captures)
+	if len(groups) != 2 {
+		t.Fatalf("got %d groups, want 2", len(groups))
+	}
+	if len(groups["S1"]) != 2 || len(groups["S2"]) != 1 {
+		t.Fatalf("unexpected group sizes: S1=%d S2=%d", len(groups["S1"]), len(groups["S2"]))
+	}
+}
+
+func TestSelectSeriesMatchingObservedLinkCountPicksTheUniqueMatch(t *testing.T) {
+	groups := map[string][]cursorCaptureWireItem{
+		"decoy": {{CaptureID: 1, SeriesKey: "decoy", Items: wireItems("A", "B", "C", "D", "E")}},
+		"real":  {{CaptureID: 2, SeriesKey: "real", Items: wireItems("F", "G", "H", "I", "J", "K", "L", "M", "N", "O")}},
+	}
+	key, ok := selectSeriesMatchingObservedLinkCount(groups, 10)
+	if !ok || key != "real" {
+		t.Fatalf("selectSeriesMatchingObservedLinkCount() = (%q, %t), want (\"real\", true)", key, ok)
+	}
+}
+
+func TestSelectSeriesMatchingObservedLinkCountFailsClosedWhenAmbiguous(t *testing.T) {
+	// Zero matches: the DOM-observed count doesn't match any series' first page.
+	if _, ok := selectSeriesMatchingObservedLinkCount(map[string][]cursorCaptureWireItem{
+		"a": {{CaptureID: 1, SeriesKey: "a", Items: wireItems("A", "B")}},
+	}, 10); ok {
+		t.Fatal("expected ok=false when no series matches the expected size")
+	}
+	// Two matches: never guess which one is real just because both happen to have the right size.
+	if _, ok := selectSeriesMatchingObservedLinkCount(map[string][]cursorCaptureWireItem{
+		"a": {{CaptureID: 1, SeriesKey: "a", Items: wireItems("A", "B")}},
+		"b": {{CaptureID: 2, SeriesKey: "b", Items: wireItems("C", "D")}},
+	}, 2); ok {
+		t.Fatal("expected ok=false when more than one series matches the expected size")
+	}
+}
+
+func TestFilterCapturesBySeriesKey(t *testing.T) {
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, SeriesKey: "keep"},
+		{CaptureID: 2, SeriesKey: "drop"},
+		{CaptureID: 3, SeriesKey: "keep"},
+	}
+	got := filterCapturesBySeriesKey(captures, "keep")
+	if len(got) != 2 || got[0].CaptureID != 1 || got[1].CaptureID != 3 {
+		t.Fatalf("filterCapturesBySeriesKey() = %+v, want captures 1 and 3", got)
 	}
 }
 
