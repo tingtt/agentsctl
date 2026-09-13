@@ -3,7 +3,7 @@
 const fs = require("node:fs");
 const net = require("node:net");
 const crypto = require("node:crypto");
-const { app, ipcMain, webContents } = require("electron");
+const { app, ipcMain, webContents, BrowserWindow } = require("electron");
 
 const socketPath = process.env.AGENTSCTL_CHATGPT_BRIDGE_SOCKET;
 const pending = new Map();
@@ -368,6 +368,19 @@ async function dispatch(request) {
     if (!region.found) {
       return { found: false, candidateCount: region.candidateCount, ticks: [] };
     }
+    // Live evidence (README ninth live run) found sendInputEvent mouseWheel intermittently has NO
+    // effect at all (scrollTop never moves across an entire attempt) even with identical target
+    // region metrics to a run where it worked — consistent with Electron sometimes not delivering
+    // synthetic input to a window/view that the OS does not consider focused/active. Explicitly
+    // focus both the owning BrowserWindow and the WebContents before sending input; windowFocused
+    // is reported so a future run can tell whether this focus step itself is succeeding.
+    const ownerWindow = BrowserWindow.fromWebContents(contents);
+    if (ownerWindow) {
+      if (typeof ownerWindow.isMinimized === "function" && ownerWindow.isMinimized()) ownerWindow.restore();
+      ownerWindow.focus();
+    }
+    contents.focus();
+    const windowFocused = ownerWindow ? ownerWindow.isFocused() : null;
     const x = Math.round(region.rect.x + region.rect.width / 2);
     const y = Math.round(region.rect.y + Math.min(region.rect.height / 2, Math.max(region.rect.height - 4, 0)));
     const tickCount = Number.isInteger(request.ticks) && request.ticks > 0 ? Math.min(request.ticks, 8) : 3;
@@ -396,7 +409,7 @@ async function dispatch(request) {
       });
       previous = snapshot;
     }
-    return { found: true, candidateCount: region.candidateCount, initial: region, ticks, final: previous };
+    return { found: true, candidateCount: region.candidateCount, windowFocused, initial: region, ticks, final: previous };
   }
   if (request.method === "knownSampleFingerprints") {
     // README Phase E: report SHA-256 fingerprints (never raw IDs) of one already-known Work-marked

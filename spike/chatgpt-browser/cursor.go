@@ -738,6 +738,7 @@ type wheelTickDiagnostic struct {
 type realWheelScrollResult struct {
 	Found          bool                  `json:"found"`
 	CandidateCount int                   `json:"candidateCount"`
+	WindowFocused  *bool                 `json:"windowFocused"`
 	Initial        projectScrollRegion   `json:"initial"`
 	Ticks          []wheelTickDiagnostic `json:"ticks"`
 	Final          projectScrollRegion   `json:"final"`
@@ -792,11 +793,19 @@ func intOrNil(p *int) string {
 	return fmt.Sprintf("%d", *p)
 }
 
+func boolOrNil(p *bool) string {
+	if p == nil {
+		return "n/a"
+	}
+	return fmt.Sprintf("%t", *p)
+}
+
 func printRealWheelResult(attempt int, w realWheelScrollResult) {
 	if !w.Found {
 		fmt.Printf("real wheel (attempt %d): NOT TRIGGERED (no scroll target found, candidate_count=%d)\n", attempt, w.CandidateCount)
 		return
 	}
+	fmt.Printf("real wheel (attempt %d): window_focused=%s\n", attempt, boolOrNil(w.WindowFocused))
 	for _, tick := range w.Ticks {
 		fmt.Printf("real wheel (attempt %d, tick %d): scroll_top_before=%s scroll_top_after=%s project_links_before=%s project_links_after=%s\n",
 			attempt, tick.Index, intOrNil(tick.ScrollTopBefore), intOrNil(tick.ScrollTopAfter),
