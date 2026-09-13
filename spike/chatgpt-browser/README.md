@@ -40,6 +40,8 @@ The bridge protocol has these browser methods:
 - `globalConversationsPage`: issues its own same-origin `fetch` to `/backend-api/conversations` with caller-supplied query parameters, rather than waiting for a passive observation. Added to test whether the bridge can self-drive pagination; empirically returns HTTP 401 (see Phase 5 follow-up) — kept only as a documented negative probe, not part of the enumeration path.
 - `simulateSidebarScroll`: dispatches synthetic `scroll` events at every scrollable ancestor of the sidebar's `/c/{id}` anchors, to test whether official ChatGPT UI issues further `/backend-api/conversations` requests as a real user would trigger by scrolling. Each candidate reports only numeric dimensions, before/after scroll positions, and conversation/Project-link counts, so a generated capture can be attributed to a concrete container without exposing DOM text. Added for the same follow-up and instrumented for the thirteenth-pass experiment.
 - `pins`: passively captures and sanitizes the observed, undocumented `/backend-api/pins` endpoint — supporting evidence for the Phase 5 `is_starred` coverage experiment (see the Phase 5 fifth-pass addendum). Reports only a raw top-level item count, a recognized-conversation-ID count, and the recognized conversation IDs themselves (never titles or other content), plus a capture generation counter so a caller can tell a fresh observation from a stale one.
+- `projectConversationsCursor`: self-issued fetch (not passive capture — the project-scoped endpoint tolerates a script-issued fetch, unlike the global endpoint) of one page of `GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor}` for the cursor-pagination spike below. Reports only conversation `id`/`create_time`/`update_time` plus the page's own opaque next-cursor state — never title or content.
+- `knownSampleFingerprints`: reports SHA-256 fingerprints (never raw IDs) of one already-known Work-marked conversation and one already-known plain conversation, reusing `openURLProbe`'s existing `async_source`-presence selection over already-captured conversation details — it never resolves or re-derives the Chat/Work discriminator itself.
 
 `ping` terminates in the main script and proves the Go-to-socket portion independently of page readiness. Its count-only health data includes the all-response match count and the latest global-conversation capture watermark; the Go side separately derives the target-MATCH watermark, distinguishing no network request from a request for the wrong query series. Unknown methods, malformed IDs, non-JSON responses, non-2xx responses, and unrecognized response shapes fail closed.
 
@@ -58,7 +60,10 @@ go test .
 go run . -hold 35s
 go run . -project-name agentsctl
 go run . -project-name agentsctl -pin-experiment
+go run . -project-name agentsctl -cursor-experiment
 ```
+
+The last form runs the Project-scoped cursor pagination full-enumeration experiment (see "ChatGPT Project session listing: cursor pagination spike" below). It requires no operator interaction beyond normal authentication — the endpoint tolerates a script-issued fetch, so no scroll simulation or human-performed mutation is needed.
 
 The last form runs the interactive Phase 5 `is_starred` coverage experiment (see the Phase 5 fifth-pass addendum, and the ninth/tenth-pass addenda for the fresh-process fallback this now uses): it prompts the operator, via stdout, to pin and later unpin one conversation of their own choosing directly in the real ChatGPT UI, and reports target-series membership evidence identified from the `/backend-api/pins` before/after delta. It requires an interactive terminal (it blocks on stdin between phases) and a human performing the actual pin/star actions — this program never issues that mutation itself. Between phases, it restarts the `terminal-browser` process itself (same persistent partition) rather than asking the operator to reload — do not manually reload when prompted; just perform the pin/unpin action and press Enter.
 
@@ -365,6 +370,95 @@ Phase 5: CONDITIONAL
 
 The harness now reports raw offset-0 identity, fingerprint-only raw membership deltas with each appeared sample's Project association, numeric scroll-target diagnostics, and the three capture watermarks above. It also treats a missing cached conversation-detail response as a non-fatal diagnostic only under `-pin-experiment`; that older Phase 6 probe is independent of the global-page and pins evidence and remains strict in normal runs.
 
+### ChatGPT Project session listing: cursor pagination spike (2026-09-13)
+
+**Hypothesis:** `GET /backend-api/gizmos/{project_id}/conversations?cursor={cursor}` has its own, independent cursor-based pagination that can enumerate a Project's sessions completely, replacing the offset/`hide_snorlax`-based global-endpoint path above.
+
+**Phase A — schema, from a real captured response (source of truth, not guessed):**
+
+```text
+response:
+  items_field=items
+  conversation_id_field=id
+  created_field=create_time
+  updated_field=update_time
+  cursor_field=cursor (top-level, sibling of items — a single opaque string, not per-item)
+  cursor_type=opaque string
+  terminal_cursor=NOT YET OBSERVED (the captured example was a non-terminal page)
+  total/count_field=none present
+```
+
+No `total`/`count` field exists in this endpoint's response at all, unlike the global endpoint — there is nothing to be tempted to (mis)use as a completeness signal here. Chat/Work-relevant metadata observed at the list-item level (not used to resolve the discriminator — see "Important" below): `is_automation_conversation` (boolean), `conversation_origin` (seen both `null` and a non-null value across items), `async_status` (null on every item seen). `is_starred`/`pinned_time` (ChatGPT's own remote pin state) are also present at the list-item level — per the design decision below, these are never read by this spike's ordering or completeness logic.
+
+**Phase B — implementation (build/test-verified in this environment; no live authenticated browser or kitty-capable terminal available here):** Added `cursor.go` (pure logic: `cursorConversation`, `accumulateCursorChain`, `sortConversationsByCreatedDesc`, `isNonIncreasingByCreated`/`isNonIncreasingByUpdated`, `parseCursorWireItems`) and its live driver (`fetchCursorPage`, `enumerateProjectConversationsByCursor`, `runCursorExperiment`, gated behind a new `-cursor-experiment` flag). Two new bridge methods were added: `projectConversationsCursor` (self-issued fetch, not passive capture — see below) and `knownSampleFingerprints` (Phase E). `go build`, `go vet`, `go test -race`, and `node --check` on both bridge files all pass (see Verification). The live full-enumeration run itself (Phase C) has not been executed — consistent with this spike's established methodology (every phase requiring a real authenticated account and, for foreground UI work, a kitty-capable terminal has always required repository-owner hand-off; see Phases 1, 4-9 above).
+
+A significant simplification versus the global-endpoint path: `bridge/preload.js`'s existing `conversations` method already proves this project-scoped endpoint tolerates a same-origin, credential-including fetch issued directly by the preload script (it has done so since Phase 1/4/5, returning real data with no 401) — unlike `/backend-api/conversations`, which 401s on a script-issued fetch (Phase 5 addendum). `projectConversationsCursor` reuses exactly that same mechanism with a `cursor` query parameter, so the cursor walker never needs passive capture or the sidebar-scroll simulation the global-endpoint path required.
+
+**Cursor discipline (design decision, enforced in code, not just documentation):** `accumulateCursorChain` and `enumerateProjectConversationsByCursor` only ever compare a cursor value for exact string equality against previously-used values (cycle detection) and pass a response's cursor back to the next request verbatim. Nothing in this code parses, increments, or numerically compares a cursor. `redactedCursor` shows only `"0"` (the documented, non-sensitive entry point) or a 12-hex SHA-256 fingerprint in every diagnostic and error message — no opaque cursor value is ever printed or logged.
+
+**Safety against infinite loops:** `enumerateProjectConversationsByCursor` re-runs `accumulateCursorChain` over all pages fetched so far immediately after each page, before issuing the next request — so a cursor cycle, a broken chain, a missing ID, or exceeding `maxPages` stops the loop immediately rather than after an extra round trip. None of these conditions are ever silently downgraded to "incomplete" only; they are reported as errors (README Phase H fail-closed).
+
+**Phase C — live full enumeration:** **NOT YET RUN.** This requires a real authenticated `agentsctl-chatgpt` partition, which this sandboxed environment does not have (the same limitation as every prior live phase in this README). `go run . -project-name agentsctl -cursor-experiment` is ready for the repository owner to run; it prints one `page=N conversation_count=M cursor_in=<fingerprint or "0"> cursor_out=<fingerprint or "<terminal>">` diagnostic line per page, followed by the completeness/count/ordering/inclusion report described below.
+
+```text
+initial cursor: 0
+pages fetched: NOT YET RUN
+terminal cursor observed: NOT YET RUN
+cursor cycle: NOT YET RUN
+```
+
+**Completeness criteria (per the task, restated as this implementation's actual checks):** `enumerateProjectConversationsByCursor`/`accumulateCursorChain` together satisfy all seven conditions in code — starts at `cursor=0`; follows only the response's own returned cursor; fails closed on any cycle; validates every page's item shape (non-empty ID) before accepting it; requires an explicit terminal (`HasNextCursor=false`) page to declare COMPLETE; accumulates every page's conversations; and dedupes by ID with a reported count. **Total is never consulted** because this endpoint's response has no such field to begin with (Phase A). None of this substitutes for the live run: `Project session enumeration` is `COMPLETE`/`INCOMPLETE`/`FAIL` only after `-cursor-experiment` is actually executed against the real account.
+
+**Phase D — re-evaluating the earlier under-report interpretation:** **SUPERSEDED, pending the live run.** The earlier project-scoped-endpoint observation (round 1, ~5 items) never passed a `cursor` parameter at all and never inspected the response's `cursor` field — it read exactly one implicit first page and stopped, which this Phase A schema review now shows was never a complete read to begin with (the endpoint has its own pagination the original Phase 5 method didn't know to look for). Framed in the task's terms: `~~Project-scoped endpoint under-reports sessions.~~ The earlier experiment observed only the first cursor page.` — but this correction should be recorded as decided only once a live run confirms the endpoint's cursor chain in this account actually extends past page 1 with more total items than the ~16-17 previously seen via the Project-filtered global path.
+
+**Phase E — known Chat/Work inclusion:** `knownSampleFingerprints` and `runCursorExperiment`'s reporting are implemented and unit-buildable, but require a live run (which also needs `conversationEvidence` to have already captured at least one `async_source`-bearing sample in the same run — see Phase 6 below) to produce real values.
+
+```text
+known normal Chat present: not verified (no live run)
+known Work present: not verified (no live run)
+```
+
+**Phase F — creation vs. update order:** `isNonIncreasingByCreated`/`isNonIncreasingByUpdated` are implemented and unit-tested against synthetic data; the real response's order has not been checked live.
+
+```text
+response ordering:
+  created_desc=NOT YET RUN
+  updated_desc=NOT YET RUN
+```
+
+**agentsctl ordering:** `sortConversationsByCreatedDesc` sorts by `CreatedAt` descending with a deterministic ID-ascending tie-break, entirely independent of server-returned order — verified by `TestSortConversationsByCreatedDescOrdersNewestFirst`/`TestSortConversationsByCreatedDescIsStableAndDeterministicOnTies` in `cursor_test.go`. `cursorConversation` structurally carries no pin/star or server-order field at all (see `TestCursorConversationHasNoPinOrStarField`), so no remote pin or server ordering signal can reach this sort even by accident.
+
+**Phase G — dedupe behavior:** `accumulateCursorChain` dedupes by conversation ID across page boundaries and reports a count; covered by `TestAccumulateCursorChainDeduplicatesAcrossPages` (no live duplicates observed yet, since no live run has happened).
+
+**Phase H — schema fail-closed:** `parseCursorWireItems`/`accumulateCursorChain`/`bridge/preload.js`'s `projectConversationsCursorFrom` together fail closed (return an error, never a partial result presented as complete) on: an unrecognized top-level collection shape, a missing conversation ID, an unparseable `create_time`/`update_time`, a `cursor` field of an unrecognized type, a broken cursor chain, and a cursor cycle. None of these are reachable from a live run yet, but each has a dedicated unit test (`cursor_test.go`).
+
+**Phase I — local pin design confirmation (decision, not yet implemented in production code):**
+
+```text
+ChatGPT remote pin/star state (is_starred, pinned_time):
+ignored — never read by any function in cursor.go
+
+agentsctl pin:
+local-only, keyed by chatgpt:<conversation_id>
+
+server response ordering:
+ignored — agentsctl always re-sorts by CreatedAt DESC locally (sortConversationsByCreatedDesc)
+```
+
+Reasoning: agentsctl's pin is a provider-independent local UX concept, not a mirror of any one provider's remote pin semantics; it must not depend on ChatGPT's `is_starred`/`pinned_time` fields, and agentsctl must never issue a ChatGPT pin/unpin mutation on the user's behalf. Keeping pin state and list ordering fully separate from server-reported ordering also means a future ChatGPT response-order change (e.g. `updated` vs `created`) cannot silently change what the user sees as "recently pinned" versus "recently created." This mirrors, and is consistent with, the identical local-pin design already documented for the offset-based path's `is_starred` investigation above — it is restated here because the cursor endpoint surfaces the same `is_starred`/`pinned_time` fields at the list-item level and a future implementer must not be tempted to wire them up differently just because the endpoint is different.
+
+**Compare with the old global path:** requires the live run's unique count and the previously-recorded Project-filtered global-endpoint count (printed by the same `go run . -project-name agentsctl -cursor-experiment` invocation, which reuses the count already produced earlier in the same run by the existing `conversations`/`globalConversations` calls). Not yet available.
+
+```text
+project cursor set count: NOT YET RUN
+previously-observed global-filtered subset count: see this run's own "global conversations: PASS project_scoped_via_global=N" line
+project cursor set >= old incomplete subset: NOT YET RUN
+```
+
+**Result: CONDITIONAL — implementation and pure-logic tests complete; live enumeration not yet run.** The cursor-pagination mechanism, dedupe, cycle-detection, and local-ordering logic are all implemented and unit-tested against synthetic data matching the real captured schema. Nothing here yet demonstrates that this account's Project cursor-chain actually terminates, or how many conversations it contains, because no live run has been performed in this environment. Per the task's explicit instruction, this correction is not asserted as decided ahead of that live evidence: **Project-inclusive pagination: CONDITIONAL** pending `go run . -project-name agentsctl -cursor-experiment` from a real authenticated terminal.
+
+**Effect on old blockers (pending the live PASS):** if the live run reaches `Project session enumeration: COMPLETE` with a count at or above the previously-observed ~16-17, the following historical investigations (Phase 5's `hide_snorlax` pagination, `is_starred` coverage experiment, and the global `offset=28` Project-inclusive trigger search) are superseded as the production List path and retained only as historical evidence, per the task's explicit instruction not to continue that research once this endpoint is COMPLETE. Until that live run happens, none of the historical Phase 5 CONDITIONAL status changes.
+
 ### Phase 6: Chat versus Work discrimination
 
 **Hypothesis:** Sanitized list/detail metadata contains an explicit discriminator that differs between known Chat and Work samples.
@@ -446,7 +540,7 @@ An Open-URL probe (Phase 7) further confirmed that navigating to the specific co
 | 2. Background helper | CONDITIONAL — PoC workaround only |
 | 3. Browser bridge | PASS |
 | 4. Project discovery | PASS (name→ID resolution); rename/duplicate-name robustness NOT VERIFIED |
-| 5. Session discovery | CONDITIONAL — global `/backend-api/conversations` filtered by Project is required; Project-inclusive pagination remains incomplete. A pin experiment proved only an `is_starred=false` first-page membership change, not filter exclusion; `is_starred=true` is unobserved and Coverage is UNKNOWN. See the Phase 5 addendum, thirteenth-pass correction. |
+| 5. Session discovery | CONDITIONAL — global `/backend-api/conversations` filtered by Project is required; Project-inclusive pagination remains incomplete. A pin experiment proved only an `is_starred=false` first-page membership change, not filter exclusion; `is_starred=true` is unobserved and Coverage is UNKNOWN. See the Phase 5 addendum, thirteenth-pass correction. A separate Project-scoped `?cursor=` pagination path is now implemented and unit-tested (see "ChatGPT Project session listing: cursor pagination spike") but not yet run live — it may replace this entire row once it does. |
 | 6. Chat / Work discrimination | CONDITIONAL — B. `async_source` field presence is a plausible undocumented discriminator (n=1 Work sample) |
 | 7. Stable identity and Open | PASS — bare `/c/{conversation_id}` is sufficient; ChatGPT normalizes to the full Project-slug URL itself |
 | 8. App-mode UX | PASS, with a known UX defect — Chat/Work both render and are usable; IME composition (e.g. Japanese) submits prematurely on the conversion-confirm `Enter` |
@@ -503,6 +597,7 @@ The bridge mechanism, persistent authentication, Project discovery, canonical Op
 
 Before starting Issue #6:
 
+0. **Run the new cursor-pagination experiment live** (`go run . -project-name agentsctl -cursor-experiment`, from a real authenticated terminal — see "ChatGPT Project session listing: cursor pagination spike"). If it reaches `Project session enumeration: COMPLETE` with a count at or above the previously-observed ~16-17, it can replace the entire global-endpoint/`hide_snorlax`/`is_starred` investigation as the production List source (item 3 below becomes moot); if not, item 3's blockers still apply.
 1. Corroborate the `async_source`-presence discriminator against more than one Work sample, and confirm it does not also appear on ordinary tool-using Chats (browsing, code interpreter, etc., which already share several marker field names). Do not ship a heuristic confirmed on n=1.
 2. Obtain a supported `terminal-browser` no-render/service lifecycle, or an explicit upstream commitment, suitable for production; the current pseudo-PTY is a PoC workaround only (Phase 2) and is needed for background discovery even though app-mode UI delegation itself works without it.
 3. **Resolve session-discovery completeness before relying on it in production.** Require `hide_snorlax` false/absent and treat enumeration as `INCOMPLETE` unless one same-SeriesKey contiguous raw offset chain ends in `RawItemCount < Limit`; never use `total` or Project-filtered count as exhaustion evidence. Determine whether normal UI actions can advance the Project-inclusive series beyond offset 0. Keep Coverage `UNKNOWN` until pagination evidence distinguishes first-page ranking from filter exclusion or a naturally emitted `is_starred=true` series establishes its own semantics; do not synthesize that query shape.
