@@ -5,7 +5,7 @@
 
 ## Abstract/Summary
 
-agentsctl は、Claude Code のバックグラウンドエージェントと Codex CLI のセッションを、単一の Agent View から操作する Unix TUI である。
+agentsctl は、Claude Code のバックグラウンドエージェント、Codex CLI のセッション、設定された ChatGPT Project の conversation を、単一の Agent View から操作する Unix TUI である。
 
 提供する共通操作は以下とする。
 
@@ -17,7 +17,7 @@ agentsctl は、Claude Code のバックグラウンドエージェントと Cod
 - Archive
 - Pin / Unpin
 
-Claude と Codex では、バックグラウンド実行の仕組みが異なる。
+各 provider では、バックグラウンド実行の仕組みが異なる。
 そのため、以下の非対称な実行モデルを前提とする。
 
 - **Claude**
@@ -26,21 +26,24 @@ Claude と Codex では、バックグラウンド実行の仕組みが異なる
 - **Codex**
   - agentsctl が supervisor と PTY を提供する。
   - supervisor が Codex CLI プロセスを保持する。
+- **ChatGPT**
+  - browser-owned authentication と ChatGPT の cloud lifecycle を利用する。
+  - List と Open のみを提供し、interaction は公式 ChatGPT UI に委譲する。
 
 各 provider のネイティブなライフサイクルを維持しつつ、Agent View 上では共通の UX を提供する。
 
 ### Provider runtime model
 
-| 項目                 | Claude                  | Codex                                               |
-| -------------------- | ----------------------- | --------------------------------------------------- |
-| バックグラウンド常駐 | Claude のネイティブ機構 | agentsctl supervisor + PTY                          |
-| Session catalog      | `claude agents`         | Codex app-server + agentsctl managed run            |
-| Dispatch             | `claude --bg`           | supervisor に Codex CLI の起動を依頼                |
-| Attach               | `claude attach`         | supervisor が保持する PTY へ接続                    |
-| Stop                 | `claude stop`           | supervisor が所有するプロセスを停止                 |
-| Rename               | `/rename` via transient attach | Codex app-server                             |
-| Archive              | agentsctl-local overlay | Codex app-server、または unbound run のローカル削除 |
-| Pin                  | agentsctl-local state   | agentsctl-local state                               |
+| 項目                 | Claude                  | Codex                                               | ChatGPT                               |
+| -------------------- | ----------------------- | --------------------------------------------------- | ------------------------------------- |
+| バックグラウンド常駐 | Claude のネイティブ機構 | agentsctl supervisor + PTY                          | ChatGPT cloud                          |
+| Session catalog      | `claude agents`         | Codex app-server + agentsctl managed run            | 公式 Project UI の passive capture    |
+| Dispatch             | `claude --bg`           | supervisor に Codex CLI の起動を依頼                | 非対応                                |
+| Open / Attach        | `claude attach`         | supervisor が保持する PTY へ接続                    | terminal-browser app mode の公式 UI   |
+| Stop                 | `claude stop`           | supervisor が所有するプロセスを停止                 | 非対応                                |
+| Rename               | `/rename` via transient attach | Codex app-server                             | 非対応                                |
+| Archive              | agentsctl-local overlay | Codex app-server、または unbound run のローカル削除 | 非対応                                |
+| Pin                  | agentsctl-local state   | agentsctl-local state                               | agentsctl-local state                 |
 
 ## Background
 
@@ -50,7 +53,7 @@ agentsctl はこの provider ごとの差異を吸収し、複数セッション
 
 ## Goals
 
-- Claude と Codex のセッションを単一の Agent View から一覧・操作できるようにする。
+- Claude、Codex、設定された ChatGPT Project のセッションを単一の Agent View から一覧・操作できるようにする。
 - 以下を provider に依存しない共通操作として提供する。
   - list / dispatch / attach / detach / stop / rename / archive / pin
 
@@ -58,14 +61,15 @@ agentsctl はこの provider ごとの差異を吸収し、複数セッション
 
 ## Non-Goals
 
-- Claude / Codex 以外の provider への対応
+- ChatGPT からの Dispatch、新規 conversation 作成、Stop、Rename、Archive
+- Chat と Work を共通 model 上で区別すること
 - Archive したセッションを Agent View から復帰させる操作
 - agentsctl 独自の session / transcript 形式を持つこと
 - Windows 対応
 
 ## Proposed Design
 
-agentsctl は、Claude と Codex を共通の session model として Agent View へ提示する。ただし、実際の lifecycle operation は provider ごとの能力へ委譲する。
+agentsctl は、Claude、Codex、ChatGPT を共通の session model として Agent View へ提示する。ただし、実際の lifecycle operation は provider ごとの能力へ委譲する。
 
 agentsctl が補うのは、主に Codex に不足するバックグラウンド実行能力である。
 
@@ -73,7 +77,7 @@ agentsctl が補うのは、主に Codex に不足するバックグラウンド
 
 #### Session catalog
 
-Claude と Codex のセッションを統合し、1つの一覧として表示する。
+Claude、Codex、ChatGPT のセッションを統合し、1つの一覧として表示する。
 
 session は作成時刻が新しい順に並べる。Activity や runtime status の変化だけでは並び順を変更しない。これにより、バックグラウンド更新によって閲覧中の行が頻繁に移動することを防ぐ。
 
@@ -96,7 +100,7 @@ Pin / Unpin 操作は即時に表示へ反映するため、provider の catalog
 
 #### Lifecycle
 
-Agent View では Claude と Codex を共通の session model として扱うが、session の実体と実行主体は provider ごとに異なる。
+Agent View では各 provider を共通の session model として扱うが、session の実体と実行主体は provider ごとに異なる。
 
 **Claude**
 
@@ -121,6 +125,28 @@ Agent View では Claude と Codex を共通の session model として扱うが
 
 - interactive Codex CLI process と PTY の lifetime は agentsctl supervisor が保持する。
 - TUI の lifetime と Codex CLI process の lifetime は分離する。
+
+**ChatGPT**
+
+- `.agentsctl.toml` の `[chatgpt].project_id` が指定する1つの Project を catalog の対象とする。
+- 設定ファイルを含む directory を全 conversation の logical CWD とし、共通の directory scope を適用する。
+- normal Chat と Work は区別せず、どちらも provider `chatgpt` の session とする。
+- local runtime を証明する概念を持たないため `RuntimeNone`、共通化できる activity signal を持たないため `ActivityUnknown` とする。
+- cloud session の実行主体と lifetime は ChatGPT が保持し、agentsctl や browser view の lifetime から独立させる。
+
+#### ChatGPT browser-backed provider
+
+ChatGPT provider は `sessionctl.Source` と `sessionctl.Opener` だけを実装する。Agent View は provider ID で分岐せず、共通 capability と session key `chatgpt:<conversation_id>` を通じて List / Open / selection / local pin を扱う。
+
+List は永続 partition `agentsctl-chatgpt` で公式 Project view を開き、frontend 自身が発行する `/backend-api/gizmos/{project_id}/conversations` response を passive に観測する。browser bridge は response body を browser-side で sanitize し、conversation ID、title、create/update time、cursor chain に必要な metadata のみを mode `0600` の local socket から Go へ渡す。credential、header、browser storage、transcript、raw response は bridge boundary を越えない。
+
+同じ endpoint には `cursor=0` を共有する異なる request series が存在しうるため、cursor 以外の relevant query parameters から `SeriesKey` を導出する。Project list と一致する series が一意に選べた場合のみそれを enumeration 中固定し、曖昧な場合は失敗する。cursor は opaque value として equality / cycle detection / unchanged forwarding だけに使う。
+
+pagination は synthetic DOM event ではなく Electron の real mouse-wheel input を使い、現在の scroll region と増加しうる `scrollHeight` を毎 round 再取得して moving bottom を追う。明示的な terminal cursor page を観測した場合だけ List を成功させる。page 数、wheel tick/round、no-progress、cursor cycle に defensive bound を設け、terminal page へ到達できなければ partial list を返さず provider failure とする。provider 単位の partial failure により、この失敗は Claude / Codex catalog を失わせない。
+
+sanitized row は server response order ではなく `CreatedAt DESC` と stable identity tie-break で整列する。remote の star / pin metadata は取り込まず、Pin は既存の agentsctl-local state だけを source of truth とする。
+
+Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation で停止して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
 
 #### Dispatch / Composer
 
@@ -535,7 +561,7 @@ session の識別に必要な情報を優先し、補助情報から省略する
 2. **Local state is supplemental**
    - agentsctl 固有の metadata のみ保持する。
 3. **Provider differences stay explicit**
-   - Claude と Codex の runtime model の差を無理に同一化しない。
+   - provider 間の runtime model の差を無理に同一化しない。
 4. **Process operations fail closed**
    - ownership や identity を証明できない process には介入しない。
 5. **TUI lifetime and agent lifetime are separated**
@@ -547,18 +573,20 @@ session の識別に必要な情報を優先し、補助情報から省略する
 C4Container
 title agentsctl system landscape
 
-Person(user, "User", "Claude Code と Codex CLI のセッションを操作する")
+Person(user, "User", "Claude Code、Codex CLI、ChatGPT のセッションを操作する")
 
 System_Boundary(agentsctl, "agentsctl") {
     Container(tui, "Agent View", "Go / Unix TUI", "統合された session catalog と操作 UI")
     Container(catalog, "Session Model", "Go", "provider 固有状態を共通 session capability へ正規化する")
     Container(state, "Local State", "JSON / file locking", "pin、overlay、managed run metadata を保持する")
     Container(supervisor, "Codex Supervisor", "Go / Unix daemon / PTY", "Codex CLI process と PTY の寿命を管理する")
+    Container(chatgptProvider, "ChatGPT Provider", "Go / terminal-browser / Unix socket", "Project catalog を取得し公式 UI を開く")
 }
 
 System_Ext(claude, "Claude Code", "Native background agent lifecycle")
 System_Ext(codexAppServer, "Codex app-server", "Thread metadata and native thread operations")
 System_Ext(codexCLI, "Codex CLI", "Interactive agent process")
+System_Ext(chatgpt, "ChatGPT Web", "Cloud session lifecycle and official UI")
 
 Rel(user, tui, "操作")
 Rel(tui, catalog, "list / dispatch / session actions")
@@ -568,6 +596,8 @@ Rel(catalog, state, "local metadata")
 Rel(tui, supervisor, "start / attach / stop")
 Rel(supervisor, state, "managed run metadata")
 Rel(supervisor, codexCLI, "PTY 上で起動・入出力")
+Rel(catalog, chatgptProvider, "List / Open")
+Rel(chatgptProvider, chatgpt, "browser-owned authentication / passive catalog capture / official UI")
 ```
 
 この図は概念上の責務境界を示す。
@@ -775,15 +805,16 @@ Codex Attach では、過去の PTY output を replay しない。
 
 ##### Catalog loading
 
-Claude と Codex の session list は provider ごとに並行取得する。
+Claude、Codex、ChatGPT の session list は provider ごとに並行取得する。
 
 目的は latency を加算させないこと。
 
 ```text
 Claude: ──────────┐
-                  ├─ merge
-Codex:  ───────┐  │
-               └──┘
+                  │
+Codex:  ───────┐  ├─ merge
+               │  │
+ChatGPT: ──────┴──┘
 ```
 
 1回の refresh は、provider ごとの取得完了を待ってから統合する。
@@ -792,7 +823,7 @@ partial result を逐次描画する方式にはしない。
 
 provider が利用できない場合は、その error を provider 単位で保持する。
 
-他方の provider から取得できた session は破棄しない。
+他の provider から取得できた session は破棄しない。
 
 ##### PTY output
 
