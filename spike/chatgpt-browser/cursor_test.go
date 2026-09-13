@@ -211,6 +211,58 @@ func TestParseCursorWireItemsFailsClosedOnMissingIDOrUnparseableTimestamp(t *tes
 	}
 }
 
+func TestDedupeCapturesByCursorInCollapsesABenignDuplicate(t *testing.T) {
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"},
+		{CaptureID: 2, CursorIn: "0", RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"}, // benign re-render duplicate
+		{CaptureID: 3, CursorIn: "C1", RawItemCount: 1, HasNextCursor: false},
+	}
+	got, err := dedupeCapturesByCursorIn(captures)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d pages, want 2 (one per distinct CursorIn)", len(got))
+	}
+	if got[0].CursorIn != "0" || got[1].CursorIn != "C1" {
+		t.Fatalf("unexpected order/content: %+v", got)
+	}
+}
+
+func TestDedupeCapturesByCursorInFailsClosedOnConflictingContent(t *testing.T) {
+	// Two observations of the SAME CursorIn that disagree — e.g. a stale pre-navigation capture
+	// compared against a fresh one, or genuine account activity mid-enumeration — must never be
+	// silently resolved by picking one.
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "OLD"},
+		{CaptureID: 9, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "NEW"},
+	}
+	_, err := dedupeCapturesByCursorIn(captures)
+	if err == nil || !strings.Contains(err.Error(), "different content") {
+		t.Fatalf("dedupeCapturesByCursorIn() error = %v, want a conflicting-content error", err)
+	}
+}
+
+func TestFilterCapturesNewerThanExcludesStaleCaptures(t *testing.T) {
+	// Mirrors the live bug this fixes: a stale capture from before some watermark-setting action
+	// (e.g. a fresh navigation) must never reach dedupeCapturesByCursorIn alongside a fresh one.
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "STALE_NEXT"},
+		{CaptureID: 5, CursorIn: "0", RawItemCount: 3, HasNextCursor: false},
+	}
+	fresh := filterCapturesNewerThan(captures, 1)
+	if len(fresh) != 1 || fresh[0].CaptureID != 5 {
+		t.Fatalf("filterCapturesNewerThan() = %+v, want only CaptureID 5", fresh)
+	}
+	// The stale+fresh pair would otherwise conflict; filtering first must let dedupe succeed.
+	if _, err := dedupeCapturesByCursorIn(fresh); err != nil {
+		t.Fatalf("unexpected error after filtering stale captures: %v", err)
+	}
+	if _, err := dedupeCapturesByCursorIn(captures); err == nil {
+		t.Fatal("expected the unfiltered stale+fresh pair to conflict (sanity check on the test fixture itself)")
+	}
+}
+
 func TestRedactedCursorNeverExposesAnOpaqueValue(t *testing.T) {
 	if redactedCursor("0") != "0" {
 		t.Fatal(`redactedCursor("0") must show the documented entry point verbatim`)
