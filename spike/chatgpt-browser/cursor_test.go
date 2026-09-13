@@ -277,6 +277,36 @@ func TestDedupeCapturesByCursorInFailsClosedOnADifferentConversationSet(t *testi
 	}
 }
 
+func TestSummarizeCursorInVariantsDistinguishesFlickeringFromStable(t *testing.T) {
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, NextCursor: "T1"},
+		{CaptureID: 2, CursorIn: "0", Items: wireItems("C", "D"), RawItemCount: 2, NextCursor: "T2"}, // different set: flicker
+		{CaptureID: 3, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, NextCursor: "T3"}, // back to the first set, new token
+		{CaptureID: 4, CursorIn: "C1", Items: wireItems("E"), RawItemCount: 1},
+	}
+	got := summarizeCursorInVariants(captures)
+	zero, ok := got["0"]
+	if !ok {
+		t.Fatalf("summarizeCursorInVariants() missing cursor_in=0: %+v", got)
+	}
+	if zero.Observations != 3 {
+		t.Fatalf("Observations = %d, want 3", zero.Observations)
+	}
+	if zero.DistinctIDSets != 2 {
+		t.Fatalf("DistinctIDSets = %d, want 2 (A,B and C,D)", zero.DistinctIDSets)
+	}
+	if zero.DistinctNextCursors != 3 {
+		t.Fatalf("DistinctNextCursors = %d, want 3 (T1, T2, T3 all distinct)", zero.DistinctNextCursors)
+	}
+	if zero.MinItemCount != 2 || zero.MaxItemCount != 2 {
+		t.Fatalf("item count range = %d-%d, want 2-2", zero.MinItemCount, zero.MaxItemCount)
+	}
+	c1, ok := got["C1"]
+	if !ok || c1.Observations != 1 || c1.DistinctIDSets != 1 {
+		t.Fatalf("unexpected summary for cursor_in=C1: %+v (ok=%t)", c1, ok)
+	}
+}
+
 func TestFilterCapturesNewerThanExcludesStaleCaptures(t *testing.T) {
 	// Mirrors the live bug this fixes: a stale capture from before some watermark-setting action
 	// (e.g. a fresh navigation) must never reach dedupeCapturesByCursorIn alongside a fresh one.
