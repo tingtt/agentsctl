@@ -214,11 +214,19 @@ func TestParseCursorWireItemsFailsClosedOnMissingIDOrUnparseableTimestamp(t *tes
 	}
 }
 
+func wireItems(ids ...string) []cursorConversationWireItem {
+	items := make([]cursorConversationWireItem, len(ids))
+	for i, id := range ids {
+		items[i] = cursorConversationWireItem{ID: id, CreatedAt: "2026-01-01T00:00:00Z"}
+	}
+	return items
+}
+
 func TestDedupeCapturesByCursorInCollapsesABenignDuplicate(t *testing.T) {
 	captures := []cursorCaptureWireItem{
-		{CaptureID: 1, CursorIn: "0", RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"},
-		{CaptureID: 2, CursorIn: "0", RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"}, // benign re-render duplicate
-		{CaptureID: 3, CursorIn: "C1", RawItemCount: 1, HasNextCursor: false},
+		{CaptureID: 1, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"},
+		{CaptureID: 2, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, HasNextCursor: true, NextCursor: "C1"}, // benign re-render duplicate
+		{CaptureID: 3, CursorIn: "C1", Items: wireItems("C"), RawItemCount: 1, HasNextCursor: false},
 	}
 	got, err := dedupeCapturesByCursorIn(captures)
 	if err != nil {
@@ -232,17 +240,40 @@ func TestDedupeCapturesByCursorInCollapsesABenignDuplicate(t *testing.T) {
 	}
 }
 
-func TestDedupeCapturesByCursorInFailsClosedOnConflictingContent(t *testing.T) {
-	// Two observations of the SAME CursorIn that disagree — e.g. a stale pre-navigation capture
-	// compared against a fresh one, or genuine account activity mid-enumeration — must never be
-	// silently resolved by picking one.
+// TestDedupeCapturesByCursorInToleratesANonIdempotentNextCursorToken covers the live bug found on
+// 2026-09-14: real-wheel-triggered traffic repeatedly re-fetched the SAME CursorIn ("0") in quick
+// succession, and two of those observations reported a DIFFERENT declared next-cursor token for an
+// otherwise-IDENTICAL conversation set. This must be tolerated as a benign duplicate (the opaque
+// cursor token is not proven idempotent — README "Cursor is opaque" already forbids assuming
+// otherwise), using the LATEST observation's own next-cursor to continue the walk from.
+func TestDedupeCapturesByCursorInToleratesANonIdempotentNextCursorToken(t *testing.T) {
 	captures := []cursorCaptureWireItem{
-		{CaptureID: 1, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "OLD"},
-		{CaptureID: 9, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "NEW"},
+		{CaptureID: 5, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, HasNextCursor: true, NextCursor: "OLD_TOKEN"},
+		{CaptureID: 9, CursorIn: "0", Items: wireItems("A", "B"), RawItemCount: 2, HasNextCursor: true, NextCursor: "NEW_TOKEN"},
+	}
+	got, err := dedupeCapturesByCursorIn(captures)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d pages, want 1", len(got))
+	}
+	if got[0].NextCursor != "NEW_TOKEN" {
+		t.Fatalf("got[0].NextCursor = %q, want the LATEST (highest CaptureID) observation's token %q", got[0].NextCursor, "NEW_TOKEN")
+	}
+}
+
+func TestDedupeCapturesByCursorInFailsClosedOnADifferentConversationSet(t *testing.T) {
+	// Two observations of the SAME CursorIn that returned a genuinely DIFFERENT conversation set —
+	// e.g. a stale pre-navigation capture compared against a fresh one, or genuine account activity
+	// mid-enumeration — must never be silently resolved by picking one.
+	captures := []cursorCaptureWireItem{
+		{CaptureID: 1, CursorIn: "0", Items: wireItems("A", "B", "C", "D", "E"), RawItemCount: 5, HasNextCursor: true, NextCursor: "OLD"},
+		{CaptureID: 9, CursorIn: "0", Items: wireItems("F", "G", "H", "I", "J"), RawItemCount: 5, HasNextCursor: true, NextCursor: "NEW"},
 	}
 	_, err := dedupeCapturesByCursorIn(captures)
-	if err == nil || !strings.Contains(err.Error(), "different content") {
-		t.Fatalf("dedupeCapturesByCursorIn() error = %v, want a conflicting-content error", err)
+	if err == nil || !strings.Contains(err.Error(), "different conversation set") {
+		t.Fatalf("dedupeCapturesByCursorIn() error = %v, want a different-conversation-set error", err)
 	}
 }
 
@@ -250,8 +281,8 @@ func TestFilterCapturesNewerThanExcludesStaleCaptures(t *testing.T) {
 	// Mirrors the live bug this fixes: a stale capture from before some watermark-setting action
 	// (e.g. a fresh navigation) must never reach dedupeCapturesByCursorIn alongside a fresh one.
 	captures := []cursorCaptureWireItem{
-		{CaptureID: 1, CursorIn: "0", RawItemCount: 5, HasNextCursor: true, NextCursor: "STALE_NEXT"},
-		{CaptureID: 5, CursorIn: "0", RawItemCount: 3, HasNextCursor: false},
+		{CaptureID: 1, CursorIn: "0", Items: wireItems("OLD-A", "OLD-B"), RawItemCount: 2, HasNextCursor: true, NextCursor: "STALE_NEXT"},
+		{CaptureID: 5, CursorIn: "0", Items: wireItems("NEW-A", "NEW-B", "NEW-C"), RawItemCount: 3, HasNextCursor: false},
 	}
 	fresh := filterCapturesNewerThan(captures, 1)
 	if len(fresh) != 1 || fresh[0].CaptureID != 5 {
