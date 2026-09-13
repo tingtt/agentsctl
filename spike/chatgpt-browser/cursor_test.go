@@ -722,24 +722,89 @@ func TestForwardProgressObservedFalseWhenNoExpectedCursorYet(t *testing.T) {
 	}
 }
 
-func TestClassifyWheelProgressReason(t *testing.T) {
+func TestClassifyScrollIncompleteReason(t *testing.T) {
 	tests := []struct {
-		name                                     string
-		scrollChanged, linkCountChanged, forward bool
-		want                                     string
+		name                        string
+		everScrolled, reachedBottom bool
+		want                        string
 	}{
-		{name: "nothing observed at all", want: "WHEEL_NO_PROGRESS"},
-		{name: "scroll moved", scrollChanged: true, want: "ATTEMPTS_EXHAUSTED"},
-		{name: "link count changed", linkCountChanged: true, want: "ATTEMPTS_EXHAUSTED"},
-		{name: "forward cursor progress", forward: true, want: "ATTEMPTS_EXHAUSTED"},
+		{name: "wheel never moved anything", everScrolled: false, reachedBottom: false, want: "WHEEL_NO_PROGRESS"},
+		{name: "wheel never moved anything, even if bottom somehow flagged", everScrolled: false, reachedBottom: true, want: "WHEEL_NO_PROGRESS"},
+		{name: "wheel worked, reached bottom, no forward request", everScrolled: true, reachedBottom: true, want: "BOTTOM_NO_REQUEST"},
+		{name: "wheel worked, never reached bottom within the bound", everScrolled: true, reachedBottom: false, want: "ATTEMPTS_EXHAUSTED"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := classifyWheelProgressReason(test.scrollChanged, test.linkCountChanged, test.forward)
+			got := classifyScrollIncompleteReason(test.everScrolled, test.reachedBottom)
 			if got != test.want {
-				t.Fatalf("classifyWheelProgressReason() = %q, want %q", got, test.want)
+				t.Fatalf("classifyScrollIncompleteReason() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDistanceToBottomAndScrollMaxTop(t *testing.T) {
+	if got := distanceToBottom(2000, 700, 900); got != 400 {
+		t.Fatalf("distanceToBottom(2000, 700, 900) = %d, want 400", got)
+	}
+	if got := scrollMaxTop(2000, 700); got != 1300 {
+		t.Fatalf("scrollMaxTop(2000, 700) = %d, want 1300", got)
+	}
+}
+
+func TestDistanceToBottomClampsAtZero(t *testing.T) {
+	// scrollTop can overshoot the theoretical maximum by a rounding hair in real browser
+	// measurements; distance must never go negative.
+	if got := distanceToBottom(2000, 700, 1400); got != 0 {
+		t.Fatalf("distanceToBottom() = %d, want 0 (clamped)", got)
+	}
+	if got := scrollMaxTop(500, 700); got != 0 {
+		t.Fatalf("scrollMaxTop(500, 700) = %d, want 0 (clamped; content shorter than viewport)", got)
+	}
+}
+
+func TestIsNearBottom(t *testing.T) {
+	if !isNearBottom(400, 700) {
+		t.Fatal("expected near-bottom: distance (400) is within one viewport height (700)")
+	}
+	if isNearBottom(1200, 700) {
+		t.Fatal("expected NOT near-bottom: distance (1200) exceeds one viewport height (700)")
+	}
+	if !isNearBottom(0, 700) {
+		t.Fatal("zero distance must always count as near-bottom")
+	}
+}
+
+func TestScrollHeightGrew(t *testing.T) {
+	if !scrollHeightGrew(1100, 2000) {
+		t.Fatal("expected grew=true when scrollHeight increased")
+	}
+	if scrollHeightGrew(2000, 2000) {
+		t.Fatal("expected grew=false when scrollHeight is unchanged")
+	}
+	if scrollHeightGrew(2000, 1100) {
+		t.Fatal("expected grew=false when scrollHeight decreased")
+	}
+}
+
+// TestForwardProgressObservedPerTransition exercises README Task 4's per-page-transition tracking
+// via the same forwardProgressObserved primitive: once page 1 is accepted and declares its own
+// next cursor, checking against page 1's NextCursor (not page 0's) is what distinguishes the
+// 1->2 transition from the already-completed 0->1 transition.
+func TestForwardProgressObservedPerTransition(t *testing.T) {
+	pages := []cursorFetchedPage{
+		{CursorIn: "0", HasNextCursor: true, NextCursor: "A"},
+		{CursorIn: "A", HasNextCursor: true, NextCursor: "B"},
+	}
+	if !forwardProgressObserved(pages, "A") {
+		t.Fatal("transition 0->1 should be observed (CursorIn=A is present)")
+	}
+	if forwardProgressObserved(pages, "B") {
+		t.Fatal("transition 1->2 should NOT yet be observed (no CursorIn=B in this page set)")
+	}
+	withPage2 := append(pages, cursorFetchedPage{CursorIn: "B", HasNextCursor: false})
+	if !forwardProgressObserved(withPage2, "B") {
+		t.Fatal("transition 1->2 should be observed once a page with CursorIn=B appears")
 	}
 }
 
