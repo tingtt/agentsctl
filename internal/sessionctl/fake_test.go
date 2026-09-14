@@ -128,3 +128,37 @@ func (p *fakePinStore) TogglePinned(key string) (bool, error) {
 }
 
 var errBoom = errors.New("boom")
+
+// fakeObserverSource implements Source+Observer only, driven entirely by
+// a test sending ProviderUpdate values on updates -- the sessionctl-level
+// counterpart to chatgpt.Provider's real Observer implementation, used to
+// prove Controller.Observe's own propagation (provider tagging,
+// actionsFor narrowing, and passing Warning through untouched) without a
+// real background refresh.
+type fakeObserverSource struct {
+	fakeSource
+	updates chan ProviderUpdate
+}
+
+func (f *fakeObserverSource) Observe(ctx context.Context) <-chan ProviderUpdate {
+	out := make(chan ProviderUpdate, 8)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case upd, ok := <-f.updates:
+				if !ok {
+					return
+				}
+				select {
+				case out <- upd:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}

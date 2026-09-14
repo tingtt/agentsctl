@@ -69,17 +69,38 @@ type Archiver interface {
 	Archive(ctx context.Context, key session.Key) error
 }
 
-// ProviderUpdate is one Observer publication: a provider's latest complete
-// catalog snapshot (a full replacement, never a delta -- see Observer), or
-// a refresh failure. Sessions is set on success and is that provider's
-// entire current catalog; Err is set instead on failure (never both). A
-// failure update deliberately carries no Sessions -- Observer's contract
-// requires a consumer to keep whatever sessions it already has for this
-// provider rather than reading an empty Sessions as "provider has no
-// sessions" (see the DesignDoc's last-known-good cache semantics).
+// ProviderUpdate is one Observer publication: either a provider's latest
+// complete catalog snapshot (a full replacement, never a delta -- see
+// Observer), optionally accompanied by a non-fatal Warning, or a refresh
+// failure. Exactly one of two shapes is valid:
+//
+//   - Err != nil, Sessions == nil, Warning == nil: a refresh failed.
+//     A consumer must keep whatever sessions it already has for this
+//     provider rather than reading a nil/absent Sessions as "provider has
+//     no sessions" (see the DesignDoc's last-known-good cache semantics).
+//
+//   - Err == nil, Sessions != nil: a refresh succeeded and Sessions is
+//     that provider's entire current catalog -- a consumer replaces its
+//     retained copy outright. Warning, if also set, does not change that:
+//     Sessions is still fully valid and usable (selectable, actionable),
+//     but some secondary/non-fatal problem exists alongside it -- e.g. the
+//     catalog refreshed correctly yet a provider's own attempt to persist
+//     it locally failed (see internal/provider/chatgpt's
+//     durabilityWarning). A consumer surfaces Warning (e.g. as a footer
+//     notice) without ever treating it as a reason to discard or hide
+//     Sessions, and clears any previously-shown Warning for this provider
+//     once an update arrives with Warning == nil.
+//
+// Err and Warning must never both be set on the same update -- they
+// answer different questions ("did this refresh fail" vs. "did this
+// otherwise-successful refresh's result end up less durable than
+// intended") and a provider must pick the one that actually applies to
+// this cycle's outcome rather than trying to report both at once (see the
+// DesignDoc's "latest provider problem wins" policy).
 type ProviderUpdate struct {
 	Sessions []session.Session
 	Err      error
+	Warning  error
 }
 
 // Observer is an optional capability for a provider that maintains its own

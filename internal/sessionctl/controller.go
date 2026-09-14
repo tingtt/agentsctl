@@ -99,11 +99,14 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 // consumer (Agent View's provider snapshot store) can apply either
 // through one code path. Sessions is nil and Err is set on a refresh
 // failure, exactly like ProviderUpdate -- Observe narrows/tags the
-// underlying provider.Observer publication but preserves that contract.
+// underlying provider.Observer publication but preserves that contract,
+// Warning (a non-fatal problem alongside otherwise-valid Sessions --
+// see ProviderUpdate's doc comment) included.
 type ObserverUpdate struct {
 	Provider session.ProviderID
 	Sessions []session.Session
 	Err      error
+	Warning  error
 }
 
 // Observe subscribes once to every configured provider that implements
@@ -139,7 +142,7 @@ func (c Controller) Observe(ctx context.Context) <-chan ObserverUpdate {
 					enriched[i] = upd.Sessions[i]
 					enriched[i].Actions = actionsFor(p, upd.Sessions[i])
 				}
-				out <- ObserverUpdate{Provider: p.ID(), Sessions: enriched}
+				out <- ObserverUpdate{Provider: p.ID(), Sessions: enriched, Warning: upd.Warning}
 			}
 		}()
 	}
