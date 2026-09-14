@@ -70,18 +70,48 @@ func newRuntime() *runtime {
 	}
 }
 
+// List runs a full cursor enumeration against the discovery bridge.
+// Deliberately does NOT hold r.mu for the (potentially long, multi-page)
+// duration of enumerate() itself -- only for the fast helper/bridge setup
+// (ensureDiscoveryLocked) and, on failure, teardown
+// (resetDiscoveryIfBrokenLocked) around it. Holding r.mu for the whole
+// call would make Open block behind an in-flight background List/refresh
+// (see chatgpt.Provider's cache/Refresher, which is the only caller of
+// List today and already guarantees at most one List runs at a time on
+// its own -- see its single-flight refresh state machine), which the
+// "cached sessions remain openable while refresh is running" product
+// guarantee requires never happens.
 func (r *runtime) List(ctx context.Context, projectID string) ([]conversation, error) {
+	bridge, err := r.ensureDiscovery(ctx)
+	if err != nil {
+		return nil, err
+	}
+	conversations, err := enumerate(ctx, bridge, projectID)
+	if err != nil {
+		r.resetDiscoveryIfBroken(err)
+		return nil, err
+	}
+	return conversations, nil
+}
+
+// ensureDiscovery is ensureDiscoveryLocked under r.mu, returning the
+// resulting bridge so the caller can use it without continuing to hold
+// r.mu (see List's doc comment).
+func (r *runtime) ensureDiscovery(ctx context.Context) (discoveryBridge, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.ensureDiscoveryLocked(ctx); err != nil {
 		return nil, err
 	}
-	conversations, err := enumerate(ctx, r.bridge, projectID)
-	if err != nil {
-		r.resetDiscoveryIfBrokenLocked(err)
-		return nil, err
-	}
-	return conversations, nil
+	return r.bridge, nil
+}
+
+// resetDiscoveryIfBroken is resetDiscoveryIfBrokenLocked under r.mu -- see
+// List's doc comment for why the caller no longer already holds it.
+func (r *runtime) resetDiscoveryIfBroken(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.resetDiscoveryIfBrokenLocked(err)
 }
 
 // resetDiscoveryIfBrokenLocked tears down the current discovery
@@ -116,15 +146,24 @@ func (r *runtime) resetDiscoveryIfBrokenLocked(err error) {
 	}
 }
 
+// Open does not hold r.mu for RunForeground's duration -- that call
+// blocks for the entire interactive browser session (until the user
+// closes the view), and must never wait behind (or block) a concurrent
+// background List/refresh; see List's doc comment for the matching half
+// of this guarantee. Only ensureDiscoveryLocked's fast setup runs under
+// the lock.
 func (r *runtime) Open(ctx context.Context, conversationID string, in *os.File, out io.Writer) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if !conversationIDPattern.MatchString(conversationID) {
 		return fmt.Errorf("invalid ChatGPT conversation ID")
 	}
+	r.mu.Lock()
 	if err := r.ensureDiscoveryLocked(ctx); err != nil {
+		r.mu.Unlock()
 		return err
 	}
+	path, partition, preloadPath := r.path, r.partition, r.preloadPath
+	r.mu.Unlock()
+
 	url := chatGPTOrigin + "/c/" + conversationID
 	args := []string{
 		"open", url,
@@ -132,10 +171,10 @@ func (r *runtime) Open(ctx context.Context, conversationID string, in *os.File, 
 		"--app-name=ChatGPT",
 		"--app-id=agentsctl-chatgpt",
 		"--no-merge",
-		"--partition=" + r.partition,
-		"--preload=" + r.preloadPath,
+		"--partition=" + partition,
+		"--preload=" + preloadPath,
 	}
-	if err := r.executor.RunForeground(ctx, r.path, args, in, out); err != nil {
+	if err := r.executor.RunForeground(ctx, path, args, in, out); err != nil {
 		return fmt.Errorf("open ChatGPT browser view: %w", err)
 	}
 	return nil
