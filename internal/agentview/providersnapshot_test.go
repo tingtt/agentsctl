@@ -14,7 +14,7 @@ import (
 )
 
 // This file covers Runtime's provider snapshot store (see agentview_unix.go's
-// providerSnapshots/applyProviderUpdate/recomputeRows): retaining a
+// providerSnapshots/applyLoadSnapshot/applyObserverUpdate/recomputeRows): retaining a
 // provider's last-known rows across reload cycles and Observer
 // publications, so a still-refreshing or failed provider never disappears
 // from State.Rows -- the Agent View half of the DesignDoc's ChatGPT
@@ -91,7 +91,7 @@ func (r *Runtime) drainN(t *testing.T, n int) {
 			}
 			r.currentScope = upd.scope
 			if upd.ps.Provider != "" {
-				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, nil)
+				r.applyLoadSnapshot(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, upd.ps.ListOwnsStatus)
 			}
 			r.recomputeRows()
 		case <-deadline:
@@ -110,7 +110,7 @@ func (r *Runtime) drainObserver(t *testing.T) {
 			t.Fatal("observerCh closed unexpectedly")
 			return
 		}
-		r.applyProviderUpdate(upd.Provider, upd.Sessions, upd.Err, upd.Warning)
+		r.applyObserverUpdate(upd.Provider, upd.Sessions, upd.Err, upd.Warning)
 		r.recomputeRows()
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected observer update never arrived")
@@ -249,7 +249,7 @@ func TestObserverUpdateReplacesOnlyThatProviderWithoutDuplicates(t *testing.T) {
 }
 
 // TestObserverSuccessWithWarningReplacesRowsAndSurfacesWarning fixes the
-// non-fatal-warning half of applyProviderUpdate: a successful Observer
+// non-fatal-warning half of applyObserverUpdate: a successful Observer
 // publication that also carries a Warning (e.g. ChatGPT's catalog
 // refreshed fine but failed to persist locally) must still fully replace
 // that provider's rows -- Warning is never a reason to keep old rows or

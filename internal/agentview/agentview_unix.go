@@ -308,10 +308,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 			// ps.Provider is only empty for the zero-provider-configured
 			// case, which has nothing to apply.
 			if update.ps.Provider != "" {
-				// LoadStream's ProviderSnapshot carries no non-fatal
-				// warning of its own (see ProviderSnapshot's doc comment)
-				// -- only Observer publications do.
-				r.applyProviderUpdate(update.ps.Provider, update.ps.Sessions, update.ps.Err, nil)
+				r.applyLoadSnapshot(update.ps.Provider, update.ps.Sessions, update.ps.Err, update.ps.ListOwnsStatus)
 			}
 			r.recomputeRows()
 			if update.done {
@@ -339,7 +336,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				r.observerCh = nil
 				break
 			}
-			r.applyProviderUpdate(update.Provider, update.Sessions, update.Err, update.Warning)
+			r.applyObserverUpdate(update.Provider, update.Sessions, update.Err, update.Warning)
 			r.recomputeRows()
 			r.render()
 		}
@@ -470,13 +467,52 @@ func (r *Runtime) requestReload(ctx context.Context) {
 	}
 }
 
-// applyProviderUpdate installs one provider's result -- from either a
-// LoadStream arrival (catalogEvent.ps, which never carries a warning) or
-// an Observer publication (ObserverUpdate) -- into providerSnapshots:
+// applyLoadSnapshot installs one LoadStream arrival (catalogEvent.ps) into
+// providerSnapshots. A List failure (err != nil) always surfaces as this
+// provider's warning, leaving its previously-known sessions untouched
+// (never discarding rows -- see the DesignDoc's last-known-good provider
+// snapshot store): a real Source.List error (misconfiguration, browser
+// unavailable, ...) is never hidden, regardless of listOwnsStatus.
 //
-//   - err != nil: a failed refresh. Sessions are left untouched (never
-//     discarding previously-known rows -- see the DesignDoc's
-//     last-known-good provider snapshot store) and warning is set to err.
+// A successful List (err == nil) always replaces sessions, but only
+// clears -- or, absent any other source of warning, leaves cleared -- the
+// warning when listOwnsStatus is true (see
+// sessionctl.ProviderSnapshot.ListOwnsStatus's doc comment). For a
+// provider that also implements sessionctl.Observer, listOwnsStatus is
+// false: List may simply be serving a last-known-good cache, and a
+// successful cached read says nothing about whether background refresh/
+// durability actually recovered -- only a subsequent Observer update (see
+// applyObserverUpdate) is entitled to replace or clear that warning. This
+// is exactly what fixes a real regression: without it, a routine Ctrl+L
+// (which still calls List for its now-fast cached read) would silently
+// erase an unresolved ChatGPT persistence or refresh-failure warning the
+// moment the cache read itself merely succeeded.
+//
+// Only ever called from the eventLoop goroutine. Does not itself update
+// State -- see recomputeRows.
+func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Session, err error, listOwnsStatus bool) {
+	st := r.providerSnapshots[id]
+	if err != nil {
+		st.warning = err
+		r.providerSnapshots[id] = st
+		return
+	}
+	st.sessions = sessions
+	if listOwnsStatus {
+		st.warning = nil
+	}
+	r.providerSnapshots[id] = st
+}
+
+// applyObserverUpdate installs one Observer publication (ObserverUpdate)
+// into providerSnapshots. Observer is always authoritative for a
+// provider's refresh/durability status -- regardless of what that
+// provider's own List last reported (see applyLoadSnapshot) -- since it
+// is the one capability specifically designed to report background
+// refresh outcomes independent of any particular List call:
+//
+//   - err != nil: a failed refresh. Sessions are left untouched and
+//     warning is set to err.
 //   - err == nil: a successful result. sessions fully replaces that
 //     provider's rows -- valid and usable regardless of warning -- and
 //     warning is set to the given non-fatal warning (nil clears it, a
@@ -486,7 +522,7 @@ func (r *Runtime) requestReload(ctx context.Context) {
 //
 // Only ever called from the eventLoop goroutine. Does not itself update
 // State -- see recomputeRows.
-func (r *Runtime) applyProviderUpdate(id session.ProviderID, sessions []session.Session, err, warning error) {
+func (r *Runtime) applyObserverUpdate(id session.ProviderID, sessions []session.Session, err, warning error) {
 	st := r.providerSnapshots[id]
 	if err != nil {
 		st.warning = err
@@ -502,9 +538,9 @@ func (r *Runtime) applyProviderUpdate(id session.ProviderID, sessions []session.
 // warning, not just whichever provider just reported) and r.currentScope,
 // through the same pin/scope/order pipeline Load itself uses
 // (sessionctl.Controller.MergeSessions) -- called after every
-// applyProviderUpdate. Iterates r.Controller.Providers (a fixed order)
-// rather than ranging the map directly, so row order is deterministic
-// across calls regardless of Go's randomized map iteration.
+// applyLoadSnapshot/applyObserverUpdate. Iterates r.Controller.Providers
+// (a fixed order) rather than ranging the map directly, so row order is
+// deterministic across calls regardless of Go's randomized map iteration.
 func (r *Runtime) recomputeRows() {
 	var sessions []session.Session
 	warnings := make(map[session.ProviderID]error)
