@@ -136,7 +136,7 @@ Agent View では各 provider を共通の session model として扱うが、se
 
 #### ChatGPT browser-backed provider
 
-ChatGPT provider は `sessionctl.Source` と `sessionctl.Opener` だけを実装する。Agent View は provider ID で分岐せず、共通 capability と session key `chatgpt:<conversation_id>` を通じて List / Open / selection / local pin を扱う。
+ChatGPT provider は `sessionctl.Source` と `sessionctl.Opener` に加えて `sessionctl.Refresher` と `sessionctl.Observer` を実装する (cache/refresh/observe の詳細は次節)。Agent View は provider ID で分岐せず、共通 capability と session key `chatgpt:<conversation_id>` を通じて List / Open / selection / local pin / refresh / catalog update を扱う。
 
 List は永続 partition `agentsctl-chatgpt` で公式 Project view を開き、frontend 自身が発行する `/backend-api/gizmos/{project_id}/conversations` response を passive に観測する。設定された Project route ID と endpoint 内の opaque ID が一致することには依存せず、navigation generation と discovery WebContents の ownership によって capture scope を確定する。browser bridge は response body を browser-side で sanitize し、conversation ID、title、create/update time、cursor chain に必要な metadata のみを mode `0600` の local socket から Go へ渡す。credential、header、browser storage、transcript、raw response は bridge boundary を越えない。
 
@@ -149,6 +149,20 @@ sanitized row は server response order ではなく `CreatedAt DESC` と stable
 Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。discovery preload と main script は runtime ごとの ownership token と terminal-browser session identity を handshake し、navigation、wheel、Network capture をその discovery WebContents だけに限定する。foreground Open や別の terminal-browser session は discovery target にならない。
 
 background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation では terminal-browser CLI へ `SIGTERM` を送り、bounded wait 後だけ強制終了して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
+
+#### ChatGPT last-known-good catalog cache
+
+`Source.List` は呼び出しのたびに full cursor enumeration を行わない。ChatGPT provider は内部に last-known-good な in-memory cache (`catalogCache`) を持ち、`List` はこの cache を即座に返すだけの軽い呼び出しになる。cache がまだ一度も埋まっていない場合は remote failure ではなく空の成功 snapshot を返し、同時に初回の background refresh を lazily 起動する — Agent View 側が ChatGPT の初回起動を特別扱いする必要はない。
+
+cache の置き換えは COMPLETE な enumeration によってのみ行う。timeout、broken bridge、request series の曖昧性、schema drift、cursor cycle、pagination 未完了、context cancellation はいずれも「直前の cache を保持したまま、今回の refresh は失敗として記録する」扱いになり、部分的な結果が cache に混入することはない。COMPLETE な enumeration が実際に 0 件の conversation を観測した場合はそれ自体が有効な置き換えであり、cache は空配列になる — これは「一度も enumeration が成功していない」状態とは区別する。
+
+cache は1 process の lifetime に限定した memory-only の状態であり、disk へは永続化しない。agentsctl を再起動すれば cache は空から始まる。
+
+background refresh は `sessionctl.Refresher.Refresh(ctx)` で要求する。実行中の refresh がある間に追加で要求された場合は新たな enumeration を並行起動せず、実行中の1回が終わった直後に最大1回だけ追加の refresh を続けて走らせる (single-flight + coalescing)。これにより Ctrl+L の連打が discovery bridge の再起動や enumeration の重複起動を引き起こすことはない。
+
+refresh の完了 (成功・失敗いずれも) は `sessionctl.Observer.Observe(ctx)` を通じて provider 単位の `ProviderUpdate` として publish される (Observer の一般的な semantics は Catalog loading 節を参照)。成功時は新しい cache 全体を full replacement として、失敗時は Sessions を持たない error-only の update として届く — 失敗を「session が0件になった」と誤読させないための区別である。
+
+cache 内の session は常に Open 可能な対象として扱う。Open は cache や in-flight refresh の状態を一切 preflight せず、対象の conversation ID へ直接遷移する。remote 側で削除されていた場合の挙動は公式 ChatGPT UI に委譲し、agentsctl 側が能動的に cache から evict することはない。runtime 内部でも List (enumeration) と Open は互いに排他しない: Open は discovery helper の起動確認だけを lock で保護し、enumeration 本体や browser view を開いている間の待機は lock の外で行うため、background refresh の最中でも Open は待たされない。
 
 #### Dispatch / Composer
 
@@ -851,6 +865,17 @@ event loop
 - 最新の reload generation の結果だけが State を更新できる。scope 変更や連続した Ctrl+L で古い generation の Snapshot (途中経過・最終いずれも) が後から届いても無視される。
 - 新しい reload は直前の reload の子 context を cancel する (ただし provider/runtime 自体の context ではない)。これにより ChatGPT のような browser-backed discovery walk が破棄される結果のために動き続けることを防ぐが、次の reload で同じ runtime を再利用できることは変わらない。
 - `LoadStream` 自身は pin 付与・scope filter・overview 順序付けを行わない。これらは `MergeSessions` として切り出されており、呼び出し側 (Agent View、あるいは `Load` 自身) がそこまでの累積結果に対して都度再適用する。
+
+##### Provider catalog observer と provider snapshot store
+
+`LoadStream` による reload generation の経路とは別に、provider 自身が保持する last-known-good cache (ChatGPT の `catalogCache` など -- 前節参照) を購読する経路として `sessionctl.Observer` / `Controller.Observe(ctx)` がある。
+
+- `Observer` を実装する provider は、request/response の List サイクルとは独立に「自分の catalog が変わった」タイミングで `ProviderUpdate` を publish する。これは常に provider 全体の full replacement であり、add/remove/update の delta ではない -- 受け手は届いた `Sessions` で自分の持つその provider の session をまるごと置き換えるだけでよく、reconciliation を必要としない。
+- 成功と失敗は区別される: 成功時は `Sessions` に新しい catalog 全体、失敗時は `Sessions` を持たない (nil の) `Err` 付き update が届く。失敗を「session が0件になった」という意味に読み替えてはならない。
+- `Runtime` はこの subscription を reload のたびに張り直さず、`Run` 起動時に1回だけ確立し、`Run` が返るときに1回だけ終える。1回の Ctrl+L (reload generation) の生死とは無関係に生き続け、`catalogGen` による stale-generation の破棄対象にもならない -- 「最後に完了した refresh が常に正」という Observer 側の semantics を、たまたまその後に始まった次の reload generation の都合で覆さないためである。
+- Ctrl+L (`IntentRefresh`) は引き続き `requestReload` を呼ぶが、`Refresher` を実装する provider にはあわせて `Refresh(ctx)` を要求する。この `ctx` は reload generation ごとに新しく作られ cancel される child context ではなく、`Runtime.Run` が受け取った長寿命の ctx をそのまま渡す -- ChatGPT の background refresh は1回の reload generation を超えて価値を持つため、次の Ctrl+L がその途中経過を cancel してしまわないようにするためである。`Refresh` 自体は fire-and-forget で、結果は常に Observer 経由で後から届く。
+
+Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`LoadStream` の到着と `Observer` の publish は同じ適用ルールを共有する: 成功はその provider の session を丸ごと置き換えて warning を消し、失敗は session をそのまま残して warning だけを更新する。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
 
 ##### PTY output
 
