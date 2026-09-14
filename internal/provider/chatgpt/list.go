@@ -43,12 +43,37 @@ type page struct {
 	nextCursor    string
 }
 
-func selectSeries(captures []capture, projectLinkCount int) (string, error) {
-	matches := matchingSeries(captures, projectLinkCount)
+func selectInitialSeries(captures []capture, region scrollRegion) (string, error) {
+	series := initialSeries(captures)
+	switch len(series) {
+	case 0:
+		return "", nil
+	case 1:
+		return series[0], nil
+	}
+	if !region.Found {
+		return "", nil
+	}
+	matches := matchingSeries(captures, region.ProjectLinkCount)
 	if len(matches) != 1 {
-		return "", fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links", len(matches), projectLinkCount)
+		return "", fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links", len(matches), region.ProjectLinkCount)
 	}
 	return matches[0], nil
+}
+
+func initialSeries(captures []capture) []string {
+	seen := make(map[string]bool)
+	for _, candidate := range captures {
+		if candidate.CursorIn == "0" && candidate.SeriesKey != "" {
+			seen[candidate.SeriesKey] = true
+		}
+	}
+	series := make([]string, 0, len(seen))
+	for key := range seen {
+		series = append(series, key)
+	}
+	sort.Strings(series)
+	return series
 }
 
 func assembleChain(captures []capture, seriesKey string, maxPages int) ([]conversation, bool, error) {

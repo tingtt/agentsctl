@@ -66,18 +66,9 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 			return nil, err
 		}
 		diagnostic = diagnoseInitialSeries(captures, region)
-		if region.Found || hasExplicitEmptyTerminalCapture(captures) {
-			matches := matchingSeries(captures, region.ProjectLinkCount)
-			switch len(matches) {
-			case 1:
-				selectedSeries = matches[0]
-			case 0:
-				// The frontend may paint links and finish its first response at
-				// different times. Wait for both signals within the bounded load
-				// window rather than treating that ordinary race as a schema error.
-			default:
-				return nil, fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links; initial series: %s", len(matches), region.ProjectLinkCount, diagnostic)
-			}
+		selectedSeries, err = selectInitialSeries(captures, region)
+		if err != nil {
+			return nil, fmt.Errorf("%w; initial series: %s", err, diagnostic)
 		}
 		if selectedSeries != "" {
 			break
@@ -154,15 +145,6 @@ func matchingSeries(captures []capture, projectLinkCount int) []string {
 		}
 	}
 	return matches
-}
-
-func hasExplicitEmptyTerminalCapture(captures []capture) bool {
-	for _, candidate := range captures {
-		if candidate.CursorIn == "0" && len(candidate.Items) == 0 && !candidate.HasNextCursor {
-			return true
-		}
-	}
-	return false
 }
 
 func distanceToBottom(region scrollRegion) int {

@@ -102,24 +102,35 @@ func TestRepeatedCursorKeepsLatestTokenOnlyWhenIdentitySetIsStable(t *testing.T)
 	}
 }
 
-func TestSelectSeriesFailsClosedOnAmbiguity(t *testing.T) {
-	captures := []capture{
-		capturePage(1, "small", "0", "", item(conversationA, "A", "2026-01-01T00:00:00Z")),
-		capturePage(2, "project", "0", "", item(conversationA, "A", "2026-01-01T00:00:00Z"), item(conversationB, "B", "2026-02-01T00:00:00Z")),
+func TestSelectInitialSeries(t *testing.T) {
+	page := func(id int, series string, count int) capture {
+		items := make([]capturedItem, count)
+		for index := range items {
+			items[index] = item(conversationA, "A", "2026-01-01T00:00:00Z")
+		}
+		return capturePage(id, series, "0", "", items...)
 	}
-	if got, err := selectSeries(captures, 2); err != nil || got != "project" {
-		t.Fatalf("series=%q err=%v", got, err)
+	tests := []struct {
+		name     string
+		captures []capture
+		links    int
+		want     string
+		wantErr  bool
+	}{
+		{name: "zero series"},
+		{name: "single matching DOM", captures: []capture{page(1, "A", 10)}, links: 10, want: "A"},
+		{name: "single mismatching DOM", captures: []capture{page(1, "A", 10)}, links: 7, want: "A"},
+		{name: "multiple unique match", captures: []capture{page(1, "A", 5), page(2, "B", 10)}, links: 10, want: "B"},
+		{name: "multiple zero matches", captures: []capture{page(1, "A", 5), page(2, "B", 7)}, links: 10, wantErr: true},
+		{name: "multiple matching series", captures: []capture{page(1, "A", 10), page(2, "B", 10)}, links: 10, wantErr: true},
 	}
-	captures = append(captures, capturePage(3, "also-project", "0", "", item(conversationA, "A", "2026-01-01T00:00:00Z"), item(conversationB, "B", "2026-02-01T00:00:00Z")))
-	if _, err := selectSeries(captures, 2); err == nil || !strings.Contains(err.Error(), "ambiguity") {
-		t.Fatalf("ambiguity err=%v", err)
-	}
-}
-
-func TestSelectSeriesAcceptsUniqueEmptyTerminalProject(t *testing.T) {
-	captures := []capture{capturePage(1, "empty-project", "0", "")}
-	if got, err := selectSeries(captures, 0); err != nil || got != "empty-project" {
-		t.Fatalf("series=%q err=%v", got, err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := selectInitialSeries(tt.captures, scrollRegion{Found: true, ProjectLinkCount: tt.links})
+			if got != tt.want || (err != nil) != tt.wantErr {
+				t.Fatalf("series=%q err=%v", got, err)
+			}
+		})
 	}
 }
 
