@@ -335,3 +335,172 @@ func TestOpenCachedSessionDoesNotWaitForInFlightReload(t *testing.T) {
 		t.Fatalf("opened=%v, want exactly [%v]", chatgptFP.opened, row.Key)
 	}
 }
+
+// This section fixes a real regression: a successful cached List
+// (ProviderSnapshot.ListOwnsStatus == false for an Observer-capable
+// provider) must never clear a warning only Observer is entitled to
+// replace or clear -- see applyLoadSnapshot's doc comment. Without this,
+// a routine Ctrl+L against ChatGPT (whose List is now a cheap cached
+// read, not a real refresh) would silently erase an unresolved
+// persistence or refresh-failure warning the instant the cached read
+// itself merely succeeded.
+
+// TestCachedListSuccessPreservesObserverDurabilityWarning is the exact
+// regression sequence from the DesignDoc: an Observer-published
+// persistence-durability warning must survive an intervening successful
+// cached List (Ctrl+L).
+func TestCachedListSuccessPreservesObserverDurabilityWarning(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	persistErr := errors.New("chatgpt: persist catalog: disk full")
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}, Warning: persistErr}
+	rt.drainObserver(t)
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the persistence warning to be recorded")
+	}
+
+	// Ctrl+L: an ordinary reload cycle where ChatGPT's cached List simply
+	// succeeds with the same rows. This must NOT clear the still-
+	// unresolved durability warning.
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("a successful cached List must not clear an Observer-owned durability warning")
+	}
+	if !contains(rowNames(rt.State.Rows), "B") {
+		t.Fatalf("rows should still include B: %v", rowNames(rt.State.Rows))
+	}
+}
+
+// TestCachedListSuccessPreservesObserverRefreshFailureWarning is the
+// DesignDoc's "refresh failure regression test": a remote-refresh-failure
+// warning from Observer must likewise survive an intervening successful
+// cached List, and only a later Observer success may finally clear it.
+func TestCachedListSuccessPreservesObserverRefreshFailureWarning(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}}
+	rt.drainObserver(t)
+	if rt.State.Warnings[session.ProviderChatGPT] != nil {
+		t.Fatalf("unexpected warning after a clean success: %v", rt.State.Warnings[session.ProviderChatGPT])
+	}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Err: errors.New("timeout")}
+	rt.drainObserver(t)
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the remote refresh failure to be recorded as a warning")
+	}
+
+	// Ctrl+L: cached List still returns B successfully -- must not clear
+	// the still-pending refresh-failure warning.
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("a successful cached List must not clear an Observer-owned refresh-failure warning")
+	}
+	if !contains(rowNames(rt.State.Rows), "B") {
+		t.Fatalf("rows should still include B: %v", rowNames(rt.State.Rows))
+	}
+
+	// Only a later Observer success may finally clear it.
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+	if rt.State.Warnings[session.ProviderChatGPT] != nil {
+		t.Fatalf("expected the later Observer success to clear the warning: %v", rt.State.Warnings[session.ProviderChatGPT])
+	}
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("rows should now be replaced by C: %v", names)
+	}
+}
+
+// TestObserverWarningReplacementSurvivesInterveningCachedListSuccess
+// covers the DesignDoc's "Observer warning replacement test": Observer
+// remains authoritative for status through a full cycle of durability
+// warning -> (cached List success, no effect) -> refresh failure -> new
+// durability warning, never losing track of "latest provider problem
+// wins" to an intervening cached List.
+func TestObserverWarningReplacementSurvivesInterveningCachedListSuccess(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}, Warning: errors.New("disk full")}
+	rt.drainObserver(t)
+
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("durability warning must survive the intervening cached List success")
+	}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Err: errors.New("remote failure")}
+	rt.drainObserver(t)
+	if !contains(rowNames(rt.State.Rows), "B") {
+		t.Fatalf("sessions must be retained on a refresh failure: %v", rowNames(rt.State.Rows))
+	}
+
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}, Warning: errors.New("disk full again")}
+	rt.drainObserver(t)
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("rows should now be replaced by C: %v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the new durability warning to be visible")
+	}
+}
+
+// TestNonObserverProviderListSuccessClearsPreviousListWarning is the
+// DesignDoc's "non-Observer recovery regression test": the fix must not
+// make List-reported warnings sticky for an ordinary provider (e.g.
+// Claude/Codex) that never implements Observer -- a successful List still
+// clears a previous List failure exactly as before this change.
+func TestNonObserverProviderListSuccessClearsPreviousListWarning(t *testing.T) {
+	claude := &failableProvider{
+		fakeProvider: &fakeProvider{id: session.ProviderClaude, rows: []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, Name: "A", CWD: "/work"}}},
+		err:          errors.New("temporary error"),
+	}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{claude}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	rt.requestReload(context.Background())
+	rt.drainCatalog(context.Background())
+	if rt.State.Warnings[session.ProviderClaude] == nil {
+		t.Fatal("expected the initial List failure to be recorded as a warning")
+	}
+
+	claude.err = nil
+	rt.requestReload(context.Background())
+	rt.drainCatalog(context.Background())
+	if rt.State.Warnings[session.ProviderClaude] != nil {
+		t.Fatalf("a successful List for a non-Observer provider must clear its previous warning: %v", rt.State.Warnings[session.ProviderClaude])
+	}
+	if !contains(rowNames(rt.State.Rows), "A") {
+		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
+	}
+}
