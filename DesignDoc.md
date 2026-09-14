@@ -948,7 +948,35 @@ event loop
 - `Runtime` はこの subscription を reload のたびに張り直さず、`Run` 起動時に1回だけ確立し、`Run` が返るときに1回だけ終える。1回の Ctrl+L (reload generation) の生死とは無関係に生き続け、`catalogGen` による stale-generation の破棄対象にもならない -- 「最後に完了した refresh が常に正」という Observer 側の semantics を、たまたまその後に始まった次の reload generation の都合で覆さないためである。
 - Ctrl+L (`IntentRefresh`) は引き続き `requestReload` を呼ぶが、`Refresher` を実装する provider にはあわせて `Refresh(ctx)` を要求する。この `ctx` は reload generation ごとに新しく作られ cancel される child context ではなく、`Runtime.Run` が受け取った長寿命の ctx をそのまま渡す -- ChatGPT の background refresh は1回の reload generation を超えて価値を持つため、次の Ctrl+L がその途中経過を cancel してしまわないようにするためである。`Refresh` 自体は fire-and-forget で、結果は常に Observer 経由で後から届く。
 
-Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`LoadStream` の到着と `Observer` の publish は同じ適用ルールを共有する: 成功はその provider の session を丸ごと置き換え、warning はその成功に伴う `Warning` (なければ nil、あれば非致命的な durability warning) で更新する。失敗は session をそのまま残し、warning だけを `Err` で更新する。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
+Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
+
+##### List と Observer、どちらが warning の authority か
+
+`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、session の置き換えルールこそ共有するが、**warning に対する authority は異なる**。これは実装上のバグとして一度発見された区別であり、意図的に分離されている:
+
+```text
+List 失敗 (Err != nil)
+  → 常に warning = Err として表示する
+  → provider の実装が Observer を持つかどうかに関わらない
+    (List 自体の failure -- 設定不備・browser 未起動など -- を隠すことはない)
+
+List 成功 (Err == nil)
+  → provider が Observer を実装しない (ProviderSnapshot.ListOwnsStatus == true)
+    → List の成功時に warning を clear する (= List 自身が status の authority)
+  → provider が Observer を実装する (ListOwnsStatus == false)
+    → session は丸ごと置き換えるが、warning には一切触れない
+    → ChatGPT のような provider にとって List は last-known-good cache の
+      読み取りに過ぎず、その成功は「remote refresh/durability が回復した」
+      ことを何も意味しないため
+
+Observer 側は常に warning の authority を持つ:
+  成功 (Err == nil)  → session を置き換え、warning を届いた Warning (nil ならクリア) にする
+  失敗 (Err != nil)  → session はそのまま、warning を Err にする
+```
+
+`ListOwnsStatus` は `sessionctl.Controller.LoadStream` が provider の capability から機械的に導出する (`provider implements sessionctl.Observer` なら `false`)。Agent View 側はこの capability を自ら判定しない -- provider 固有の分岐は sessionctl の境界内に閉じ込める。
+
+この区別がないと、ChatGPT のような Observer provider で次のような regression が起きる: Observer が持続的な durability warning (例: persist 失敗) を publish した直後に Ctrl+L を押すと、ChatGPT の `List` はただ cache を読むだけで容易に成功し、その「成功」を Agent View が (誤って) warning の解消と解釈して warning を消してしまう -- 実際には持続的な問題は何も解決していないにもかかわらず。
 
 ##### PTY output
 
