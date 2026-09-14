@@ -3,6 +3,7 @@ package chatgpt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
+	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
 
 // browserResult is one queued sequenceBrowser.List outcome.
@@ -86,21 +88,42 @@ func conv(id, title string, at time.Time) conversation {
 	return conversation{ID: id, Title: title, CreatedAt: at, UpdatedAt: at}
 }
 
-// TestListServesEmptyCacheAndLazilyStartsRefresh fixes the "initial empty"
-// contract (see Provider.List's doc comment): before any refresh has ever
-// completed, List returns an empty *successful* snapshot immediately --
-// never blocking on, or waiting for, the background enumeration it
-// lazily starts.
-func TestListServesEmptyCacheAndLazilyStartsRefresh(t *testing.T) {
+// TestListServesEmptyCacheWithoutTriggeringRemoteWork fixes both the
+// "initial empty" contract and the List-is-a-pure-cache-read contract
+// together (see Provider.List's doc comment): before any refresh has ever
+// completed, List returns an empty *successful* snapshot immediately, and
+// -- unlike this Provider's earlier behavior -- never itself initiates a
+// background refresh as a side effect. Initial-refresh ownership belongs
+// entirely to Refresh (sessionctl.Refresher), which Agent View's own
+// reload cycle already calls independently of List; a List-triggered
+// refresh here would only race and needlessly coalesce an extra
+// enumeration immediately after that already-requested one.
+func TestListServesEmptyCacheWithoutTriggeringRemoteWork(t *testing.T) {
 	browser := newGatedBrowser()
 	p := &Provider{config: Config{ProjectID: "g-p-x", Root: "/w"}, browser: browser}
 
-	rows, err := p.List(context.Background(), false)
-	if err != nil || rows == nil || len(rows) != 0 {
-		t.Fatalf("rows=%+v err=%v, want empty successful snapshot", rows, err)
+	for i := 0; i < 3; i++ {
+		rows, err := p.List(context.Background(), false)
+		if err != nil || rows == nil || len(rows) != 0 {
+			t.Fatalf("List #%d: rows=%+v err=%v, want empty successful snapshot", i, rows, err)
+		}
 	}
+	select {
+	case call := <-browser.calls:
+		t.Fatalf("List must never call browser.List on its own, but got a call (ctx=%v)", call.ctx)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Only an explicit Refresh performs the enumeration.
+	p.Refresh(context.Background())
 	call := awaitGatedCall(t, browser.calls, time.Second)
 	close(call.release)
+
+	select {
+	case <-browser.calls:
+		t.Fatal("expected exactly one browser.List call from the single explicit Refresh")
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 // TestSuccessfulRefreshReplacesCacheAndPublishes fixes cache replacement
@@ -336,6 +359,104 @@ func TestObserveClosesWhenContextCancelled(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("Observe channel never closed after ctx cancellation")
+	}
+}
+
+// sessionWithID is a minimal session.Session distinguishable only by key
+// ID, enough for the latest-wins tests below to tell which publish a
+// received ProviderUpdate came from.
+func sessionWithID(id string) session.Session {
+	return session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: id}}
+}
+
+// TestObserverPublishIsLatestWinsUnderBackpressure fixes the Observer
+// contract directly: publish is a full-replacement/latest-provider-state
+// channel, not an event log (see sessionctl.Observer's doc comment), so a
+// subscriber that hasn't drained in between publishes must converge on
+// the newest one -- never an older success, and never a failure that a
+// later success has already superseded.
+func TestObserverPublishIsLatestWinsUnderBackpressure(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationA)}})
+	p.publish(sessionctl.ProviderUpdate{Err: errors.New("refresh failed")})
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationB)}})
+
+	got := waitForUpdate(t, updates)
+	if got.Err != nil || len(got.Sessions) != 1 || got.Sessions[0].Key.ID != conversationB {
+		t.Fatalf("expected the latest state (B) to survive backpressure, got %+v", got)
+	}
+	select {
+	case extra, ok := <-updates:
+		if ok {
+			t.Fatalf("expected no queued backlog behind the latest value, got %+v", extra)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestObserverPublishFailureThenSuccessConvergesToSuccess is the same
+// guarantee for the specific ordering the DesignDoc calls out: a warning
+// queued behind a not-yet-delivered success must never win once the
+// subscriber catches up.
+func TestObserverPublishFailureThenSuccessConvergesToSuccess(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	p.publish(sessionctl.ProviderUpdate{Err: errors.New("timeout")})
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationA)}})
+
+	got := waitForUpdate(t, updates)
+	if got.Err != nil || len(got.Sessions) != 1 || got.Sessions[0].Key.ID != conversationA {
+		t.Fatalf("expected the success to win over the queued-but-stale failure, got %+v", got)
+	}
+}
+
+// TestObserverPublishThreeSuccessesConvergesToLast covers the plain
+// success/success/success case under the same backpressure.
+func TestObserverPublishThreeSuccessesConvergesToLast(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID("c1")}})
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID("c2")}})
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID("c3")}})
+
+	got := waitForUpdate(t, updates)
+	if got.Err != nil || len(got.Sessions) != 1 || got.Sessions[0].Key.ID != "c3" {
+		t.Fatalf("expected convergence to the last of three successes, got %+v", got)
+	}
+}
+
+// TestObserverPublishConvergesForConcurrentSlowReader exercises
+// sendLatest's actual concurrency contract (rather than only the
+// happens-before-drain cases above) under -race: many publishes racing a
+// reader that only starts consuming partway through must still converge
+// on the very last value published, with no panic (e.g. a send racing a
+// concurrent close) and no deadlock.
+func TestObserverPublishConvergesForConcurrentSlowReader(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	result := make(chan sessionctl.ProviderUpdate, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		result <- <-updates
+	}()
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(fmt.Sprintf("c%d", i))}})
+	}
+
+	select {
+	case got := <-result:
+		if len(got.Sessions) != 1 || got.Sessions[0].Key.ID != fmt.Sprintf("c%d", n-1) {
+			t.Fatalf("expected convergence to the very latest publish, got %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow reader never received an update")
 	}
 }
 

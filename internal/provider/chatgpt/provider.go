@@ -86,14 +86,23 @@ func NewUnavailable(configurationError error) *Provider {
 // ID returns the stable ChatGPT provider identity.
 func (*Provider) ID() session.ProviderID { return session.ProviderChatGPT }
 
-// List returns the cached last-known-good catalog immediately -- it never
-// performs a full browser cursor enumeration itself (see Provider's doc
-// comment). If no successful enumeration has completed yet, it returns an
-// empty, successful snapshot (never a remote-failure error: absence of a
-// cache is not the same as a failed refresh) and lazily starts the first
-// background refresh via Refresh, so a caller need not special-case
-// ChatGPT's first-ever List. The eventual result -- populated rows or a
-// warning -- arrives later through Observe.
+// List is a pure cache read: it returns catalogCache's current snapshot
+// immediately and never itself performs a full browser cursor enumeration
+// or otherwise initiates remote work (see Provider's doc comment). If no
+// successful enumeration has completed yet (and no persisted catalog was
+// hydrated at construction -- see hydrate), it returns an empty,
+// successful snapshot, never a remote-failure error: absence of a cache
+// is not the same as a failed refresh.
+//
+// List deliberately does NOT trigger a background Refresh as a side
+// effect. Initial-refresh ownership belongs entirely to
+// sessionctl.Refresher: Agent View's own reload cycle already calls
+// Refresh independently of List (see agentview.Runtime.requestReload), so
+// a List-triggered Refresh here would only race/duplicate that call --
+// harmless under single-flight, but it would still coalesce into one
+// unnecessary extra enumeration immediately following the first. The
+// eventual refresh result -- populated rows or a warning -- arrives
+// through Observe.
 func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, error) {
 	if p.configErr != nil {
 		return nil, p.configErr
@@ -106,7 +115,6 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	sessions, hasSnapshot := p.cache.snapshot()
 	if !hasSnapshot {
-		p.Refresh(ctx)
 		return []session.Session{}, nil
 	}
 	return sessions, nil
@@ -181,7 +189,11 @@ func (p *Provider) runRefresh(ctx context.Context) {
 // on why a consumer must retain its own last-known Sessions in that case).
 // It closes when ctx ends or the Provider is closed.
 func (p *Provider) Observe(ctx context.Context) <-chan sessionctl.ProviderUpdate {
-	ch := make(chan sessionctl.ProviderUpdate, 8)
+	// Buffered 1, not more: with latest-wins publish (see sendLatest),
+	// this single slot always holds exactly the newest not-yet-consumed
+	// update -- a bigger buffer would only let more stale history
+	// accumulate behind the latest value, never anything useful.
+	ch := make(chan sessionctl.ProviderUpdate, 1)
 
 	p.mu.Lock()
 	p.ensureLifecycleLocked()
@@ -215,17 +227,40 @@ func (p *Provider) Observe(ctx context.Context) <-chan sessionctl.ProviderUpdate
 	return ch
 }
 
-// publish delivers update to every live subscriber. A subscriber channel
-// is buffered (8) and has exactly one consumer (the watch goroutine in
-// Observe races the same lock to remove/close it), so publish never blocks
-// cache replacement on a slow consumer -- a full channel simply drops the
-// update rather than stalling the refresh that produced it.
+// publish delivers update to every live subscriber using latest-wins
+// semantics (see sendLatest): it never blocks cache replacement on a slow
+// consumer, and a subscriber that falls behind converges on the newest
+// provider state rather than working through a backlog of superseded
+// ones. This matters concretely: an Observer publication is a full
+// replacement of "the provider's current state", not an event in a log
+// (see sessionctl.Observer's doc comment) -- so a failure queued behind a
+// not-yet-delivered success (or vice versa) must never win over
+// whichever actually reflects the provider's current cache once the
+// subscriber catches up.
 func (p *Provider) publish(update sessionctl.ProviderUpdate) {
 	p.subMu.Lock()
 	defer p.subMu.Unlock()
 	for ch := range p.subscribers {
+		sendLatest(ch, update)
+	}
+}
+
+// sendLatest enqueues update as ch's one pending value, discarding
+// whatever stale update (if any) is already queued and not yet consumed
+// by dequeuing it first. The caller must hold a lock (subMu) that also
+// guards ch's removal/close, so this can never race a concurrent close of
+// ch, and must be the only writer to ch, so this loop is guaranteed to
+// terminate: a concurrent reader can only ever make room, never take it
+// away, between this function's two non-blocking selects.
+func sendLatest(ch chan sessionctl.ProviderUpdate, update sessionctl.ProviderUpdate) {
+	for {
 		select {
 		case ch <- update:
+			return
+		default:
+		}
+		select {
+		case <-ch:
 		default:
 		}
 	}

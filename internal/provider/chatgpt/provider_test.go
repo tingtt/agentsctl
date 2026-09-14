@@ -35,14 +35,15 @@ func TestProviderNormalizesProjectConversationForAgentView(t *testing.T) {
 	provider := &Provider{config: Config{ProjectID: "g-p-project", Root: "/work/project"}, browser: browser}
 
 	// List serves the cache, which is empty before any refresh has
-	// completed -- it also lazily starts the first background refresh
-	// (see Provider.List's doc comment), whose result this test waits for
-	// on Observe rather than List's own (immediate, empty) return value.
+	// completed, and never itself triggers one (see Provider.List's doc
+	// comment) -- this test explicitly requests the refresh whose result
+	// it then waits for on Observe.
 	rows, err := provider.List(context.Background(), false)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("first List before any refresh: rows=%+v err=%v, want empty successful snapshot", rows, err)
 	}
 	updates := provider.Observe(context.Background())
+	provider.Refresh(context.Background())
 	upd := waitForUpdate(t, updates)
 	if upd.Err != nil || len(upd.Sessions) != 1 {
 		t.Fatalf("observed update=%+v", upd)
