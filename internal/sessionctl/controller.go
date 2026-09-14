@@ -35,47 +35,109 @@ type Snapshot struct {
 	Warnings map[session.ProviderID]error
 }
 
-// Load fetches every provider's sessions concurrently (so one provider's
-// latency is never added to another's -- see the DesignDoc's Catalog
-// loading section), narrows each session's Actions to what the concrete
-// provider actually implements (actionsFor), enriches with local pin
-// state, applies scope filtering, and sorts into the canonical overview
-// order. It performs no partial/incremental rendering: one Load call
-// always waits for every provider before returning.
-func (c Controller) Load(ctx context.Context, scope session.Scope) Snapshot {
+// ProviderSnapshot is one provider's incremental Load contribution --
+// LoadStream's per-arrival unit, mirroring UsageStream's UsageUpdate for
+// the catalog side. Sessions is already actionsFor-narrowed, matching
+// what Load's own per-provider fetch does; Err is set instead when that
+// provider's List call failed (never both).
+type ProviderSnapshot struct {
+	Provider session.ProviderID
+	Sessions []session.Session
+	Err      error
+}
+
+// LoadStream is Load's incremental counterpart: the same concurrent,
+// per-provider List call, but delivered as each provider's own call
+// completes rather than collected into one batch behind the slowest
+// provider (see Load's doc comment). This is what lets a caller (Agent
+// View) show and act on a fast provider's rows (e.g. Claude, Codex)
+// without waiting on a slow one (e.g. ChatGPT's multi-page browser-backed
+// discovery walk) -- the catalog-loading counterpart to UsageStream's
+// existing latency isolation.
+//
+// Unlike Load, LoadStream does not apply pin state, scope filtering, or
+// overview ordering: those operate over the accumulated set of every
+// provider heard from so far, which only a caller ranging over the
+// channel can know at any given moment (see MergeSessions).
+//
+// The channel is closed once every provider has sent its ProviderSnapshot
+// (immediately, already closed, if c.Providers is empty).
+func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
+	out := make(chan ProviderSnapshot)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	result := Snapshot{Warnings: make(map[session.ProviderID]error)}
 	for _, p := range c.Providers {
 		p := p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			rows, err := p.List(ctx, false)
-			mu.Lock()
-			defer mu.Unlock()
 			if err != nil {
-				result.Warnings[p.ID()] = err
+				out <- ProviderSnapshot{Provider: p.ID(), Err: err}
 				return
 			}
+			// A fresh slice, never rows itself: a provider whose List
+			// returns a live reference into its own mutable state (a
+			// test double, typically) must never be mutated here.
+			enriched := make([]session.Session, len(rows))
 			for i := range rows {
-				rows[i].Actions = actionsFor(p, rows[i])
+				enriched[i] = rows[i]
+				enriched[i].Actions = actionsFor(p, rows[i])
 			}
-			result.Sessions = append(result.Sessions, rows...)
+			out <- ProviderSnapshot{Provider: p.ID(), Sessions: enriched}
 		}()
 	}
-	wg.Wait()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
+// MergeSessions applies Load's pin-enrichment, scope filtering, and
+// overview ordering to an arbitrary collection of already actionsFor-
+// narrowed sessions -- the same post-processing Load itself applies to
+// its one complete batch, factored out so a caller accumulating
+// LoadStream's incremental ProviderSnapshots can re-run it over its own
+// running total after each arrival, without duplicating pin-store/Filter/
+// SortOverview wiring outside this package.
+func (c Controller) MergeSessions(sessions []session.Session, scope session.Scope) []session.Session {
 	pinned := map[string]bool{}
 	if c.Pins != nil {
 		if values, err := c.Pins.ListPinned(); err == nil {
 			pinned = values
 		}
 	}
-	for i := range result.Sessions {
-		result.Sessions[i].Pinned = pinned[result.Sessions[i].Key.String()]
+	merged := make([]session.Session, len(sessions))
+	copy(merged, sessions)
+	for i := range merged {
+		merged[i].Pinned = pinned[merged[i].Key.String()]
 	}
-	result.Sessions = session.Filter(result.Sessions, scope)
-	session.SortOverview(result.Sessions)
+	merged = session.Filter(merged, scope)
+	session.SortOverview(merged)
+	return merged
+}
+
+// Load fetches every provider's sessions concurrently (so one provider's
+// latency is never added to another's -- see the DesignDoc's Catalog
+// loading section), narrows each session's Actions to what the concrete
+// provider actually implements, enriches with local pin state, applies
+// scope filtering, and sorts into the canonical overview order (see
+// LoadStream/MergeSessions, which this is built from). One Load call
+// always waits for every provider before returning its one complete,
+// merged Snapshot; a caller that instead wants each provider's rows as
+// soon as they're ready uses LoadStream directly (see Agent View's
+// Runtime.requestReload).
+func (c Controller) Load(ctx context.Context, scope session.Scope) Snapshot {
+	result := Snapshot{Warnings: make(map[session.ProviderID]error)}
+	var sessions []session.Session
+	for ps := range c.LoadStream(ctx) {
+		if ps.Err != nil {
+			result.Warnings[ps.Provider] = ps.Err
+			continue
+		}
+		sessions = append(sessions, ps.Sessions...)
+	}
+	result.Sessions = c.MergeSessions(sessions, scope)
 	return result
 }
 
