@@ -53,6 +53,7 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 	var selectedSeries string
 	var captures []capture
 	var region scrollRegion
+	var diagnostic initialSeriesDiagnostic
 	initialDeadline := time.Now().Add(limits.initialTimeout)
 	for selectedSeries == "" {
 		var err error
@@ -64,6 +65,7 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 		if err != nil {
 			return nil, err
 		}
+		diagnostic = diagnoseInitialSeries(captures, region)
 		if region.Found || hasExplicitEmptyTerminalCapture(captures) {
 			matches := matchingSeries(captures, region.ProjectLinkCount)
 			switch len(matches) {
@@ -74,14 +76,14 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 				// different times. Wait for both signals within the bounded load
 				// window rather than treating that ordinary race as a schema error.
 			default:
-				return nil, fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links", len(matches), region.ProjectLinkCount)
+				return nil, fmt.Errorf("request-series ambiguity: %d series match the Project list's %d links; initial series: %s", len(matches), region.ProjectLinkCount, diagnostic)
 			}
 		}
 		if selectedSeries != "" {
 			break
 		}
 		if time.Now().After(initialDeadline) {
-			return nil, fmt.Errorf("no unambiguous Project conversation request series observed within %s", limits.initialTimeout)
+			return nil, fmt.Errorf("no unambiguous Project conversation request series observed within %s; initial series: %s", limits.initialTimeout, diagnostic)
 		}
 		if err := waitContext(ctx, limits.pollInterval); err != nil {
 			return nil, err
