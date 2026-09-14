@@ -2,6 +2,11 @@
 
 const { ipcRenderer } = require("electron");
 
+const ownershipToken = "__AGENTSCTL_CHATGPT_OWNER_TOKEN__";
+const requestChannel = `agentsctl-chatgpt:request:${ownershipToken}`;
+const responseChannel = `agentsctl-chatgpt:response:${ownershipToken}`;
+const registerChannel = `agentsctl-chatgpt:register:${ownershipToken}`;
+
 const projectIDPattern = /^g-p-[A-Za-z0-9_-]+$/;
 
 function classifyLink(href) {
@@ -64,18 +69,25 @@ async function dispatch(request) {
   throw new Error(`unsupported browser method: ${request.method}`);
 }
 
-ipcRenderer.on("agentsctl-chatgpt:request", async (_event, message) => {
+ipcRenderer.on(requestChannel, async (_event, message) => {
   try {
     const result = await dispatch(message.request);
-    ipcRenderer.send("agentsctl-chatgpt:response", { ipcRequestID: message.ipcRequestID, ok: true, result });
+    ipcRenderer.send(responseChannel, { ipcRequestID: message.ipcRequestID, ok: true, result });
   } catch (error) {
-    ipcRenderer.send("agentsctl-chatgpt:response", {
+    ipcRenderer.send(responseChannel, {
       ipcRequestID: message.ipcRequestID,
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
   }
 });
+
+if (process.isMainFrame && location.hash === `#agentsctl-discovery=${ownershipToken}`) {
+  const prefix = "--terminal-browser-session=";
+  const sessionArgument = process.argv.find((argument) => argument.startsWith(prefix));
+  const sessionKey = sessionArgument ? sessionArgument.slice(prefix.length) : "";
+  void ipcRenderer.invoke(registerChannel, { ownershipToken, sessionKey });
+}
 
 addEventListener("keydown", (event) => {
   if (event.ctrlKey && event.key === "]") {

@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ const (
 	defaultPartition   = "agentsctl-chatgpt"
 	chatGPTOrigin      = "https://chatgpt.com"
 	socketPlaceholder  = `"__AGENTSCTL_CHATGPT_SOCKET_PATH__"`
+	ownerPlaceholder   = `"__AGENTSCTL_CHATGPT_OWNER_TOKEN__"`
 )
 
 type browser interface {
@@ -54,6 +56,7 @@ type runtime struct {
 	mainPath    string
 	preloadPath string
 	socketPath  string
+	ownerToken  string
 	helper      processHandle
 	bridge      discoveryBridge
 }
@@ -135,7 +138,7 @@ func (r *runtime) ensureDiscoveryLocked(ctx context.Context) error {
 		return err
 	}
 	args := []string{
-		"open", chatGPTOrigin,
+		"open", chatGPTOrigin + "/#agentsctl-discovery=" + r.ownerToken,
 		"--no-merge",
 		"--partition=" + r.partition,
 		"--main-script=" + r.mainPath,
@@ -179,21 +182,46 @@ func (r *runtime) materializeAssetsLocked() error {
 	if err != nil {
 		return err
 	}
+	ownerToken, err := newOwnerToken()
+	if err != nil {
+		return fmt.Errorf("create ChatGPT discovery ownership token: %w", err)
+	}
+	quotedOwner, err := json.Marshal(ownerToken)
+	if err != nil {
+		return err
+	}
 	if strings.Count(mainScriptTemplate, socketPlaceholder) != 1 {
 		return fmt.Errorf("embedded ChatGPT bridge has an invalid socket placeholder")
 	}
+	if strings.Count(mainScriptTemplate, ownerPlaceholder) != 1 || strings.Count(preloadScriptTemplate, ownerPlaceholder) != 1 {
+		return fmt.Errorf("embedded ChatGPT bridge has an invalid ownership placeholder")
+	}
 	mainScript := strings.Replace(mainScriptTemplate, socketPlaceholder, string(quotedSocket), 1)
+	mainScript = strings.Replace(mainScript, ownerPlaceholder, string(quotedOwner), 1)
+	preloadScript := strings.Replace(preloadScriptTemplate, ownerPlaceholder, string(quotedOwner), 1)
 	mainPath := filepath.Join(dir, "main.js")
 	preloadPath := filepath.Join(dir, "preload.js")
+	ownershipPath := filepath.Join(dir, "ownership.js")
 	if err := os.WriteFile(mainPath, []byte(mainScript), 0o600); err != nil {
 		return fmt.Errorf("write ChatGPT main script: %w", err)
 	}
-	if err := os.WriteFile(preloadPath, preloadScript, 0o600); err != nil {
+	if err := os.WriteFile(preloadPath, []byte(preloadScript), 0o600); err != nil {
 		return fmt.Errorf("write ChatGPT preload: %w", err)
 	}
-	r.assetDir, r.mainPath, r.preloadPath, r.socketPath = dir, mainPath, preloadPath, socketPath
+	if err := os.WriteFile(ownershipPath, ownershipScript, 0o600); err != nil {
+		return fmt.Errorf("write ChatGPT ownership helper: %w", err)
+	}
+	r.assetDir, r.mainPath, r.preloadPath, r.socketPath, r.ownerToken = dir, mainPath, preloadPath, socketPath, ownerToken
 	cleanup = false
 	return nil
+}
+
+func newOwnerToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", token), nil
 }
 
 func dialBridge(ctx context.Context, path string) (net.Conn, error) {

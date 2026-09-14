@@ -4,11 +4,18 @@ const fs = require("node:fs");
 const net = require("node:net");
 const crypto = require("node:crypto");
 const { app, ipcMain, webContents, BrowserWindow } = require("electron");
+const { DiscoveryOwner, captureBelongsToGeneration } = require("./ownership.js");
 
 const socketPath = "__AGENTSCTL_CHATGPT_SOCKET_PATH__";
+const ownershipToken = "__AGENTSCTL_CHATGPT_OWNER_TOKEN__";
+const requestChannel = `agentsctl-chatgpt:request:${ownershipToken}`;
+const responseChannel = `agentsctl-chatgpt:response:${ownershipToken}`;
+const registerChannel = `agentsctl-chatgpt:register:${ownershipToken}`;
+const owner = new DiscoveryOwner(ownershipToken);
 const pending = new Map();
 const enumerations = new Map();
-const attached = new WeakSet();
+const attachment = new WeakMap();
+let ownershipError = "";
 let nextIPCRequestID = 1;
 let nextCaptureID = 1;
 let nextGeneration = 1;
@@ -19,13 +26,10 @@ function validProjectID(value) {
   return typeof value === "string" && /^g-p-[A-Za-z0-9_-]+$/.test(value);
 }
 
-function chatGPTContents() {
-  return webContents.getAllWebContents().find((contents) => {
-    try {
-      return new URL(contents.getURL()).hostname === "chatgpt.com";
-    } catch {
-      return false;
-    }
+function discoveryContents() {
+  return owner.resolve((id) => {
+    const contents = webContents.fromId(id);
+    return contents && !contents.isDestroyed() ? contents : null;
   });
 }
 
@@ -91,62 +95,80 @@ function sanitizePage(payload) {
 }
 
 function attachCapture(contents) {
-  if (attached.has(contents)) return;
-  try {
+  const existing = attachment.get(contents);
+  if (existing) return existing;
+  const ready = (async () => {
     if (!contents.debugger.isAttached()) contents.debugger.attach("1.3");
-  } catch {
-    return;
-  }
-  attached.add(contents);
-  const responses = new Map();
-  contents.debugger.on("message", async (_event, method, params) => {
-    if (method === "Network.responseReceived") {
-      const target = targetFrom(params.response?.url || "");
-      const active = target ? enumerations.get(target.projectID) : null;
-      if (target && active && params.response.status === 200) {
-        responses.set(params.requestId, { ...target, generation: active.generation });
+    const responses = new Map();
+    contents.debugger.on("message", async (_event, method, params) => {
+      if (!owner.owns(contents.id)) return;
+      if (method === "Network.responseReceived") {
+        const target = targetFrom(params.response?.url || "");
+        const active = target ? enumerations.get(target.projectID) : null;
+        if (target && active && params.response.status === 200) {
+          responses.set(params.requestId, { ...target, generation: active.generation });
+        }
+        return;
       }
-      return;
-    }
-    if (method !== "Network.loadingFinished") return;
-    const target = responses.get(params.requestId);
-    if (!target) return;
-    responses.delete(params.requestId);
-    try {
-      const result = await contents.debugger.sendCommand("Network.getResponseBody", { requestId: params.requestId });
-      const body = result.base64Encoded ? Buffer.from(result.body, "base64").toString("utf8") : result.body;
-      if (Buffer.byteLength(body) > 5 * 1024 * 1024) throw new Error("captured response exceeds 5 MiB");
-      const active = enumerations.get(target.projectID);
-      if (!active || active.generation !== target.generation) return;
-      if (active.captures.length >= maxCaptures) throw new Error("capture history limit reached");
-      const page = sanitizePage(JSON.parse(body));
-      active.captures.push({
-        captureID: nextCaptureID++,
-        cursorIn: target.cursorIn,
-        seriesKey: target.seriesKey,
-        ...page,
-      });
-    } catch (error) {
-      const active = enumerations.get(target.projectID);
-      if (active && active.generation === target.generation) {
-        active.error = error instanceof Error ? error.message : String(error);
+      if (method !== "Network.loadingFinished") return;
+      const target = responses.get(params.requestId);
+      if (!target) return;
+      responses.delete(params.requestId);
+      try {
+        const result = await contents.debugger.sendCommand("Network.getResponseBody", { requestId: params.requestId });
+        const body = result.base64Encoded ? Buffer.from(result.body, "base64").toString("utf8") : result.body;
+        if (Buffer.byteLength(body) > 5 * 1024 * 1024) throw new Error("captured response exceeds 5 MiB");
+        const active = enumerations.get(target.projectID);
+        if (!active || !captureBelongsToGeneration(active.generation, target.generation)) return;
+        if (active.captures.length >= maxCaptures) throw new Error("capture history limit reached");
+        const page = sanitizePage(JSON.parse(body));
+        active.captures.push({
+          captureID: nextCaptureID++,
+          cursorIn: target.cursorIn,
+          seriesKey: target.seriesKey,
+          ...page,
+        });
+      } catch (error) {
+        const active = enumerations.get(target.projectID);
+        if (active && captureBelongsToGeneration(active.generation, target.generation)) {
+          active.error = error instanceof Error ? error.message : String(error);
+        }
       }
-    }
-  });
-  contents.debugger.sendCommand("Network.enable").catch(() => {});
+    });
+    await contents.debugger.sendCommand("Network.enable");
+  })();
+  attachment.set(contents, ready);
+  ready.catch(() => attachment.delete(contents));
+  return ready;
 }
 
-for (const contents of webContents.getAllWebContents()) attachCapture(contents);
-app.on("web-contents-created", (_event, contents) => attachCapture(contents));
+ipcMain.handle(registerChannel, async (event, message) => {
+  if (event.senderFrame !== event.sender.mainFrame || !owner.acceptsToken(message?.ownershipToken)) {
+    return { accepted: false };
+  }
+  try {
+    await attachCapture(event.sender);
+    owner.register({
+      token: message.ownershipToken,
+      contentsID: event.sender.id,
+      sessionKey: message.sessionKey,
+    });
+    return { accepted: true };
+  } catch (error) {
+    ownershipError = error instanceof Error ? error.message : String(error);
+    return { accepted: false, error: ownershipError };
+  }
+});
 
 async function requestPage(request) {
   const deadline = Date.now() + 15_000;
-  let contents = chatGPTContents();
+  let contents = discoveryContents();
   while (!contents && Date.now() < deadline) {
+    if (ownershipError) throw new Error(`ChatGPT discovery renderer unavailable: ${ownershipError}`);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    contents = chatGPTContents();
+    contents = discoveryContents();
   }
-  if (!contents) throw new Error("ChatGPT page is unavailable");
+  if (!contents) throw new Error("owned ChatGPT discovery renderer is unavailable");
   const ipcRequestID = nextIPCRequestID++;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -154,13 +176,13 @@ async function requestPage(request) {
       reject(new Error("browser response timed out"));
     }, 10_000);
     pending.set(ipcRequestID, { resolve, reject, timer, senderID: contents.id });
-    contents.send("agentsctl-chatgpt:request", { ipcRequestID, request });
+    contents.send(requestChannel, { ipcRequestID, request });
   });
 }
 
-ipcMain.on("agentsctl-chatgpt:response", (event, message) => {
+ipcMain.on(responseChannel, (event, message) => {
   const entry = pending.get(message?.ipcRequestID);
-  if (!entry || event.sender.id !== entry.senderID) return;
+  if (!entry || !owner.owns(event.sender.id) || event.sender.id !== entry.senderID) return;
   clearTimeout(entry.timer);
   pending.delete(message.ipcRequestID);
   if (message.ok) entry.resolve(message.result);
@@ -186,8 +208,8 @@ async function dispatch(request) {
   if (request.method === "scrollRegion") return requestPage({ method: "scrollRegion" });
   if (request.method !== "wheel") throw new Error(`unsupported method: ${request.method}`);
 
-  const contents = chatGPTContents();
-  if (!contents) throw new Error("ChatGPT page is unavailable");
+  const contents = discoveryContents();
+  if (!contents) throw new Error("owned ChatGPT discovery renderer is unavailable");
   const initial = await requestPage({ method: "scrollRegion" });
   if (!initial.found) return { found: false, initial, final: initial, ticks: 0 };
   const ownerWindow = BrowserWindow.fromWebContents(contents);

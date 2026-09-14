@@ -56,8 +56,8 @@ func TestRuntimeOpenUsesCanonicalAppModeInPersistentPartition(t *testing.T) {
 	if executor.foregroundPath != "terminal-browser-test" {
 		t.Fatalf("foreground path=%q", executor.foregroundPath)
 	}
-	if !strings.Contains(string(preloadScript), `event.ctrlKey && event.key === "]"`) ||
-		!strings.Contains(string(preloadScript), "globalThis.terminalBrowser.quit()") {
+	if !strings.Contains(preloadScriptTemplate, `event.ctrlKey && event.key === "]"`) ||
+		!strings.Contains(preloadScriptTemplate, "globalThis.terminalBrowser.quit()") {
 		t.Fatal("embedded preload does not preserve Ctrl+] close-view behavior")
 	}
 }
@@ -78,6 +78,15 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 	if strings.Contains(string(mainContents), "__AGENTSCTL_CHATGPT_SOCKET_PATH__") || !strings.Contains(string(mainContents), socketPath) {
 		t.Fatal("materialized main script did not receive its private socket path")
 	}
+	preloadContents, err := os.ReadFile(runtime.preloadPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.ownerToken == "" || strings.Contains(string(mainContents), "__AGENTSCTL_CHATGPT_OWNER_TOKEN__") ||
+		strings.Contains(string(preloadContents), "__AGENTSCTL_CHATGPT_OWNER_TOKEN__") ||
+		!strings.Contains(string(mainContents), runtime.ownerToken) || !strings.Contains(string(preloadContents), runtime.ownerToken) {
+		t.Fatal("materialized bridge did not receive its private ownership token")
+	}
 	if filepath.Dir(socketPath) != dir {
 		t.Fatalf("socket=%q is outside owned runtime dir %q", socketPath, dir)
 	}
@@ -90,7 +99,7 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 }
 
 func TestEmbeddedBridgeContainsNoCredentialTransport(t *testing.T) {
-	combined := strings.ToLower(mainScriptTemplate + string(preloadScript))
+	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(ownershipScript))
 	for _, forbidden := range []string{"authorization", "access_token", "refresh_token", "document.cookie"} {
 		if strings.Contains(combined, forbidden) {
 			t.Fatalf("embedded bridge contains forbidden credential transport %q", forbidden)

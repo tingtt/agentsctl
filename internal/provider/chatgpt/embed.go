@@ -6,4 +6,7 @@ import _ "embed"
 var mainScriptTemplate string
 
 //go:embed bridge/preload.js
-var preloadScript []byte
+var preloadScriptTemplate string
+
+//go:embed bridge/ownership.js
+var ownershipScript []byte
