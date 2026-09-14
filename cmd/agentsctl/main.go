@@ -72,7 +72,7 @@ func run() error {
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
 		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
 	}
-	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers)
+	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {
 		defer func() { _ = chatGPTProvider.Close() }()
 	}
@@ -84,7 +84,7 @@ func run() error {
 	return rt.Run(ctx)
 }
 
-func appendChatGPTProvider(cwd string, providers []sessionctl.Source) ([]sessionctl.Source, *chatgpt.Provider) {
+func appendChatGPTProvider(cwd string, providers []sessionctl.Source, store *localstate.Store) ([]sessionctl.Source, *chatgpt.Provider) {
 	config, configured, err := chatgpt.Discover(cwd)
 	if !configured {
 		return providers, nil
@@ -93,7 +93,7 @@ func appendChatGPTProvider(cwd string, providers []sessionctl.Source) ([]session
 	if err != nil {
 		provider = chatgpt.NewUnavailable(err)
 	} else {
-		provider = chatgpt.New(config)
+		provider = chatgpt.New(config, store)
 	}
 	return append(providers, provider), provider
 }

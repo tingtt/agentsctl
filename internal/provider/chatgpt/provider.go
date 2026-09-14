@@ -5,12 +5,29 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
+
+// CatalogStore persists ChatGPT's last-known-good catalog across process
+// restarts, keyed by Project ID so catalogs from different configured
+// Projects never cross (see (*localstate.Store).ChatGPTCatalog/
+// SaveChatGPTCatalog, which satisfies this interface in production --
+// tests use a fake). It is a small, consumer-side interface: Provider
+// depends on this shape, never on localstate's own concrete Store or its
+// private raw schema. A nil CatalogStore is valid and means Provider
+// behaves as if persistence were simply absent -- nothing hydrated at
+// construction, nothing saved after a refresh -- never a required
+// dependency.
+type CatalogStore interface {
+	ChatGPTCatalog(projectID string) (localstate.ChatGPTCatalog, bool, error)
+	SaveChatGPTCatalog(projectID string, catalog localstate.ChatGPTCatalog) error
+}
 
 // Provider lists and opens conversations from one configured ChatGPT
 // Project. Browser authentication and undocumented endpoint behavior stay
@@ -22,11 +39,14 @@ import (
 // enumeration (see Refresh/runRefresh and catalogCache's doc comment) --
 // scheduled, coalesced, and single-flighted by the refresh state machine
 // below -- and published to any Observer subscriber as a full-replacement
-// ProviderUpdate. The cache is memory-only and scoped to this Provider's
-// lifetime; nothing here persists it to disk.
+// ProviderUpdate. The in-memory cache is additionally hydrated from, and
+// kept durable through, CatalogStore -- see New/hydrate and runRefresh --
+// so a restarted process can immediately serve last-known-good rows
+// before any browser discovery even starts.
 type Provider struct {
 	config    Config
 	browser   browser
+	store     CatalogStore
 	configErr error
 
 	cache catalogCache
@@ -67,10 +87,13 @@ var (
 	_ sessionctl.Refresher = (*Provider)(nil)
 )
 
-// New returns a provider for config using the production browser runtime.
-func New(config Config) *Provider {
-	p := &Provider{config: config, browser: newRuntime()}
+// New returns a provider for config using the production browser runtime,
+// hydrating its in-memory cache from store's persisted catalog (if any)
+// for config.ProjectID before returning -- see hydrate. store may be nil.
+func New(config Config, store CatalogStore) *Provider {
+	p := &Provider{config: config, browser: newRuntime(), store: store}
 	p.lifecycleCtx, p.lifecycleCancel = context.WithCancel(context.Background())
+	p.hydrate()
 	return p
 }
 
@@ -152,14 +175,26 @@ func (p *Provider) startRefreshLocked() {
 }
 
 // runRefresh performs one full browser cursor enumeration and, only if it
-// completes successfully, atomically replaces catalogCache and publishes
-// the new catalog to every Observer subscriber. Any failure (timeout,
-// broken bridge, ambiguous request series, schema drift, cursor cycle,
-// incomplete pagination, context cancellation -- see browser.List/
-// enumerate) leaves the cache exactly as it was and instead publishes (and
-// records) the failure, so cached rows always survive a failed refresh.
-// On completion it starts exactly one more refresh if Refresh was
-// requested again while this one ran (coalescing).
+// completes successfully, atomically replaces catalogCache, persists the
+// new catalog through CatalogStore (if configured), and publishes the new
+// catalog to every Observer subscriber. Any failure (timeout, broken
+// bridge, ambiguous request series, schema drift, cursor cycle, incomplete
+// pagination, context cancellation -- see browser.List/enumerate) leaves
+// the memory cache and persisted catalog exactly as they were and instead
+// publishes (and records) the failure, so cached rows always survive a
+// failed refresh. On completion it starts exactly one more refresh if
+// Refresh was requested again while this one ran (coalescing).
+//
+// A persistence write failure (see persist) never un-does the memory
+// replacement above it or suppresses the success publication: the fresh
+// remote result is valid regardless of local durability, and is never
+// discarded or hidden on account of a disk error. It is recorded on the
+// cache (catalogCache.lastErr) for internal/future diagnostic use, but
+// deliberately does not ride along on this cycle's Observer publication --
+// sessionctl.ProviderUpdate's Sessions-xor-Err shape has no way to express
+// "these sessions are valid AND there's also a durability warning" without
+// widening that contract for every Observer provider, which durability
+// alone does not justify.
 func (p *Provider) runRefresh(ctx context.Context) {
 	conversations, err := p.browser.List(ctx, p.config.ProjectID)
 	if err != nil {
@@ -167,7 +202,9 @@ func (p *Provider) runRefresh(ctx context.Context) {
 		p.publish(sessionctl.ProviderUpdate{Err: err})
 	} else {
 		sessions := toSessions(conversations, p.config.Root)
-		p.cache.replace(sessions)
+		refreshedAt := time.Now()
+		p.cache.replaceAt(sessions, refreshedAt)
+		p.persist(conversations, refreshedAt)
 		p.publish(sessionctl.ProviderUpdate{Sessions: sessions})
 	}
 
@@ -316,6 +353,99 @@ func (p *Provider) Close() error {
 	return p.browser.Close()
 }
 
+// hydrate loads store's persisted catalog for p.config.ProjectID (if any)
+// and installs it as catalogCache's initial snapshot, entirely from local
+// state -- no browser process, network, or authentication is touched.
+// Called once, synchronously, from New, before the Provider is ever
+// registered or returns to its caller, so the very first List already
+// has rows to serve (see the DesignDoc's "cached rows before remote
+// refresh" startup guarantee) without waiting on the background refresh
+// Agent View separately triggers via Refresh.
+//
+// A store read/decode error or an invalid persisted row (see
+// sessionsFromPersisted) is recorded on the cache for diagnostics but
+// does not prevent Provider from working: it simply starts with an empty
+// cache, exactly as if nothing had ever been persisted, and the normal
+// background refresh path takes over from there.
+func (p *Provider) hydrate() {
+	if p.store == nil {
+		return
+	}
+	persisted, ok, err := p.store.ChatGPTCatalog(p.config.ProjectID)
+	if err != nil {
+		p.cache.recordErr(fmt.Errorf("load persisted ChatGPT catalog: %w", err))
+		return
+	}
+	if !ok {
+		return
+	}
+	sessions, err := sessionsFromPersisted(persisted, p.config.Root)
+	if err != nil {
+		p.cache.recordErr(fmt.Errorf("persisted ChatGPT catalog is invalid: %w", err))
+		return
+	}
+	p.cache.replaceAt(sessions, persisted.RefreshedAt)
+}
+
+// persist saves conversations (from a just-COMPLETED enumeration -- see
+// runRefresh, the only caller) to p.store under p.config.ProjectID. A
+// nil store is a no-op (persistence is optional -- see CatalogStore's doc
+// comment); a write failure is recorded on the cache but otherwise
+// ignored here -- see runRefresh's doc comment on why it must never
+// affect the memory cache or Observer publication already committed to
+// for this refresh.
+func (p *Provider) persist(conversations []conversation, refreshedAt time.Time) {
+	if p.store == nil {
+		return
+	}
+	if err := p.store.SaveChatGPTCatalog(p.config.ProjectID, toPersistedCatalog(conversations, refreshedAt)); err != nil {
+		p.cache.recordErr(fmt.Errorf("persist ChatGPT catalog: %w", err))
+	}
+}
+
+// sessionsFromPersisted validates and converts a persisted catalog into
+// the provider-neutral session.Session shape, rooted at root -- root is
+// always the CURRENT Config.Root, deliberately never anything persisted
+// (see localstate.ChatGPTConversation's doc comment: only remote metadata
+// is persisted, never a local CWD), so a moved checkout or a second local
+// clone of the same Project hydrates with today's logical CWD, not a
+// stale one.
+//
+// Persisted data is local state that may be stale or corrupt (hand-edited,
+// written by a future/older agentsctl build, or otherwise malformed); a
+// single invalid row fails the whole load rather than silently admitting
+// a partially-corrupt catalog with e.g. an unparseable conversation ID
+// into a session.Key.
+func sessionsFromPersisted(catalog localstate.ChatGPTCatalog, root string) ([]session.Session, error) {
+	conversations := make([]conversation, len(catalog.Conversations))
+	for i, item := range catalog.Conversations {
+		if !conversationIDPattern.MatchString(item.ID) {
+			return nil, fmt.Errorf("persisted conversation %d has an invalid ID", i)
+		}
+		if strings.TrimSpace(item.Title) == "" {
+			return nil, fmt.Errorf("persisted conversation %d has no title", i)
+		}
+		if item.CreatedAt.IsZero() || item.UpdatedAt.IsZero() {
+			return nil, fmt.Errorf("persisted conversation %d has an invalid timestamp", i)
+		}
+		conversations[i] = conversation{ID: item.ID, Title: item.Title, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt}
+	}
+	return toSessions(conversations, root), nil
+}
+
+// toPersistedCatalog converts a COMPLETE enumeration's conversations into
+// CatalogStore's persisted shape -- remote metadata only (see
+// localstate.ChatGPTConversation's doc comment), never local CWD/Actions/
+// Pinned/Runtime/Activity, which are reconstructed by normal domain rules
+// on every hydrate/List instead of being persisted.
+func toPersistedCatalog(conversations []conversation, refreshedAt time.Time) localstate.ChatGPTCatalog {
+	items := make([]localstate.ChatGPTConversation, len(conversations))
+	for i, c := range conversations {
+		items[i] = localstate.ChatGPTConversation{ID: c.ID, Title: c.Title, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
+	}
+	return localstate.ChatGPTCatalog{RefreshedAt: refreshedAt, Conversations: items}
+}
+
 // toSessions normalizes browser-enumerated conversations into the
 // provider-neutral session.Session shape. ChatGPT remote star/pin fields
 // never enter this representation; the controller overlays agentsctl's
@@ -368,19 +498,27 @@ func (c *catalogCache) snapshot() ([]session.Session, bool) {
 	return out, true
 }
 
-// replace atomically installs sessions as the new last-known-good catalog,
-// copying its input so the caller's own slice (and any earlier snapshot
-// still held by another goroutine) is never shared with -- or later
-// mutated through -- the cache's backing storage. It also clears any
-// previously recorded refresh error: a successful replacement supersedes
-// it.
+// replace is replaceAt(sessions, time.Now()) -- the common case, a fresh
+// successful refresh. See replaceAt.
 func (c *catalogCache) replace(sessions []session.Session) {
+	c.replaceAt(sessions, time.Now())
+}
+
+// replaceAt atomically installs sessions as the new last-known-good
+// catalog with an explicit refreshedAt (hydrate passes the persisted
+// catalog's own original refresh time rather than time.Now(), since
+// hydration itself is not a refresh), copying its input so the caller's
+// own slice (and any earlier snapshot still held by another goroutine) is
+// never shared with -- or later mutated through -- the cache's backing
+// storage. It also clears any previously recorded error: a successful
+// replacement (or valid hydration) supersedes it.
+func (c *catalogCache) replaceAt(sessions []session.Session, refreshedAt time.Time) {
 	cp := make([]session.Session, len(sessions))
 	copy(cp, sessions)
 	c.mu.Lock()
 	c.sessions = cp
 	c.hasSnapshot = true
-	c.refreshedAt = time.Now()
+	c.refreshedAt = refreshedAt
 	c.lastErr = nil
 	c.mu.Unlock()
 }
