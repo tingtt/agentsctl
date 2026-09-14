@@ -2,6 +2,28 @@
 
 const { ipcRenderer } = require("electron");
 
+const navigationLogic = (() => {
+  const module = { exports: {} };
+  ((module, exports) => {
+    /*__AGENTSCTL_CHATGPT_NAVIGATION_MODULE__*/
+  })(module, module.exports);
+  return module.exports;
+})();
+
+const rendererNavigation = (() => {
+  const module = { exports: {} };
+  const requireNavigation = (path) => {
+    if (path === "./navigation.js") return navigationLogic;
+    throw new Error(`unsupported renderer navigation module: ${path}`);
+  };
+  ((module, exports, require) => {
+    /*__AGENTSCTL_CHATGPT_RENDERER_NAVIGATION_MODULE__*/
+  })(module, module.exports, requireNavigation);
+  return module.exports;
+})();
+
+const { installChatGPTNavigation, isCloseShortcut } = rendererNavigation;
+
 const ownershipToken = "__AGENTSCTL_CHATGPT_OWNER_TOKEN__";
 const requestChannel = `agentsctl-chatgpt:request:${ownershipToken}`;
 const responseChannel = `agentsctl-chatgpt:response:${ownershipToken}`;
@@ -82,15 +104,19 @@ ipcRenderer.on(requestChannel, async (_event, message) => {
   }
 });
 
-if (process.isMainFrame && location.hash === `#agentsctl-discovery=${ownershipToken}`) {
+const discoveryRenderer = process.isMainFrame && location.hash === `#agentsctl-discovery=${ownershipToken}`;
+
+if (discoveryRenderer) {
   const prefix = "--terminal-browser-session=";
   const sessionArgument = process.argv.find((argument) => argument.startsWith(prefix));
   const sessionKey = sessionArgument ? sessionArgument.slice(prefix.length) : "";
   void ipcRenderer.invoke(registerChannel, { ownershipToken, sessionKey });
 }
 
+if (process.isMainFrame && !discoveryRenderer) installChatGPTNavigation(globalThis, document);
+
 addEventListener("keydown", (event) => {
-  if (event.ctrlKey && event.key === "]") {
+  if (isCloseShortcut(event)) {
     event.preventDefault();
     event.stopImmediatePropagation();
     globalThis.terminalBrowser.quit();

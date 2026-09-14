@@ -148,6 +148,12 @@ sanitized row は server response order ではなく `CreatedAt DESC` と stable
 
 Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。discovery preload と main script は runtime ごとの ownership token と terminal-browser session identity を handshake し、navigation、wheel、Network capture をその discovery WebContents だけに限定する。foreground Open や別の terminal-browser session は discovery target にならない。
 
+foreground conversation の keyboard navigation は renderer preload 内で完結し、Go runtime や discovery IPC へ DOM 操作を持ち込まない。`.` の番号 jump は text-entry context と IME composition 中には開始せず、開始時点で viewport 内にあり HTML semantics / ARIA 上操作可能な element だけを採番する。番号 prefix の決定は DOM から独立した pure logic とし、overlay は fixed positioning、closed shadow root、`pointer-events: none` によって document layout と既存 target を変更しない。
+
+user prompt は ChatGPT が現在提供する semantic metadata `[data-message-author-role="user"][data-message-id]` から操作ごとに再解決し、保持する現在位置は DOM node ではなく message ID とする。対象 prompt には navigation 中だけ一時的な focusability を与え、prompt の scrollable ancestor へ移動する。最後の prompt の次は同じ scroll owner の末尾へ移動して位置 state を解除する。macOS の terminal-browser PTY で `{` / `}` は Shift 付き `BracketLeft` / `BracketRight` として renderer に届くため、prompt shortcut は `code` と modifier を組み合わせて判定し、unshifted `Ctrl+]` の close shortcut と分離する。
+
+discovery renderer は keyboard navigation を install せず、registration と catalog enumeration の既存経路だけを保持する。これにより hidden window が overlay を生成したり、navigation のために focus / scroll されたりする経路を作らない。
+
 background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation では terminal-browser CLI へ `SIGTERM` を送り、bounded wait 後だけ強制終了して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
 
 #### ChatGPT last-known-good catalog cache

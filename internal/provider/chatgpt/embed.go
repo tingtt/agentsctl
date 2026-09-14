@@ -8,6 +8,12 @@ var mainScriptTemplate string
 //go:embed bridge/preload.js
 var preloadScriptTemplate string
 
+//go:embed bridge/navigation.js
+var navigationScript []byte
+
+//go:embed bridge/renderer-navigation.js
+var rendererNavigationScript []byte
+
 //go:embed bridge/ownership.js
 var ownershipScript []byte
 

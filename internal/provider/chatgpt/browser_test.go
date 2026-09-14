@@ -58,7 +58,7 @@ func TestRuntimeOpenUsesCanonicalAppModeInPersistentPartition(t *testing.T) {
 	if executor.foregroundPath != "terminal-browser-test" {
 		t.Fatalf("foreground path=%q", executor.foregroundPath)
 	}
-	if !strings.Contains(preloadScriptTemplate, `event.ctrlKey && event.key === "]"`) ||
+	if !strings.Contains(preloadScriptTemplate, "isCloseShortcut(event)") ||
 		!strings.Contains(preloadScriptTemplate, "globalThis.terminalBrowser.quit()") {
 		t.Fatal("embedded preload does not preserve Ctrl+] close-view behavior")
 	}
@@ -151,6 +151,12 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 		!strings.Contains(string(mainContents), runtime.ownerToken) || !strings.Contains(string(preloadContents), runtime.ownerToken) {
 		t.Fatal("materialized bridge did not receive its private ownership token")
 	}
+	if strings.Contains(string(preloadContents), navigationPlaceholder) ||
+		strings.Contains(string(preloadContents), rendererNavigationPlaceholder) ||
+		!strings.Contains(string(preloadContents), "class NumberJumpState") ||
+		!strings.Contains(string(preloadContents), "class ChatGPTNavigation") {
+		t.Fatal("materialized preload does not contain the renderer navigation modules")
+	}
 	if filepath.Dir(socketPath) != dir {
 		t.Fatalf("socket=%q is outside owned runtime dir %q", socketPath, dir)
 	}
@@ -163,7 +169,8 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 }
 
 func TestEmbeddedBridgeContainsNoCredentialTransport(t *testing.T) {
-	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(ownershipScript) + string(captureScript))
+	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(navigationScript) +
+		string(rendererNavigationScript) + string(ownershipScript) + string(captureScript))
 	for _, forbidden := range []string{"authorization", "access_token", "refresh_token", "document.cookie"} {
 		if strings.Contains(combined, forbidden) {
 			t.Fatalf("embedded bridge contains forbidden credential transport %q", forbidden)

@@ -20,11 +20,13 @@ import (
 )
 
 const (
-	defaultBrowserPath = "terminal-browser"
-	defaultPartition   = "agentsctl-chatgpt"
-	chatGPTOrigin      = "https://chatgpt.com"
-	socketPlaceholder  = `"__AGENTSCTL_CHATGPT_SOCKET_PATH__"`
-	ownerPlaceholder   = `"__AGENTSCTL_CHATGPT_OWNER_TOKEN__"`
+	defaultBrowserPath            = "terminal-browser"
+	defaultPartition              = "agentsctl-chatgpt"
+	chatGPTOrigin                 = "https://chatgpt.com"
+	socketPlaceholder             = `"__AGENTSCTL_CHATGPT_SOCKET_PATH__"`
+	ownerPlaceholder              = `"__AGENTSCTL_CHATGPT_OWNER_TOKEN__"`
+	navigationPlaceholder         = "/*__AGENTSCTL_CHATGPT_NAVIGATION_MODULE__*/"
+	rendererNavigationPlaceholder = "/*__AGENTSCTL_CHATGPT_RENDERER_NAVIGATION_MODULE__*/"
 )
 
 type browser interface {
@@ -272,9 +274,15 @@ func (r *runtime) materializeAssetsLocked() error {
 	if strings.Count(mainScriptTemplate, ownerPlaceholder) != 1 || strings.Count(preloadScriptTemplate, ownerPlaceholder) != 1 {
 		return fmt.Errorf("embedded ChatGPT bridge has an invalid ownership placeholder")
 	}
+	if strings.Count(preloadScriptTemplate, navigationPlaceholder) != 1 ||
+		strings.Count(preloadScriptTemplate, rendererNavigationPlaceholder) != 1 {
+		return fmt.Errorf("embedded ChatGPT preload has invalid navigation placeholders")
+	}
 	mainScript := strings.Replace(mainScriptTemplate, socketPlaceholder, string(quotedSocket), 1)
 	mainScript = strings.Replace(mainScript, ownerPlaceholder, string(quotedOwner), 1)
 	preloadScript := strings.Replace(preloadScriptTemplate, ownerPlaceholder, string(quotedOwner), 1)
+	preloadScript = strings.Replace(preloadScript, navigationPlaceholder, string(navigationScript), 1)
+	preloadScript = strings.Replace(preloadScript, rendererNavigationPlaceholder, string(rendererNavigationScript), 1)
 	mainPath := filepath.Join(dir, "main.js")
 	preloadPath := filepath.Join(dir, "preload.js")
 	ownershipPath := filepath.Join(dir, "ownership.js")
