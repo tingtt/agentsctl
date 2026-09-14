@@ -40,6 +40,12 @@ type data struct {
 	ClaudeNames map[string]string `json:"claudeNames,omitempty"`
 	Pinned      map[string]bool   `json:"pinned,omitempty"`
 	Runs        map[string]run    `json:"runs,omitempty"`
+	// ChatGPTCatalogs is provider/chatgpt's persisted last-known-good
+	// catalog cache, keyed by ChatGPT Project ID (see
+	// (*Store).ChatGPTCatalog/SaveChatGPTCatalog in chatgpt.go) so a
+	// catalog from one configured Project can never be read back under
+	// another.
+	ChatGPTCatalogs map[string]chatGPTCatalog `json:"chatgptCatalogs,omitempty"`
 }
 
 // run is data.Runs' persisted element shape, converted to/from the
@@ -59,6 +65,21 @@ type run struct {
 	StartedAt time.Time `json:"startedAt"`
 }
 
+// chatGPTCatalog is data.ChatGPTCatalogs' persisted element shape,
+// converted to/from the exported ChatGPTCatalog domain type at the
+// package boundary (toChatGPTCatalog/fromChatGPTCatalog in chatgpt.go).
+type chatGPTCatalog struct {
+	RefreshedAt   time.Time             `json:"refreshedAt"`
+	Conversations []chatGPTConversation `json:"conversations,omitempty"`
+}
+
+type chatGPTConversation struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 func toRun(r run) Run {
 	return Run{ID: r.ID, Provider: r.Provider, SessionID: r.SessionID, CWD: r.CWD, PID: r.PID, StartTime: r.StartTime, UID: r.UID, Socket: r.Socket, State: r.State, Error: r.Error, Baseline: r.Baseline, StartedAt: r.StartedAt}
 }
@@ -67,7 +88,7 @@ func fromRun(r Run) run {
 }
 
 func emptyData() data {
-	return data{ClaudeArchived: map[string]bool{}, ClaudeNames: map[string]string{}, Pinned: map[string]bool{}, Runs: map[string]run{}}
+	return data{ClaudeArchived: map[string]bool{}, ClaudeNames: map[string]string{}, Pinned: map[string]bool{}, Runs: map[string]run{}, ChatGPTCatalogs: map[string]chatGPTCatalog{}}
 }
 
 // normalize ensures every map field is non-nil after decode/mutation, so
@@ -85,5 +106,8 @@ func (d *data) normalize() {
 	}
 	if d.Runs == nil {
 		d.Runs = map[string]run{}
+	}
+	if d.ChatGPTCatalogs == nil {
+		d.ChatGPTCatalogs = map[string]chatGPTCatalog{}
 	}
 }
