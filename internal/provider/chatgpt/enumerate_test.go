@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -21,6 +22,28 @@ type slowGrowingBridge struct {
 	pageIndex  int
 	wheelCalls int
 }
+
+type settlingSelectionBridge struct {
+	captures []capture
+	checks   int
+}
+
+func (b *settlingSelectionBridge) BeginList(context.Context, string) error { return nil }
+func (b *settlingSelectionBridge) Captures(context.Context, string) ([]capture, error) {
+	b.checks++
+	return b.captures, nil
+}
+func (b *settlingSelectionBridge) ScrollRegion(context.Context, string) (scrollRegion, error) {
+	links := 7
+	if b.checks > 1 {
+		links = 10
+	}
+	return scrollRegion{Found: true, ProjectLinkCount: links}, nil
+}
+func (b *settlingSelectionBridge) Wheel(context.Context, string, int) (wheelResult, error) {
+	return wheelResult{}, errors.New("wheel should not be called")
+}
+func (b *settlingSelectionBridge) Close() error { return nil }
 
 func (b *slowGrowingBridge) BeginList(context.Context, string) error { return nil }
 func (b *slowGrowingBridge) Captures(context.Context, string) ([]capture, error) {
@@ -82,6 +105,23 @@ func TestEnumerateTracksGrowingBottomUntilTerminalCursor(t *testing.T) {
 	}
 	if bridge.regions[1].ScrollHeight <= bridge.regions[0].ScrollHeight {
 		t.Fatal("fixture must prove the current bottom moved after pagination")
+	}
+}
+
+func TestEnumerateWaitsForMultipleSeriesDOMSignalToSettle(t *testing.T) {
+	items := make([]capturedItem, 10)
+	for index := range items {
+		items[index] = item(conversationForIndex(index), "conversation", "2026-01-01T00:00:00Z")
+	}
+	bridge := &settlingSelectionBridge{captures: []capture{
+		capturePage(1, "small", "0", "", items[:5]...),
+		capturePage(2, "project", "0", "", items...),
+	}}
+	limits := testEnumerationLimits()
+	limits.pollInterval = 0
+	got, err := enumerateWithLimits(context.Background(), bridge, "g-p-test", limits)
+	if err != nil || len(got) != len(items) || bridge.checks != 2 {
+		t.Fatalf("conversations=%d checks=%d err=%v", len(got), bridge.checks, err)
 	}
 }
 

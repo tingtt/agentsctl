@@ -54,6 +54,7 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 	var captures []capture
 	var region scrollRegion
 	var diagnostic initialSeriesDiagnostic
+	var selectionErr error
 	initialDeadline := time.Now().Add(limits.initialTimeout)
 	for selectedSeries == "" {
 		var err error
@@ -66,14 +67,14 @@ func enumerateWithLimits(ctx context.Context, bridge discoveryBridge, projectID 
 			return nil, err
 		}
 		diagnostic = diagnoseInitialSeries(captures, region)
-		selectedSeries, err = selectInitialSeries(captures, region)
-		if err != nil {
-			return nil, fmt.Errorf("%w; initial series: %s", err, diagnostic)
-		}
-		if selectedSeries != "" {
+		selectedSeries, selectionErr = selectInitialSeries(captures, region)
+		if selectionErr == nil && selectedSeries != "" {
 			break
 		}
 		if time.Now().After(initialDeadline) {
+			if selectionErr != nil {
+				return nil, fmt.Errorf("%w; initial series: %s", selectionErr, diagnostic)
+			}
 			return nil, fmt.Errorf("no unambiguous Project conversation request series observed within %s; initial series: %s", limits.initialTimeout, diagnostic)
 		}
 		if err := waitContext(ctx, limits.pollInterval); err != nil {
