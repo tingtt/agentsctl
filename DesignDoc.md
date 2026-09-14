@@ -138,15 +138,17 @@ Agent View では各 provider を共通の session model として扱うが、se
 
 ChatGPT provider は `sessionctl.Source` と `sessionctl.Opener` だけを実装する。Agent View は provider ID で分岐せず、共通 capability と session key `chatgpt:<conversation_id>` を通じて List / Open / selection / local pin を扱う。
 
-List は永続 partition `agentsctl-chatgpt` で公式 Project view を開き、frontend 自身が発行する `/backend-api/gizmos/{project_id}/conversations` response を passive に観測する。browser bridge は response body を browser-side で sanitize し、conversation ID、title、create/update time、cursor chain に必要な metadata のみを mode `0600` の local socket から Go へ渡す。credential、header、browser storage、transcript、raw response は bridge boundary を越えない。
+List は永続 partition `agentsctl-chatgpt` で公式 Project view を開き、frontend 自身が発行する `/backend-api/gizmos/{project_id}/conversations` response を passive に観測する。設定された Project route ID と endpoint 内の opaque ID が一致することには依存せず、navigation generation と discovery WebContents の ownership によって capture scope を確定する。browser bridge は response body を browser-side で sanitize し、conversation ID、title、create/update time、cursor chain に必要な metadata のみを mode `0600` の local socket から Go へ渡す。credential、header、browser storage、transcript、raw response は bridge boundary を越えない。
 
-同じ endpoint には `cursor=0` を共有する異なる request series が存在しうるため、cursor 以外の relevant query parameters から `SeriesKey` を導出する。Project list と一致する series が一意に選べた場合のみそれを enumeration 中固定し、曖昧な場合は失敗する。cursor は opaque value として equality / cycle detection / unchanged forwarding だけに使う。
+同じ `cursor=0` を共有する異なる request series が存在しうるため、browser-side の endpoint identity と cursor 以外の relevant query parameters から `SeriesKey` を導出する。fresh series が1つだけなら DOM render count を条件にせず固定し、複数なら Project conversation link count と一致する first page が一意に決まるまで bounded load window 内で待つ。期限まで曖昧なら失敗する。cursor は opaque value として equality / cycle detection / unchanged forwarding だけに使い、terminal response は absent / `null` / empty string の互換 shape のみを受理する。
 
 pagination は synthetic DOM event ではなく Electron の real mouse-wheel input を使い、現在の scroll region と増加しうる `scrollHeight` を毎 round 再取得して moving bottom を追う。明示的な terminal cursor page を観測した場合だけ List を成功させる。page 数、wheel tick/round、no-progress、cursor cycle に defensive bound を設け、terminal page へ到達できなければ partial list を返さず provider failure とする。provider 単位の partial failure により、この失敗は Claude / Codex catalog を失わせない。
 
 sanitized row は server response order ではなく `CreatedAt DESC` と stable identity tie-break で整列する。remote の star / pin metadata は取り込まず、Pin は既存の agentsctl-local state だけを source of truth とする。
 
-Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation で停止して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
+Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。discovery preload と main script は runtime ごとの ownership token と terminal-browser session identity を handshake し、navigation、wheel、Network capture をその discovery WebContents だけに限定する。foreground Open や別の terminal-browser session は discovery target にならない。
+
+background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation では terminal-browser CLI へ `SIGTERM` を送り、bounded wait 後だけ強制終了して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
 
 #### Dispatch / Composer
 
