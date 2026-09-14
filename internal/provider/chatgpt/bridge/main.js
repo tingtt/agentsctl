@@ -2,7 +2,7 @@
 
 const fs = require("node:fs");
 const net = require("node:net");
-const { app, ipcMain, webContents, BrowserWindow } = require("electron");
+const { ipcMain, webContents, BrowserWindow } = require("electron");
 const { responseCursor, targetFrom } = require("./capture.js");
 const { DiscoveryOwner, captureBelongsToGeneration } = require("./ownership.js");
 
@@ -177,16 +177,25 @@ async function dispatch(request) {
   if (!contents) throw new Error("owned ChatGPT discovery renderer is unavailable");
   const initial = await requestPage({ method: "scrollRegion" });
   if (!initial.found) return { found: false, initial, final: initial, ticks: 0 };
+  // Discovery must never surface a native window: making the discovery
+  // BrowserWindow visible would paint Electron's offscreen native view as
+  // a "No content under offscreen mode" window, and stealing OS-level
+  // focus would yank the user's terminal/editor to the foreground -- see
+  // main.test.js's regression guard. This mirrors terminal-browser's own
+  // hidden-window focus path (BrowserController.focusContent(): a window-
+  // level focus call plus a content-level focus call plus CDP focus
+  // emulation, on a BrowserWindow constructed to never be shown) -- that
+  // same window-level focus call there never makes the window visible
+  // either, which is why the owning BrowserWindow's focus is still taken
+  // below, on that precedent.
   const ownerWindow = BrowserWindow.fromWebContents(contents);
-  if (ownerWindow) {
-    if (ownerWindow.isMinimized()) ownerWindow.restore();
-    ownerWindow.show();
-    ownerWindow.focus();
-  }
-  if (typeof app.focus === "function") app.focus({ steal: true });
+  if (ownerWindow) ownerWindow.focus();
   contents.focus();
   if (!contents.debugger.isAttached()) contents.debugger.attach("1.3");
   await contents.debugger.sendCommand("Emulation.setFocusEmulationEnabled", { enabled: true });
+  if (ownerWindow && ownerWindow.isVisible()) {
+    throw new Error("ChatGPT discovery window became visible -- refusing to deliver wheel input");
+  }
   // Let Chromium observe the focus-emulation transition before delivering
   // the first real wheel detent. The validated terminal-browser path needs
   // this focus state for wheel input to reach the offscreen-rendered page.
