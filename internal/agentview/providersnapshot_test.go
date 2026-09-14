@@ -504,3 +504,283 @@ func TestNonObserverProviderListSuccessClearsPreviousListWarning(t *testing.T) {
 		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
 	}
 }
+
+// This section fixes a second real regression, independent of the
+// warning-preservation one above: once Observer has published a
+// successful full catalog for a provider, that provider's rows belong to
+// Observer -- not List -- from then on (see providerState.
+// observerSnapshotSeen and applyLoadSnapshot's doc comment). Without
+// this, a slower LoadStream List arrival from the same (or an earlier)
+// reload cycle could be delivered AFTER a faster background refresh has
+// already published a newer Observer catalog, silently rolling the UI
+// back to a stale snapshot -- catalogGen alone cannot catch this, since
+// Observer publications are deliberately independent of reload
+// generations (see the DesignDoc's "Observer generations").
+
+// gatedObserverProvider combines gatedProvider's deterministic,
+// one-call-at-a-time control over List with a test-driven Observer
+// subscription (see newObserverFakeProvider) -- needed to construct the
+// exact race this section fixes: a List call held open while an Observer
+// publication is applied out from under it.
+type gatedObserverProvider struct {
+	*gatedProvider
+	updates chan sessionctl.ProviderUpdate
+}
+
+func newGatedObserverProvider(fp *fakeProvider) *gatedObserverProvider {
+	return &gatedObserverProvider{gatedProvider: newGatedProvider(fp), updates: make(chan sessionctl.ProviderUpdate, 8)}
+}
+
+func (g *gatedObserverProvider) Observe(ctx context.Context) <-chan sessionctl.ProviderUpdate {
+	out := make(chan sessionctl.ProviderUpdate, 8)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case upd, ok := <-g.updates:
+				if !ok {
+					return
+				}
+				select {
+				case out <- upd:
+				case <-ctx.Done():
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// TestObserverRowsSurviveDelayedStaleCachedList is the primary
+// acceptance test: a LoadStream List call already in flight when Observer
+// publishes a newer catalog must never be allowed to roll rows back once
+// it finally completes -- exercised across two repeated Ctrl+L cycles to
+// prove the lock-in persists, not just survives once.
+func TestObserverRowsSurviveDelayedStaleCachedList(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newGatedObserverProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	// requestReload below initializes providerSnapshots, but this test
+	// pushes an Observer update before ever draining a catalogEvent (the
+	// only other place currentScope gets set) -- set it explicitly here,
+	// exactly as Run() does before its own first requestReload.
+	rt.currentScope = session.Scope{CurrentDirectory: "/work"}
+
+	// Cycle 1: a reload's List(B) starts and blocks -- modeling the
+	// slower LoadStream arm of a Ctrl+L cycle -- while the faster
+	// background refresh (Observer) completes first with a newer catalog.
+	rt.requestReload(ctx)
+	call := awaitCall(t, chatgpt.calls, 2*time.Second)
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+	if !contains(rowNames(rt.State.Rows), "C") {
+		t.Fatalf("expected C after the Observer publication: %v", rowNames(rt.State.Rows))
+	}
+	close(call.release) // deliver the now-stale List(B)
+	rt.drainCatalog(ctx)
+
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("a stale cached List must never roll rows back once Observer owns them: %v", names)
+	}
+
+	// Cycle 2: repeat Ctrl+L -- the lock-in must persist, not just survive
+	// once. ChatGPT's own List keeps "returning" the stale B.
+	rt.requestReload(ctx)
+	call2 := awaitCall(t, chatgpt.calls, 2*time.Second)
+	close(call2.release)
+	rt.drainCatalog(ctx)
+
+	names = rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("rows must remain C across repeated Ctrl+L cycles: %v", names)
+	}
+}
+
+// TestListBootstrapsRowsBeforeFirstObserverSuccess fixes the other half
+// of the same mechanism: before Observer has ever published successfully,
+// List is still allowed -- expected -- to seed rows (the persisted-cache
+// restart-bootstrap path), and the first Observer success then takes over
+// row ownership from it.
+func TestListBootstrapsRowsBeforeFirstObserverSuccess(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if !contains(rowNames(rt.State.Rows), "B") {
+		t.Fatalf("List must bootstrap rows before any Observer success: %v", rowNames(rt.State.Rows))
+	}
+
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("the first Observer success must take over row ownership from List: %v", names)
+	}
+}
+
+// TestObserverErrorDoesNotBlockBootstrapList fixes that an Observer
+// *failure* never transfers row authority: a persisted-cache bootstrap
+// List result must still be able to seed rows even after an initial
+// background refresh has already failed.
+func TestObserverErrorDoesNotBlockBootstrapList(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	// This test pushes an Observer update before any requestReload call
+	// has ever run (which is what normally lazily initializes
+	// providerSnapshots) -- initialize it explicitly, mirroring Run()'s
+	// own startup sequencing (Observe subscribes before the first
+	// requestReload's background List/Refresh work completes).
+	rt.providerSnapshots = map[session.ProviderID]providerState{}
+	rt.currentScope = session.Scope{CurrentDirectory: "/work"}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Err: errors.New("timeout")}
+	rt.drainObserver(t)
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the observer error to be recorded")
+	}
+
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "B") {
+		t.Fatalf("a persisted-cache bootstrap List must still seed rows after an initial Observer failure: %v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("the observer error's warning must remain (List does not own status for this provider)")
+	}
+}
+
+// TestObserverErrorAfterAuthoritativeSnapshotThenRecovery fixes the tail
+// end of the state machine: once Observer owns rows, a later Observer
+// error must retain those rows and surface as the warning (List still
+// cannot roll them back or clear that warning), and a later Observer
+// success recovers cleanly.
+func TestObserverErrorAfterAuthoritativeSnapshotThenRecovery(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}
+	dRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "d"}, Name: "D", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	// See TestObserverErrorDoesNotBlockBootstrapList's comment: no
+	// requestReload has run yet to lazily initialize these.
+	rt.providerSnapshots = map[session.ProviderID]providerState{}
+	rt.currentScope = session.Scope{CurrentDirectory: "/work"}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Err: errors.New("timeout")}
+	rt.drainObserver(t)
+	if !contains(rowNames(rt.State.Rows), "C") {
+		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the observer error to be recorded")
+	}
+
+	// A stale List(B) must neither roll rows back nor clear the warning.
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("List must neither rollback rows nor clear the warning: %v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("warning must remain after a stale List")
+	}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{dRow}}
+	rt.drainObserver(t)
+	names = rowNames(rt.State.Rows)
+	if !contains(names, "D") || contains(names, "C") {
+		t.Fatalf("expected the later Observer success to replace rows: %v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] != nil {
+		t.Fatalf("expected the later Observer success to clear the warning: %v", rt.State.Warnings[session.ProviderChatGPT])
+	}
+}
+
+// TestObserverEmptySuccessNotRepopulatedByStaleList fixes the nil/empty
+// contract's interaction with row authority: a successful, legitimately
+// empty Observer snapshot is still authoritative -- a later stale,
+// non-empty List result must not repopulate it.
+func TestObserverEmptySuccessNotRepopulatedByStaleList(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	// See TestObserverErrorDoesNotBlockBootstrapList's comment: no
+	// requestReload has run yet to lazily initialize these.
+	rt.providerSnapshots = map[session.ProviderID]providerState{}
+	rt.currentScope = session.Scope{CurrentDirectory: "/work"}
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{}}
+	rt.drainObserver(t)
+	if len(rt.State.Rows) != 0 {
+		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
+	}
+
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if len(rt.State.Rows) != 0 {
+		t.Fatalf("a stale non-empty List must not repopulate an authoritative empty Observer snapshot: %v", rowNames(rt.State.Rows))
+	}
+}
+
+// TestScopeChangeReFiltersObserverOwnedRowsWithoutListReplacement fixes
+// that scope changes keep working once Observer owns a provider's rows:
+// recomputeRows always re-runs MergeSessions/Filter against
+// r.currentScope over whatever providerSnapshots currently holds, so a
+// scope change re-filters Observer-owned rows correctly without any List
+// row replacement being necessary.
+func TestScopeChangeReFiltersObserverOwnedRowsWithoutListReplacement(t *testing.T) {
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/elsewhere"}
+	fp := &fakeProvider{id: session.ProviderChatGPT} // List never itself returns C
+	chatgpt := newObserverFakeProvider(fp)
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx) // ScopeSame (default)
+	rt.drainCatalog(ctx)
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+	if contains(rowNames(rt.State.Rows), "C") {
+		t.Fatalf("C (CWD=/elsewhere) must be filtered out under ScopeSame (/work): %v", rowNames(rt.State.Rows))
+	}
+
+	rt.State.Scope = session.ScopeAll
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if !contains(rowNames(rt.State.Rows), "C") {
+		t.Fatalf("C must reappear once scope widens to ScopeAll, purely via re-filtering (List returned nothing new): %v", rowNames(rt.State.Rows))
+	}
+}
