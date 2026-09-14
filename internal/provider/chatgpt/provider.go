@@ -75,6 +75,20 @@ type Provider struct {
 	pending       bool
 	refreshCancel context.CancelFunc
 
+	// durabilityMu guards durabilityWarning: the current non-fatal LOCAL
+	// durability problem, if any -- set when hydrate's persisted-catalog
+	// load/validation fails, or when an otherwise-successful refresh's
+	// persist fails; cleared the next time persist succeeds (see
+	// setDurabilityWarning/persist). It is deliberately independent of a
+	// remote refresh's own success/failure: a failed remote refresh
+	// publishes its own Err directly (see runRefresh) and never touches
+	// this field, so an unresolved durability problem is re-surfaced on
+	// the next successful refresh rather than silently lost behind an
+	// unrelated transient refresh failure ("latest provider problem
+	// wins" -- see runRefresh's doc comment).
+	durabilityMu      sync.Mutex
+	durabilityWarning error
+
 	// subMu guards subscribers, the set of live Observe channels.
 	subMu       sync.Mutex
 	subscribers map[chan sessionctl.ProviderUpdate]struct{}
@@ -177,35 +191,45 @@ func (p *Provider) startRefreshLocked() {
 // runRefresh performs one full browser cursor enumeration and, only if it
 // completes successfully, atomically replaces catalogCache, persists the
 // new catalog through CatalogStore (if configured), and publishes the new
-// catalog to every Observer subscriber. Any failure (timeout, broken
-// bridge, ambiguous request series, schema drift, cursor cycle, incomplete
-// pagination, context cancellation -- see browser.List/enumerate) leaves
-// the memory cache and persisted catalog exactly as they were and instead
-// publishes (and records) the failure, so cached rows always survive a
-// failed refresh. On completion it starts exactly one more refresh if
-// Refresh was requested again while this one ran (coalescing).
+// catalog to every Observer subscriber. Any remote failure (timeout,
+// broken bridge, ambiguous request series, schema drift, cursor cycle,
+// incomplete pagination, context cancellation -- see browser.List/
+// enumerate) leaves the memory cache and persisted catalog exactly as they
+// were and instead publishes the failure as ProviderUpdate.Err, so cached
+// rows always survive a failed refresh.
 //
-// A persistence write failure (see persist) never un-does the memory
-// replacement above it or suppresses the success publication: the fresh
-// remote result is valid regardless of local durability, and is never
-// discarded or hidden on account of a disk error. It is recorded on the
-// cache (catalogCache.lastErr) for internal/future diagnostic use, but
-// deliberately does not ride along on this cycle's Observer publication --
-// sessionctl.ProviderUpdate's Sessions-xor-Err shape has no way to express
-// "these sessions are valid AND there's also a durability warning" without
-// widening that contract for every Observer provider, which durability
-// alone does not justify.
+// A persistence write failure after an otherwise-successful remote
+// enumeration is different: it never un-does the memory replacement above
+// it or suppresses the publication -- the fresh remote result is valid
+// regardless of local durability, and is never discarded or hidden on
+// account of a disk error. Instead it rides along as
+// ProviderUpdate.Warning on the very same (successful) publication: valid
+// Sessions plus a non-fatal Warning, distinct from a failed refresh's
+// Sessions-less Err (see sessionctl.ProviderUpdate's doc comment).
+//
+// These two problem categories -- "this refresh failed" (Err) and "the
+// last successful refresh's local durability is degraded" (Warning) --
+// are deliberately independent: a remote refresh failure here never
+// touches durabilityWarning, so an unresolved persistence problem is
+// re-surfaced (as Warning) the next time a refresh actually succeeds,
+// rather than being silently cleared or hidden by an unrelated transient
+// refresh failure in between. This is the "latest provider problem wins"
+// policy: whichever of Err/Warning this cycle's own outcome carries is
+// what Agent View shows, without accumulating (e.g. via errors.Join)
+// across cycles.
+//
+// On completion it starts exactly one more refresh if Refresh was
+// requested again while this one ran (coalescing).
 func (p *Provider) runRefresh(ctx context.Context) {
 	conversations, err := p.browser.List(ctx, p.config.ProjectID)
 	if err != nil {
-		p.cache.recordErr(err)
 		p.publish(sessionctl.ProviderUpdate{Err: err})
 	} else {
 		sessions := toSessions(conversations, p.config.Root)
 		refreshedAt := time.Now()
 		p.cache.replaceAt(sessions, refreshedAt)
-		p.persist(conversations, refreshedAt)
-		p.publish(sessionctl.ProviderUpdate{Sessions: sessions})
+		warning := p.persist(conversations, refreshedAt)
+		p.publish(sessionctl.ProviderUpdate{Sessions: sessions, Warning: warning})
 	}
 
 	p.mu.Lock()
@@ -221,10 +245,21 @@ func (p *Provider) runRefresh(ctx context.Context) {
 
 // Observe implements sessionctl.Observer: the channel receives one
 // ProviderUpdate for every completed cache replacement (Err == nil,
-// Sessions == the new full cache) and one for every refresh failure (Err
-// != nil, Sessions == nil -- see sessionctl.ProviderUpdate's doc comment
-// on why a consumer must retain its own last-known Sessions in that case).
-// It closes when ctx ends or the Provider is closed.
+// Sessions == the new full cache, possibly with a non-fatal Warning --
+// see sessionctl.ProviderUpdate's doc comment) and one for every refresh
+// failure (Err != nil, Sessions == nil -- a consumer must retain its own
+// last-known Sessions in that case). It closes when ctx ends or the
+// Provider is closed.
+//
+// If a durability problem is already pending when this subscription is
+// established -- e.g. hydrate's persisted-catalog load/validation failed
+// at construction, before anything ever subscribed to see it published --
+// this new subscriber immediately receives one initial ProviderUpdate
+// carrying the current cache (whatever hydrate managed to install, or
+// none) and that Warning, rather than silently waiting for the next
+// successful refresh to (maybe) surface it. A subscriber joining with no
+// pending durability problem gets no such initial update; it simply waits
+// for the first real publish like always.
 func (p *Provider) Observe(ctx context.Context) <-chan sessionctl.ProviderUpdate {
 	// Buffered 1, not more: with latest-wins publish (see sendLatest),
 	// this single slot always holds exactly the newest not-yet-consumed
@@ -247,6 +282,10 @@ func (p *Provider) Observe(ctx context.Context) <-chan sessionctl.ProviderUpdate
 		p.subscribers = make(map[chan sessionctl.ProviderUpdate]struct{})
 	}
 	p.subscribers[ch] = struct{}{}
+	if warning := p.getDurabilityWarning(); warning != nil {
+		sessions, _ := p.cache.snapshot()
+		sendLatest(ch, sessionctl.ProviderUpdate{Sessions: sessions, Warning: warning})
+	}
 	p.subMu.Unlock()
 
 	go func() {
@@ -363,17 +402,18 @@ func (p *Provider) Close() error {
 // Agent View separately triggers via Refresh.
 //
 // A store read/decode error or an invalid persisted row (see
-// sessionsFromPersisted) is recorded on the cache for diagnostics but
-// does not prevent Provider from working: it simply starts with an empty
-// cache, exactly as if nothing had ever been persisted, and the normal
-// background refresh path takes over from there.
+// sessionsFromPersisted) is recorded as a durability warning (see
+// setDurabilityWarning) -- surfaced to the first Observer subscriber, see
+// Observe -- but does not prevent Provider from working: it simply starts
+// with an empty cache, exactly as if nothing had ever been persisted, and
+// the normal background refresh path takes over from there.
 func (p *Provider) hydrate() {
 	if p.store == nil {
 		return
 	}
 	persisted, ok, err := p.store.ChatGPTCatalog(p.config.ProjectID)
 	if err != nil {
-		p.cache.recordErr(fmt.Errorf("load persisted ChatGPT catalog: %w", err))
+		p.setDurabilityWarning(fmt.Errorf("load persisted ChatGPT catalog: %w", err))
 		return
 	}
 	if !ok {
@@ -381,26 +421,50 @@ func (p *Provider) hydrate() {
 	}
 	sessions, err := sessionsFromPersisted(persisted, p.config.Root)
 	if err != nil {
-		p.cache.recordErr(fmt.Errorf("persisted ChatGPT catalog is invalid: %w", err))
+		p.setDurabilityWarning(fmt.Errorf("persisted ChatGPT catalog is invalid: %w", err))
 		return
 	}
 	p.cache.replaceAt(sessions, persisted.RefreshedAt)
 }
 
 // persist saves conversations (from a just-COMPLETED enumeration -- see
-// runRefresh, the only caller) to p.store under p.config.ProjectID. A
-// nil store is a no-op (persistence is optional -- see CatalogStore's doc
-// comment); a write failure is recorded on the cache but otherwise
-// ignored here -- see runRefresh's doc comment on why it must never
-// affect the memory cache or Observer publication already committed to
-// for this refresh.
-func (p *Provider) persist(conversations []conversation, refreshedAt time.Time) {
+// runRefresh, the only caller) to p.store under p.config.ProjectID and
+// returns the resulting durability warning (nil on success). A nil store
+// is a no-op (persistence is optional -- see CatalogStore's doc comment)
+// and never a durability warning. A write failure sets durabilityWarning
+// (surfaced as this cycle's ProviderUpdate.Warning by runRefresh, and to
+// any later Observer subscriber via Observe until cleared); a write
+// success clears whatever durability warning -- from this call or an
+// earlier hydrate/persist -- was previously set. The write's own error is
+// never treated as a refresh failure: see runRefresh's doc comment on why
+// it must never affect the memory cache or Observer publication already
+// committed to for this refresh.
+func (p *Provider) persist(conversations []conversation, refreshedAt time.Time) error {
 	if p.store == nil {
-		return
+		return nil
 	}
-	if err := p.store.SaveChatGPTCatalog(p.config.ProjectID, toPersistedCatalog(conversations, refreshedAt)); err != nil {
-		p.cache.recordErr(fmt.Errorf("persist ChatGPT catalog: %w", err))
+	err := p.store.SaveChatGPTCatalog(p.config.ProjectID, toPersistedCatalog(conversations, refreshedAt))
+	if err != nil {
+		err = fmt.Errorf("persist ChatGPT catalog: %w", err)
 	}
+	p.setDurabilityWarning(err)
+	return err
+}
+
+// setDurabilityWarning atomically sets (or, given nil, clears)
+// durabilityWarning -- see its doc comment on Provider for the full
+// contract.
+func (p *Provider) setDurabilityWarning(err error) {
+	p.durabilityMu.Lock()
+	p.durabilityWarning = err
+	p.durabilityMu.Unlock()
+}
+
+// getDurabilityWarning returns the current durability warning, if any.
+func (p *Provider) getDurabilityWarning() error {
+	p.durabilityMu.Lock()
+	defer p.durabilityMu.Unlock()
+	return p.durabilityWarning
 }
 
 // sessionsFromPersisted validates and converts a persisted catalog into
@@ -471,15 +535,19 @@ func toSessions(conversations []conversation, root string) []session.Session {
 }
 
 // catalogCache is ChatGPT's last-known-good in-memory catalog: replaced
-// only by a COMPLETE background enumeration (see Provider.runRefresh),
-// never by a partial or failed one. It is memory-only for the life of one
-// Provider/process -- nothing here persists to disk.
+// only by a COMPLETE background enumeration or a valid hydration (see
+// Provider.runRefresh/hydrate), never by a partial or failed one. It is
+// memory-only for the life of one Provider/process -- nothing here
+// persists to disk (see CatalogStore for that). It deliberately holds no
+// error state of its own: a failed refresh publishes its Err directly
+// (see runRefresh), and a hydration/persistence problem is tracked
+// separately as Provider.durabilityWarning -- neither is "about the
+// cache" the way sessions/hasSnapshot/refreshedAt are.
 type catalogCache struct {
 	mu          sync.RWMutex
 	sessions    []session.Session
 	hasSnapshot bool
 	refreshedAt time.Time
-	lastErr     error
 }
 
 // snapshot returns an independent copy of the current cache -- never a
@@ -510,8 +578,7 @@ func (c *catalogCache) replace(sessions []session.Session) {
 // hydration itself is not a refresh), copying its input so the caller's
 // own slice (and any earlier snapshot still held by another goroutine) is
 // never shared with -- or later mutated through -- the cache's backing
-// storage. It also clears any previously recorded error: a successful
-// replacement (or valid hydration) supersedes it.
+// storage.
 func (c *catalogCache) replaceAt(sessions []session.Session, refreshedAt time.Time) {
 	cp := make([]session.Session, len(sessions))
 	copy(cp, sessions)
@@ -519,15 +586,5 @@ func (c *catalogCache) replaceAt(sessions []session.Session, refreshedAt time.Ti
 	c.sessions = cp
 	c.hasSnapshot = true
 	c.refreshedAt = refreshedAt
-	c.lastErr = nil
-	c.mu.Unlock()
-}
-
-// recordErr records a failed refresh's error without touching sessions or
-// hasSnapshot -- the defining last-known-good guarantee: a failed refresh
-// never evicts or overwrites whatever the cache already held.
-func (c *catalogCache) recordErr(err error) {
-	c.mu.Lock()
-	c.lastErr = err
 	c.mu.Unlock()
 }
