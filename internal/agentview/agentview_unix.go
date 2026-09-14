@@ -39,15 +39,35 @@ type Runtime struct {
 	Worktrees func(ctx context.Context, dir string) []string
 
 	// usageCh receives incremental sessionctl.Controller.UsageStream
-	// results from reload's background usage fetch, each tagged with the
-	// reload cycle that started it (usageGen) -- see refreshUsageAsync.
-	// Lazily initialized (nil is a valid zero value): a Runtime built
-	// directly for a test that only calls reload/act, with no event loop
-	// draining it, never blocks on it either, since UsageStream only ever
-	// starts a goroutine for a provider that actually implements
-	// UsageSource (see sessionctl.Controller.UsageStream).
+	// results from refreshUsageAsync's background usage fetch, each tagged
+	// with the reload cycle that started it (usageGen) -- see
+	// refreshUsageAsync. Lazily initialized (nil is a valid zero value): a
+	// Runtime built directly for a test that only calls requestReload/act,
+	// with no event loop draining it, never blocks on it either, since
+	// UsageStream only ever starts a goroutine for a provider that
+	// actually implements UsageSource (see sessionctl.Controller.
+	// UsageStream).
 	usageCh  chan usageEvent
 	usageGen int
+
+	// catalogCh receives one catalogEvent per requestReload cycle, from
+	// the background goroutine requestReload starts -- see its doc
+	// comment. Lazily initialized (nil is a valid zero value) the same way
+	// usageCh is.
+	catalogCh chan catalogEvent
+	// catalogGen is the current reload cycle's generation: eventLoop's
+	// catalogCh case drops any catalogEvent whose gen doesn't match, so an
+	// older, superseded reload's Snapshot (e.g. a slow ChatGPT List that
+	// lost a race with a second Ctrl+L) can never overwrite a newer
+	// cycle's already-applied result.
+	catalogGen int
+	// catalogCancel cancels the most recently started reload cycle's own
+	// child context (see requestReload) -- called again (superseding the
+	// previous cycle) each time requestReload runs, and once more when Run
+	// returns, so no reload goroutine outlives the overview. It never
+	// cancels ctx itself, so the underlying provider/runtime (e.g. the
+	// ChatGPT discovery bridge) stays reusable for the next reload.
+	catalogCancel context.CancelFunc
 
 	terminal        overviewLifecycle
 	runPromptEditor promptEditorRunner
@@ -60,6 +80,24 @@ type usageEvent struct {
 	provider session.ProviderID
 	usage    session.Usage
 	err      error
+}
+
+// catalogEvent is one incremental merged Snapshot carried over
+// Runtime.catalogCh, stamped with the reload cycle (gen) that started the
+// fetch it came from -- see requestReload and eventLoop's catalogCh case.
+// requestReload's background goroutine sends one catalogEvent per provider
+// arrival from sessionctl.Controller.LoadStream, each carrying the merge
+// (sessionctl.Controller.MergeSessions) of every provider heard from so
+// far in this cycle -- so a fast provider's rows (Claude, Codex) reach
+// State well before a slow one (ChatGPT) finishes, rather than waiting
+// behind it. done marks the last event for this generation (every provider
+// has now reported, successfully or not) -- only then does eventLoop clear
+// State.CatalogLoading and start a usage refresh (see eventLoop's
+// catalogCh case).
+type catalogEvent struct {
+	gen      int
+	snapshot sessionctl.Snapshot
+	done     bool
 }
 
 // keyResult is one physically-decoded key read (or read error), carried
@@ -82,25 +120,31 @@ func startKeyRead(reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent,
 	}()
 }
 
-// Run starts the terminal event loop: raw mode, an initial catalog load,
-// then render-and-wait for either the next physical key or a background
-// usage update, until IntentQuit or a read error.
+// Run starts the terminal event loop: raw mode, an initial catalog reload
+// request, then render-and-wait for the next physical key, background
+// usage update, or background catalog reload result, until IntentQuit or
+// a read error.
 //
-// Usage is never on this loop's critical path (see reload/
-// refreshUsageAsync): the first frame renders as soon as the catalog
-// loads, without waiting for any provider's usage, and a usage update
-// arriving later triggers its own redraw without consuming or requiring a
-// key press.
+// Neither a provider's catalog List nor its usage probe is ever on this
+// loop's critical path (see requestReload/refreshUsageAsync): the first
+// frame renders immediately, before the initial reload's provider fetches
+// have even started, let alone completed -- Rows stays whatever it already
+// was (empty, for a fresh Runtime) until each provider's own catalogEvent
+// arrives on r.catalogCh and eventLoop applies it. A slow or hung provider
+// (e.g. ChatGPT's multi-page browser-backed discovery walk) therefore
+// never blocks keyboard input, composer editing, help, or quit -- nor does
+// it hold back a faster provider's rows (Claude, Codex) from appearing and
+// staying actionable in the meantime (see catalogEvent's doc comment).
 //
 // Input ownership: while Run owns the overview, exactly one key-read
 // goroutine is ever outstanding (see startKeyRead) -- it is consumed
 // (removing it) before intent handling begins, and no state ever races a
-// usage update against handling that intent, since both are only ever
-// processed from this one select loop. IntentOpen's provider Open call
-// (agentview.Runtime.act) therefore always runs with zero outstanding
-// Agent View readers on r.Input, so the real terminal is safe to hand to
-// the attached child. The next key read is only started again after
-// act() returns control to the overview.
+// usage or catalog update against handling that intent, since all three
+// are only ever processed from this one select loop. IntentOpen's
+// provider Open call (agentview.Runtime.act) therefore always runs with
+// zero outstanding Agent View readers on r.Input, so the real terminal is
+// safe to hand to the attached child. The next key read is only started
+// again after act() returns control to the overview.
 func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	if r.Input == nil {
 		r.Input = os.Stdin
@@ -117,7 +161,17 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 		r.terminal = nil
 		runErr = errors.Join(runErr, terminal.close())
 	}()
-	r.reload(ctx)
+	// The last reload cycle's own child context is cancelled on the way
+	// out regardless of how Run is returning (IntentQuit, a key-read
+	// error, ...), so a catalog fetch still in flight (e.g. ChatGPT still
+	// paginating) is torn down with the overview rather than left running
+	// to completion for a Snapshot nothing will ever apply.
+	defer func() {
+		if r.catalogCancel != nil {
+			r.catalogCancel()
+		}
+	}()
+	r.requestReload(ctx)
 	r.render()
 	reader := bufio.NewReader(r.Input)
 	readKeyFn := r.ReadKey
@@ -169,6 +223,39 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				r.State.ApplyUsageUpdate(upd.provider, upd.usage, upd.err)
 				r.render()
 			}
+		case update := <-r.catalogCh:
+			// A Snapshot from an older, superseded reload cycle (e.g. a
+			// slow ChatGPT List that lost a race with a second Ctrl+L, or a
+			// scope change requested before the previous scope's Load
+			// finished) is dropped: only the latest requestReload call may
+			// ever update State (see requestReload's doc comment) -- this
+			// is the correctness half of that guarantee; requestReload's
+			// own context cancellation is the save-work half.
+			if update.gen != r.catalogGen {
+				break
+			}
+			// Every provider heard from so far this cycle is already
+			// merged into update.snapshot (see catalogEvent's doc
+			// comment) -- applied here regardless of update.done, so a
+			// fast provider's rows (Claude, Codex) render as soon as they
+			// arrive, without waiting on a slower one (ChatGPT) still in
+			// flight.
+			r.State.SetRows(update.snapshot.Sessions)
+			r.State.Warnings = update.snapshot.Warnings
+			if update.done {
+				r.State.CatalogLoading = false
+				// Usage is deliberately started only once every provider
+				// in this cycle has reported, from the final accepted
+				// Snapshot, rather than once per provider arrival or from
+				// requestReload itself: a superseded reload's own usage
+				// cycle would just be discarded work for state the
+				// catalogGen check above already threw away, and starting
+				// it on every partial arrival would refetch usage for
+				// providers that already reported earlier in the same
+				// cycle.
+				r.refreshUsageAsync(ctx)
+			}
+			r.render()
 		}
 	}
 }
@@ -199,39 +286,130 @@ func normalizeTerminalNewlines(value string) string {
 	return b.String()
 }
 
-// reload re-fetches the session catalog synchronously -- render-ready the
-// moment it returns -- then kicks off a usage refresh in the background
-// (see refreshUsageAsync). Usage is deliberately NOT fetched here: a slow
-// or hung provider (a Claude usage probe waiting out its own timeout, for
-// instance) must never add its latency to catalog loading, since reload
-// runs on Run's own critical path for startup, every Ctrl+/ or Ctrl+L
-// refresh, and every provider action whose sessionctl.Result asks for a
-// reload (including returning from a detached session) -- see the
-// DesignDoc's Agent View responsiveness guarantee.
+// requestReload starts one catalog reload cycle in the background and
+// returns immediately -- Run's event loop is never blocked on a
+// provider's List, however slow (e.g. ChatGPT's multi-page browser-backed
+// discovery walk), since requestReload runs on Run's own critical path
+// for startup, every Ctrl+/ or Ctrl+L refresh, and every provider action
+// whose sessionctl.Result asks for a reload (including returning from a
+// detached session) -- see the DesignDoc's Agent View responsiveness
+// guarantee.
 //
-// State.Usage is never cleared here either: whatever was already known
-// keeps rendering until refreshUsageAsync's own updates replace it,
-// provider by provider, so a reload never flickers the usage line blank.
-func (r *Runtime) reload(ctx context.Context) {
+// Each call:
+//   - snapshots the scope inputs (CWD, State.Scope, Worktrees) on the
+//     calling goroutine, since State is otherwise only ever touched from
+//     Run's own event-loop goroutine -- the (possibly slow) Worktrees
+//     discovery call itself then runs in the background along with the
+//     provider fetch, not here;
+//   - cancels the previous reload cycle's own child context (see
+//     catalogCancel), so a superseded ChatGPT List/enumeration stops
+//     doing work for a Snapshot that will be discarded -- but never
+//     touches ctx itself, so the provider/runtime stays reusable for the
+//     next reload (e.g. the ChatGPT runtime's own mutex-serialized List
+//     unblocks and re-locks for the new cycle once the old call unwinds);
+//   - increments catalogGen and stamps every catalogEvent this cycle sends
+//     with it, so eventLoop's catalogCh case can drop a stale cycle's
+//     Snapshot if a newer one already applied (mirroring the
+//     usageGen/usageCh precedent).
+//
+// Providers are fetched via sessionctl.Controller.LoadStream, not Load:
+// each provider's own ProviderSnapshot is merged into the running total
+// (sessionctl.Controller.MergeSessions) and sent as its own catalogEvent
+// the moment it arrives, rather than collecting every provider into one
+// batch behind the slowest -- see catalogEvent's doc comment. This is what
+// lets Claude/Codex rows render (and stay actionable) without waiting on a
+// slow or erroring ChatGPT.
+//
+// Until each provider has reported, State.Rows keeps rendering whatever
+// it already held for that provider's contribution (see eventLoop's
+// catalogCh case for where a new Snapshot actually replaces it) -- old
+// rows, and the selection/action target they carry, stay visible and
+// usable rather than flashing empty. State.CatalogLoading is set so the
+// view can render a small "loading sessions…" indicator until the whole
+// cycle (every provider) finishes.
+func (r *Runtime) requestReload(ctx context.Context) {
 	r.State.StartupCWD = r.CWD
-	scope := session.Scope{CurrentDirectory: r.CWD, Directory: r.State.Scope}
-	if r.State.Scope == session.ScopeDescendants && r.Worktrees != nil {
-		scope.WorktreeDirectories = r.Worktrees(ctx, r.CWD)
+	cwd, dirScope, worktrees := r.CWD, r.State.Scope, r.Worktrees
+
+	if r.catalogCh == nil {
+		r.catalogCh = make(chan catalogEvent, 1)
 	}
-	snap := r.Controller.Load(ctx, scope)
-	r.State.SetRows(snap.Sessions)
-	r.State.Warnings = snap.Warnings
-	r.refreshUsageAsync(ctx)
+	if r.catalogCancel != nil {
+		r.catalogCancel()
+	}
+	childCtx, cancel := context.WithCancel(ctx)
+	r.catalogCancel = cancel
+	r.catalogGen++
+	gen := r.catalogGen
+	r.State.CatalogLoading = true
+
+	ch := r.catalogCh
+	providerCount := len(r.Controller.Providers)
+	go func() {
+		scope := session.Scope{CurrentDirectory: cwd, Directory: dirScope}
+		if dirScope == session.ScopeDescendants && worktrees != nil {
+			scope.WorktreeDirectories = worktrees(childCtx, cwd)
+		}
+		if providerCount == 0 {
+			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, snapshot: sessionctl.Snapshot{Warnings: map[session.ProviderID]error{}}, done: true})
+			return
+		}
+		var sessions []session.Session
+		warnings := make(map[session.ProviderID]error)
+		remaining := providerCount
+		// Always fully drains LoadStream (even once superseded --
+		// childCtx.Done() only skips the *send* below, never the loop
+		// itself) so a still-running provider's own goroutine can never
+		// block forever trying to hand off a result nothing reads.
+		for ps := range r.Controller.LoadStream(childCtx) {
+			remaining--
+			if ps.Err != nil {
+				warnings[ps.Provider] = ps.Err
+			} else {
+				sessions = append(sessions, ps.Sessions...)
+			}
+			snap := sessionctl.Snapshot{
+				Sessions: r.Controller.MergeSessions(sessions, scope),
+				Warnings: cloneProviderWarnings(warnings),
+			}
+			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, snapshot: snap, done: remaining == 0})
+		}
+	}()
+}
+
+// sendCatalogEvent delivers ev on ch unless childCtx has already ended -- a superseded
+// reload cycle's own catalogEvent is simply dropped rather than blocking
+// on (or stale-writing into) a channel eventLoop may no longer be
+// draining for this generation.
+func sendCatalogEvent(ch chan<- catalogEvent, childCtx context.Context, ev catalogEvent) {
+	select {
+	case ch <- ev:
+	case <-childCtx.Done():
+	}
+}
+
+// cloneProviderWarnings copies m: requestReload's goroutine keeps
+// accumulating into its own warnings map across LoadStream arrivals, so
+// each catalogEvent it sends needs its own independent snapshot of that
+// map rather than a shared reference the next iteration would go on to
+// mutate out from under whatever already received (or is about to
+// receive) this one.
+func cloneProviderWarnings(m map[session.ProviderID]error) map[session.ProviderID]error {
+	out := make(map[session.ProviderID]error, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // refreshUsageAsync starts one usage-refresh cycle in the background via
 // sessionctl.Controller.UsageStream, forwarding each provider's result to
 // r.usageCh as it arrives, tagged with this cycle's generation (see
-// usageEvent). It returns immediately -- callers (reload) never wait on
-// it -- and uses ctx as given (the long-lived, app-scoped context Run was
-// called with, not a context bound to this call), so the fetch keeps
-// running to completion (or ctx cancellation, e.g. agentsctl exiting) even
-// though reload has already returned.
+// usageEvent). It returns immediately -- callers never wait on it -- and
+// uses ctx as given (the long-lived, app-scoped context Run was called
+// with, not a context bound to this call), so the fetch keeps running to
+// completion (or ctx cancellation, e.g. agentsctl exiting) even though the
+// caller has already returned.
 func (r *Runtime) refreshUsageAsync(ctx context.Context) {
 	if r.usageCh == nil {
 		r.usageCh = make(chan usageEvent, 8)
@@ -248,16 +426,19 @@ func (r *Runtime) refreshUsageAsync(ctx context.Context) {
 
 // act carries out intent via the Controller and applies its Result to
 // State: IntentNone/IntentRefresh short-circuit (a plain Ctrl+/ or Ctrl+L
-// refresh is exactly "reload, no operation"), otherwise every operation's
-// sessionctl.Result decides Reload vs. local Patch application -- Run's
-// loop above never hardcodes a per-intent refresh policy (see
-// sessionctl.Result's doc comment).
+// refresh is exactly "request a reload, no operation"), otherwise every
+// operation's sessionctl.Result decides Reload vs. local Patch
+// application -- Run's loop above never hardcodes a per-intent refresh
+// policy (see sessionctl.Result's doc comment). act itself never blocks
+// on a reload it requests (see requestReload/applyResult): it returns as
+// soon as the operation's own provider call (and, for Reload results, the
+// background fetch it starts) is under way.
 func (r *Runtime) act(ctx context.Context, x Intent) error {
 	if x.Kind == IntentNone {
 		return nil
 	}
 	if x.Kind == IntentRefresh {
-		r.reload(ctx)
+		r.requestReload(ctx)
 		return nil
 	}
 	switch x.Kind {
@@ -314,12 +495,13 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 	return nil
 }
 
-// applyResult reflects one operation's sessionctl.Result: Reload re-runs
-// the full catalog load, otherwise a non-nil Patch is applied locally
+// applyResult reflects one operation's sessionctl.Result: Reload starts a
+// new background reload cycle (see requestReload) rather than re-running
+// the catalog load in place, otherwise a non-nil Patch is applied locally
 // (see State.ApplyPatch) with no provider round-trip.
 func (r *Runtime) applyResult(ctx context.Context, result sessionctl.Result) {
 	if result.Reload {
-		r.reload(ctx)
+		r.requestReload(ctx)
 		return
 	}
 	if result.Patch != nil {

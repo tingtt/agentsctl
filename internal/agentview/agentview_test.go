@@ -26,8 +26,18 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) ID() session.ProviderID { return f.id }
+
+// List returns a copy of f.rows, not f.rows itself: sessionctl.Controller.
+// Load's actionsFor mutates each returned session.Session's Actions field
+// in place (rows[i].Actions = ...), and now that Runtime.requestReload
+// runs Load in the background (see agentview_unix.go), that mutation can
+// race with a test goroutine reading f.rows/p.rows directly right after
+// an act() call -- exactly what a real provider's List (which never hands
+// back a live reference into its own mutable state) never risks either.
 func (f *fakeProvider) List(context.Context, bool) ([]session.Session, error) {
-	return f.rows, nil
+	rows := make([]session.Session, len(f.rows))
+	copy(rows, f.rows)
+	return rows, nil
 }
 func (f *fakeProvider) Dispatch(_ context.Context, prompt, cwd string) (session.Session, error) {
 	s := session.Session{Key: session.Key{Provider: f.id, ID: "new"}, Name: prompt, CWD: cwd}
@@ -89,7 +99,7 @@ func newTestRuntime(provider *fakeProvider) *Runtime {
 		State:      NewState(),
 		CWD:        "/work",
 	}
-	rt.reload(context.Background())
+	rt.syncReload(context.Background())
 	return rt
 }
 
@@ -102,7 +112,7 @@ func TestRuntimeCtrlTUnpinSelectsRemainingPinnedSession(t *testing.T) {
 		State:      NewState(),
 		CWD:        "/work",
 	}
-	rt.reload(context.Background())
+	rt.syncReload(context.Background())
 	rt.State.selectIndex(0)
 
 	intent := rt.State.Handle(KeyEvent{Key: KeyCtrlT})
@@ -134,6 +144,10 @@ func TestRuntimeDispatchReloadsAndShowsNewSession(t *testing.T) {
 	if rt.State.Composer.Prompt != "" {
 		t.Fatalf("composer not cleared: %q", rt.State.Composer.Prompt)
 	}
+	// Dispatch's Result.Reload starts a background reload cycle (see
+	// Runtime.applyResult) rather than applying synchronously -- wait for
+	// it to land before asserting on rt.State.Rows.
+	rt.drainCatalog(context.Background())
 	found := false
 	for _, row := range rt.State.Rows {
 		if row.Key.ID == "new" {
@@ -162,7 +176,7 @@ func TestRuntimeDispatchUsesSelectedSessionCWDNotStartupCWD(t *testing.T) {
 	// ("/work"), so widen scope past ScopeSame's exact-match filter to
 	// keep it selectable.
 	rt.State.Scope = session.ScopeAll
-	rt.reload(context.Background())
+	rt.syncReload(context.Background())
 	rt.State.selectIndex(0)
 	if got := rt.State.ComposerCWD(); got != "/work/repo-a" {
 		t.Fatalf("ComposerCWD()=%q, want the selected row's own CWD", got)
@@ -302,10 +316,14 @@ func TestRuntimeStopAndArchiveReachProviderAndReload(t *testing.T) {
 	if len(p.stopped) != 1 || p.stopped[0] != target {
 		t.Fatalf("provider Stop not reached: %+v", p.stopped)
 	}
+	// Wait for Stop's own background reload (Result.Reload) to finish
+	// reading p.rows before mutating it below -- otherwise the write races
+	// the reload goroutine's concurrent List call under -race.
+	rt.drainCatalog(context.Background())
 
 	// Now archive it away (two presses).
 	p.rows = []session.Session{{Key: target, CWD: "/work", Actions: session.Actions{session.ActionArchive: {Available: true}}}}
-	rt.reload(context.Background())
+	rt.syncReload(context.Background())
 	rt.State.selectIndex(0)
 	rt.State.Handle(KeyEvent{Key: KeyCtrlX})
 	archiveIntent := rt.State.Handle(KeyEvent{Key: KeyCtrlX})
@@ -315,6 +333,9 @@ func TestRuntimeStopAndArchiveReachProviderAndReload(t *testing.T) {
 	if err := rt.act(context.Background(), archiveIntent); err != nil {
 		t.Fatal(err)
 	}
+	// Archive's Result.Reload starts a background reload cycle -- wait for
+	// it to land before asserting the row is gone.
+	rt.drainCatalog(context.Background())
 	if len(rt.State.Rows) != 0 {
 		t.Fatalf("archived session must be gone after reload: %+v", rt.State.Rows)
 	}
