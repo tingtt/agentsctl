@@ -139,8 +139,11 @@ func (r *Runtime) drainCatalog(ctx context.Context) {
 			if upd.gen != r.catalogGen {
 				continue
 			}
-			r.State.SetRows(upd.snapshot.Sessions)
-			r.State.Warnings = upd.snapshot.Warnings
+			r.currentScope = upd.scope
+			if upd.ps.Provider != "" {
+				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err)
+			}
+			r.recomputeRows()
 			if upd.done {
 				r.State.CatalogLoading = false
 				r.refreshUsageAsync(ctx)

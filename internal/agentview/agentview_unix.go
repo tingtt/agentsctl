@@ -57,9 +57,9 @@ type Runtime struct {
 	catalogCh chan catalogEvent
 	// catalogGen is the current reload cycle's generation: eventLoop's
 	// catalogCh case drops any catalogEvent whose gen doesn't match, so an
-	// older, superseded reload's Snapshot (e.g. a slow ChatGPT List that
-	// lost a race with a second Ctrl+L) can never overwrite a newer
-	// cycle's already-applied result.
+	// older, superseded reload's ProviderSnapshot (e.g. a slow ChatGPT
+	// List that lost a race with a second Ctrl+L) can never overwrite a
+	// newer cycle's already-applied result.
 	catalogGen int
 	// catalogCancel cancels the most recently started reload cycle's own
 	// child context (see requestReload) -- called again (superseding the
@@ -69,8 +69,51 @@ type Runtime struct {
 	// ChatGPT discovery bridge) stays reusable for the next reload.
 	catalogCancel context.CancelFunc
 
+	// providerSnapshots is Agent View's provider snapshot store: the
+	// latest known sessions + refresh warning for every provider heard
+	// from so far, retained across reload cycles (see applyProviderUpdate/
+	// recomputeRows) rather than rebuilt from scratch each cycle -- so a
+	// provider that hasn't reported yet in the current cycle (e.g. a
+	// Refresher still enumerating in the background) never disappears
+	// from Rows, and a failed refresh only sets that provider's warning
+	// without discarding its previously-known sessions. Only ever touched
+	// from the eventLoop goroutine. Lazily initialized the same way
+	// catalogCh is.
+	providerSnapshots map[session.ProviderID]providerState
+	// currentScope is the directory Scope basis (including any resolved
+	// worktree directories) most recently computed by requestReload --
+	// reused by both the catalogCh and observerCh cases to re-merge
+	// providerSnapshots, since an Observer update can arrive independent
+	// of any specific reload cycle and must not re-run Worktrees
+	// discovery itself (I/O this goroutine never performs). See Run's
+	// initial assignment for the value in effect before the first reload
+	// cycle's own (worktree-resolved) scope arrives.
+	currentScope session.Scope
+
+	// observerCh receives every sessionctl.ObserverUpdate from
+	// sessionctl.Controller.Observe -- subscribed exactly once, at Run
+	// startup (see Run), independent of catalogGen/reload cycles: a
+	// completed ChatGPT refresh (or any other Observer provider) updates
+	// Rows the moment it publishes, even with no reload in flight, and is
+	// never dropped merely because a newer Ctrl+L started a fresh reload
+	// cycle in the meantime (see the DesignDoc's "Observer generations").
+	// Set to nil once the underlying channel closes (ctx ended, or no
+	// configured provider implements Observer), removing this case from
+	// eventLoop's select rather than busy-looping on a closed channel.
+	observerCh <-chan sessionctl.ObserverUpdate
+
 	terminal        overviewLifecycle
 	runPromptEditor promptEditorRunner
+}
+
+// providerState is one provider's retained catalog entry in
+// Runtime.providerSnapshots: the latest known sessions and the latest
+// refresh warning, tracked independently so a failed refresh (an
+// Observer's error update, or a LoadStream provider error) never
+// discards previously-known sessions -- see applyProviderUpdate.
+type providerState struct {
+	sessions []session.Session
+	warning  error
 }
 
 // usageEvent is one sessionctl.UsageUpdate carried over Runtime.usageCh,
@@ -82,22 +125,27 @@ type usageEvent struct {
 	err      error
 }
 
-// catalogEvent is one incremental merged Snapshot carried over
+// catalogEvent is one provider's LoadStream arrival carried over
 // Runtime.catalogCh, stamped with the reload cycle (gen) that started the
 // fetch it came from -- see requestReload and eventLoop's catalogCh case.
 // requestReload's background goroutine sends one catalogEvent per provider
-// arrival from sessionctl.Controller.LoadStream, each carrying the merge
-// (sessionctl.Controller.MergeSessions) of every provider heard from so
-// far in this cycle -- so a fast provider's rows (Claude, Codex) reach
-// State well before a slow one (ChatGPT) finishes, rather than waiting
-// behind it. done marks the last event for this generation (every provider
-// has now reported, successfully or not) -- only then does eventLoop clear
+// arrival from sessionctl.Controller.LoadStream (ps), which eventLoop
+// applies into Runtime.providerSnapshots (see applyProviderUpdate) and
+// re-merges -- so a fast provider's rows (Claude, Codex) reach State well
+// before a slow one finishes, rather than waiting behind it, and a
+// provider that already reported in an earlier cycle keeps showing its
+// last-known rows until this cycle's own arrival for it replaces them.
+// done marks the last event for this generation (every provider has now
+// reported, successfully or not) -- only then does eventLoop clear
 // State.CatalogLoading and start a usage refresh (see eventLoop's
-// catalogCh case).
+// catalogCh case). scope is this cycle's resolved directory Scope (see
+// Runtime.currentScope), carried on every event so eventLoop never needs
+// to re-run Worktrees discovery itself.
 type catalogEvent struct {
-	gen      int
-	snapshot sessionctl.Snapshot
-	done     bool
+	gen   int
+	ps    sessionctl.ProviderSnapshot
+	scope session.Scope
+	done  bool
 }
 
 // keyResult is one physically-decoded key read (or read error), carried
@@ -171,6 +219,23 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 			r.catalogCancel()
 		}
 	}()
+	// currentScope's synchronous default (no worktree resolution -- that
+	// only matters for ScopeDescendants, and a fresh State starts scoped
+	// to ScopeSame) covers the narrow race where an Observer publishes
+	// before requestReload's own background goroutine has resolved and
+	// carried its first (possibly worktree-resolved) scope; that first
+	// catalogEvent immediately supersedes it regardless.
+	r.currentScope = session.Scope{CurrentDirectory: r.CWD, Directory: r.State.Scope}
+	// Observer providers (e.g. ChatGPT) are subscribed exactly once here,
+	// for Run's entire lifetime -- never re-subscribed per reload cycle
+	// (see observerCh's doc comment). observeCtx is Run's own child
+	// context (not ctx itself, and not any per-reload catalogCancel
+	// child), cancelled in this defer so the subscription always ends
+	// when Run returns, for any reason (IntentQuit, a key-read error, ...)
+	// -- not only when the caller eventually cancels ctx.
+	observeCtx, observeCancel := context.WithCancel(ctx)
+	defer observeCancel()
+	r.observerCh = r.Controller.Observe(observeCtx)
 	r.requestReload(ctx)
 	r.render()
 	reader := bufio.NewReader(r.Input)
@@ -224,7 +289,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				r.render()
 			}
 		case update := <-r.catalogCh:
-			// A Snapshot from an older, superseded reload cycle (e.g. a
+			// An arrival from an older, superseded reload cycle (e.g. a
 			// slow ChatGPT List that lost a race with a second Ctrl+L, or a
 			// scope change requested before the previous scope's Load
 			// finished) is dropped: only the latest requestReload call may
@@ -234,19 +299,23 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 			if update.gen != r.catalogGen {
 				break
 			}
-			// Every provider heard from so far this cycle is already
-			// merged into update.snapshot (see catalogEvent's doc
+			r.currentScope = update.scope
+			// Every provider heard from so far this cycle already
+			// applied its own catalogEvent (see catalogEvent's doc
 			// comment) -- applied here regardless of update.done, so a
 			// fast provider's rows (Claude, Codex) render as soon as they
-			// arrive, without waiting on a slower one (ChatGPT) still in
-			// flight.
-			r.State.SetRows(update.snapshot.Sessions)
-			r.State.Warnings = update.snapshot.Warnings
+			// arrive, without waiting on a slower one still in flight.
+			// ps.Provider is only empty for the zero-provider-configured
+			// case, which has nothing to apply.
+			if update.ps.Provider != "" {
+				r.applyProviderUpdate(update.ps.Provider, update.ps.Sessions, update.ps.Err)
+			}
+			r.recomputeRows()
 			if update.done {
 				r.State.CatalogLoading = false
 				// Usage is deliberately started only once every provider
 				// in this cycle has reported, from the final accepted
-				// Snapshot, rather than once per provider arrival or from
+				// arrival, rather than once per provider arrival or from
 				// requestReload itself: a superseded reload's own usage
 				// cycle would just be discarded work for state the
 				// catalogGen check above already threw away, and starting
@@ -255,6 +324,20 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				// cycle.
 				r.refreshUsageAsync(ctx)
 			}
+			r.render()
+		case update, ok := <-r.observerCh:
+			// Independent of catalogGen/reload cycles by design (see
+			// observerCh's doc comment): a completed provider refresh is
+			// authoritative the moment it publishes, whether or not a
+			// reload cycle is currently in flight, and is never dropped
+			// merely because a newer Ctrl+L started one since this
+			// subscription began.
+			if !ok {
+				r.observerCh = nil
+				break
+			}
+			r.applyProviderUpdate(update.Provider, update.Sessions, update.Err)
+			r.recomputeRows()
 			r.render()
 		}
 	}
@@ -313,26 +396,38 @@ func normalizeTerminalNewlines(value string) string {
 //     usageGen/usageCh precedent).
 //
 // Providers are fetched via sessionctl.Controller.LoadStream, not Load:
-// each provider's own ProviderSnapshot is merged into the running total
-// (sessionctl.Controller.MergeSessions) and sent as its own catalogEvent
-// the moment it arrives, rather than collecting every provider into one
-// batch behind the slowest -- see catalogEvent's doc comment. This is what
-// lets Claude/Codex rows render (and stay actionable) without waiting on a
-// slow or erroring ChatGPT.
+// each provider's own ProviderSnapshot is applied into
+// Runtime.providerSnapshots (see applyProviderUpdate) and sent as its own
+// catalogEvent the moment it arrives, rather than collecting every
+// provider into one batch behind the slowest -- see catalogEvent's doc
+// comment. This is what lets Claude/Codex rows render (and stay
+// actionable) without waiting on a slow or erroring ChatGPT.
 //
-// Until each provider has reported, State.Rows keeps rendering whatever
-// it already held for that provider's contribution (see eventLoop's
-// catalogCh case for where a new Snapshot actually replaces it) -- old
-// rows, and the selection/action target they carry, stay visible and
-// usable rather than flashing empty. State.CatalogLoading is set so the
-// view can render a small "loading sessions…" indicator until the whole
-// cycle (every provider) finishes.
+// Until each provider has reported for this cycle, State.Rows keeps
+// rendering whatever providerSnapshots already held for that provider
+// (see eventLoop's catalogCh case for where a new arrival actually
+// replaces it) -- old rows, and the selection/action target they carry,
+// stay visible and usable rather than flashing empty. State.CatalogLoading
+// is set so the view can render a small "loading sessions…" indicator
+// until the whole cycle (every provider) finishes.
+//
+// Separately, every provider implementing sessionctl.Refresher (e.g.
+// ChatGPT) is asked to Refresh -- deliberately with ctx, this call's own
+// long-lived argument, not the childCtx this cycle's LoadStream uses:
+// unlike a List call, a background refresh has value beyond this one
+// reload cycle (see sessionctl.Refresher's doc comment), so a superseded
+// reload must never cancel it. Its eventual result arrives later, and
+// independent of any reload generation, through r.observerCh (see
+// eventLoop's observerCh case) -- Refresh itself is fire-and-forget here.
 func (r *Runtime) requestReload(ctx context.Context) {
 	r.State.StartupCWD = r.CWD
 	cwd, dirScope, worktrees := r.CWD, r.State.Scope, r.Worktrees
 
 	if r.catalogCh == nil {
 		r.catalogCh = make(chan catalogEvent, 1)
+	}
+	if r.providerSnapshots == nil {
+		r.providerSnapshots = make(map[session.ProviderID]providerState)
 	}
 	if r.catalogCancel != nil {
 		r.catalogCancel()
@@ -351,11 +446,9 @@ func (r *Runtime) requestReload(ctx context.Context) {
 			scope.WorktreeDirectories = worktrees(childCtx, cwd)
 		}
 		if providerCount == 0 {
-			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, snapshot: sessionctl.Snapshot{Warnings: map[session.ProviderID]error{}}, done: true})
+			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, scope: scope, done: true})
 			return
 		}
-		var sessions []session.Session
-		warnings := make(map[session.ProviderID]error)
 		remaining := providerCount
 		// Always fully drains LoadStream (even once superseded --
 		// childCtx.Done() only skips the *send* below, never the loop
@@ -363,18 +456,60 @@ func (r *Runtime) requestReload(ctx context.Context) {
 		// block forever trying to hand off a result nothing reads.
 		for ps := range r.Controller.LoadStream(childCtx) {
 			remaining--
-			if ps.Err != nil {
-				warnings[ps.Provider] = ps.Err
-			} else {
-				sessions = append(sessions, ps.Sessions...)
-			}
-			snap := sessionctl.Snapshot{
-				Sessions: r.Controller.MergeSessions(sessions, scope),
-				Warnings: cloneProviderWarnings(warnings),
-			}
-			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, snapshot: snap, done: remaining == 0})
+			sendCatalogEvent(ch, childCtx, catalogEvent{gen: gen, ps: ps, scope: scope, done: remaining == 0})
 		}
 	}()
+
+	for _, p := range r.Controller.Providers {
+		if refresher, ok := p.(sessionctl.Refresher); ok {
+			refresher.Refresh(ctx)
+		}
+	}
+}
+
+// applyProviderUpdate installs one provider's result -- from either a
+// LoadStream arrival (catalogEvent.ps) or an Observer publication
+// (ObserverUpdate) -- into providerSnapshots: a successful result
+// (err == nil) fully replaces that provider's sessions and clears its
+// warning; a failure only sets the warning, deliberately leaving sessions
+// untouched, so a failed refresh never discards previously-known rows
+// (see the DesignDoc's last-known-good provider snapshot store). Only
+// ever called from the eventLoop goroutine. Does not itself update
+// State -- see recomputeRows.
+func (r *Runtime) applyProviderUpdate(id session.ProviderID, sessions []session.Session, err error) {
+	st := r.providerSnapshots[id]
+	if err != nil {
+		st.warning = err
+	} else {
+		st.sessions = sessions
+		st.warning = nil
+	}
+	r.providerSnapshots[id] = st
+}
+
+// recomputeRows re-derives State.Rows/Warnings from the full
+// providerSnapshots store (every provider's latest known sessions and
+// warning, not just whichever provider just reported) and r.currentScope,
+// through the same pin/scope/order pipeline Load itself uses
+// (sessionctl.Controller.MergeSessions) -- called after every
+// applyProviderUpdate. Iterates r.Controller.Providers (a fixed order)
+// rather than ranging the map directly, so row order is deterministic
+// across calls regardless of Go's randomized map iteration.
+func (r *Runtime) recomputeRows() {
+	var sessions []session.Session
+	warnings := make(map[session.ProviderID]error)
+	for _, p := range r.Controller.Providers {
+		st, ok := r.providerSnapshots[p.ID()]
+		if !ok {
+			continue
+		}
+		sessions = append(sessions, st.sessions...)
+		if st.warning != nil {
+			warnings[p.ID()] = st.warning
+		}
+	}
+	r.State.SetRows(r.Controller.MergeSessions(sessions, r.currentScope))
+	r.State.Warnings = warnings
 }
 
 // sendCatalogEvent delivers ev on ch unless childCtx has already ended -- a superseded
@@ -386,20 +521,6 @@ func sendCatalogEvent(ch chan<- catalogEvent, childCtx context.Context, ev catal
 	case ch <- ev:
 	case <-childCtx.Done():
 	}
-}
-
-// cloneProviderWarnings copies m: requestReload's goroutine keeps
-// accumulating into its own warnings map across LoadStream arrivals, so
-// each catalogEvent it sends needs its own independent snapshot of that
-// map rather than a shared reference the next iteration would go on to
-// mutate out from under whatever already received (or is about to
-// receive) this one.
-func cloneProviderWarnings(m map[session.ProviderID]error) map[session.ProviderID]error {
-	out := make(map[session.ProviderID]error, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
 
 // refreshUsageAsync starts one usage-refresh cycle in the background via
