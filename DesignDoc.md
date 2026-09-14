@@ -200,9 +200,39 @@ remote COMPLETE
   → Observer publish
 ```
 
-**persistence failure は remote success を無効化しない**: disk 書き込みが失敗しても、memory cache の更新と Observer publish は既に完了しているためそのまま有効であり、取り消したり握りつぶしたりしない。persistence failure は cache 内部に記録されるだけで、この refresh cycle の Observer publication 自体には現状影響を与えない (`sessionctl.ProviderUpdate` は成功/失敗のどちらか一方しか表現できない shape のため、durability の警告だけのために contract を拡張することはしていない)。
+**persistence failure は remote success を無効化しない**: disk 書き込みが失敗しても、memory cache の更新と Observer publish は既に完了しているためそのまま有効であり、取り消したり握りつぶしたりしない。
 
-hydrate 時に無効な persisted row (conversation ID の形式が不正、title が空、timestamp が zero value など) を検出した場合は、その catalog 全体を hydrate せず (部分的に corrupt な catalog を許容しない)、空の cache から始める。persisted state の read/decode 自体が失敗した場合も同様に、診断情報として記録するだけで provider の起動は妨げない -- remote refresh は通常どおり background で開始される。
+##### Catalog validity と local durability の区別
+
+「今回の remote catalog が有効かどうか」と「その catalog を local に確実に保存できたかどうか」は別の問いであり、`sessionctl.ProviderUpdate` (`Observer` 参照) はこれを明示的に区別する:
+
+```text
+Err != nil, Sessions == nil, Warning == nil
+  → remote refresh そのものが失敗した
+  → 既存 sessions を保持したまま warning として Err を表示する
+
+Err == nil, Sessions != nil, Warning == nil
+  → remote refresh は成功し、local durability にも問題はない
+  → sessions を丸ごと置き換え、warning を消す
+
+Err == nil, Sessions != nil, Warning != nil
+  → remote refresh は成功したが、local への persist に失敗した (durability の問題)
+  → sessions は完全に有効なので丸ごと置き換え、選択・Open もそのまま可能なまま
+  → warning として Warning を表示する (rows を隠したり古い rows に戻したりしない)
+```
+
+`Err` と `Warning` が同一 update に同時に立つことはない -- 「今回の refresh が失敗した」と「今回の refresh (は成功したが、その結果を保存する) local durability が劣化した」は独立した問いであり、provider はそのどちらか一方だけを、今回の refresh cycle が実際に該当する方だけを report する ("latest provider problem wins" -- 下記)。
+
+ChatGPT provider はこの区別を `durabilityWarning` という1つの内部状態として追跡する:
+
+- hydrate 時に persisted catalog の read/decode/validation が失敗した場合に set される。
+- 成功した refresh の後段の `persist` が失敗した場合に set される。
+- 成功した `persist` によって clear される (hydrate 由来であっても persist 由来であっても)。
+- **remote refresh の失敗そのものによっては一切変更されない** -- 失敗した refresh は `Err` だけを publish し、`durabilityWarning` には触れない。これにより、たまたま次の refresh が (無関係な理由で) 失敗しても、まだ解消していない durability の問題を黙って見失うことはなく、次に refresh が実際に成功したタイミングで再び surface される ("latest provider problem wins": この refresh cycle 自身の結果 -- Err か、Warning か、あるいはどちらもないか -- だけが見える状態になり、`errors.Join` のように複数 cycle 分の問題を蓄積することはしない)。
+
+hydrate 時に無効な persisted row (conversation ID の形式が不正、title が空、timestamp が zero value など) を検出した場合は、その catalog 全体を hydrate せず (部分的に corrupt な catalog を許容しない)、空の cache から始める。persisted state の read/decode 自体が失敗した場合も同様に、provider の起動やその後の remote refresh を妨げない。
+
+いずれの場合も `durabilityWarning` は set され、Observer subscription が確立された時点 (`Observe` 呼び出し) で pending な durability warning があれば、その新しい subscriber へ直ちに1回、現在の cache (hydrate できていればその内容、できていなければ空) と Warning を1つの `ProviderUpdate` として publish する。これにより、construction 時点の hydration failure のように「まだ一度も refresh が起きていない」状況でも、その警告が Agent View 側から観測可能になる -- 次の成功した refresh を待って初めて (しかも成功時にしか) 見える、ということがない。
 
 state.json 全体が読めない、あるいは decode できない場合の挙動は `internal/localstate` 既存の挙動にそのまま従う -- ChatGPT 固有の corruption recovery は追加しない。
 
@@ -914,11 +944,11 @@ event loop
 `LoadStream` による reload generation の経路とは別に、provider 自身が保持する last-known-good cache (ChatGPT の `catalogCache` など -- 前節参照) を購読する経路として `sessionctl.Observer` / `Controller.Observe(ctx)` がある。
 
 - `Observer` を実装する provider は、request/response の List サイクルとは独立に「自分の catalog が変わった」タイミングで `ProviderUpdate` を publish する。これは常に provider 全体の full replacement であり、add/remove/update の delta ではない -- 受け手は届いた `Sessions` で自分の持つその provider の session をまるごと置き換えるだけでよく、reconciliation を必要としない。
-- 成功と失敗は区別される: 成功時は `Sessions` に新しい catalog 全体、失敗時は `Sessions` を持たない (nil の) `Err` 付き update が届く。失敗を「session が0件になった」という意味に読み替えてはならない。
+- 成功と失敗は区別される: 成功時は `Sessions` に新しい catalog 全体、失敗時は `Sessions` を持たない (nil の) `Err` 付き update が届く。失敗を「session が0件になった」という意味に読み替えてはならない。成功時はさらに、catalog 自体は有効なまま何らかの非致命的な問題 (例: ChatGPT の local persist 失敗) を伴うことがあり、その場合は `Sessions` はそのまま丸ごと置き換え対象としつつ `Warning` を追加で立てる -- catalog の妥当性 (`Err`) と local durability (`Warning`) を混同しない (詳細は ChatGPT last-known-good catalog cache 節の「Catalog validity と local durability の区別」参照)。
 - `Runtime` はこの subscription を reload のたびに張り直さず、`Run` 起動時に1回だけ確立し、`Run` が返るときに1回だけ終える。1回の Ctrl+L (reload generation) の生死とは無関係に生き続け、`catalogGen` による stale-generation の破棄対象にもならない -- 「最後に完了した refresh が常に正」という Observer 側の semantics を、たまたまその後に始まった次の reload generation の都合で覆さないためである。
 - Ctrl+L (`IntentRefresh`) は引き続き `requestReload` を呼ぶが、`Refresher` を実装する provider にはあわせて `Refresh(ctx)` を要求する。この `ctx` は reload generation ごとに新しく作られ cancel される child context ではなく、`Runtime.Run` が受け取った長寿命の ctx をそのまま渡す -- ChatGPT の background refresh は1回の reload generation を超えて価値を持つため、次の Ctrl+L がその途中経過を cancel してしまわないようにするためである。`Refresh` 自体は fire-and-forget で、結果は常に Observer 経由で後から届く。
 
-Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`LoadStream` の到着と `Observer` の publish は同じ適用ルールを共有する: 成功はその provider の session を丸ごと置き換えて warning を消し、失敗は session をそのまま残して warning だけを更新する。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
+Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`LoadStream` の到着と `Observer` の publish は同じ適用ルールを共有する: 成功はその provider の session を丸ごと置き換え、warning はその成功に伴う `Warning` (なければ nil、あれば非致命的な durability warning) で更新する。失敗は session をそのまま残し、warning だけを `Err` で更新する。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
 
 ##### PTY output
 

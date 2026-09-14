@@ -41,6 +41,8 @@ ChatGPT Project conversations remain visible while the background catalog refres
 
 The last successfully refreshed ChatGPT catalog (conversation titles/IDs and timestamps, in agentsctl's local state) is also cached locally, so it can appear immediately the next time `agentsctl` starts -- before the background refresh against the live Project even completes -- and remains selectable and openable in the meantime. Only a complete refresh replaces this cache; a failed one never overwrites it. It is scoped to the configured Project ID, so switching to a different Project never shows a stale one's cached rows. It never includes message/transcript contents, prompts, or authentication material.
 
+If a catalog refreshes successfully but agentsctl can't save it locally (e.g. disk full), the freshly refreshed rows are still shown and remain fully usable -- a footer warning notes only that the local cache itself may be out of date, distinct from a warning about the refresh itself failing.
+
 Current limitations are inherited from the browser boundary: `terminal-browser` is kept alive by an agentsctl-owned background PTY, and the ChatGPT Web endpoint is undocumented and may change. In app mode, `terminal-browser` cannot currently distinguish Japanese IME composition-confirm `Enter` from message-send `Enter`; composing elsewhere and pasting avoids premature submission.
 
 ### Managed Codex external editor
