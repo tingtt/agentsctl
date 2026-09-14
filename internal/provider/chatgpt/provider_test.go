@@ -34,9 +34,25 @@ func TestProviderNormalizesProjectConversationForAgentView(t *testing.T) {
 	browser := &fakeBrowser{conversations: []conversation{{ID: conversationA, Title: "Conversation", CreatedAt: created, UpdatedAt: updated}}}
 	provider := &Provider{config: Config{ProjectID: "g-p-project", Root: "/work/project"}, browser: browser}
 
+	// List serves the cache, which is empty before any refresh has
+	// completed -- it also lazily starts the first background refresh
+	// (see Provider.List's doc comment), whose result this test waits for
+	// on Observe rather than List's own (immediate, empty) return value.
 	rows, err := provider.List(context.Background(), false)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("first List before any refresh: rows=%+v err=%v, want empty successful snapshot", rows, err)
+	}
+	updates := provider.Observe(context.Background())
+	upd := waitForUpdate(t, updates)
+	if upd.Err != nil || len(upd.Sessions) != 1 {
+		t.Fatalf("observed update=%+v", upd)
+	}
+	if browser.projectID != "g-p-project" {
+		t.Fatalf("projectID=%q", browser.projectID)
+	}
+	rows, err = provider.List(context.Background(), false)
 	if err != nil || len(rows) != 1 {
-		t.Fatalf("rows=%+v err=%v", rows, err)
+		t.Fatalf("List after refresh: rows=%+v err=%v", rows, err)
 	}
 	row := rows[0]
 	if browser.projectID != "g-p-project" || row.Key.String() != "chatgpt:"+conversationA {
@@ -60,6 +76,12 @@ func TestProviderExposesOnlySourceAndOpenCapabilities(t *testing.T) {
 	}
 	if _, ok := provider.(sessionctl.Opener); !ok {
 		t.Fatal("Provider must implement Opener")
+	}
+	if _, ok := provider.(sessionctl.Observer); !ok {
+		t.Fatal("Provider must implement Observer")
+	}
+	if _, ok := provider.(sessionctl.Refresher); !ok {
+		t.Fatal("Provider must implement Refresher")
 	}
 	if _, ok := provider.(sessionctl.Dispatcher); ok {
 		t.Fatal("Provider must not implement Dispatcher")
@@ -91,5 +113,23 @@ func TestUnavailableProviderReportsConfigErrorWithoutBrowser(t *testing.T) {
 	provider := NewUnavailable(os.ErrInvalid)
 	if _, err := provider.List(context.Background(), false); err == nil {
 		t.Fatal("invalid explicit configuration must surface as a provider error")
+	}
+}
+
+// waitForUpdate blocks until updates delivers one sessionctl.ProviderUpdate
+// or fails the test after a bounded timeout -- test-only convenience for
+// asserting on an Observe subscription's next publication without a real
+// background browser.
+func waitForUpdate(t *testing.T, updates <-chan sessionctl.ProviderUpdate) sessionctl.ProviderUpdate {
+	t.Helper()
+	select {
+	case upd, ok := <-updates:
+		if !ok {
+			t.Fatal("Observe channel closed before publishing an update")
+		}
+		return upd
+	case <-time.After(2 * time.Second):
+		t.Fatal("no ProviderUpdate published within 2s")
+		return sessionctl.ProviderUpdate{}
 	}
 }
