@@ -819,13 +819,38 @@ Codex:  ───────┐  ├─ merge
 ChatGPT: ──────┴──┘
 ```
 
-1回の refresh は、provider ごとの取得完了を待ってから統合する。
-
-partial result を逐次描画する方式にはしない。
-
 provider が利用できない場合は、その error を provider 単位で保持する。
 
 他の provider から取得できた session は破棄しない。
+
+`sessionctl.Controller` はこの並行取得を 2 通りの形で公開する。
+
+- `Load(ctx, scope)` -- 全 provider の取得完了を待ってから、1回の呼び出しが常に merge 済み atomic な `Snapshot` を1つ返す。partial result を逐次描画する方式にはしない。
+- `LoadStream(ctx)` -- 同じ並行取得を、provider ごとの完了を待たずに `ProviderSnapshot` として順次 (到着した順に) 届ける。`MergeSessions` は、そこまでに届いた provider の session 集合に対して pin 付与・scope filter・overview 順序付けを再適用するための helper であり、`Load` 自身もこの `LoadStream` + `MergeSessions` の上に実装されている。
+
+Agent View の `Runtime.requestReload` は `Load` ではなく `LoadStream` を使う。理由は、ChatGPT の複数ページ browser-backed discovery walk のように遅い (または失敗する) provider 1つのために、Claude/Codex のように速く応答する provider の rows まで表示・操作できなくなることを避けるため (Issue #6 のライブ検証で、ChatGPT 側のエラーによって catalog 全体が長時間空のままになる問題が判明した)。
+
+さらに、その `LoadStream` の呼び出しを Agent View の event loop がいつ・どう起動するかも非同期化されている (同じくライブ検証で判明した、ChatGPT の discovery walk が Agent View 全体の応答性を止めてしまう問題への対応)。
+
+```text
+Runtime.requestReload(ctx)
+  → 現在の rows/選択/入力はそのまま
+  → background goroutine で Controller.LoadStream を消費 (event loop はブロックしない)
+  → provider の ProviderSnapshot が届くたびに:
+      これまで届いた provider の session を MergeSessions で再統合
+      → catalogEvent を event loop へ送る (done は「これが今 generation 最後の provider か」)
+
+event loop
+  → catalogEvent の gen が最新の reload generation と一致する場合のみ State.Rows/Warnings に適用
+  → 一致しない (supersede された) generation の Snapshot は破棄
+  → done な catalogEvent でだけ CatalogLoading を解除し、usage refresh を開始する
+```
+
+- 現在表示中の rows は reload 中も操作可能なまま維持される (Ctrl+L のたびに空になったりはしない)。selection・compose・help・pin・quit はいずれも catalog fetch の完了を待たない。
+- 速い provider (Claude/Codex 等) の rows は、遅い/失敗する provider (ChatGPT 等) の応答を待たずに表示され、選択・操作できる。まだ届いていない provider は単に「まだそのぶんの session が merge されていない」状態であり、warning としては扱わない (成功でも失敗でもなく、単に未到着)。
+- 最新の reload generation の結果だけが State を更新できる。scope 変更や連続した Ctrl+L で古い generation の Snapshot (途中経過・最終いずれも) が後から届いても無視される。
+- 新しい reload は直前の reload の子 context を cancel する (ただし provider/runtime 自体の context ではない)。これにより ChatGPT のような browser-backed discovery walk が破棄される結果のために動き続けることを防ぐが、次の reload で同じ runtime を再利用できることは変わらない。
+- `LoadStream` 自身は pin 付与・scope filter・overview 順序付けを行わない。これらは `MergeSessions` として切り出されており、呼び出し側 (Agent View、あるいは `Load` 自身) がそこまでの累積結果に対して都度再適用する。
 
 ##### PTY output
 
