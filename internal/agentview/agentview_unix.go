@@ -308,7 +308,10 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 			// ps.Provider is only empty for the zero-provider-configured
 			// case, which has nothing to apply.
 			if update.ps.Provider != "" {
-				r.applyProviderUpdate(update.ps.Provider, update.ps.Sessions, update.ps.Err)
+				// LoadStream's ProviderSnapshot carries no non-fatal
+				// warning of its own (see ProviderSnapshot's doc comment)
+				// -- only Observer publications do.
+				r.applyProviderUpdate(update.ps.Provider, update.ps.Sessions, update.ps.Err, nil)
 			}
 			r.recomputeRows()
 			if update.done {
@@ -336,7 +339,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				r.observerCh = nil
 				break
 			}
-			r.applyProviderUpdate(update.Provider, update.Sessions, update.Err)
+			r.applyProviderUpdate(update.Provider, update.Sessions, update.Err, update.Warning)
 			r.recomputeRows()
 			r.render()
 		}
@@ -468,21 +471,28 @@ func (r *Runtime) requestReload(ctx context.Context) {
 }
 
 // applyProviderUpdate installs one provider's result -- from either a
-// LoadStream arrival (catalogEvent.ps) or an Observer publication
-// (ObserverUpdate) -- into providerSnapshots: a successful result
-// (err == nil) fully replaces that provider's sessions and clears its
-// warning; a failure only sets the warning, deliberately leaving sessions
-// untouched, so a failed refresh never discards previously-known rows
-// (see the DesignDoc's last-known-good provider snapshot store). Only
-// ever called from the eventLoop goroutine. Does not itself update
+// LoadStream arrival (catalogEvent.ps, which never carries a warning) or
+// an Observer publication (ObserverUpdate) -- into providerSnapshots:
+//
+//   - err != nil: a failed refresh. Sessions are left untouched (never
+//     discarding previously-known rows -- see the DesignDoc's
+//     last-known-good provider snapshot store) and warning is set to err.
+//   - err == nil: a successful result. sessions fully replaces that
+//     provider's rows -- valid and usable regardless of warning -- and
+//     warning is set to the given non-fatal warning (nil clears it, a
+//     non-nil one surfaces it alongside the now-current sessions; see
+//     sessionctl.ProviderUpdate's doc comment on why valid Sessions and a
+//     Warning can coexist on one update, unlike Sessions and Err).
+//
+// Only ever called from the eventLoop goroutine. Does not itself update
 // State -- see recomputeRows.
-func (r *Runtime) applyProviderUpdate(id session.ProviderID, sessions []session.Session, err error) {
+func (r *Runtime) applyProviderUpdate(id session.ProviderID, sessions []session.Session, err, warning error) {
 	st := r.providerSnapshots[id]
 	if err != nil {
 		st.warning = err
 	} else {
 		st.sessions = sessions
-		st.warning = nil
+		st.warning = warning
 	}
 	r.providerSnapshots[id] = st
 }

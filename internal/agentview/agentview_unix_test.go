@@ -141,7 +141,7 @@ func (r *Runtime) drainCatalog(ctx context.Context) {
 			}
 			r.currentScope = upd.scope
 			if upd.ps.Provider != "" {
-				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err)
+				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, nil)
 			}
 			r.recomputeRows()
 			if upd.done {
