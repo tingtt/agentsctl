@@ -38,3 +38,18 @@ test("discovery wheel handling refuses to proceed if the window ever becomes vis
   assert.match(source, /ownerWindow\.isVisible\(\)/);
 });
 
+// Regression guard for "chatgpt unavailable: receive browser bridge
+// scrollRegion: EOF" persisting for the rest of the session: a
+// net.Socket's own "error" event is fatal (an uncaught exception, crashing
+// this whole Electron main process) unless something listens for it, and
+// one client-side disconnect (e.g. agentsctl abandoning a superseded/
+// cancelled reload by forcing its own read deadline) must never take the
+// bridge down for every other request. See main.js's connection handler.
+test("the bridge socket server never lets one connection's error crash the process", () => {
+  assert.match(source, /socket\.on\(\s*["']error["']/, "each client connection must have its own \"error\" listener");
+  assert.match(source, /server\.on\(\s*["']error["']/, "the listening server itself must have an \"error\" listener");
+});
+
+test("the bridge never writes a response to an already-destroyed socket", () => {
+  assert.match(source, /socket\.destroyed/, "send() must check socket.destroyed before writing");
+});

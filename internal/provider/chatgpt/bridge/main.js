@@ -219,6 +219,12 @@ async function dispatch(request) {
 }
 
 function send(socket, response) {
+  // A request can still be in flight (a pending dispatch(...).then) after
+  // its client has already disconnected -- e.g. agentsctl abandoning a
+  // superseded/cancelled reload by forcing its own read deadline (see
+  // bridgeClient.call in bridge.go). Writing to an already-destroyed
+  // socket at that point must be a silent no-op, not a crash.
+  if (socket.destroyed) return;
   socket.write(`${JSON.stringify(response)}\n`);
 }
 
@@ -231,6 +237,19 @@ try {
 }
 
 const server = net.createServer((socket) => {
+  // A net.Socket's "error" event is fatal (an uncaught exception, taking
+  // down this whole Electron main process -- every other in-flight and
+  // future request with it) if nothing listens for it. The Go client
+  // (bridgeClient.call) deliberately forces its own read deadline to
+  // abandon a superseded/cancelled request (see requestReload's context
+  // cancellation), which can surface here as exactly this kind of abrupt
+  // disconnect (ECONNRESET/EPIPE) on an otherwise-unrelated connection.
+  // One client-side disconnect must never crash the bridge for every
+  // other request; see the sibling repro this class of bug produces on
+  // the Go side: "chatgpt unavailable: receive browser bridge
+  // scrollRegion: EOF" persisting for the rest of the session because the
+  // whole process died mid-request.
+  socket.on("error", () => {});
   socket.setEncoding("utf8");
   let buffered = "";
   socket.on("data", (chunk) => {
@@ -261,6 +280,7 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(socketPath, () => fs.chmodSync(socketPath, 0o600));
+server.on("error", () => {});
 server.on("close", () => {
   try {
     fs.unlinkSync(socketPath);
