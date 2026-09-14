@@ -40,10 +40,26 @@ type Snapshot struct {
 // the catalog side. Sessions is already actionsFor-narrowed, matching
 // what Load's own per-provider fetch does; Err is set instead when that
 // provider's List call failed (never both).
+//
+// ListOwnsStatus reports whether a successful List (Err == nil) is
+// authoritative for this provider's refresh/availability status -- true
+// for an ordinary Source-only provider (a successful List means it
+// recovered from any previous failure, exactly like before this field
+// existed), false for a provider that also implements Observer. For the
+// latter, List may simply be serving a last-known-good cache (see e.g.
+// provider/chatgpt): a successful cached read says nothing about
+// whether background refresh/durability actually recovered, so it must
+// not silently clear a warning only Observer is entitled to replace or
+// clear (see the DesignDoc's "Catalog validity vs. local durability" /
+// this field's rationale). A List failure (Err != nil) is always
+// surfaced as this provider's warning regardless of ListOwnsStatus -- a
+// real Source.List error (misconfiguration, browser unavailable, ...) is
+// never hidden just because the provider also has an Observer.
 type ProviderSnapshot struct {
-	Provider session.ProviderID
-	Sessions []session.Session
-	Err      error
+	Provider       session.ProviderID
+	Sessions       []session.Session
+	Err            error
+	ListOwnsStatus bool
 }
 
 // LoadStream is Load's incremental counterpart: the same concurrent,
@@ -67,12 +83,14 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 	var wg sync.WaitGroup
 	for _, p := range c.Providers {
 		p := p
+		_, observes := p.(Observer)
+		listOwnsStatus := !observes
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			rows, err := p.List(ctx, false)
 			if err != nil {
-				out <- ProviderSnapshot{Provider: p.ID(), Err: err}
+				out <- ProviderSnapshot{Provider: p.ID(), Err: err, ListOwnsStatus: listOwnsStatus}
 				return
 			}
 			// A fresh slice, never rows itself: a provider whose List
@@ -83,7 +101,7 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 				enriched[i] = rows[i]
 				enriched[i].Actions = actionsFor(p, rows[i])
 			}
-			out <- ProviderSnapshot{Provider: p.ID(), Sessions: enriched}
+			out <- ProviderSnapshot{Provider: p.ID(), Sessions: enriched, ListOwnsStatus: listOwnsStatus}
 		}()
 	}
 	go func() {

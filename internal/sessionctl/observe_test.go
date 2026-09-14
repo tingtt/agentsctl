@@ -70,6 +70,60 @@ func TestObserveSuccessfulSessionsWithWarningPreservesBoth(t *testing.T) {
 	}
 }
 
+// TestLoadStreamMarksObserverProviderListOwnsStatusFalse fixes
+// ProviderSnapshot.ListOwnsStatus's computation: a provider that also
+// implements Observer is never authoritative for status through List
+// alone -- only through Observer (see agentview.Runtime.applyLoadSnapshot).
+func TestLoadStreamMarksObserverProviderListOwnsStatusFalse(t *testing.T) {
+	src := &fakeObserverSource{fakeSource: fakeSource{id: session.ProviderChatGPT, rows: []session.Session{{Key: session.Key{Provider: session.ProviderChatGPT, ID: "a"}}}}}
+	c := Controller{Providers: []Source{src}}
+	var got ProviderSnapshot
+	for ps := range c.LoadStream(context.Background()) {
+		got = ps
+	}
+	if got.Err != nil || len(got.Sessions) != 1 {
+		t.Fatalf("got=%+v", got)
+	}
+	if got.ListOwnsStatus {
+		t.Fatalf("expected ListOwnsStatus=false for an Observer-capable provider: %+v", got)
+	}
+}
+
+// TestLoadStreamMarksNonObserverProviderListOwnsStatusTrue is the
+// converse: an ordinary Source-only provider keeps List as the sole
+// authority on its own status, exactly as before ListOwnsStatus existed.
+func TestLoadStreamMarksNonObserverProviderListOwnsStatusTrue(t *testing.T) {
+	src := fakeSource{id: session.ProviderClaude, rows: []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}}}}
+	c := Controller{Providers: []Source{src}}
+	var got ProviderSnapshot
+	for ps := range c.LoadStream(context.Background()) {
+		got = ps
+	}
+	if got.Err != nil || len(got.Sessions) != 1 {
+		t.Fatalf("got=%+v", got)
+	}
+	if !got.ListOwnsStatus {
+		t.Fatalf("expected ListOwnsStatus=true for a non-Observer provider: %+v", got)
+	}
+}
+
+// TestLoadStreamListOwnsStatusPopulatedOnFailureToo fixes that
+// ListOwnsStatus is set on the failure branch too, not just success --
+// Agent View's applyLoadSnapshot does not currently key its failure
+// handling on it (a List failure always surfaces regardless), but the
+// field must still be populated consistently either way.
+func TestLoadStreamListOwnsStatusPopulatedOnFailureToo(t *testing.T) {
+	src := fakeSource{id: session.ProviderClaude, err: errBoom}
+	c := Controller{Providers: []Source{src}}
+	var got ProviderSnapshot
+	for ps := range c.LoadStream(context.Background()) {
+		got = ps
+	}
+	if got.Err == nil || !got.ListOwnsStatus {
+		t.Fatalf("got=%+v", got)
+	}
+}
+
 // TestObserveRefreshErrorCarriesNoSessions fixes the failure shape: Err
 // set, Sessions nil -- a consumer must retain its own last-known rows.
 func TestObserveRefreshErrorCarriesNoSessions(t *testing.T) {

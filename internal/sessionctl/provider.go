@@ -72,16 +72,20 @@ type Archiver interface {
 // ProviderUpdate is one Observer publication: either a provider's latest
 // complete catalog snapshot (a full replacement, never a delta -- see
 // Observer), optionally accompanied by a non-fatal Warning, or a refresh
-// failure. Exactly one of two shapes is valid:
+// failure. Err is the sole success/failure discriminator -- never the
+// nilness of Sessions:
 //
-//   - Err != nil, Sessions == nil, Warning == nil: a refresh failed.
-//     A consumer must keep whatever sessions it already has for this
-//     provider rather than reading a nil/absent Sessions as "provider has
-//     no sessions" (see the DesignDoc's last-known-good cache semantics).
+//   - Err != nil: a refresh failed. Sessions is ignored/nil. A consumer
+//     must keep whatever sessions it already has for this provider rather
+//     than treating this as "provider has no sessions" (see the
+//     DesignDoc's last-known-good cache semantics).
 //
-//   - Err == nil, Sessions != nil: a refresh succeeded and Sessions is
-//     that provider's entire current catalog -- a consumer replaces its
-//     retained copy outright. Warning, if also set, does not change that:
+//   - Err == nil: a refresh succeeded -- a full replacement, even when
+//     Sessions is nil or empty (a valid, real "this provider currently has
+//     no sessions" catalog, e.g. an empty ChatGPT Project, or nothing
+//     hydrated yet -- never confuse this with a failed refresh just
+//     because Sessions is unset). A consumer replaces its retained copy
+//     of Sessions outright. Warning, if also set, does not change that:
 //     Sessions is still fully valid and usable (selectable, actionable),
 //     but some secondary/non-fatal problem exists alongside it -- e.g. the
 //     catalog refreshed correctly yet a provider's own attempt to persist
