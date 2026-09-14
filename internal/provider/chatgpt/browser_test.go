@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -60,6 +61,58 @@ func TestRuntimeOpenUsesCanonicalAppModeInPersistentPartition(t *testing.T) {
 	if !strings.Contains(preloadScriptTemplate, `event.ctrlKey && event.key === "]"`) ||
 		!strings.Contains(preloadScriptTemplate, "globalThis.terminalBrowser.quit()") {
 		t.Fatal("embedded preload does not preserve Ctrl+] close-view behavior")
+	}
+}
+
+// TestListResetsDiscoveryOnBrokenTransport fixes the self-healing
+// guarantee behind "chatgpt unavailable: receive browser bridge
+// scrollRegion: EOF" never becoming permanent: once the bridge socket
+// connection itself has broken (not merely a cancelled/timed-out request
+// against an otherwise-healthy connection), List must tear down the
+// current helper/bridge so the *next* List call re-materializes a fresh
+// one via ensureDiscoveryLocked, rather than reusing -- and immediately
+// failing against -- the same dead connection forever (see
+// resetDiscoveryIfBrokenLocked's doc comment). ensureDiscoveryLocked's own
+// helper.Done() check alone never catches this: the helper OS process here
+// is still running the whole time.
+func TestListResetsDiscoveryOnBrokenTransport(t *testing.T) {
+	helper := &fakeProcessHandle{done: make(chan struct{})} // never closes: the process is still alive
+	bridge := &fakeDiscoveryBridge{beginListErr: errors.New("receive browser bridge scrollRegion: EOF")}
+	rt := &runtime{helper: helper, bridge: bridge}
+
+	if _, err := rt.List(context.Background(), "g-p-test"); err == nil {
+		t.Fatal("expected the broken-transport error to propagate")
+	}
+	if rt.bridge != nil || rt.helper != nil {
+		t.Fatalf("broken transport must reset both bridge and helper, got bridge=%v helper=%v", rt.bridge, rt.helper)
+	}
+	if !bridge.closed {
+		t.Fatal("the broken bridge connection must be closed on reset")
+	}
+	if !helper.stopped {
+		t.Fatal("the helper process must be stopped on reset")
+	}
+}
+
+// TestListDoesNotResetDiscoveryOnContextCancellation fixes the other half
+// of resetDiscoveryIfBrokenLocked's guarantee: a request that failed only
+// because its own ctx was cancelled or timed out (e.g. a superseded
+// catalog reload -- see agentview.Runtime.requestReload) must NOT tear
+// down an otherwise-healthy connection; the caller is expected to retry
+// against the same bridge next time.
+func TestListDoesNotResetDiscoveryOnContextCancellation(t *testing.T) {
+	helper := &fakeProcessHandle{done: make(chan struct{})}
+	bridge := &fakeDiscoveryBridge{beginListErr: context.Canceled}
+	rt := &runtime{helper: helper, bridge: bridge}
+
+	if _, err := rt.List(context.Background(), "g-p-test"); err == nil {
+		t.Fatal("expected the cancellation error to propagate")
+	}
+	if rt.bridge == nil || rt.helper == nil {
+		t.Fatal("a context-cancellation failure must not reset an otherwise-healthy bridge/helper")
+	}
+	if bridge.closed || helper.stopped {
+		t.Fatal("a context-cancellation failure must not close the bridge or stop the helper")
 	}
 }
 

@@ -76,7 +76,44 @@ func (r *runtime) List(ctx context.Context, projectID string) ([]conversation, e
 	if err := r.ensureDiscoveryLocked(ctx); err != nil {
 		return nil, err
 	}
-	return enumerate(ctx, r.bridge, projectID)
+	conversations, err := enumerate(ctx, r.bridge, projectID)
+	if err != nil {
+		r.resetDiscoveryIfBrokenLocked(err)
+		return nil, err
+	}
+	return conversations, nil
+}
+
+// resetDiscoveryIfBrokenLocked tears down the current discovery
+// helper/bridge when err indicates the underlying transport itself broke
+// (the bridge socket connection was closed out from under a request --
+// e.g. "receive browser bridge scrollRegion: EOF" -- rather than the
+// request having simply been cancelled by the caller, which a superseded
+// reload or an ordinary timeout is expected to retry against the SAME
+// still-healthy connection).
+//
+// Without this, a transport-level failure wedges the provider permanently:
+// ensureDiscoveryLocked only ever recreates the helper once its OS process
+// has actually exited (r.helper.Done()), which a connection that broke
+// while the helper process itself is still running never satisfies on its
+// own -- every subsequent List would keep reusing, and immediately fail
+// again against, the same dead bridge, rendering "chatgpt unavailable"
+// permanent until agentsctl is restarted. Nulling both out here instead
+// makes the very next List call take ensureDiscoveryLocked's full
+// materialize-and-reconnect path, self-healing the provider without
+// requiring a restart.
+func (r *runtime) resetDiscoveryIfBrokenLocked(err error) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if r.bridge != nil {
+		_ = r.bridge.Close()
+		r.bridge = nil
+	}
+	if r.helper != nil {
+		_ = r.helper.Stop()
+		r.helper = nil
+	}
 }
 
 func (r *runtime) Open(ctx context.Context, conversationID string, in *os.File, out io.Writer) error {

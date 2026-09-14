@@ -10,11 +10,12 @@ import (
 )
 
 type fakeDiscoveryBridge struct {
-	snapshots  [][]capture
-	regions    []scrollRegion
-	wheelIndex int
-	wheelCalls int
-	closed     bool
+	snapshots    [][]capture
+	regions      []scrollRegion
+	wheelIndex   int
+	wheelCalls   int
+	closed       bool
+	beginListErr error
 }
 
 type slowGrowingBridge struct {
@@ -71,7 +72,7 @@ func (b *slowGrowingBridge) region() scrollRegion {
 	}
 }
 
-func (f *fakeDiscoveryBridge) BeginList(context.Context, string) error { return nil }
+func (f *fakeDiscoveryBridge) BeginList(context.Context, string) error { return f.beginListErr }
 func (f *fakeDiscoveryBridge) Captures(context.Context, string) ([]capture, error) {
 	return f.snapshots[min(f.wheelIndex, len(f.snapshots)-1)], nil
 }
