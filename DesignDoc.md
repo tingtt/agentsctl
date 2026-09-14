@@ -950,9 +950,11 @@ event loop
 
 Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
 
-##### List と Observer、どちらが warning の authority か
+##### List と Observer、どちらが warning/rows の authority か
 
-`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、session の置き換えルールこそ共有するが、**warning に対する authority は異なる**。これは実装上のバグとして一度発見された区別であり、意図的に分離されている:
+`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、providerSnapshots への適用ルールこそ大枠を共有するが、**warning と rows それぞれの authority は provider の capability と、Observer がこれまでに成功したことがあるかによって変わる**。これらは実装上のバグとして一度ずつ発見された区別であり、意図的に分離されている。
+
+warning の authority:
 
 ```text
 List 失敗 (Err != nil)
@@ -964,17 +966,49 @@ List 成功 (Err == nil)
   → provider が Observer を実装しない (ProviderSnapshot.ListOwnsStatus == true)
     → List の成功時に warning を clear する (= List 自身が status の authority)
   → provider が Observer を実装する (ListOwnsStatus == false)
-    → session は丸ごと置き換えるが、warning には一切触れない
-    → ChatGPT のような provider にとって List は last-known-good cache の
-      読み取りに過ぎず、その成功は「remote refresh/durability が回復した」
-      ことを何も意味しないため
+    → warning には一切触れない (下記の rows authority とは独立)
 
 Observer 側は常に warning の authority を持つ:
-  成功 (Err == nil)  → session を置き換え、warning を届いた Warning (nil ならクリア) にする
-  失敗 (Err != nil)  → session はそのまま、warning を Err にする
+  成功 (Err == nil)  → warning を届いた Warning (nil ならクリア) にする
+  失敗 (Err != nil)  → warning を Err にする
 ```
 
 `ListOwnsStatus` は `sessionctl.Controller.LoadStream` が provider の capability から機械的に導出する (`provider implements sessionctl.Observer` なら `false`)。Agent View 側はこの capability を自ら判定しない -- provider 固有の分岐は sessionctl の境界内に閉じ込める。
+
+rows (session) の authority は、warning とは別のもう1つの区別として存在する。`providerState.observerSnapshotSeen` が「この provider について Observer からの成功 update を一度でも適用したか」を追跡する:
+
+```text
+provider が Observer を実装しない (ListOwnsStatus == true)
+  → List が常に rows の authority (今までどおり)
+
+provider が Observer を実装する (ListOwnsStatus == false)
+  → observerSnapshotSeen == false (Observer からまだ一度も成功 update が
+    来ていない -- 典型的には起動直後、persisted cache からの hydrate 直後)
+    → List 成功はここでは rows を bootstrap してよい
+      (再起動直後に persisted rows を即座に表示するための経路)
+  → observerSnapshotSeen == true (Observer からの成功 update が一度でも
+    適用済み)
+    → 以降の List 成功は rows を一切書き換えない (無視する)
+    → Observer からの成功 update だけが rows を置き換えられる
+
+observerSnapshotSeen は Observer の成功 update でだけ true になる
+(false → true の一方向のみ)。Observer の失敗 update では変化しない
+-- 初回の background refresh が失敗しても、persisted cache からの
+bootstrap List は依然として rows を供給できる必要があるため。
+```
+
+この rows authority の区別が必要な理由は、`catalogGen` (reload generation の順序保証) だけでは防げない race があるため: Observer の publish は reload generation から独立しており (前節「Observer generations」参照)、1回の Ctrl+L cycle 内でも「LoadStream の List 呼び出しがたまたま遅れて完了する」ことと「その間に background refresh が先に完了して Observer が新しい catalog を publish する」ことが両方起こりうる。どちらも個別には正当な (現行 generation の、あるいは generation に無関係な) event であり、`catalogGen` はこの2つの event 間の新旧を区別しない。`observerSnapshotSeen` はこれを別の軸として解決する:
+
+```text
+catalogGen
+  → reload generation の順序を保証する (古い generation の event を破棄)
+
+observerSnapshotSeen
+  → Observer が rows の authority を獲得したかどうかを保証する
+    (Observer 獲得後は、List からの rows 書き換えそのものを許可しない)
+```
+
+両方が必要であり、互いを代替しない。
 
 この区別がないと、ChatGPT のような Observer provider で次のような regression が起きる: Observer が持続的な durability warning (例: persist 失敗) を publish した直後に Ctrl+L を押すと、ChatGPT の `List` はただ cache を読むだけで容易に成功し、その「成功」を Agent View が (誤って) warning の解消と解釈して warning を消してしまう -- 実際には持続的な問題は何も解決していないにもかかわらず。
 
