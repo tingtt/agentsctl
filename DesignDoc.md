@@ -152,17 +152,59 @@ background discovery helper は agentsctl-owned PTY で維持し、provider Clos
 
 #### ChatGPT last-known-good catalog cache
 
-`Source.List` は呼び出しのたびに full cursor enumeration を行わない。ChatGPT provider は内部に last-known-good な in-memory cache (`catalogCache`) を持ち、`List` はこの cache を即座に返すだけの軽い呼び出しになる。cache がまだ一度も埋まっていない場合は remote failure ではなく空の成功 snapshot を返し、同時に初回の background refresh を lazily 起動する — Agent View 側が ChatGPT の初回起動を特別扱いする必要はない。
+`Source.List` は呼び出しのたびに full cursor enumeration を行わない。ChatGPT provider は内部に last-known-good な in-memory cache (`catalogCache`) を持ち、`List` はこの cache を即座に返すだけの純粋な読み取りになる。cache がまだ一度も埋まっていない場合 (persisted cache も存在しない場合 -- 後述) は remote failure ではなく空の成功 snapshot を返す。
 
-cache の置き換えは COMPLETE な enumeration によってのみ行う。timeout、broken bridge、request series の曖昧性、schema drift、cursor cycle、pagination 未完了、context cancellation はいずれも「直前の cache を保持したまま、今回の refresh は失敗として記録する」扱いになり、部分的な結果が cache に混入することはない。COMPLETE な enumeration が実際に 0 件の conversation を観測した場合はそれ自体が有効な置き換えであり、cache は空配列になる — これは「一度も enumeration が成功していない」状態とは区別する。
+**`List` は決して自ら remote work を開始しない。** 初回 refresh の起動責務は完全に `sessionctl.Refresher` 側にあり、Agent View 自身の reload cycle が `requestReload` から独立して `Refresh` を呼ぶ (次節 "Provider catalog observer と provider snapshot store" 参照)。以前は `List` が cache 不在を検知して自ら `Refresh` を呼ぶ実装だったが、これは同じ reload cycle 内で `requestReload` 自身も `Refresh` を呼ぶため、single-flight で衝突こそしないものの「初回 enumeration の直後にもう1回 coalesced follow-up が余分に走る」という無駄を生んでいた。`List` を純粋な cache 読み取りに限定することでこの重複を避けている。
 
-cache は1 process の lifetime に限定した memory-only の状態であり、disk へは永続化しない。agentsctl を再起動すれば cache は空から始まる。
+cache の置き換えは COMPLETE な enumeration によってのみ行う。timeout、broken bridge、request series の曖昧性、schema drift、cursor cycle、pagination 未完了、context cancellation はいずれも「直前の cache (memory / persisted 双方) を保持したまま、今回の refresh は失敗として記録する」扱いになり、部分的な結果が cache に混入することはない。COMPLETE な enumeration が実際に 0 件の conversation を観測した場合はそれ自体が有効な置き換えであり、cache は空配列になる — これは「一度も enumeration が成功していない」状態とは区別する。
 
 background refresh は `sessionctl.Refresher.Refresh(ctx)` で要求する。実行中の refresh がある間に追加で要求された場合は新たな enumeration を並行起動せず、実行中の1回が終わった直後に最大1回だけ追加の refresh を続けて走らせる (single-flight + coalescing)。これにより Ctrl+L の連打が discovery bridge の再起動や enumeration の重複起動を引き起こすことはない。
 
-refresh の完了 (成功・失敗いずれも) は `sessionctl.Observer.Observe(ctx)` を通じて provider 単位の `ProviderUpdate` として publish される (Observer の一般的な semantics は Catalog loading 節を参照)。成功時は新しい cache 全体を full replacement として、失敗時は Sessions を持たない error-only の update として届く — 失敗を「session が0件になった」と誤読させないための区別である。
+refresh の完了 (成功・失敗いずれも) は `sessionctl.Observer.Observe(ctx)` を通じて provider 単位の `ProviderUpdate` として publish される (Observer の一般的な semantics は Catalog loading 節を参照)。成功時は新しい cache 全体を full replacement として、失敗時は Sessions を持たない error-only の update として届く — 失敗を「session が0件になった」と誤読させないための区別である。publish は **latest-wins**: subscriber 側の buffer が詰まっている (= Agent View 側が一時的に読み出せていない) 場合でも、古い queued update を1つ捨てて最新の update を積み直す。Observer publication は event log ではなく「provider の現在状態」の full replacement であるため、遅れて追いついた subscriber が受け取るべきは常に最新の状態であり、途中に挟まった古い成功や失敗であってはならない。
 
 cache 内の session は常に Open 可能な対象として扱う。Open は cache や in-flight refresh の状態を一切 preflight せず、対象の conversation ID へ直接遷移する。remote 側で削除されていた場合の挙動は公式 ChatGPT UI に委譲し、agentsctl 側が能動的に cache から evict することはない。runtime 内部でも List (enumeration) と Open は互いに排他しない: Open は discovery helper の起動確認だけを lock で保護し、enumeration 本体や browser view を開いている間の待機は lock の外で行うため、background refresh の最中でも Open は待たされない。
+
+##### Persistence (agentsctl 再起動をまたぐ last-known-good catalog)
+
+in-memory cache は、`internal/localstate.Store` (agentsctl の local state の Root Owner) を通じて disk 上の last-known-good catalog によって裏打ちされる。Provider construction (`New`) は、configured Project ID に対応する persisted catalog があれば同期的に in-memory cache へ hydrate してから返る -- browser process も network access も一切発生させない、純粋な local state の読み込みである。これにより、agentsctl を再起動した直後の最初の `List` から、前回成功した catalog の rows が (background refresh の完了を待たずに) 即座に返る。
+
+persist される粒度は Project ID をキーにした catalog 全体で、以下を含む:
+
+```text
+conversation ID
+title
+create time
+update time
+catalog 全体の refreshed-at timestamp
+```
+
+以下は意図的に persist しない:
+
+```text
+session.CWD / config root         -- hydrate 時点の現在の Config.Root を常に使う
+Actions / Pinned / Runtime / Activity / provider warning
+refreshing / pending といった refresh state machine の状態
+```
+
+CWD を persist しないのは、リポジトリの移動や同一 Project を参照する別 checkout がある場合に、古い CWD がそのまま残ってしまうのを避けるため -- remote catalog (何がある conversation か) と local logical CWD (それが今どのディレクトリに属するか) は別の関心事として扱う。Local pin は既存の pin store がそのまま source of truth であり、ChatGPT catalog の persist/hydrate はそれに一切関与しない。
+
+Provider は raw JSON schema や `localstate` の内部型に直接依存しない。`internal/provider/chatgpt` は自身の consumer-side interface `CatalogStore` (`ChatGPTCatalog`/`SaveChatGPTCatalog`) を所有し、`*localstate.Store` がそれを満たす -- `provider/codex` が `localstate.Run` を介して `supervisor.Dispatcher` を consumer-side interface で受け取るのと同じ構図であり、テストは fake store で差し替えられる。
+
+replace は COMPLETE な enumeration の後にのみ行われ、memory cache の更新と persist は同じ成功パス内で行われる:
+
+```text
+remote COMPLETE
+  → normalize
+  → memory cache replace (今回の refreshedAt で)
+  → CatalogStore へ persist
+  → Observer publish
+```
+
+**persistence failure は remote success を無効化しない**: disk 書き込みが失敗しても、memory cache の更新と Observer publish は既に完了しているためそのまま有効であり、取り消したり握りつぶしたりしない。persistence failure は cache 内部に記録されるだけで、この refresh cycle の Observer publication 自体には現状影響を与えない (`sessionctl.ProviderUpdate` は成功/失敗のどちらか一方しか表現できない shape のため、durability の警告だけのために contract を拡張することはしていない)。
+
+hydrate 時に無効な persisted row (conversation ID の形式が不正、title が空、timestamp が zero value など) を検出した場合は、その catalog 全体を hydrate せず (部分的に corrupt な catalog を許容しない)、空の cache から始める。persisted state の read/decode 自体が失敗した場合も同様に、診断情報として記録するだけで provider の起動は妨げない -- remote refresh は通常どおり background で開始される。
+
+state.json 全体が読めない、あるいは decode できない場合の挙動は `internal/localstate` 既存の挙動にそのまま従う -- ChatGPT 固有の corruption recovery は追加しない。
 
 #### Dispatch / Composer
 
@@ -663,6 +705,7 @@ agentsctl は native session record や transcript を複製せず、agentsctl �
 - Pin
 - Claude Archive overlay
 - Codex managed run metadata
+- ChatGPT の persisted last-known-good catalog (Project ID ごと -- 前述の "Persistence" 節参照)
 
 Claude session の表示名 (`ClaudeNames`) は、native rename 導入以前の overlay が migration compatibility として残るのみで、新規 rename の保存先ではない。
 
