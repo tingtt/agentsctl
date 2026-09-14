@@ -8,8 +8,8 @@ import (
 
 const (
 	maxPages                  = 100
-	maxWheelTicks             = 60
-	maxWheelRounds            = 40
+	maxWheelTicks             = 600
+	maxWheelRounds            = 200
 	wheelTicksPerRound        = 3
 	maxNoProgressRounds       = 6
 	initialProjectLoadTimeout = 15 * time.Second

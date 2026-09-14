@@ -2,6 +2,7 @@ package chatgpt
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,38 @@ type fakeDiscoveryBridge struct {
 	wheelIndex int
 	wheelCalls int
 	closed     bool
+}
+
+type slowGrowingBridge struct {
+	pages      []capture
+	pageIndex  int
+	wheelCalls int
+}
+
+func (b *slowGrowingBridge) BeginList(context.Context, string) error { return nil }
+func (b *slowGrowingBridge) Captures(context.Context, string) ([]capture, error) {
+	return b.pages[:b.pageIndex+1], nil
+}
+func (b *slowGrowingBridge) ScrollRegion(context.Context, string) (scrollRegion, error) {
+	return b.region(), nil
+}
+func (b *slowGrowingBridge) Wheel(_ context.Context, _ string, ticks int) (wheelResult, error) {
+	initial := b.region()
+	b.wheelCalls++
+	if b.wheelCalls%13 == 0 && b.pageIndex+1 < len(b.pages) {
+		b.pageIndex++
+	}
+	return wheelResult{Found: true, Initial: initial, Final: b.region(), Ticks: ticks}, nil
+}
+func (b *slowGrowingBridge) Close() error { return nil }
+func (b *slowGrowingBridge) region() scrollRegion {
+	return scrollRegion{
+		Found:            true,
+		ProjectLinkCount: (b.pageIndex + 1) * 10,
+		ScrollTop:        b.wheelCalls * 20,
+		ScrollHeight:     1000 + b.pageIndex*500 + b.wheelCalls*20,
+		ClientHeight:     500,
+	}
 }
 
 func (f *fakeDiscoveryBridge) BeginList(context.Context, string) error { return nil }
@@ -64,6 +97,38 @@ func TestEnumerateReturnsErrorInsteadOfPartialListWithoutTerminalCursor(t *testi
 	if got, err := enumerateWithLimits(context.Background(), bridge, "g-p-test", limits); err == nil || got != nil || !strings.Contains(err.Error(), "terminal") {
 		t.Fatalf("conversations=%+v err=%v", got, err)
 	}
+}
+
+func TestEnumerateAllowsLargeGrowingProjectWithinDefensiveBounds(t *testing.T) {
+	pages := make([]capture, 6)
+	for index := range pages {
+		cursorIn := "0"
+		if index > 0 {
+			cursorIn = fmt.Sprintf("cursor-%d", index)
+		}
+		next := ""
+		if index+1 < len(pages) {
+			next = fmt.Sprintf("cursor-%d", index+1)
+		}
+		pages[index] = capturePage(index+1, "project", cursorIn, next, item(conversationForIndex(index), "conversation", "2026-01-01T00:00:00Z"))
+	}
+	bridge := &slowGrowingBridge{pages: pages}
+	limits := defaultEnumerationLimits()
+	limits.initialTimeout = time.Second
+	limits.pollInterval = 0
+	limits.settle = 0
+	limits.bottomSettle = 0
+	got, err := enumerateWithLimits(context.Background(), bridge, "g-p-test", limits)
+	if err != nil || len(got) != len(pages) {
+		t.Fatalf("conversations=%d wheelCalls=%d err=%v", len(got), bridge.wheelCalls, err)
+	}
+	if bridge.wheelCalls*limits.ticksPerRound <= 60 {
+		t.Fatalf("fixture used %d ticks; it must exceed the old 60-tick ceiling", bridge.wheelCalls*limits.ticksPerRound)
+	}
+}
+
+func conversationForIndex(index int) string {
+	return fmt.Sprintf("00000000-0000-0000-0000-%012d", index+1)
 }
 
 func testEnumerationLimits() enumerationLimits {

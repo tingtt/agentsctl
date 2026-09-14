@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { targetFrom } = require("./capture.js");
+const { responseCursor, targetFrom } = require("./capture.js");
 
 test("capture target preserves opaque cursor and ignores it for series identity", () => {
   const first = targetFrom("https://chatgpt.com/backend-api/gizmos/g-p-internal/conversations?cursor=opaque-a&limit=10");
@@ -21,4 +21,16 @@ test("endpoint identity separates otherwise identical request series", () => {
 test("non-project and cursor-less requests are ignored", () => {
   assert.equal(targetFrom("https://chatgpt.com/backend-api/conversations?cursor=0"), null);
   assert.equal(targetFrom("https://chatgpt.com/backend-api/gizmos/g-p-internal/conversations"), null);
+});
+
+test("terminal cursor accepts absent, null, and empty response shapes", () => {
+  for (const payload of [{}, { cursor: null }, { cursor: "" }]) {
+    assert.deepEqual(responseCursor(payload), { cursorObserved: true, hasNextCursor: false, nextCursor: "" });
+  }
+  assert.deepEqual(responseCursor({ cursor: "opaque-next" }), {
+    cursorObserved: true,
+    hasNextCursor: true,
+    nextCursor: "opaque-next",
+  });
+  assert.throws(() => responseCursor({ cursor: 7 }), /unrecognized type/);
 });

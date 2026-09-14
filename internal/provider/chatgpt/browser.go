@@ -247,7 +247,7 @@ func dialBridge(ctx context.Context, path string) (net.Conn, error) {
 type commandExecutor struct{}
 
 func (commandExecutor) StartBackground(ctx context.Context, path string, args []string) (processHandle, error) {
-	cmd := exec.CommandContext(ctx, path, args...)
+	cmd := gracefulCommand(ctx, path, args...)
 	cmd.Env = append(os.Environ(), "TERMINAL_BROWSER_SKIP_GRAPHICS_CHECK=1")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
@@ -267,11 +267,27 @@ func (commandExecutor) StartBackground(ctx context.Context, path string, args []
 }
 
 func (commandExecutor) RunForeground(ctx context.Context, path string, args []string, in *os.File, out io.Writer) error {
-	cmd := exec.CommandContext(ctx, path, args...)
+	cmd := gracefulCommand(ctx, path, args...)
 	cmd.Stdin = in
 	cmd.Stdout = out
 	cmd.Stderr = out
 	return cmd.Run()
+}
+
+func gracefulCommand(ctx context.Context, path string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		err := cmd.Process.Signal(syscall.SIGTERM)
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 5 * time.Second
+	return cmd
 }
 
 type commandProcess struct {

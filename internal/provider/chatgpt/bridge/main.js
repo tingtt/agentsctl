@@ -3,7 +3,7 @@
 const fs = require("node:fs");
 const net = require("node:net");
 const { app, ipcMain, webContents, BrowserWindow } = require("electron");
-const { targetFrom } = require("./capture.js");
+const { responseCursor, targetFrom } = require("./capture.js");
 const { DiscoveryOwner, captureBelongsToGeneration } = require("./ownership.js");
 
 const socketPath = "__AGENTSCTL_CHATGPT_SOCKET_PATH__";
@@ -46,9 +46,6 @@ function sanitizePage(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload) || !Array.isArray(payload.items)) {
     throw new Error("Project conversation response schema is not recognized");
   }
-  if (!Object.prototype.hasOwnProperty.call(payload, "cursor")) {
-    throw new Error("Project conversation response has no explicit cursor state");
-  }
   const items = payload.items.map((raw) => {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("conversation item is not an object");
     const id = firstString(raw, ["id", "conversation_id"]);
@@ -59,13 +56,7 @@ function sanitizePage(payload) {
     if (typeof raw.update_time !== "string") throw new Error("conversation item has no update_time");
     return { id, title, createdAt: raw.create_time, updatedAt: raw.update_time };
   });
-  if (payload.cursor === null || payload.cursor === "") {
-    return { items, cursorObserved: true, hasNextCursor: false, nextCursor: "" };
-  }
-  if (typeof payload.cursor !== "string") {
-    throw new Error("Project conversation cursor has an unrecognized type");
-  }
-  return { items, cursorObserved: true, hasNextCursor: true, nextCursor: payload.cursor };
+  return { items, ...responseCursor(payload) };
 }
 
 function attachCapture(contents) {

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeBrowserExecutor struct {
@@ -59,6 +60,16 @@ func TestRuntimeOpenUsesCanonicalAppModeInPersistentPartition(t *testing.T) {
 	if !strings.Contains(preloadScriptTemplate, `event.ctrlKey && event.key === "]"`) ||
 		!strings.Contains(preloadScriptTemplate, "globalThis.terminalBrowser.quit()") {
 		t.Fatal("embedded preload does not preserve Ctrl+] close-view behavior")
+	}
+}
+
+func TestGracefulCommandUsesBoundedCancellation(t *testing.T) {
+	cmd := gracefulCommand(context.Background(), "terminal-browser", "open")
+	if cmd.Cancel == nil {
+		t.Fatal("command cancellation must send a graceful termination signal")
+	}
+	if cmd.WaitDelay != 5*time.Second {
+		t.Fatalf("WaitDelay=%s, want 5s", cmd.WaitDelay)
 	}
 }
 

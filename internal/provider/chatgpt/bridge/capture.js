@@ -23,4 +23,17 @@ function targetFrom(rawURL) {
   }
 }
 
-module.exports = { targetFrom };
+// The final spike did not establish that the terminal response always owns a
+// cursor property. Preserve all three observed-compatible terminal shapes,
+// while rejecting every unknown cursor type.
+function responseCursor(payload) {
+  if (!Object.prototype.hasOwnProperty.call(payload, "cursor") || payload.cursor === null || payload.cursor === "") {
+    return { cursorObserved: true, hasNextCursor: false, nextCursor: "" };
+  }
+  if (typeof payload.cursor !== "string") {
+    throw new Error("Project conversation cursor has an unrecognized type");
+  }
+  return { cursorObserved: true, hasNextCursor: true, nextCursor: payload.cursor };
+}
+
+module.exports = { responseCursor, targetFrom };
