@@ -91,7 +91,7 @@ func (r *Runtime) drainN(t *testing.T, n int) {
 			}
 			r.currentScope = upd.scope
 			if upd.ps.Provider != "" {
-				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err)
+				r.applyProviderUpdate(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, nil)
 			}
 			r.recomputeRows()
 		case <-deadline:
@@ -110,7 +110,7 @@ func (r *Runtime) drainObserver(t *testing.T) {
 			t.Fatal("observerCh closed unexpectedly")
 			return
 		}
-		r.applyProviderUpdate(upd.Provider, upd.Sessions, upd.Err)
+		r.applyProviderUpdate(upd.Provider, upd.Sessions, upd.Err, upd.Warning)
 		r.recomputeRows()
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected observer update never arrived")
