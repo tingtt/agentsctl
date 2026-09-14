@@ -136,6 +136,28 @@ func TestHydrationRejectsMalformedPersistedConversation(t *testing.T) {
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("a malformed persisted row must be rejected wholesale, not partially admitted: rows=%+v err=%v", rows, err)
 	}
+	assertInitialObserverWarning(t, p)
+}
+
+// assertInitialObserverWarning fixes that a hydration failure (read error
+// or validation failure) is observable, not just internally recorded: the
+// first Observer subscription established after such a Provider is
+// constructed must immediately receive one ProviderUpdate carrying the
+// pending warning (see Provider.Observe's doc comment on Option A).
+func assertInitialObserverWarning(t *testing.T, p *Provider) {
+	t.Helper()
+	updates := p.Observe(context.Background())
+	select {
+	case upd, ok := <-updates:
+		if !ok || upd.Warning == nil {
+			t.Fatalf("expected an initial ProviderUpdate carrying the hydration warning: upd=%+v ok=%v", upd, ok)
+		}
+		if upd.Err != nil {
+			t.Fatalf("a hydration warning must never look like a refresh failure (Err): %+v", upd)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected an initial warning update for the new subscriber")
+	}
 }
 
 // TestHydrationLoadErrorDoesNotPreventProviderFromWorking fixes that a
@@ -148,6 +170,50 @@ func TestHydrationLoadErrorDoesNotPreventProviderFromWorking(t *testing.T) {
 	rows, err := p.List(context.Background(), false)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("a persisted-catalog load error must not surface as a remote List failure: rows=%+v err=%v", rows, err)
+	}
+	assertInitialObserverWarning(t, p)
+}
+
+// TestHydrationWarningClearsAfterSuccessfulRefreshAndPersist fixes the
+// last mile of the durability-warning lifecycle: a hydration failure's
+// warning is not permanent -- once a background refresh actually
+// succeeds and persists, the warning clears exactly like a persistence-
+// write-failure warning would.
+func TestHydrationWarningClearsAfterSuccessfulRefreshAndPersist(t *testing.T) {
+	at := time.Now()
+	browser := &sequenceBrowser{results: []browserResult{{conversations: []conversation{conv(conversationA, "A", at)}}}}
+	store := &fakeCatalogStore{loadErr: errors.New("disk read failed")}
+	p := &Provider{config: Config{ProjectID: "g-p-project", Root: "/work"}, browser: browser, store: store}
+	p.hydrate()
+	assertInitialObserverWarning(t, p)
+
+	// The load error is transient in this test double: clear it so the
+	// next persist (from a successful refresh) can succeed.
+	store.mu.Lock()
+	store.loadErr = nil
+	store.mu.Unlock()
+
+	// This subscription itself may immediately receive one initial update
+	// carrying the still-pending hydration warning (Observe's Option A --
+	// see assertInitialObserverWarning above), before Refresh's own result
+	// arrives shortly after; drain past that expected stale entry to the
+	// real, settled outcome rather than asserting on whichever arrives
+	// first.
+	updates := p.Observe(context.Background())
+	p.Refresh(context.Background())
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case upd, ok := <-updates:
+			if !ok {
+				t.Fatal("Observe channel closed before settling")
+			}
+			if upd.Err == nil && upd.Warning == nil {
+				return
+			}
+		case <-deadline:
+			t.Fatal("a successful refresh+persist never cleared the earlier hydration warning")
+		}
 	}
 }
 
@@ -265,6 +331,9 @@ func TestPersistenceWriteFailureDoesNotDiscardFreshMemoryCache(t *testing.T) {
 	if upd.Err != nil || len(upd.Sessions) != 1 || upd.Sessions[0].Key.ID != conversationB {
 		t.Fatalf("a persistence write failure must not suppress the Observer publication of a valid remote result: %+v", upd)
 	}
+	if upd.Warning == nil {
+		t.Fatal("expected the persistence write failure to surface as a non-fatal Warning on the same (successful) update")
+	}
 
 	rows, err := p.List(context.Background(), false)
 	if err != nil || len(rows) != 1 || rows[0].Key.ID != conversationB {
@@ -272,6 +341,91 @@ func TestPersistenceWriteFailureDoesNotDiscardFreshMemoryCache(t *testing.T) {
 	}
 	if store.saveN != 1 {
 		t.Fatalf("expected exactly one (failed) save attempt, got %d", store.saveN)
+	}
+}
+
+// TestPersistenceRecoveryClearsWarning fixes the durability-warning
+// lifecycle: a later successful persist clears a Warning set by an
+// earlier failed one, on the very update that succeeds.
+func TestPersistenceRecoveryClearsWarning(t *testing.T) {
+	at := time.Now()
+	browser := &sequenceBrowser{results: []browserResult{
+		{conversations: []conversation{conv(conversationB, "B", at)}},
+		{conversations: []conversation{conv(conversationA, "A", at.Add(time.Hour))}},
+	}}
+	store := &fakeCatalogStore{saveErr: errors.New("disk full")}
+	p := &Provider{config: Config{ProjectID: "g-p-project", Root: "/work"}, browser: browser, store: store}
+	updates := p.Observe(context.Background())
+
+	p.Refresh(context.Background())
+	first := waitForUpdate(t, updates)
+	if first.Warning == nil || len(first.Sessions) != 1 || first.Sessions[0].Key.ID != conversationB {
+		t.Fatalf("first update=%+v", first)
+	}
+
+	store.mu.Lock()
+	store.saveErr = nil
+	store.mu.Unlock()
+
+	p.Refresh(context.Background())
+	second := waitForUpdate(t, updates)
+	if second.Err != nil || second.Warning != nil {
+		t.Fatalf("a successful persist must clear the previous Warning: %+v", second)
+	}
+	if len(second.Sessions) != 1 || second.Sessions[0].Key.ID != conversationA {
+		t.Fatalf("second update sessions=%+v", second.Sessions)
+	}
+
+	// A durability warning that has already cleared must not resurface on
+	// a later subscriber either.
+	laterSubscriber := p.Observe(context.Background())
+	select {
+	case upd, ok := <-laterSubscriber:
+		if ok {
+			t.Fatalf("a fresh subscriber must not receive a stale/cleared durability warning: %+v", upd)
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+// TestRefreshFailureDoesNotClearPendingDurabilityWarning fixes the
+// DesignDoc's "latest provider problem wins" policy from the other
+// direction: a remote refresh failure must never silently resolve an
+// unrelated, still-unresolved durability warning -- it stays pending
+// (visible to a newly-joining subscriber) until a refresh actually
+// succeeds AND persists.
+func TestRefreshFailureDoesNotClearPendingDurabilityWarning(t *testing.T) {
+	at := time.Now()
+	browser := &sequenceBrowser{results: []browserResult{
+		{conversations: []conversation{conv(conversationB, "B", at)}},
+		{err: errors.New("timeout")},
+	}}
+	store := &fakeCatalogStore{saveErr: errors.New("disk full")}
+	p := &Provider{config: Config{ProjectID: "g-p-project", Root: "/work"}, browser: browser, store: store}
+	updates := p.Observe(context.Background())
+
+	p.Refresh(context.Background())
+	first := waitForUpdate(t, updates)
+	if first.Warning == nil {
+		t.Fatalf("first update=%+v", first)
+	}
+
+	p.Refresh(context.Background())
+	second := waitForUpdate(t, updates)
+	if second.Err == nil || second.Sessions != nil || second.Warning != nil {
+		t.Fatalf("a plain refresh failure must carry only Err: %+v", second)
+	}
+
+	// The durability warning from the first (successful-but-unpersisted)
+	// refresh must still be pending -- a new subscriber sees it.
+	late := p.Observe(context.Background())
+	select {
+	case upd, ok := <-late:
+		if !ok || upd.Warning == nil {
+			t.Fatalf("expected the still-pending durability warning to surface to a new subscriber: upd=%+v ok=%v", upd, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected an initial warning update for the new subscriber")
 	}
 }
 

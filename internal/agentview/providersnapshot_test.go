@@ -248,6 +248,49 @@ func TestObserverUpdateReplacesOnlyThatProviderWithoutDuplicates(t *testing.T) {
 	}
 }
 
+// TestObserverSuccessWithWarningReplacesRowsAndSurfacesWarning fixes the
+// non-fatal-warning half of applyProviderUpdate: a successful Observer
+// publication that also carries a Warning (e.g. ChatGPT's catalog
+// refreshed fine but failed to persist locally) must still fully replace
+// that provider's rows -- Warning is never a reason to keep old rows or
+// treat the update as a failure -- while also surfacing the warning. A
+// later clean success (no Warning) must both replace the rows again and
+// clear the warning.
+func TestObserverSuccessWithWarningReplacesRowsAndSurfacesWarning(t *testing.T) {
+	chatgpt := newObserverFakeProvider(&fakeProvider{id: session.ProviderChatGPT})
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work", Actions: session.Actions{session.ActionOpen: {Available: true}}}
+	persistErr := errors.New("chatgpt: persist catalog: disk full")
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}, Warning: persistErr}
+	rt.drainObserver(t)
+
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "B") {
+		t.Fatalf("a warning-bearing success must still replace rows: rows=%v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatal("expected the persistence warning to be surfaced")
+	}
+
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work", Actions: session.Actions{session.ActionOpen: {Available: true}}}
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}}
+	rt.drainObserver(t)
+
+	names = rowNames(rt.State.Rows)
+	if !contains(names, "C") || contains(names, "B") {
+		t.Fatalf("a later clean success must replace rows again: rows=%v", names)
+	}
+	if rt.State.Warnings[session.ProviderChatGPT] != nil {
+		t.Fatalf("a later clean success must clear the previous warning: %v", rt.State.Warnings[session.ProviderChatGPT])
+	}
+}
+
 // TestOpenCachedSessionDoesNotWaitForInFlightReload fixes the DesignDoc's
 // Phase 7 regression test at the Agent View level: a session already in
 // State.Rows from a completed cycle must remain immediately openable while

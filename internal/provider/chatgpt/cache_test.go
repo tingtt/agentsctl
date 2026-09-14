@@ -429,6 +429,51 @@ func TestObserverPublishThreeSuccessesConvergesToLast(t *testing.T) {
 	}
 }
 
+// TestObserverPublishWarningBearingSuccessThenCleanSuccessConverges fixes
+// latest-wins for warning-bearing updates specifically: a success with a
+// non-fatal Warning (e.g. a persistence write failure) queued behind a
+// later clean success must not resurface once the subscriber catches up
+// -- it converges directly to the clean success, warning and all
+// superseded together as one unit (see sessionctl.ProviderUpdate's doc
+// comment: Warning travels with the Sessions/success it happened
+// alongside, not as an independent, separately-queued event).
+func TestObserverPublishWarningBearingSuccessThenCleanSuccessConverges(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationA)}, Warning: errors.New("persist ChatGPT catalog: disk full")})
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationB)}})
+
+	got := waitForUpdate(t, updates)
+	if got.Err != nil || got.Warning != nil {
+		t.Fatalf("expected the later clean success to win, warning and all: got=%+v", got)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].Key.ID != conversationB {
+		t.Fatalf("expected convergence to the later success's own sessions: got=%+v", got)
+	}
+}
+
+// TestObserverPublishFailureThenWarningBearingSuccessConverges covers the
+// other direction: a plain refresh-failure update queued behind a later
+// warning-bearing success must converge to the success (with its
+// Warning), never the stale failure.
+func TestObserverPublishFailureThenWarningBearingSuccessConverges(t *testing.T) {
+	p := &Provider{}
+	updates := p.Observe(context.Background())
+
+	p.publish(sessionctl.ProviderUpdate{Err: errors.New("timeout")})
+	warning := errors.New("persist ChatGPT catalog: disk full")
+	p.publish(sessionctl.ProviderUpdate{Sessions: []session.Session{sessionWithID(conversationA)}, Warning: warning})
+
+	got := waitForUpdate(t, updates)
+	if got.Err != nil {
+		t.Fatalf("expected the later success to win over the stale failure: got=%+v", got)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].Key.ID != conversationA || got.Warning == nil {
+		t.Fatalf("expected convergence to the warning-bearing success: got=%+v", got)
+	}
+}
+
 // TestObserverPublishConvergesForConcurrentSlowReader exercises
 // sendLatest's actual concurrency contract (rather than only the
 // happens-before-drain cases above) under -race: many publishes racing a
