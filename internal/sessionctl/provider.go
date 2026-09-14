@@ -68,3 +68,47 @@ type Renamer interface {
 type Archiver interface {
 	Archive(ctx context.Context, key session.Key) error
 }
+
+// ProviderUpdate is one Observer publication: a provider's latest complete
+// catalog snapshot (a full replacement, never a delta -- see Observer), or
+// a refresh failure. Sessions is set on success and is that provider's
+// entire current catalog; Err is set instead on failure (never both). A
+// failure update deliberately carries no Sessions -- Observer's contract
+// requires a consumer to keep whatever sessions it already has for this
+// provider rather than reading an empty Sessions as "provider has no
+// sessions" (see the DesignDoc's last-known-good cache semantics).
+type ProviderUpdate struct {
+	Sessions []session.Session
+	Err      error
+}
+
+// Observer is an optional capability for a provider that maintains its own
+// last-known-good catalog independent of the request/response List cycle
+// (e.g. ChatGPT's browser-backed cache, replaced only by a complete
+// background enumeration -- see internal/provider/chatgpt's catalogCache).
+// Observe publishes a ProviderUpdate every time that catalog changes --
+// full replacement, not incremental add/remove/update -- so a consumer
+// (sessionctl.Controller.Observe, ultimately Agent View's provider
+// snapshot store) can simply overwrite its retained copy of this
+// provider's sessions rather than reconcile a delta.
+//
+// An Observer subscription is independent of any particular List/reload
+// call: it belongs to the provider instance for as long as ctx lives, not
+// to one Agent View reload generation (see the DesignDoc's "Observer
+// generations"). The channel closes when ctx ends or the provider itself
+// shuts down (see e.g. chatgpt.Provider.Close).
+type Observer interface {
+	Observe(ctx context.Context) <-chan ProviderUpdate
+}
+
+// Refresher is an optional capability: requests a background catalog
+// refresh without blocking the caller for its result -- the eventual
+// outcome (success or failure) arrives later through Observer, never as
+// Refresh's own return value. A provider implementing Refresher is
+// expected to coalesce concurrent/rapid Refresh requests into at most one
+// extra refresh after the one already running (see the DesignDoc's
+// single-flight refresh state machine) rather than starting one
+// enumeration per call.
+type Refresher interface {
+	Refresh(ctx context.Context)
+}

@@ -93,6 +93,63 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 	return out
 }
 
+// ObserverUpdate is one Observer-sourced provider update, mirroring
+// ProviderSnapshot for the Observe side: the same provider-tagged,
+// actionsFor-narrowed shape LoadStream's ProviderSnapshot uses, so a
+// consumer (Agent View's provider snapshot store) can apply either
+// through one code path. Sessions is nil and Err is set on a refresh
+// failure, exactly like ProviderUpdate -- Observe narrows/tags the
+// underlying provider.Observer publication but preserves that contract.
+type ObserverUpdate struct {
+	Provider session.ProviderID
+	Sessions []session.Session
+	Err      error
+}
+
+// Observe subscribes once to every configured provider that implements
+// Observer, merging their independent publication streams into one
+// channel, each tagged with its provider and actionsFor-narrowed the same
+// way LoadStream's ProviderSnapshot is (see actionsFor). Unlike
+// LoadStream, this is not one reload cycle: it is a long-lived
+// subscription a caller (Agent View) establishes once and drains for as
+// long as ctx lives (see the DesignDoc's "Observer generations" -- a
+// completed provider refresh is authoritative independent of any Agent
+// View reload generation). The returned channel closes once every
+// Observer provider's own channel has closed (immediately, already
+// closed, if no configured provider implements Observer).
+func (c Controller) Observe(ctx context.Context) <-chan ObserverUpdate {
+	out := make(chan ObserverUpdate)
+	var wg sync.WaitGroup
+	for _, p := range c.Providers {
+		obs, ok := p.(Observer)
+		if !ok {
+			continue
+		}
+		p, obs := p, obs
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for upd := range obs.Observe(ctx) {
+				if upd.Err != nil {
+					out <- ObserverUpdate{Provider: p.ID(), Err: upd.Err}
+					continue
+				}
+				enriched := make([]session.Session, len(upd.Sessions))
+				for i := range upd.Sessions {
+					enriched[i] = upd.Sessions[i]
+					enriched[i].Actions = actionsFor(p, upd.Sessions[i])
+				}
+				out <- ObserverUpdate{Provider: p.ID(), Sessions: enriched}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
+}
+
 // MergeSessions applies Load's pin-enrichment, scope filtering, and
 // overview ordering to an arbitrary collection of already actionsFor-
 // narrowed sessions -- the same post-processing Load itself applies to
