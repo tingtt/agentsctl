@@ -101,6 +101,21 @@ func TestSelectedRowRendersCursorMarker(t *testing.T) {
 	}
 }
 
+func TestChatGPTRowUsesGenericProviderRendering(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{
+		Key:      session.Key{Provider: session.ProviderChatGPT, ID: "conversation"},
+		Name:     "ChatGPT session",
+		CWD:      "/work/project",
+		Activity: session.ActivityUnknown,
+		Runtime:  session.RuntimeNone,
+	}})
+	row := renderedSessionLine(t, s.View(100, 12), "ChatGPT session")
+	if !strings.Contains(visibleText(row), "chatgpt") {
+		t.Fatalf("row=%q", row)
+	}
+}
+
 func visibleText(styled string) string {
 	var plain strings.Builder
 	for i := 0; i < len(styled); {
@@ -184,7 +199,7 @@ func TestSelectedRowBackgroundPreservesForegroundStyles(t *testing.T) {
 		"status":         "\x1b[32m✻",
 		"notice":         "\x1b[31mPress Ctrl+X again to archive",
 		"cwd":            "\x1b[90m/work/repo-a",
-		"provider":       "\x1b[" + providerColorCodexCodes + "m codex",
+		"provider":       "\x1b[" + providerColorCodexCodes + "m  codex",
 	} {
 		if !strings.Contains(row, prefix) {
 			t.Errorf("selected row lost %s foreground style: %q", name, row)

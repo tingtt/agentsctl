@@ -1,12 +1,13 @@
 # agentsctl
 
-`agentsctl` is a Unix TUI that presents Claude Code background agents and Codex CLI sessions in one Agent View. It normalizes list, dispatch, attach, detach, stop, rename, and archive as capabilities while keeping each provider's lifecycle intact.
+`agentsctl` is a Unix TUI that presents Claude Code background agents, Codex CLI sessions, and configured ChatGPT Project conversations in one Agent View. It exposes only the capabilities each provider genuinely supports while keeping each provider's lifecycle intact.
 
 ## Requirements
 
 - macOS or Linux
 - Go 1.25+ to build from source
 - `claude` and/or `codex` on `PATH`; either provider may be unavailable
+- `terminal-browser` on `PATH` for the optional ChatGPT provider, with its `agentsctl-chatgpt` partition already authenticated
 
 ```sh
 go build ./cmd/agentsctl
@@ -14,6 +15,35 @@ go build ./cmd/agentsctl
 ```
 
 ## Configuration
+
+### ChatGPT Project
+
+ChatGPT integration is opt-in. Add the stable Project ID to the nearest `.agentsctl.toml` at or above the directory where `agentsctl` starts:
+
+```toml
+[chatgpt]
+project_id = "g-p-..."
+```
+
+Authenticate the dedicated partition interactively before starting `agentsctl`; login and MFA remain entirely user-driven:
+
+```sh
+terminal-browser open https://chatgpt.com --partition=agentsctl-chatgpt --app-mode
+```
+
+The directory containing that file is the logical CWD for every conversation in the configured Project, so ChatGPT rows participate in the existing `same directory`, `descendants`, and `all directories` scopes. A nearer `.agentsctl.toml` establishes a project boundary; when it has no `[chatgpt]` table, configuration is not inherited from a more distant file. An explicitly configured but missing or invalid `project_id` appears as an isolated ChatGPT provider warning and does not prevent Claude or Codex from loading.
+
+The initial provider supports List and Open only. Chat and Work are intentionally not classified: both appear as `chatgpt` sessions and open in the official ChatGPT UI. Empty-composer `Enter` opens the selected conversation; a non-empty composer still dispatches only through Claude or Codex, and `Shift+Tab` continues to cycle only those two providers. `Ctrl+]` closes the browser view and returns to Agent View without stopping or deleting the cloud conversation.
+
+Session discovery passively observes the official Project page's undocumented cursor endpoint in `terminal-browser`. A background refresh only replaces its result rather than returning partial results unless an explicit terminal cursor page is observed. Browser authentication remains inside the persistent browser partition; cookies, authorization headers, tokens, browser storage, complete request headers, raw backend payloads, and transcript contents do not cross into Go. ChatGPT star state is ignored: `Ctrl+T` uses the same agentsctl-local pin store as other providers. Rows use ChatGPT creation time for newest-first ordering, not remote update order.
+
+ChatGPT Project conversations remain visible while the background catalog refresh runs, and stay selectable and openable the whole time -- opening one never waits on that refresh. If a refresh temporarily fails (timeout, an interrupted browser session, and so on), the last successful catalog remains usable, including Open, until a later complete refresh replaces it; a footer warning surfaces the failure without hiding the still-usable rows.
+
+The last successfully refreshed ChatGPT catalog (conversation titles/IDs and timestamps, in agentsctl's local state) is also cached locally, so it can appear immediately the next time `agentsctl` starts -- before the background refresh against the live Project even completes -- and remains selectable and openable in the meantime. Only a complete refresh replaces this cache; a failed one never overwrites it. It is scoped to the configured Project ID, so switching to a different Project never shows a stale one's cached rows. It never includes message/transcript contents, prompts, or authentication material.
+
+If a catalog refreshes successfully but agentsctl can't save it locally (e.g. disk full), the freshly refreshed rows are still shown and remain fully usable -- a footer warning notes only that the local cache itself may be out of date, distinct from a warning about the refresh itself failing.
+
+Current limitations are inherited from the browser boundary: `terminal-browser` is kept alive by an agentsctl-owned background PTY, and the ChatGPT Web endpoint is undocumented and may change. In app mode, `terminal-browser` cannot currently distinguish Japanese IME composition-confirm `Enter` from message-send `Enter`; composing elsewhere and pasting avoids premature submission.
 
 ### Managed Codex external editor
 
@@ -32,7 +62,7 @@ When `CODEX_EDITOR` is unset or empty, the managed process keeps the normally in
 | Key | Action |
 | --- | --- |
 | `Shift+Tab` | Toggle the composer between Claude and Codex without clearing the prompt. |
-| `Enter` | Dispatch the composer prompt in the background, or attach the selected session when the composer is empty. |
+| `Enter` | Dispatch the composer prompt in the background, or open/attach the selected session when the composer is empty. |
 | `Option+Enter` / `Shift+Enter` | Insert a newline into the composer prompt at the cursor, without dispatching. |
 | `Ctrl+S` | Swap the composer text with one shared in-memory stash slot. While attached, forward `Ctrl+S` to the child instead. |
 | `Ctrl+G` | Edit the composer prompt in Vim. Saving and exiting updates the composer without dispatching; exiting without saving preserves it. |
@@ -43,7 +73,7 @@ When `CODEX_EDITOR` is unset or empty, the managed process keeps the normally in
 | `Ctrl+R` | Rename the selected session. Edit the current name inline with `←` / `→`, `Home`, `End`, `Backspace`, and `Delete`; use `Enter` to save or `Esc` to cancel. |
 | `Ctrl+X` | Stop an active managed session. For an inactive session, press twice to confirm and archive it. The confirmation ("Press Ctrl+X again to archive") appears on that session's own row, not as a separate message. |
 | `Ctrl+L` | Refresh the active session catalog and runtime state. |
-| `Ctrl+]` | Detach to the overview without stopping the underlying session. |
+| `Ctrl+]` | Detach to the overview, or close a ChatGPT browser view, without stopping the underlying session. |
 | `?` | Show the help view, only when the composer prompt is empty and help isn't already shown (otherwise `?` is a plain prompt character). |
 | `Esc` | Hide the help view if it's showing; otherwise clear a non-empty composer prompt; otherwise cancel a rename/archive confirmation, or exit the overview. Background sessions continue. |
 
@@ -67,7 +97,7 @@ Pinned sessions always form a single `Pinned` group, regardless of how many dire
 
 Pressing `?` on an empty prompt replaces the contextual/usage lines with a categorized help view (`manage sessions` / `prompt` / `help`) instead. Help stays open while typing; only `Esc` closes it, without touching the prompt.
 
-The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. It supports multiline prompts: `Option+Enter` or `Shift+Enter` inserts a newline at the cursor instead of dispatching, and each embedded newline renders as its own row, indented to align under the `❯ ` prefix; `←` / `→` move across a newline like any other character, and `Home` / `End` still jump to the start/end of the whole prompt (not just the current line). Only plain `Enter` dispatches (or, on an empty composer, attaches). `Ctrl+G` opens the complete prompt in foreground Vim; `:wq` returns the saved text to the composer, while `:q!` leaves the prior composer state intact. Returning from Vim never dispatches or starts a session—the normal submit action is still required. The prompt stash and the `Shift+Tab` provider toggle preserve multiline content, including embedded newlines, exactly as typed. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
+The composer supports `←` / `→`, `Home`, `End`, `Backspace`, and `Delete` with a visible cursor. It supports multiline prompts: `Option+Enter` or `Shift+Enter` inserts a newline at the cursor instead of dispatching, and each embedded newline renders as its own row, indented to align under the `❯ ` prefix; `←` / `→` move across a newline like any other character, and `Home` / `End` still jump to the start/end of the whole prompt (not just the current line). Only plain `Enter` dispatches (or, on an empty composer, opens/attaches). `Ctrl+G` opens the complete prompt in foreground Vim; `:wq` returns the saved text to the composer, while `:q!` leaves the prior composer state intact. Returning from Vim never dispatches or starts a session—the normal submit action is still required. The prompt stash and the `Shift+Tab` provider toggle preserve multiline content, including embedded newlines, exactly as typed. The prompt stash stores text only. It is shared across providers, directory scopes, and selected sessions, and is discarded when `agentsctl` exits. Restoring a stashed prompt places the cursor at its end. Rename and archive confirmation keep both the composer and stash unchanged.
 
 Whether `Shift+Enter` is distinguishable from plain `Enter` depends on the terminal: `agentsctl` recognizes it when the terminal sends a bare line feed (`\n`) for `Shift+Enter` as opposed to a carriage return (`\r`) for plain `Enter` (confirmed against a real macOS terminal via a raw-byte probe). A terminal that instead sends the identical byte for both cannot be distinguished at the application level. `Option+Enter` works wherever the terminal sends the classic "meta sends escape" convention (`ESC` followed by the Enter byte) for the Option modifier, which is how it was confirmed.
 

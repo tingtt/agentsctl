@@ -68,3 +68,72 @@ type Renamer interface {
 type Archiver interface {
 	Archive(ctx context.Context, key session.Key) error
 }
+
+// ProviderUpdate is one Observer publication: either a provider's latest
+// complete catalog snapshot (a full replacement, never a delta -- see
+// Observer), optionally accompanied by a non-fatal Warning, or a refresh
+// failure. Err is the sole success/failure discriminator -- never the
+// nilness of Sessions:
+//
+//   - Err != nil: a refresh failed. Sessions is ignored/nil. A consumer
+//     must keep whatever sessions it already has for this provider rather
+//     than treating this as "provider has no sessions" (see the
+//     DesignDoc's last-known-good cache semantics).
+//
+//   - Err == nil: a refresh succeeded -- a full replacement, even when
+//     Sessions is nil or empty (a valid, real "this provider currently has
+//     no sessions" catalog, e.g. an empty ChatGPT Project, or nothing
+//     hydrated yet -- never confuse this with a failed refresh just
+//     because Sessions is unset). A consumer replaces its retained copy
+//     of Sessions outright. Warning, if also set, does not change that:
+//     Sessions is still fully valid and usable (selectable, actionable),
+//     but some secondary/non-fatal problem exists alongside it -- e.g. the
+//     catalog refreshed correctly yet a provider's own attempt to persist
+//     it locally failed (see internal/provider/chatgpt's
+//     durabilityWarning). A consumer surfaces Warning (e.g. as a footer
+//     notice) without ever treating it as a reason to discard or hide
+//     Sessions, and clears any previously-shown Warning for this provider
+//     once an update arrives with Warning == nil.
+//
+// Err and Warning must never both be set on the same update -- they
+// answer different questions ("did this refresh fail" vs. "did this
+// otherwise-successful refresh's result end up less durable than
+// intended") and a provider must pick the one that actually applies to
+// this cycle's outcome rather than trying to report both at once (see the
+// DesignDoc's "latest provider problem wins" policy).
+type ProviderUpdate struct {
+	Sessions []session.Session
+	Err      error
+	Warning  error
+}
+
+// Observer is an optional capability for a provider that maintains its own
+// last-known-good catalog independent of the request/response List cycle
+// (e.g. ChatGPT's browser-backed cache, replaced only by a complete
+// background enumeration -- see internal/provider/chatgpt's catalogCache).
+// Observe publishes a ProviderUpdate every time that catalog changes --
+// full replacement, not incremental add/remove/update -- so a consumer
+// (sessionctl.Controller.Observe, ultimately Agent View's provider
+// snapshot store) can simply overwrite its retained copy of this
+// provider's sessions rather than reconcile a delta.
+//
+// An Observer subscription is independent of any particular List/reload
+// call: it belongs to the provider instance for as long as ctx lives, not
+// to one Agent View reload generation (see the DesignDoc's "Observer
+// generations"). The channel closes when ctx ends or the provider itself
+// shuts down (see e.g. chatgpt.Provider.Close).
+type Observer interface {
+	Observe(ctx context.Context) <-chan ProviderUpdate
+}
+
+// Refresher is an optional capability: requests a background catalog
+// refresh without blocking the caller for its result -- the eventual
+// outcome (success or failure) arrives later through Observer, never as
+// Refresh's own return value. A provider implementing Refresher is
+// expected to coalesce concurrent/rapid Refresh requests into at most one
+// extra refresh after the one already running (see the DesignDoc's
+// single-flight refresh state machine) rather than starting one
+// enumeration per call.
+type Refresher interface {
+	Refresh(ctx context.Context)
+}

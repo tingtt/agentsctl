@@ -19,7 +19,11 @@ type displayLine struct {
 // can be tested by constructing a State and comparing rendered text (see
 // render_test.go), without a real terminal or provider.
 func (s State) View(width, height int) string {
-	header := []string{clipLine(fmt.Sprintf("agentsctl · %s", scopeLabel(s.Scope)), width), ""}
+	headerText := fmt.Sprintf("agentsctl · %s", scopeLabel(s.Scope))
+	if s.CatalogLoading {
+		headerText += styleText(" · loading sessions…", colorGray)
+	}
+	header := []string{clipLine(headerText, width), ""}
 	list := make([]displayLine, 0, len(s.Rows)+4)
 	selectedIndex := s.SelectedIndex()
 	for _, g := range groupRows(s.Rows) {

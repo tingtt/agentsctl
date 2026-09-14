@@ -5,7 +5,7 @@
 
 ## Abstract/Summary
 
-agentsctl は、Claude Code のバックグラウンドエージェントと Codex CLI のセッションを、単一の Agent View から操作する Unix TUI である。
+agentsctl は、Claude Code のバックグラウンドエージェント、Codex CLI のセッション、設定された ChatGPT Project の conversation を、単一の Agent View から操作する Unix TUI である。
 
 提供する共通操作は以下とする。
 
@@ -17,7 +17,7 @@ agentsctl は、Claude Code のバックグラウンドエージェントと Cod
 - Archive
 - Pin / Unpin
 
-Claude と Codex では、バックグラウンド実行の仕組みが異なる。
+各 provider では、バックグラウンド実行の仕組みが異なる。
 そのため、以下の非対称な実行モデルを前提とする。
 
 - **Claude**
@@ -26,21 +26,24 @@ Claude と Codex では、バックグラウンド実行の仕組みが異なる
 - **Codex**
   - agentsctl が supervisor と PTY を提供する。
   - supervisor が Codex CLI プロセスを保持する。
+- **ChatGPT**
+  - browser-owned authentication と ChatGPT の cloud lifecycle を利用する。
+  - List と Open のみを提供し、interaction は公式 ChatGPT UI に委譲する。
 
 各 provider のネイティブなライフサイクルを維持しつつ、Agent View 上では共通の UX を提供する。
 
 ### Provider runtime model
 
-| 項目                 | Claude                  | Codex                                               |
-| -------------------- | ----------------------- | --------------------------------------------------- |
-| バックグラウンド常駐 | Claude のネイティブ機構 | agentsctl supervisor + PTY                          |
-| Session catalog      | `claude agents`         | Codex app-server + agentsctl managed run            |
-| Dispatch             | `claude --bg`           | supervisor に Codex CLI の起動を依頼                |
-| Attach               | `claude attach`         | supervisor が保持する PTY へ接続                    |
-| Stop                 | `claude stop`           | supervisor が所有するプロセスを停止                 |
-| Rename               | `/rename` via transient attach | Codex app-server                             |
-| Archive              | agentsctl-local overlay | Codex app-server、または unbound run のローカル削除 |
-| Pin                  | agentsctl-local state   | agentsctl-local state                               |
+| 項目                 | Claude                  | Codex                                               | ChatGPT                               |
+| -------------------- | ----------------------- | --------------------------------------------------- | ------------------------------------- |
+| バックグラウンド常駐 | Claude のネイティブ機構 | agentsctl supervisor + PTY                          | ChatGPT cloud                          |
+| Session catalog      | `claude agents`         | Codex app-server + agentsctl managed run            | 公式 Project UI の passive capture    |
+| Dispatch             | `claude --bg`           | supervisor に Codex CLI の起動を依頼                | 非対応                                |
+| Open / Attach        | `claude attach`         | supervisor が保持する PTY へ接続                    | terminal-browser app mode の公式 UI   |
+| Stop                 | `claude stop`           | supervisor が所有するプロセスを停止                 | 非対応                                |
+| Rename               | `/rename` via transient attach | Codex app-server                             | 非対応                                |
+| Archive              | agentsctl-local overlay | Codex app-server、または unbound run のローカル削除 | 非対応                                |
+| Pin                  | agentsctl-local state   | agentsctl-local state                               | agentsctl-local state                 |
 
 ## Background
 
@@ -50,7 +53,7 @@ agentsctl はこの provider ごとの差異を吸収し、複数セッション
 
 ## Goals
 
-- Claude と Codex のセッションを単一の Agent View から一覧・操作できるようにする。
+- Claude、Codex、設定された ChatGPT Project のセッションを単一の Agent View から一覧・操作できるようにする。
 - 以下を provider に依存しない共通操作として提供する。
   - list / dispatch / attach / detach / stop / rename / archive / pin
 
@@ -58,14 +61,15 @@ agentsctl はこの provider ごとの差異を吸収し、複数セッション
 
 ## Non-Goals
 
-- Claude / Codex 以外の provider への対応
+- ChatGPT からの Dispatch、新規 conversation 作成、Stop、Rename、Archive
+- Chat と Work を共通 model 上で区別すること
 - Archive したセッションを Agent View から復帰させる操作
 - agentsctl 独自の session / transcript 形式を持つこと
 - Windows 対応
 
 ## Proposed Design
 
-agentsctl は、Claude と Codex を共通の session model として Agent View へ提示する。ただし、実際の lifecycle operation は provider ごとの能力へ委譲する。
+agentsctl は、Claude、Codex、ChatGPT を共通の session model として Agent View へ提示する。ただし、実際の lifecycle operation は provider ごとの能力へ委譲する。
 
 agentsctl が補うのは、主に Codex に不足するバックグラウンド実行能力である。
 
@@ -73,7 +77,7 @@ agentsctl が補うのは、主に Codex に不足するバックグラウンド
 
 #### Session catalog
 
-Claude と Codex のセッションを統合し、1つの一覧として表示する。
+Claude、Codex、ChatGPT のセッションを統合し、1つの一覧として表示する。
 
 session は作成時刻が新しい順に並べる。Activity や runtime status の変化だけでは並び順を変更しない。これにより、バックグラウンド更新によって閲覧中の行が頻繁に移動することを防ぐ。
 
@@ -96,7 +100,7 @@ Pin / Unpin 操作は即時に表示へ反映するため、provider の catalog
 
 #### Lifecycle
 
-Agent View では Claude と Codex を共通の session model として扱うが、session の実体と実行主体は provider ごとに異なる。
+Agent View では各 provider を共通の session model として扱うが、session の実体と実行主体は provider ごとに異なる。
 
 **Claude**
 
@@ -121,6 +125,116 @@ Agent View では Claude と Codex を共通の session model として扱うが
 
 - interactive Codex CLI process と PTY の lifetime は agentsctl supervisor が保持する。
 - TUI の lifetime と Codex CLI process の lifetime は分離する。
+
+**ChatGPT**
+
+- `.agentsctl.toml` の `[chatgpt].project_id` が指定する1つの Project を catalog の対象とする。
+- 設定ファイルを含む directory を全 conversation の logical CWD とし、共通の directory scope を適用する。
+- normal Chat と Work は区別せず、どちらも provider `chatgpt` の session とする。
+- local runtime を証明する概念を持たないため `RuntimeNone`、共通化できる activity signal を持たないため `ActivityUnknown` とする。
+- cloud session の実行主体と lifetime は ChatGPT が保持し、agentsctl や browser view の lifetime から独立させる。
+
+#### ChatGPT browser-backed provider
+
+ChatGPT provider は `sessionctl.Source` と `sessionctl.Opener` に加えて `sessionctl.Refresher` と `sessionctl.Observer` を実装する (cache/refresh/observe の詳細は次節)。Agent View は provider ID で分岐せず、共通 capability と session key `chatgpt:<conversation_id>` を通じて List / Open / selection / local pin / refresh / catalog update を扱う。
+
+List は永続 partition `agentsctl-chatgpt` で公式 Project view を開き、frontend 自身が発行する `/backend-api/gizmos/{project_id}/conversations` response を passive に観測する。設定された Project route ID と endpoint 内の opaque ID が一致することには依存せず、navigation generation と discovery WebContents の ownership によって capture scope を確定する。browser bridge は response body を browser-side で sanitize し、conversation ID、title、create/update time、cursor chain に必要な metadata のみを mode `0600` の local socket から Go へ渡す。credential、header、browser storage、transcript、raw response は bridge boundary を越えない。
+
+同じ `cursor=0` を共有する異なる request series が存在しうるため、browser-side の endpoint identity と cursor 以外の relevant query parameters から `SeriesKey` を導出する。fresh series が1つだけなら DOM render count を条件にせず固定し、複数なら Project conversation link count と一致する first page が一意に決まるまで bounded load window 内で待つ。期限まで曖昧なら失敗する。cursor は opaque value として equality / cycle detection / unchanged forwarding だけに使い、terminal response は absent / `null` / empty string の互換 shape のみを受理する。
+
+pagination は synthetic DOM event ではなく Electron の real mouse-wheel input を使い、現在の scroll region と増加しうる `scrollHeight` を毎 round 再取得して moving bottom を追う。明示的な terminal cursor page を観測した場合だけ List を成功させる。page 数、wheel tick/round、no-progress、cursor cycle に defensive bound を設け、terminal page へ到達できなければ partial list を返さず provider failure とする。provider 単位の partial failure により、この失敗は Claude / Codex catalog を失わせない。
+
+sanitized row は server response order ではなく `CreatedAt DESC` と stable identity tie-break で整列する。remote の star / pin metadata は取り込まず、Pin は既存の agentsctl-local state だけを source of truth とする。
+
+Open は同じ persistent partition を用いた terminal-browser app mode で `https://chatgpt.com/c/{conversation_id}` を開く。`Ctrl+]` は browser view のみを閉じ、cloud conversation を停止・削除しない。discovery preload と main script は runtime ごとの ownership token と terminal-browser session identity を handshake し、navigation、wheel、Network capture をその discovery WebContents だけに限定する。foreground Open や別の terminal-browser session は discovery target にならない。
+
+background discovery helper は agentsctl-owned PTY で維持し、provider Close / context cancellation では terminal-browser CLI へ `SIGTERM` を送り、bounded wait 後だけ強制終了して materialized bridge assets を削除する。この PTY lifecycle は stock terminal-browser に supported service mode がない現時点の実装上の制約であり、将来 provider boundary 内で置換できるようにする。
+
+#### ChatGPT last-known-good catalog cache
+
+`Source.List` は呼び出しのたびに full cursor enumeration を行わない。ChatGPT provider は内部に last-known-good な in-memory cache (`catalogCache`) を持ち、`List` はこの cache を即座に返すだけの純粋な読み取りになる。cache がまだ一度も埋まっていない場合 (persisted cache も存在しない場合 -- 後述) は remote failure ではなく空の成功 snapshot を返す。
+
+**`List` は決して自ら remote work を開始しない。** 初回 refresh の起動責務は完全に `sessionctl.Refresher` 側にあり、Agent View 自身の reload cycle が `requestReload` から独立して `Refresh` を呼ぶ (次節 "Provider catalog observer と provider snapshot store" 参照)。以前は `List` が cache 不在を検知して自ら `Refresh` を呼ぶ実装だったが、これは同じ reload cycle 内で `requestReload` 自身も `Refresh` を呼ぶため、single-flight で衝突こそしないものの「初回 enumeration の直後にもう1回 coalesced follow-up が余分に走る」という無駄を生んでいた。`List` を純粋な cache 読み取りに限定することでこの重複を避けている。
+
+cache の置き換えは COMPLETE な enumeration によってのみ行う。timeout、broken bridge、request series の曖昧性、schema drift、cursor cycle、pagination 未完了、context cancellation はいずれも「直前の cache (memory / persisted 双方) を保持したまま、今回の refresh は失敗として記録する」扱いになり、部分的な結果が cache に混入することはない。COMPLETE な enumeration が実際に 0 件の conversation を観測した場合はそれ自体が有効な置き換えであり、cache は空配列になる — これは「一度も enumeration が成功していない」状態とは区別する。
+
+background refresh は `sessionctl.Refresher.Refresh(ctx)` で要求する。実行中の refresh がある間に追加で要求された場合は新たな enumeration を並行起動せず、実行中の1回が終わった直後に最大1回だけ追加の refresh を続けて走らせる (single-flight + coalescing)。これにより Ctrl+L の連打が discovery bridge の再起動や enumeration の重複起動を引き起こすことはない。
+
+refresh の完了 (成功・失敗いずれも) は `sessionctl.Observer.Observe(ctx)` を通じて provider 単位の `ProviderUpdate` として publish される (Observer の一般的な semantics は Catalog loading 節を参照)。成功時は新しい cache 全体を full replacement として、失敗時は Sessions を持たない error-only の update として届く — 失敗を「session が0件になった」と誤読させないための区別である。publish は **latest-wins**: subscriber 側の buffer が詰まっている (= Agent View 側が一時的に読み出せていない) 場合でも、古い queued update を1つ捨てて最新の update を積み直す。Observer publication は event log ではなく「provider の現在状態」の full replacement であるため、遅れて追いついた subscriber が受け取るべきは常に最新の状態であり、途中に挟まった古い成功や失敗であってはならない。
+
+cache 内の session は常に Open 可能な対象として扱う。Open は cache や in-flight refresh の状態を一切 preflight せず、対象の conversation ID へ直接遷移する。remote 側で削除されていた場合の挙動は公式 ChatGPT UI に委譲し、agentsctl 側が能動的に cache から evict することはない。runtime 内部でも List (enumeration) と Open は互いに排他しない: Open は discovery helper の起動確認だけを lock で保護し、enumeration 本体や browser view を開いている間の待機は lock の外で行うため、background refresh の最中でも Open は待たされない。
+
+##### Persistence (agentsctl 再起動をまたぐ last-known-good catalog)
+
+in-memory cache は、`internal/localstate.Store` (agentsctl の local state の Root Owner) を通じて disk 上の last-known-good catalog によって裏打ちされる。Provider construction (`New`) は、configured Project ID に対応する persisted catalog があれば同期的に in-memory cache へ hydrate してから返る -- browser process も network access も一切発生させない、純粋な local state の読み込みである。これにより、agentsctl を再起動した直後の最初の `List` から、前回成功した catalog の rows が (background refresh の完了を待たずに) 即座に返る。
+
+persist される粒度は Project ID をキーにした catalog 全体で、以下を含む:
+
+```text
+conversation ID
+title
+create time
+update time
+catalog 全体の refreshed-at timestamp
+```
+
+以下は意図的に persist しない:
+
+```text
+session.CWD / config root         -- hydrate 時点の現在の Config.Root を常に使う
+Actions / Pinned / Runtime / Activity / provider warning
+refreshing / pending といった refresh state machine の状態
+```
+
+CWD を persist しないのは、リポジトリの移動や同一 Project を参照する別 checkout がある場合に、古い CWD がそのまま残ってしまうのを避けるため -- remote catalog (何がある conversation か) と local logical CWD (それが今どのディレクトリに属するか) は別の関心事として扱う。Local pin は既存の pin store がそのまま source of truth であり、ChatGPT catalog の persist/hydrate はそれに一切関与しない。
+
+Provider は raw JSON schema や `localstate` の内部型に直接依存しない。`internal/provider/chatgpt` は自身の consumer-side interface `CatalogStore` (`ChatGPTCatalog`/`SaveChatGPTCatalog`) を所有し、`*localstate.Store` がそれを満たす -- `provider/codex` が `localstate.Run` を介して `supervisor.Dispatcher` を consumer-side interface で受け取るのと同じ構図であり、テストは fake store で差し替えられる。
+
+replace は COMPLETE な enumeration の後にのみ行われ、memory cache の更新と persist は同じ成功パス内で行われる:
+
+```text
+remote COMPLETE
+  → normalize
+  → memory cache replace (今回の refreshedAt で)
+  → CatalogStore へ persist
+  → Observer publish
+```
+
+**persistence failure は remote success を無効化しない**: disk 書き込みが失敗しても、memory cache の更新と Observer publish は既に完了しているためそのまま有効であり、取り消したり握りつぶしたりしない。
+
+##### Catalog validity と local durability の区別
+
+「今回の remote catalog が有効かどうか」と「その catalog を local に確実に保存できたかどうか」は別の問いであり、`sessionctl.ProviderUpdate` (`Observer` 参照) はこれを明示的に区別する:
+
+```text
+Err != nil, Sessions == nil, Warning == nil
+  → remote refresh そのものが失敗した
+  → 既存 sessions を保持したまま warning として Err を表示する
+
+Err == nil, Sessions != nil, Warning == nil
+  → remote refresh は成功し、local durability にも問題はない
+  → sessions を丸ごと置き換え、warning を消す
+
+Err == nil, Sessions != nil, Warning != nil
+  → remote refresh は成功したが、local への persist に失敗した (durability の問題)
+  → sessions は完全に有効なので丸ごと置き換え、選択・Open もそのまま可能なまま
+  → warning として Warning を表示する (rows を隠したり古い rows に戻したりしない)
+```
+
+`Err` と `Warning` が同一 update に同時に立つことはない -- 「今回の refresh が失敗した」と「今回の refresh (は成功したが、その結果を保存する) local durability が劣化した」は独立した問いであり、provider はそのどちらか一方だけを、今回の refresh cycle が実際に該当する方だけを report する ("latest provider problem wins" -- 下記)。
+
+ChatGPT provider はこの区別を `durabilityWarning` という1つの内部状態として追跡する:
+
+- hydrate 時に persisted catalog の read/decode/validation が失敗した場合に set される。
+- 成功した refresh の後段の `persist` が失敗した場合に set される。
+- 成功した `persist` によって clear される (hydrate 由来であっても persist 由来であっても)。
+- **remote refresh の失敗そのものによっては一切変更されない** -- 失敗した refresh は `Err` だけを publish し、`durabilityWarning` には触れない。これにより、たまたま次の refresh が (無関係な理由で) 失敗しても、まだ解消していない durability の問題を黙って見失うことはなく、次に refresh が実際に成功したタイミングで再び surface される ("latest provider problem wins": この refresh cycle 自身の結果 -- Err か、Warning か、あるいはどちらもないか -- だけが見える状態になり、`errors.Join` のように複数 cycle 分の問題を蓄積することはしない)。
+
+hydrate 時に無効な persisted row (conversation ID の形式が不正、title が空、timestamp が zero value など) を検出した場合は、その catalog 全体を hydrate せず (部分的に corrupt な catalog を許容しない)、空の cache から始める。persisted state の read/decode 自体が失敗した場合も同様に、provider の起動やその後の remote refresh を妨げない。
+
+いずれの場合も `durabilityWarning` は set され、Observer subscription が確立された時点 (`Observe` 呼び出し) で pending な durability warning があれば、その新しい subscriber へ直ちに1回、現在の cache (hydrate できていればその内容、できていなければ空) と Warning を1つの `ProviderUpdate` として publish する。これにより、construction 時点の hydration failure のように「まだ一度も refresh が起きていない」状況でも、その警告が Agent View 側から観測可能になる -- 次の成功した refresh を待って初めて (しかも成功時にしか) 見える、ということがない。
+
+state.json 全体が読めない、あるいは decode できない場合の挙動は `internal/localstate` 既存の挙動にそのまま従う -- ChatGPT 固有の corruption recovery は追加しない。
 
 #### Dispatch / Composer
 
@@ -535,7 +649,7 @@ session の識別に必要な情報を優先し、補助情報から省略する
 2. **Local state is supplemental**
    - agentsctl 固有の metadata のみ保持する。
 3. **Provider differences stay explicit**
-   - Claude と Codex の runtime model の差を無理に同一化しない。
+   - provider 間の runtime model の差を無理に同一化しない。
 4. **Process operations fail closed**
    - ownership や identity を証明できない process には介入しない。
 5. **TUI lifetime and agent lifetime are separated**
@@ -547,18 +661,20 @@ session の識別に必要な情報を優先し、補助情報から省略する
 C4Container
 title agentsctl system landscape
 
-Person(user, "User", "Claude Code と Codex CLI のセッションを操作する")
+Person(user, "User", "Claude Code、Codex CLI、ChatGPT のセッションを操作する")
 
 System_Boundary(agentsctl, "agentsctl") {
     Container(tui, "Agent View", "Go / Unix TUI", "統合された session catalog と操作 UI")
     Container(catalog, "Session Model", "Go", "provider 固有状態を共通 session capability へ正規化する")
     Container(state, "Local State", "JSON / file locking", "pin、overlay、managed run metadata を保持する")
     Container(supervisor, "Codex Supervisor", "Go / Unix daemon / PTY", "Codex CLI process と PTY の寿命を管理する")
+    Container(chatgptProvider, "ChatGPT Provider", "Go / terminal-browser / Unix socket", "Project catalog を取得し公式 UI を開く")
 }
 
 System_Ext(claude, "Claude Code", "Native background agent lifecycle")
 System_Ext(codexAppServer, "Codex app-server", "Thread metadata and native thread operations")
 System_Ext(codexCLI, "Codex CLI", "Interactive agent process")
+System_Ext(chatgpt, "ChatGPT Web", "Cloud session lifecycle and official UI")
 
 Rel(user, tui, "操作")
 Rel(tui, catalog, "list / dispatch / session actions")
@@ -568,6 +684,8 @@ Rel(catalog, state, "local metadata")
 Rel(tui, supervisor, "start / attach / stop")
 Rel(supervisor, state, "managed run metadata")
 Rel(supervisor, codexCLI, "PTY 上で起動・入出力")
+Rel(catalog, chatgptProvider, "List / Open")
+Rel(chatgptProvider, chatgpt, "browser-owned authentication / passive catalog capture / official UI")
 ```
 
 この図は概念上の責務境界を示す。
@@ -617,6 +735,7 @@ agentsctl は native session record や transcript を複製せず、agentsctl �
 - Pin
 - Claude Archive overlay
 - Codex managed run metadata
+- ChatGPT の persisted last-known-good catalog (Project ID ごと -- 前述の "Persistence" 節参照)
 
 Claude session の表示名 (`ClaudeNames`) は、native rename 導入以前の overlay が migration compatibility として残るのみで、新規 rename の保存先ではない。
 
@@ -775,24 +894,123 @@ Codex Attach では、過去の PTY output を replay しない。
 
 ##### Catalog loading
 
-Claude と Codex の session list は provider ごとに並行取得する。
+Claude、Codex、ChatGPT の session list は provider ごとに並行取得する。
 
 目的は latency を加算させないこと。
 
 ```text
 Claude: ──────────┐
-                  ├─ merge
-Codex:  ───────┐  │
-               └──┘
+                  │
+Codex:  ───────┐  ├─ merge
+               │  │
+ChatGPT: ──────┴──┘
 ```
-
-1回の refresh は、provider ごとの取得完了を待ってから統合する。
-
-partial result を逐次描画する方式にはしない。
 
 provider が利用できない場合は、その error を provider 単位で保持する。
 
-他方の provider から取得できた session は破棄しない。
+他の provider から取得できた session は破棄しない。
+
+`sessionctl.Controller` はこの並行取得を 2 通りの形で公開する。
+
+- `Load(ctx, scope)` -- 全 provider の取得完了を待ってから、1回の呼び出しが常に merge 済み atomic な `Snapshot` を1つ返す。partial result を逐次描画する方式にはしない。
+- `LoadStream(ctx)` -- 同じ並行取得を、provider ごとの完了を待たずに `ProviderSnapshot` として順次 (到着した順に) 届ける。`MergeSessions` は、そこまでに届いた provider の session 集合に対して pin 付与・scope filter・overview 順序付けを再適用するための helper であり、`Load` 自身もこの `LoadStream` + `MergeSessions` の上に実装されている。
+
+Agent View の `Runtime.requestReload` は `Load` ではなく `LoadStream` を使う。理由は、ChatGPT の複数ページ browser-backed discovery walk のように遅い (または失敗する) provider 1つのために、Claude/Codex のように速く応答する provider の rows まで表示・操作できなくなることを避けるため (Issue #6 のライブ検証で、ChatGPT 側のエラーによって catalog 全体が長時間空のままになる問題が判明した)。
+
+さらに、その `LoadStream` の呼び出しを Agent View の event loop がいつ・どう起動するかも非同期化されている (同じくライブ検証で判明した、ChatGPT の discovery walk が Agent View 全体の応答性を止めてしまう問題への対応)。
+
+```text
+Runtime.requestReload(ctx)
+  → 現在の rows/選択/入力はそのまま
+  → background goroutine で Controller.LoadStream を消費 (event loop はブロックしない)
+  → provider の ProviderSnapshot が届くたびに:
+      これまで届いた provider の session を MergeSessions で再統合
+      → catalogEvent を event loop へ送る (done は「これが今 generation 最後の provider か」)
+
+event loop
+  → catalogEvent の gen が最新の reload generation と一致する場合のみ State.Rows/Warnings に適用
+  → 一致しない (supersede された) generation の Snapshot は破棄
+  → done な catalogEvent でだけ CatalogLoading を解除し、usage refresh を開始する
+```
+
+- 現在表示中の rows は reload 中も操作可能なまま維持される (Ctrl+L のたびに空になったりはしない)。selection・compose・help・pin・quit はいずれも catalog fetch の完了を待たない。
+- 速い provider (Claude/Codex 等) の rows は、遅い/失敗する provider (ChatGPT 等) の応答を待たずに表示され、選択・操作できる。まだ届いていない provider は単に「まだそのぶんの session が merge されていない」状態であり、warning としては扱わない (成功でも失敗でもなく、単に未到着)。
+- 最新の reload generation の結果だけが State を更新できる。scope 変更や連続した Ctrl+L で古い generation の Snapshot (途中経過・最終いずれも) が後から届いても無視される。
+- 新しい reload は直前の reload の子 context を cancel する (ただし provider/runtime 自体の context ではない)。これにより ChatGPT のような browser-backed discovery walk が破棄される結果のために動き続けることを防ぐが、次の reload で同じ runtime を再利用できることは変わらない。
+- `LoadStream` 自身は pin 付与・scope filter・overview 順序付けを行わない。これらは `MergeSessions` として切り出されており、呼び出し側 (Agent View、あるいは `Load` 自身) がそこまでの累積結果に対して都度再適用する。
+
+##### Provider catalog observer と provider snapshot store
+
+`LoadStream` による reload generation の経路とは別に、provider 自身が保持する last-known-good cache (ChatGPT の `catalogCache` など -- 前節参照) を購読する経路として `sessionctl.Observer` / `Controller.Observe(ctx)` がある。
+
+- `Observer` を実装する provider は、request/response の List サイクルとは独立に「自分の catalog が変わった」タイミングで `ProviderUpdate` を publish する。これは常に provider 全体の full replacement であり、add/remove/update の delta ではない -- 受け手は届いた `Sessions` で自分の持つその provider の session をまるごと置き換えるだけでよく、reconciliation を必要としない。
+- 成功と失敗は区別される: 成功時は `Sessions` に新しい catalog 全体、失敗時は `Sessions` を持たない (nil の) `Err` 付き update が届く。失敗を「session が0件になった」という意味に読み替えてはならない。成功時はさらに、catalog 自体は有効なまま何らかの非致命的な問題 (例: ChatGPT の local persist 失敗) を伴うことがあり、その場合は `Sessions` はそのまま丸ごと置き換え対象としつつ `Warning` を追加で立てる -- catalog の妥当性 (`Err`) と local durability (`Warning`) を混同しない (詳細は ChatGPT last-known-good catalog cache 節の「Catalog validity と local durability の区別」参照)。
+- `Runtime` はこの subscription を reload のたびに張り直さず、`Run` 起動時に1回だけ確立し、`Run` が返るときに1回だけ終える。1回の Ctrl+L (reload generation) の生死とは無関係に生き続け、`catalogGen` による stale-generation の破棄対象にもならない -- 「最後に完了した refresh が常に正」という Observer 側の semantics を、たまたまその後に始まった次の reload generation の都合で覆さないためである。
+- Ctrl+L (`IntentRefresh`) は引き続き `requestReload` を呼ぶが、`Refresher` を実装する provider にはあわせて `Refresh(ctx)` を要求する。この `ctx` は reload generation ごとに新しく作られ cancel される child context ではなく、`Runtime.Run` が受け取った長寿命の ctx をそのまま渡す -- ChatGPT の background refresh は1回の reload generation を超えて価値を持つため、次の Ctrl+L がその途中経過を cancel してしまわないようにするためである。`Refresh` 自体は fire-and-forget で、結果は常に Observer 経由で後から届く。
+
+Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
+
+##### List と Observer、どちらが warning/rows の authority か
+
+`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、providerSnapshots への適用ルールこそ大枠を共有するが、**warning と rows それぞれの authority は provider の capability と、Observer がこれまでに成功したことがあるかによって変わる**。これらは実装上のバグとして一度ずつ発見された区別であり、意図的に分離されている。
+
+warning の authority:
+
+```text
+List 失敗 (Err != nil)
+  → 常に warning = Err として表示する
+  → provider の実装が Observer を持つかどうかに関わらない
+    (List 自体の failure -- 設定不備・browser 未起動など -- を隠すことはない)
+
+List 成功 (Err == nil)
+  → provider が Observer を実装しない (ProviderSnapshot.ListOwnsStatus == true)
+    → List の成功時に warning を clear する (= List 自身が status の authority)
+  → provider が Observer を実装する (ListOwnsStatus == false)
+    → warning には一切触れない (下記の rows authority とは独立)
+
+Observer 側は常に warning の authority を持つ:
+  成功 (Err == nil)  → warning を届いた Warning (nil ならクリア) にする
+  失敗 (Err != nil)  → warning を Err にする
+```
+
+`ListOwnsStatus` は `sessionctl.Controller.LoadStream` が provider の capability から機械的に導出する (`provider implements sessionctl.Observer` なら `false`)。Agent View 側はこの capability を自ら判定しない -- provider 固有の分岐は sessionctl の境界内に閉じ込める。
+
+rows (session) の authority は、warning とは別のもう1つの区別として存在する。`providerState.observerSnapshotSeen` が「この provider について Observer からの成功 update を一度でも適用したか」を追跡する:
+
+```text
+provider が Observer を実装しない (ListOwnsStatus == true)
+  → List が常に rows の authority (今までどおり)
+
+provider が Observer を実装する (ListOwnsStatus == false)
+  → observerSnapshotSeen == false (Observer からまだ一度も成功 update が
+    来ていない -- 典型的には起動直後、persisted cache からの hydrate 直後)
+    → List 成功はここでは rows を bootstrap してよい
+      (再起動直後に persisted rows を即座に表示するための経路)
+  → observerSnapshotSeen == true (Observer からの成功 update が一度でも
+    適用済み)
+    → 以降の List 成功は rows を一切書き換えない (無視する)
+    → Observer からの成功 update だけが rows を置き換えられる
+
+observerSnapshotSeen は Observer の成功 update でだけ true になる
+(false → true の一方向のみ)。Observer の失敗 update では変化しない
+-- 初回の background refresh が失敗しても、persisted cache からの
+bootstrap List は依然として rows を供給できる必要があるため。
+```
+
+この rows authority の区別が必要な理由は、`catalogGen` (reload generation の順序保証) だけでは防げない race があるため: Observer の publish は reload generation から独立しており (前節「Observer generations」参照)、1回の Ctrl+L cycle 内でも「LoadStream の List 呼び出しがたまたま遅れて完了する」ことと「その間に background refresh が先に完了して Observer が新しい catalog を publish する」ことが両方起こりうる。どちらも個別には正当な (現行 generation の、あるいは generation に無関係な) event であり、`catalogGen` はこの2つの event 間の新旧を区別しない。`observerSnapshotSeen` はこれを別の軸として解決する:
+
+```text
+catalogGen
+  → reload generation の順序を保証する (古い generation の event を破棄)
+
+observerSnapshotSeen
+  → Observer が rows の authority を獲得したかどうかを保証する
+    (Observer 獲得後は、List からの rows 書き換えそのものを許可しない)
+```
+
+両方が必要であり、互いを代替しない。
+
+この区別がないと、ChatGPT のような Observer provider で次のような regression が起きる: Observer が持続的な durability warning (例: persist 失敗) を publish した直後に Ctrl+L を押すと、ChatGPT の `List` はただ cache を読むだけで容易に成功し、その「成功」を Agent View が (誤って) warning の解消と解釈して warning を消してしまう -- 実際には持続的な問題は何も解決していないにもかかわらず。
 
 ##### PTY output
 

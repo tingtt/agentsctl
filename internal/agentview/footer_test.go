@@ -77,6 +77,15 @@ func TestContextualFooterTextSwapsEmptyVsNonEmptyPrompt(t *testing.T) {
 	}
 }
 
+func TestContextualFooterShowsFailureFromNonDispatchProvider(t *testing.T) {
+	s := NewState()
+	s.Warnings[session.ProviderChatGPT] = fmt.Errorf("browser unavailable")
+	footer := contextualFooterText(s)
+	if !strings.Contains(footer, "chatgpt unavailable: browser unavailable") {
+		t.Fatalf("footer=%q", footer)
+	}
+}
+
 // TestUsageColorThresholds fixes the exact boundary values from #14's
 // Colors section: white below 70, yellow at 70-89, red at 90-100.
 func TestUsageColorThresholds(t *testing.T) {

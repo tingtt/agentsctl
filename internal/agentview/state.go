@@ -90,6 +90,15 @@ type State struct {
 	// survives row reordering intact.
 	LastAttachedKey session.Key
 	HasLastAttached bool
+
+	// CatalogLoading is true whenever the latest requested catalog reload
+	// cycle (Runtime.requestReload) has not yet had its Snapshot applied
+	// (see Runtime.eventLoop's catalogCh case) -- rendered as a small
+	// "loading sessions…" header indicator (see View), never a blocking
+	// modal. Every other control -- Rows, Composer, help, pin, quit --
+	// stays interactive while it is true; see the DesignDoc's non-blocking
+	// catalog refresh section.
+	CatalogLoading bool
 }
 
 // NewState returns a freshly-initialized State: Claude as the initial

@@ -470,6 +470,23 @@ func TestShiftTabTogglesComposerProvider(t *testing.T) {
 	}
 }
 
+func TestChatGPTSelectionOpensWhenEmptyButDoesNotBecomeDispatchTarget(t *testing.T) {
+	s := NewState()
+	chatGPTKey := session.Key{Provider: session.ProviderChatGPT, ID: "conversation"}
+	s.SetRows([]session.Session{{Key: chatGPTKey, Actions: session.Actions{session.ActionOpen: {Available: true}}}})
+	if intent := s.Handle(KeyEvent{Key: KeyEnter}); intent.Kind != IntentOpen || intent.Key != chatGPTKey {
+		t.Fatalf("empty-composer intent=%+v", intent)
+	}
+	s.Composer.Prompt = "dispatch through existing target"
+	if intent := s.Handle(KeyEvent{Key: KeyEnter}); intent.Kind != IntentDispatch || intent.Provider != session.ProviderClaude {
+		t.Fatalf("non-empty-composer intent=%+v", intent)
+	}
+	s.Handle(KeyEvent{Key: KeyShiftTab})
+	if s.Provider != session.ProviderCodex {
+		t.Fatalf("provider cycle selected %q, want codex", s.Provider)
+	}
+}
+
 func TestEscQuitsOnlyOutsideRenameAndConfirmation(t *testing.T) {
 	s := NewState()
 	if intent := s.Handle(KeyEvent{Key: KeyEsc}); intent.Kind != IntentQuit {

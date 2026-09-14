@@ -2,6 +2,7 @@ package agentview
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -52,6 +53,17 @@ func contextualFooterText(s State) string {
 		provider += styleText(" (unavailable: "+err.Error()+")", colorGray)
 	}
 	segments := []string{provider + styleText(" (shift+tab to cycle)", colorGray)}
+	var warningProviders []string
+	for providerID, err := range s.Warnings {
+		if providerID != s.Provider && err != nil {
+			warningProviders = append(warningProviders, string(providerID))
+		}
+	}
+	sort.Strings(warningProviders)
+	for _, providerID := range warningProviders {
+		err := s.Warnings[session.ProviderID(providerID)]
+		segments = append(segments, styleText(providerID+" unavailable: "+err.Error(), colorGray))
+	}
 	segments = append(segments, styleText(strings.ToLower(bindingPromptEditor.Label)+" to edit in vim", colorGray))
 	if row, ok := s.SelectedRow(); ok {
 		if label, has := ctrlXHint(row); has {

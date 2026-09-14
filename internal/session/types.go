@@ -12,8 +12,9 @@ import "time"
 type ProviderID string
 
 const (
-	ProviderClaude ProviderID = "claude"
-	ProviderCodex  ProviderID = "codex"
+	ProviderClaude  ProviderID = "claude"
+	ProviderCodex   ProviderID = "codex"
+	ProviderChatGPT ProviderID = "chatgpt"
 )
 
 // Key is a provider-qualified session identifier: the single source of

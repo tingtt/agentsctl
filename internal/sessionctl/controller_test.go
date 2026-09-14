@@ -23,6 +23,17 @@ func TestLoadKeepsHealthyProviderWhenPeerFails(t *testing.T) {
 	}
 }
 
+func TestLoadKeepsClaudeWhenChatGPTFails(t *testing.T) {
+	c := Controller{Providers: []Source{
+		fakeSource{id: session.ProviderClaude, rows: []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "healthy"}}}},
+		fakeSource{id: session.ProviderChatGPT, err: errBoom},
+	}}
+	got := c.Load(context.Background(), session.Scope{Directory: session.ScopeAll})
+	if len(got.Sessions) != 1 || got.Sessions[0].Key.Provider != session.ProviderClaude || got.Warnings[session.ProviderChatGPT] == nil {
+		t.Fatalf("snapshot=%+v", got)
+	}
+}
+
 func TestLoadMergesMultipleProviders(t *testing.T) {
 	c := Controller{Providers: []Source{
 		fakeSource{id: session.ProviderClaude, rows: []session.Session{{Key: session.Key{Provider: session.ProviderClaude, ID: "a"}, CreatedAt: time.Now()}}},
@@ -68,6 +79,18 @@ func TestLoadEnrichesPinnedState(t *testing.T) {
 	got := c.Load(context.Background(), session.Scope{Directory: session.ScopeAll})
 	if len(got.Sessions) != 1 || !got.Sessions[0].Pinned {
 		t.Fatalf("want pinned session, got %+v", got.Sessions)
+	}
+}
+
+func TestLoadOverlaysChatGPTPinFromLocalStableKey(t *testing.T) {
+	key := session.Key{Provider: session.ProviderChatGPT, ID: "conversation"}
+	c := Controller{
+		Providers: []Source{&fakeOpenerSource{fakeSource: fakeSource{id: session.ProviderChatGPT, rows: []session.Session{{Key: key}}}}},
+		Pins:      &fakePinStore{pinned: map[string]bool{"chatgpt:conversation": true}},
+	}
+	got := c.Load(context.Background(), session.Scope{Directory: session.ScopeAll})
+	if len(got.Sessions) != 1 || !got.Sessions[0].Pinned {
+		t.Fatalf("sessions=%+v", got.Sessions)
 	}
 }
 

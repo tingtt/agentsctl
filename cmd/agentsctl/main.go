@@ -12,6 +12,7 @@ import (
 	"github.com/tingtt/agentsctl/internal/agentview"
 	"github.com/tingtt/agentsctl/internal/localstate"
 	base "github.com/tingtt/agentsctl/internal/provider"
+	"github.com/tingtt/agentsctl/internal/provider/chatgpt"
 	"github.com/tingtt/agentsctl/internal/provider/claude"
 	"github.com/tingtt/agentsctl/internal/provider/codex"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
@@ -63,20 +64,40 @@ func run() error {
 	api := &codex.CommandAppServer{Path: "codex"}
 	dispatch := supervisor.Dispatcher{Client: client}
 	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
-	controller := sessionctl.Controller{
-		Providers: []sessionctl.Source{
-			&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-			&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
-		},
-		Pins: store,
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
+	providers := []sessionctl.Source{
+		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
+	}
+	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
+	if chatGPTProvider != nil {
+		defer func() { _ = chatGPTProvider.Close() }()
+	}
+	controller := sessionctl.Controller{
+		Providers: providers,
+		Pins:      store,
+	}
 	rt := agentview.Runtime{Controller: controller, State: agentview.NewState(), CWD: cwd, Worktrees: workspace.Worktrees}
 	return rt.Run(ctx)
 }
+
+func appendChatGPTProvider(cwd string, providers []sessionctl.Source, store *localstate.Store) ([]sessionctl.Source, *chatgpt.Provider) {
+	config, configured, err := chatgpt.Discover(cwd)
+	if !configured {
+		return providers, nil
+	}
+	var provider *chatgpt.Provider
+	if err != nil {
+		provider = chatgpt.NewUnavailable(err)
+	} else {
+		provider = chatgpt.New(config, store)
+	}
+	return append(providers, provider), provider
+}
+
 func configDir() (string, error) {
 	if v := os.Getenv("AGENTSCTL_STATE_DIR"); v != "" {
 		return v, nil
