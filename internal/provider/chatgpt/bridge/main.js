@@ -2,8 +2,8 @@
 
 const fs = require("node:fs");
 const net = require("node:net");
-const crypto = require("node:crypto");
 const { app, ipcMain, webContents, BrowserWindow } = require("electron");
+const { targetFrom } = require("./capture.js");
 const { DiscoveryOwner, captureBelongsToGeneration } = require("./ownership.js");
 
 const socketPath = "__AGENTSCTL_CHATGPT_SOCKET_PATH__";
@@ -13,7 +13,7 @@ const responseChannel = `agentsctl-chatgpt:response:${ownershipToken}`;
 const registerChannel = `agentsctl-chatgpt:register:${ownershipToken}`;
 const owner = new DiscoveryOwner(ownershipToken);
 const pending = new Map();
-const enumerations = new Map();
+let enumeration = null;
 const attachment = new WeakMap();
 let ownershipError = "";
 let nextIPCRequestID = 1;
@@ -31,32 +31,6 @@ function discoveryContents() {
     const contents = webContents.fromId(id);
     return contents && !contents.isDestroyed() ? contents : null;
   });
-}
-
-function targetFrom(rawURL) {
-  try {
-    const url = new URL(rawURL);
-    if (url.hostname !== "chatgpt.com") return null;
-    const match = /^\/backend-api\/gizmos\/(g-p-[A-Za-z0-9_-]+)\/conversations$/.exec(url.pathname);
-    if (!match || !url.searchParams.has("cursor")) return null;
-    return {
-      projectID: match[1],
-      cursorIn: url.searchParams.get("cursor"),
-      seriesKey: cursorSeriesKey(rawURL),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function cursorSeriesKey(rawURL) {
-  const url = new URL(rawURL);
-  const pairs = [...url.searchParams.entries()].filter(([key]) => key !== "cursor");
-  pairs.sort(([keyA, valueA], [keyB, valueB]) => {
-    if (keyA !== keyB) return keyA < keyB ? -1 : 1;
-    return valueA < valueB ? -1 : valueA > valueB ? 1 : 0;
-  });
-  return crypto.createHash("sha256").update(JSON.stringify(pairs)).digest("hex");
 }
 
 function firstString(object, keys) {
@@ -104,7 +78,7 @@ function attachCapture(contents) {
       if (!owner.owns(contents.id)) return;
       if (method === "Network.responseReceived") {
         const target = targetFrom(params.response?.url || "");
-        const active = target ? enumerations.get(target.projectID) : null;
+        const active = enumeration;
         if (target && active && params.response.status === 200) {
           responses.set(params.requestId, { ...target, generation: active.generation });
         }
@@ -118,7 +92,7 @@ function attachCapture(contents) {
         const result = await contents.debugger.sendCommand("Network.getResponseBody", { requestId: params.requestId });
         const body = result.base64Encoded ? Buffer.from(result.body, "base64").toString("utf8") : result.body;
         if (Buffer.byteLength(body) > 5 * 1024 * 1024) throw new Error("captured response exceeds 5 MiB");
-        const active = enumerations.get(target.projectID);
+        const active = enumeration;
         if (!active || !captureBelongsToGeneration(active.generation, target.generation)) return;
         if (active.captures.length >= maxCaptures) throw new Error("capture history limit reached");
         const page = sanitizePage(JSON.parse(body));
@@ -129,7 +103,7 @@ function attachCapture(contents) {
           ...page,
         });
       } catch (error) {
-        const active = enumerations.get(target.projectID);
+        const active = enumeration;
         if (active && captureBelongsToGeneration(active.generation, target.generation)) {
           active.error = error instanceof Error ? error.message : String(error);
         }
@@ -196,12 +170,12 @@ async function dispatch(request) {
   if (request.method === "ping") return { protocol: 1 };
   if (!validProjectID(request.projectID)) throw new Error("invalid Project ID");
   if (request.method === "beginList") {
-    enumerations.set(request.projectID, { generation: nextGeneration++, captures: [], error: "" });
+    enumeration = { projectID: request.projectID, generation: nextGeneration++, captures: [], error: "" };
     return requestPage({ method: "navigateProject", projectID: request.projectID });
   }
   if (request.method === "captures") {
-    const active = enumerations.get(request.projectID);
-    if (!active) throw new Error("Project enumeration has not started");
+    const active = enumeration;
+    if (!active || active.projectID !== request.projectID) throw new Error("Project enumeration has not started");
     if (active.error) throw new Error(active.error);
     return active.captures;
   }

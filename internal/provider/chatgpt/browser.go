@@ -202,6 +202,7 @@ func (r *runtime) materializeAssetsLocked() error {
 	mainPath := filepath.Join(dir, "main.js")
 	preloadPath := filepath.Join(dir, "preload.js")
 	ownershipPath := filepath.Join(dir, "ownership.js")
+	capturePath := filepath.Join(dir, "capture.js")
 	if err := os.WriteFile(mainPath, []byte(mainScript), 0o600); err != nil {
 		return fmt.Errorf("write ChatGPT main script: %w", err)
 	}
@@ -210,6 +211,9 @@ func (r *runtime) materializeAssetsLocked() error {
 	}
 	if err := os.WriteFile(ownershipPath, ownershipScript, 0o600); err != nil {
 		return fmt.Errorf("write ChatGPT ownership helper: %w", err)
+	}
+	if err := os.WriteFile(capturePath, captureScript, 0o600); err != nil {
+		return fmt.Errorf("write ChatGPT capture helper: %w", err)
 	}
 	r.assetDir, r.mainPath, r.preloadPath, r.socketPath, r.ownerToken = dir, mainPath, preloadPath, socketPath, ownerToken
 	cleanup = false

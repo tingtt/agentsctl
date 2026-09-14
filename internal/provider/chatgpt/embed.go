@@ -10,3 +10,6 @@ var preloadScriptTemplate string
 
 //go:embed bridge/ownership.js
 var ownershipScript []byte
+
+//go:embed bridge/capture.js
+var captureScript []byte

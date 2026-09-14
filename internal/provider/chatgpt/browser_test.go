@@ -99,7 +99,7 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 }
 
 func TestEmbeddedBridgeContainsNoCredentialTransport(t *testing.T) {
-	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(ownershipScript))
+	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(ownershipScript) + string(captureScript))
 	for _, forbidden := range []string{"authorization", "access_token", "refresh_token", "document.cookie"} {
 		if strings.Contains(combined, forbidden) {
 			t.Fatalf("embedded bridge contains forbidden credential transport %q", forbidden)
