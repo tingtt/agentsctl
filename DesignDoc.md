@@ -128,6 +128,8 @@ Agent View では各 provider を共通の session model として扱うが、se
 
 **ChatGPT**
 
+- agentsctl の起動 directory から親方向へ探索し、最も近い `.agentsctl.toml` を configuration root とする。
+- 最も近い `.agentsctl.toml` が project boundary となる。そのファイルに `[chatgpt]` がない場合、さらに親の `.agentsctl.toml` から ChatGPT 設定を継承しない。
 - `.agentsctl.toml` の `[chatgpt].project_id` が指定する1つの Project を catalog の対象とする。
 - 設定ファイルを含む directory を全 conversation の logical CWD とし、共通の directory scope を適用する。
 - normal Chat と Work は区別せず、どちらも provider `chatgpt` の session とする。

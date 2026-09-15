@@ -1,5 +1,14 @@
 # Contributing
 
+## Development
+
+Go 1.25 or later is required to build from source.
+
+```sh
+go build ./cmd/agentsctl
+./agentsctl
+```
+
 ## Releasing
 
 Releases follow [Semantic Versioning](https://semver.org/) and are triggered by pushing a `v*` tag. GitHub Actions cross-compiles `agentsctl` for Linux and macOS, then publishes the binaries to a GitHub Release automatically.
