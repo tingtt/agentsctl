@@ -5,14 +5,42 @@
 ## Requirements
 
 - macOS or Linux
-- Go 1.25+ to build from source
 - `claude` and/or `codex` on `PATH`; either provider may be unavailable
 - `terminal-browser` on `PATH` for the optional ChatGPT provider, with its `agentsctl-chatgpt` partition already authenticated
+
+## Installation
+
+### GitHub Release
+
+Download the binary for your OS and architecture from [GitHub Releases](https://github.com/tingtt/agentsctl/releases):
+
+| Platform | Binary |
+| --- | --- |
+| Linux amd64 | `agentsctl-linux-amd64` |
+| Linux arm64 | `agentsctl-linux-arm64` |
+| macOS Intel | `agentsctl-darwin-amd64` |
+| macOS Apple Silicon | `agentsctl-darwin-arm64` |
+
+Make the downloaded file executable and place it on your `PATH`.
+
+### `go install`
+
+With Go 1.25 or later installed, run:
+
+```sh
+go install github.com/tingtt/agentsctl/cmd/agentsctl@latest
+```
+
+## Development
+
+Go 1.25 or later is required to build from source:
 
 ```sh
 go build ./cmd/agentsctl
 ./agentsctl
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the release process.
 
 ## Configuration
 
