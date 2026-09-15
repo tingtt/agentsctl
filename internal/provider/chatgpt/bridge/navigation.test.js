@@ -2,7 +2,14 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { confirmNumber, enterNumber, nextPrompt, NumberJumpState } = require("./navigation.js");
+const {
+  confirmNumber,
+  enterNumber,
+  initialPromptPosition,
+  nextPrompt,
+  NumberJumpState,
+  promptPosition,
+} = require("./navigation.js");
 
 test("number selection waits while an exact number is also a longer prefix", () => {
   assert.deepEqual(enterNumber(["1", "10"], "", "1"), {
@@ -34,20 +41,31 @@ test("number selection rejects invalid prefixes without carrying state", () => {
 
 test("prompt navigation walks by stable ID and reaches the conversation bottom", () => {
   const prompts = ["prompt-1", "prompt-2", "prompt-3"];
-  assert.deepEqual(nextPrompt(prompts, null, "previous"), { kind: "prompt", promptID: "prompt-3" });
-  assert.deepEqual(nextPrompt(prompts, "prompt-3", "previous"), { kind: "prompt", promptID: "prompt-2" });
-  assert.deepEqual(nextPrompt(prompts, "prompt-2", "previous"), { kind: "prompt", promptID: "prompt-1" });
-  assert.deepEqual(nextPrompt(prompts, null, "next"), { kind: "prompt", promptID: "prompt-1" });
-  assert.deepEqual(nextPrompt(prompts, "prompt-1", "next"), { kind: "prompt", promptID: "prompt-2" });
-  assert.deepEqual(nextPrompt(prompts, "prompt-3", "next"), { kind: "bottom" });
+  assert.deepEqual(nextPrompt(prompts, initialPromptPosition(), "previous"), promptPosition("prompt-3"));
+  assert.deepEqual(nextPrompt(prompts, promptPosition("prompt-3"), "previous"), promptPosition("prompt-2"));
+  assert.deepEqual(nextPrompt(prompts, promptPosition("prompt-2"), "previous"), promptPosition("prompt-1"));
+
+  let position = initialPromptPosition();
+  position = nextPrompt(prompts, position, "next");
+  assert.deepEqual(position, promptPosition("prompt-1"));
+  position = nextPrompt(prompts, position, "next");
+  assert.deepEqual(position, promptPosition("prompt-2"));
+  position = nextPrompt(prompts, position, "next");
+  assert.deepEqual(position, promptPosition("prompt-3"));
+  position = nextPrompt(prompts, position, "next");
+  assert.deepEqual(position, { kind: "bottom" });
+  position = nextPrompt(prompts, position, "next");
+  assert.deepEqual(position, { kind: "bottom" });
+  position = nextPrompt(prompts, position, "previous");
+  assert.deepEqual(position, promptPosition("prompt-3"));
 });
 
 test("prompt navigation recovers when a streaming rerender invalidates the current ID", () => {
-  assert.deepEqual(nextPrompt(["new-1", "new-2"], "stale", "previous"), {
+  assert.deepEqual(nextPrompt(["new-1", "new-2"], promptPosition("stale"), "previous"), {
     kind: "prompt",
     promptID: "new-2",
   });
-  assert.deepEqual(nextPrompt(["new-1", "new-2"], "stale", "next"), {
+  assert.deepEqual(nextPrompt(["new-1", "new-2"], promptPosition("stale"), "next"), {
     kind: "prompt",
     promptID: "new-1",
   });

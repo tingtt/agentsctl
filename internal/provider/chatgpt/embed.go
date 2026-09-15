@@ -11,6 +11,9 @@ var preloadScriptTemplate string
 //go:embed bridge/navigation.js
 var navigationScript []byte
 
+//go:embed bridge/renderer-identity.js
+var rendererIdentityScript []byte
+
 //go:embed bridge/renderer-navigation.js
 var rendererNavigationScript []byte
 

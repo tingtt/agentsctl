@@ -1,6 +1,6 @@
 "use strict";
 
-const { nextPrompt, NumberJumpState } = require("./navigation.js");
+const { initialPromptPosition, nextPrompt, NumberJumpState } = require("./navigation.js");
 
 const editableSelector = [
   "input",
@@ -160,7 +160,7 @@ class ChatGPTNavigation {
     this.view = view;
     this.document = document;
     this.jump = null;
-    this.currentPromptID = null;
+    this.promptPosition = initialPromptPosition();
     this.composing = false;
     this.handleKeydown = this.handleKeydown.bind(this);
     this.cancelJump = this.cancelJump.bind(this);
@@ -258,20 +258,20 @@ class ChatGPTNavigation {
   navigatePrompt(direction) {
     const prompts = this.prompts();
     const byID = new Map(prompts.map((prompt) => [prompt.getAttribute("data-message-id"), prompt]));
-    const decision = nextPrompt([...byID.keys()], this.currentPromptID, direction);
+    const decision = nextPrompt([...byID.keys()], this.promptPosition, direction);
     if (decision.kind === "none") return;
     this.clearPromptFocus();
     if (decision.kind === "bottom") {
       const container = prompts.length > 0 ? scrollableAncestor(prompts[prompts.length - 1], this.view) : null;
       if (container) container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
       else this.view.scrollTo({ top: this.document.documentElement.scrollHeight, behavior: "auto" });
-      this.currentPromptID = null;
+      this.promptPosition = decision;
       return;
     }
 
     const prompt = byID.get(decision.promptID);
     if (!prompt) {
-      this.currentPromptID = null;
+      this.promptPosition = initialPromptPosition();
       return;
     }
     prompt.setAttribute("data-agentsctl-prompt-current", "");
@@ -281,7 +281,7 @@ class ChatGPTNavigation {
     }
     prompt.focus({ preventScroll: true });
     prompt.scrollIntoView({ block: "start", behavior: "auto" });
-    this.currentPromptID = decision.promptID;
+    this.promptPosition = decision;
   }
 }
 

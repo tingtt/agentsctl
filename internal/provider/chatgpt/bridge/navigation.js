@@ -44,23 +44,51 @@ class NumberJumpState {
   }
 }
 
-function nextPrompt(promptIDs, currentPromptID, direction) {
+function initialPromptPosition() {
+  return { kind: "initial" };
+}
+
+function promptPosition(promptID) {
+  return { kind: "prompt", promptID };
+}
+
+function bottomPromptPosition() {
+  return { kind: "bottom" };
+}
+
+function nextPrompt(promptIDs, position, direction) {
   if (direction !== "previous" && direction !== "next") throw new Error(`unknown prompt direction: ${direction}`);
   if (promptIDs.length === 0) return { kind: "none" };
 
-  const currentIndex = promptIDs.indexOf(currentPromptID);
+  if (position.kind === "bottom") {
+    return direction === "previous"
+      ? promptPosition(promptIDs[promptIDs.length - 1])
+      : bottomPromptPosition();
+  }
+  if (position.kind === "initial") {
+    return promptPosition(direction === "previous" ? promptIDs[promptIDs.length - 1] : promptIDs[0]);
+  }
+  if (position.kind !== "prompt") throw new Error(`unknown prompt position: ${position.kind}`);
+
+  const currentIndex = promptIDs.indexOf(position.promptID);
   if (currentIndex < 0) {
-    return {
-      kind: "prompt",
-      promptID: direction === "previous" ? promptIDs[promptIDs.length - 1] : promptIDs[0],
-    };
+    return promptPosition(direction === "previous" ? promptIDs[promptIDs.length - 1] : promptIDs[0]);
   }
   if (direction === "previous") {
-    return currentIndex === 0 ? { kind: "none" } : { kind: "prompt", promptID: promptIDs[currentIndex - 1] };
+    return currentIndex === 0 ? { kind: "none" } : promptPosition(promptIDs[currentIndex - 1]);
   }
   return currentIndex === promptIDs.length - 1
-    ? { kind: "bottom" }
-    : { kind: "prompt", promptID: promptIDs[currentIndex + 1] };
+    ? bottomPromptPosition()
+    : promptPosition(promptIDs[currentIndex + 1]);
 }
 
-module.exports = { confirmNumber, enterNumber, matchNumberPrefix, nextPrompt, NumberJumpState };
+module.exports = {
+  bottomPromptPosition,
+  confirmNumber,
+  enterNumber,
+  initialPromptPosition,
+  matchNumberPrefix,
+  nextPrompt,
+  NumberJumpState,
+  promptPosition,
+};

@@ -152,8 +152,10 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 		t.Fatal("materialized bridge did not receive its private ownership token")
 	}
 	if strings.Contains(string(preloadContents), navigationPlaceholder) ||
+		strings.Contains(string(preloadContents), rendererIdentityPlaceholder) ||
 		strings.Contains(string(preloadContents), rendererNavigationPlaceholder) ||
 		!strings.Contains(string(preloadContents), "class NumberJumpState") ||
+		!strings.Contains(string(preloadContents), "function initializeRendererRole") ||
 		!strings.Contains(string(preloadContents), "class ChatGPTNavigation") {
 		t.Fatal("materialized preload does not contain the renderer navigation modules")
 	}
@@ -169,7 +171,7 @@ func TestRuntimeMaterializesOwnedScriptsAndCleansThemUp(t *testing.T) {
 }
 
 func TestEmbeddedBridgeContainsNoCredentialTransport(t *testing.T) {
-	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(navigationScript) +
+	combined := strings.ToLower(mainScriptTemplate + preloadScriptTemplate + string(navigationScript) + string(rendererIdentityScript) +
 		string(rendererNavigationScript) + string(ownershipScript) + string(captureScript))
 	for _, forbidden := range []string{"authorization", "access_token", "refresh_token", "document.cookie"} {
 		if strings.Contains(combined, forbidden) {
