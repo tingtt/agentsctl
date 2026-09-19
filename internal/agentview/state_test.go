@@ -496,3 +496,21 @@ func TestSetRowsIdentityTransitionDropsConfirmationOnlyForMovedKey(t *testing.T)
 		t.Fatalf("unrelated confirmation lost: %+v", s.Confirmation)
 	}
 }
+
+// Continuity across providers is rejected by the shared validation: a
+// Codex row claiming a Claude key never takes over that key's selection.
+func TestSetRowsCrossProviderContinuityIsNotFollowed(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("abc")}, {Key: key("z")}})
+	s.selectIndex(0)
+	s.MarkAttached(key("abc"))
+	crossing := boundRow("thread-1")
+	crossing.PreviousKeys = []session.Key{key("abc")}
+	s.SetRows([]session.Session{crossing, {Key: key("z")}})
+	if got, _ := s.SelectedRow(); got.Key == codexKey("thread-1") {
+		t.Fatalf("cross-provider continuity was followed: %+v", got)
+	}
+	if s.LastAttachedKey != key("abc") {
+		t.Fatalf("LastAttachedKey=%v", s.LastAttachedKey)
+	}
+}

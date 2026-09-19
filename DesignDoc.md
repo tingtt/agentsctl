@@ -898,12 +898,21 @@ binding の成立は identity transition である。selection と agentsctl-loc
 - provisional key が canonical key へ移る根拠は provider の明示のみとする。Agent View は RunID、CWD、作成時刻、row position、session name、直前の `Starting` row といった手掛かりから同一 session を推測しない。
 - 「Codex run-to-thread binding」の fail-closed 規則は変わらない。candidate が 0 件、複数、ownership 未証明、process identity 未確認のとき、run は unbound のままであり、`PreviousKeys` は公開されない。thread に対応付かない run は `Unbound run` として run ID の key を保つ。
 
-consumer は `PreviousKeys` に沿って次のように追従する。
+`PreviousKeys` が存在するだけでは transition は成立しない。consumer は provider が明示した continuity に対しても、`internal/session` の共通の検証 (`session.IdentityTransitions`) を通ったものだけを transition として受理する。
 
-- **Selection** (`internal/agentview`): 選択中 (または rename 中) の key が消え、別 row の `PreviousKeys` に含まれる場合、その row の key へ selection を移す。これは「選択 row が消えたため近傍 session を選ぶ」規則より優先する。旧 key がまだ存在する場合、および複数の row が同じ旧 key を主張する場合は transition として扱わない。
+- 旧 key が現在の catalog に row として存在しない。
+- 旧 key の遷移先が catalog 上で一意である。複数の row が同じ旧 key を主張する場合は曖昧であり、row の並び順で遷移先を選ばず、どれも受理しない。
+- 旧 key と新しい key が異なる (self transition は transition ではない)。
+- 旧 key と新しい key が同一 provider に属する。identity は provider の境界を越えない。
+
+検証を満たさない continuity は無視し (fail closed)、selection も pin も移さない。この検証は selection と pin の移行が共有し、両者の semantics が食い違わないようにする。
+
+consumer は検証済みの transition に沿って次のように追従する。
+
+- **Selection** (`internal/agentview`): 選択中 (または rename 中) の key が消え、別 row の `PreviousKeys` に含まれる場合、その row の key へ selection を移す。これは「選択 row が消えたため近傍 session を選ぶ」規則より優先する。検証を満たさない continuity は transition として扱わない。
 - **Last attached**: `LastAttachedKey` も同様に canonical key へ移る。rename の target も同じ規則で移る。
 - **Pending confirmation**: 確認待ちは transition 前の row の action availability に対して armed されているため、移行せず破棄する。
-- **Pin** (`internal/sessionctl` / `internal/localstate`): catalog を pin state と統合する際、`PreviousKeys` の key に pin があれば canonical key へ移す。移行は `localstate` の atomic な操作であり、旧 key の pin は残らず、canonical key に既に pin があっても重複しない。移行は catalog を統合するたびに評価する。pin 操作と snapshot の到着順が入れ替わっても、旧 key の pin が canonical key へ収束する。移行後の canonical key は通常の session と同じく unpin でき、旧 key によって再び pin されることはない。local state への書き込みに失敗した場合も、pin は canonical key 上に表示され続け、次回の統合で再試行する。
+- **Pin** (`internal/sessionctl` / `internal/localstate`): catalog を pin state と統合する際、検証済みの transition の旧 key に pin があれば canonical key へ移す。移行は `localstate` の atomic な操作であり、旧 key の pin は残らず、canonical key に既に pin があっても重複しない。移行は catalog を統合するたびに評価する。pin 操作と snapshot の到着順が入れ替わっても、旧 key の pin が canonical key へ収束する。移行後の canonical key は通常の session と同じく unpin でき、旧 key によって再び pin されることはない。local state への書き込みに失敗した場合も、pin は canonical key 上に表示され続け、次回の統合で再試行する。
 
 Agent View は local persistence の表現を知らない。pin の移行は `sessionctl` が `PinStore` を通じて行い、`Dispatch` が返す `Starting` row を catalog へ即時に挿入する仕組みには依存しない (reload 後の catalog が identity transition を運ぶ)。
 

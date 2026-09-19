@@ -200,32 +200,31 @@ func (c Controller) MergeSessions(sessions []session.Session, scope session.Scop
 	return merged
 }
 
-// migratePins follows each session's provider-stated identity continuity
-// (session.Session.PreviousKeys) in the pin store: a pin left on a
-// provisional key -- pinned while the session was still Starting, or pinned
-// on a stale view after its binding -- moves to the session's current Key,
-// so no provisional pin metadata outlives the transition. It is applied on
-// every merge rather than as a one-shot event, which makes the outcome
-// independent of how pin operations and catalog arrivals interleave: the
-// store move is atomic and idempotent, and once the provisional pin is gone
-// there is nothing left to do. pinned is the caller's ListPinned snapshot
-// and is updated in place to reflect the moves. If the store cannot persist
-// a move the pin is still shown on the current Key (the persisted
-// provisional pin is kept, so the next merge retries) rather than
-// disappearing from the UI.
+// migratePins follows the validated identity continuity of sessions (see
+// session.IdentityTransitions -- the same validation Agent View applies to
+// selection) in the pin store: a pin left on a provisional key -- pinned
+// while the session was still Starting, or pinned on a stale view after its
+// binding -- moves to the session's current Key, so no provisional pin
+// metadata outlives the transition. A continuity that fails validation
+// (ambiguous, old key still present, cross-provider, ...) moves nothing.
+// It is applied on every merge rather than as a one-shot event, which
+// makes the outcome independent of how pin operations and catalog arrivals
+// interleave: the store move is atomic and idempotent, and once the
+// provisional pin is gone there is nothing left to do. pinned is the
+// caller's ListPinned snapshot and is updated in place to reflect the
+// moves. If the store cannot persist a move the pin is still shown on the
+// current Key (the persisted provisional pin is kept, so the next merge
+// retries) rather than disappearing from the UI.
 func (c Controller) migratePins(sessions []session.Session, pinned map[string]bool) {
-	for _, s := range sessions {
-		to := s.Key.String()
-		for _, prev := range s.PreviousKeys {
-			from := prev.String()
-			if from == to || !pinned[from] {
-				continue
-			}
-			if err := c.Pins.MigratePinned(from, to); err == nil {
-				delete(pinned, from)
-			}
-			pinned[to] = true
+	for prev, current := range session.IdentityTransitions(sessions) {
+		from, to := prev.String(), current.String()
+		if !pinned[from] {
+			continue
 		}
+		if err := c.Pins.MigratePinned(from, to); err == nil {
+			delete(pinned, from)
+		}
+		pinned[to] = true
 	}
 }
 

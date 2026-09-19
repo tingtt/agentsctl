@@ -211,3 +211,101 @@ func TestLoadCarriesPreviousKeysAndMigratesPin(t *testing.T) {
 		t.Fatalf("sessions=%+v", got.Sessions)
 	}
 }
+
+func codexRow(id string, previous ...session.Key) session.Session {
+	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: id}, CWD: "/work", PreviousKeys: previous}
+}
+
+// pinnedRows reports which of rows the merge shows as pinned.
+func pinnedRows(rows []session.Session) map[session.Key]bool {
+	m := map[session.Key]bool{}
+	for _, r := range rows {
+		m[r.Key] = r.Pinned
+	}
+	return m
+}
+
+// Continuity that does not pass session.IdentityTransitions must not move
+// a pin, whatever the row order, and must not even reach the store.
+func TestInvalidContinuityNeverMigratesPin(t *testing.T) {
+	claude := session.Key{Provider: session.ProviderClaude, ID: "abc"}
+	tests := []struct {
+		name   string
+		pinned string
+		rows   func() []session.Session
+		want   map[session.Key]bool
+	}{
+		{
+			name:   "ambiguous destination",
+			pinned: "codex:run-1",
+			rows: func() []session.Session {
+				return []session.Session{codexRow("thread-1", runKey), codexRow("thread-2", runKey)}
+			},
+			want: map[session.Key]bool{threadKey: false, {Provider: session.ProviderCodex, ID: "thread-2"}: false},
+		},
+		{
+			name:   "ambiguous destination, reversed order",
+			pinned: "codex:run-1",
+			rows: func() []session.Session {
+				return []session.Session{codexRow("thread-2", runKey), codexRow("thread-1", runKey)}
+			},
+			want: map[session.Key]bool{threadKey: false, {Provider: session.ProviderCodex, ID: "thread-2"}: false},
+		},
+		{
+			name:   "old key still present",
+			pinned: "codex:run-1",
+			rows:   func() []session.Session { return []session.Session{startingRow(), boundRow()} },
+			want:   map[session.Key]bool{runKey: true, threadKey: false},
+		},
+		{
+			name:   "cross-provider continuity",
+			pinned: "claude:abc",
+			rows:   func() []session.Session { return []session.Session{codexRow("thread-1", claude)} },
+			want:   map[session.Key]bool{threadKey: false},
+		},
+		{
+			name:   "self transition",
+			pinned: "codex:thread-1",
+			rows:   func() []session.Session { return []session.Session{codexRow("thread-1", threadKey)} },
+			want:   map[session.Key]bool{threadKey: true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pins := &fakePinStore{pinned: map[string]bool{tc.pinned: true}}
+			got := mergeAll(Controller{Pins: pins}, tc.rows()...)
+			for key, want := range tc.want {
+				if pinnedRows(got)[key] != want {
+					t.Errorf("%v pinned=%v, want %v", key, !want, want)
+				}
+			}
+			if k := pinnedKeys(t, pins); len(k) != 1 || !k[tc.pinned] {
+				t.Errorf("persisted pins=%v, want only %s", k, tc.pinned)
+			}
+			if len(pins.migrations) != 0 {
+				t.Errorf("MigratePinned must not be called: %v", pins.migrations)
+			}
+		})
+	}
+}
+
+// Independent valid transitions all migrate, and an invalid one next to
+// them does not.
+func TestValidTransitionsMigrateWhileInvalidOnesAreSkipped(t *testing.T) {
+	run2 := session.Key{Provider: session.ProviderCodex, ID: "run-2"}
+	run3 := session.Key{Provider: session.ProviderCodex, ID: "run-3"}
+	pins := &fakePinStore{pinned: map[string]bool{"codex:run-1": true, "codex:run-2": true, "codex:run-3": true}}
+	got := mergeAll(Controller{Pins: pins},
+		codexRow("thread-1", runKey),
+		codexRow("thread-2", run2),
+		codexRow("thread-3", run3), codexRow("thread-4", run3), // run-3 is ambiguous
+	)
+	want := map[string]bool{"codex:thread-1": true, "codex:thread-2": true, "codex:run-3": true}
+	if k := pinnedKeys(t, pins); len(k) != len(want) || !k["codex:thread-1"] || !k["codex:thread-2"] || !k["codex:run-3"] {
+		t.Fatalf("persisted pins=%v, want %v", k, want)
+	}
+	shown := pinnedRows(got)
+	if !shown[threadKey] || shown[session.Key{Provider: session.ProviderCodex, ID: "thread-3"}] || shown[session.Key{Provider: session.ProviderCodex, ID: "thread-4"}] {
+		t.Fatalf("shown=%v", shown)
+	}
+}

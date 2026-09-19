@@ -119,11 +119,13 @@ func NewState() State {
 //
 // Selection also follows a provider-stated identity transition: when a row
 // in rows lists the tracked key in its PreviousKeys (e.g. a Codex Starting
-// row whose managed run has been bound to its thread), the tracked key
-// moves to that row's current Key, taking precedence over the nearby-
-// session fallback above. The same continuity carries the rename target
-// and LastAttachedKey (see followIdentity). It only ever consumes what the
-// rows state; it never derives an old/new relationship itself.
+// row whose managed run has been bound to its thread) and the continuity
+// passes session.IdentityTransitions' validation, the tracked key moves to
+// that row's current Key, taking precedence over the nearby-session
+// fallback above. The same continuity carries the rename target and
+// LastAttachedKey (see followIdentity). It only ever consumes validated
+// provider-stated transitions; it never derives an old/new relationship
+// itself.
 //
 // Pending confirmations are NOT cleared here: the DesignDoc requires a
 // row notice to follow its session across a Refresh, not just a local
@@ -147,7 +149,7 @@ func (s *State) SetRows(rows []session.Session) {
 	}
 
 	s.Rows = rows
-	moved := identityTransitions(rows)
+	moved := session.IdentityTransitions(rows)
 	s.followIdentity(moved)
 	if tracking {
 		for _, r := range rows {
@@ -186,36 +188,6 @@ func (s *State) SetRows(rows []session.Session) {
 		return
 	}
 	s.selectedKey, s.hasSelection = session.Key{}, false
-}
-
-// identityTransitions maps each provisional key a row in rows declares in
-// its PreviousKeys to that row's current Key. A previous key that is still
-// itself the Key of a row in rows is not a transition (the old identity
-// still exists), and a previous key claimed by more than one row is
-// ambiguous, so neither is followed: continuity is only honored when the
-// provider stated it unambiguously.
-func identityTransitions(rows []session.Session) map[session.Key]session.Key {
-	present := make(map[session.Key]struct{}, len(rows))
-	for _, r := range rows {
-		present[r.Key] = struct{}{}
-	}
-	moved := map[session.Key]session.Key{}
-	ambiguous := map[session.Key]struct{}{}
-	for _, r := range rows {
-		for _, prev := range r.PreviousKeys {
-			if _, exists := present[prev]; exists || prev == r.Key {
-				continue
-			}
-			if other, claimed := moved[prev]; claimed && other != r.Key {
-				ambiguous[prev] = struct{}{}
-			}
-			moved[prev] = r.Key
-		}
-	}
-	for prev := range ambiguous {
-		delete(moved, prev)
-	}
-	return moved
 }
 
 // followIdentity re-keys the transient UI state that holds a session.Key
