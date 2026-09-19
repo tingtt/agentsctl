@@ -88,11 +88,11 @@ session は作成時刻が新しい順に並べる。Activity や runtime status
 - Pinned session は directory scope に関わらず常に単一の `Pinned` group へ集約する。scope が複数 directory を含む場合、Pinned row には directory path を表示する (directory を跨ぐため group heading だけでは判別できない)。
 - Unpinned session は、表示対象の directory がすべて同一なら単一の `Recently created` group、複数 directory を含むなら directory ごとの group に分ける。directory ごとの group では、その heading が directory を示すため row 自体に directory を表示しない。
 
-grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺へ selection を移す。
+grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺へ selection を移す。また、provider が session の identity transition (provisional key から canonical key への変更) を明示した場合は、selection は canonical key へ移る (「Codex provisional session identity」を参照)。
 
 ##### Pin / Unpin
 
-Pin 状態は agentsctl が永続化する。
+Pin 状態は agentsctl が永続化する。key は `session.Key` (`<provider>:<ID>`) である。session が identity transition を経た場合、provisional key に対する pin は canonical key へ移行され、provisional key の pin は残らない (「Codex provisional session identity」を参照)。
 
 Pin / Unpin 操作は即時に表示へ反映するため、provider の catalog を再取得せず、現在の一覧へ ordering rule を再適用する。
 
@@ -122,6 +122,7 @@ Agent View では各 provider を共通の session model として扱うが、se
 - thread とまだ対応付いていない managed run も、session catalog 上で状態を確認できる。
   - 起動中: `Starting`
   - thread に対応付かないまま終了: `Unbound run`
+- thread と対応付く前の managed run の session key (`codex:<run ID>`) は provisional であり、対応付いた後の canonical key は `codex:<thread ID>` とする。詳細は「Codex provisional session identity」を参照。
 
 - interactive Codex CLI process と PTY の lifetime は agentsctl supervisor が保持する。
 - TUI の lifetime と Codex CLI process の lifetime は分離する。
@@ -708,6 +709,7 @@ Agent View は provider 固有 object を直接扱わず、共通の session mod
 
 - Provider
 - Native session identifier
+- Previous keys (identity continuity。provisional key から canonical key へ変わった session だけが持つ)
 - Display name
 - Summary
 - CWD
@@ -740,7 +742,7 @@ agentsctl は native session record や transcript を複製せず、agentsctl �
 
 主に以下を保持する。
 
-- Pin
+- Pin (provisional key の pin は canonical key へ移行される)
 - Claude Archive overlay
 - Codex managed run metadata
 - ChatGPT の persisted last-known-good catalog (Project ID ごと -- 前述の "Persistence" 節参照)
@@ -878,6 +880,32 @@ candidate が以下の場合は binding しない。
 - 2件以上
 
 session ID を推測して割り当てることはしない。
+
+#### Codex provisional session identity
+
+Codex session の実体は app-server thread であり、canonical な session key は `codex:<thread ID>` である。managed run は thread とは別の lifecycle を持つため、run ID を session の恒久的な identity へ昇格させない (existing thread の Resume では新しい managed run が作られうる)。
+
+一方、thread と対応付く前の managed run は catalog 上で `Starting` として提示する必要がある。この row は thread ID を持たないため、`codex:<run ID>` という provisional key で列挙する。
+
+```text
+binding 前:  codex:<run ID>      (provisional)
+binding 後:  codex:<thread ID>   (canonical)
+```
+
+binding の成立は identity transition である。selection と agentsctl-local metadata は `session.Key` を identity としているため、key が変わったことを別 session の出現と消失として扱わないよう、transition を catalog boundary が明示する。
+
+- provider は、対応付いた thread の `session.Session.PreviousKeys` に provisional key を載せる。`localstate.Run.SessionID` が確定している run だけが対象であり、run が既に停止していても、対応付いていれば継続して公開する。
+- provisional key が canonical key へ移る根拠は provider の明示のみとする。Agent View は RunID、CWD、作成時刻、row position、session name、直前の `Starting` row といった手掛かりから同一 session を推測しない。
+- 「Codex run-to-thread binding」の fail-closed 規則は変わらない。candidate が 0 件、複数、ownership 未証明、process identity 未確認のとき、run は unbound のままであり、`PreviousKeys` は公開されない。thread に対応付かない run は `Unbound run` として run ID の key を保つ。
+
+consumer は `PreviousKeys` に沿って次のように追従する。
+
+- **Selection** (`internal/agentview`): 選択中 (または rename 中) の key が消え、別 row の `PreviousKeys` に含まれる場合、その row の key へ selection を移す。これは「選択 row が消えたため近傍 session を選ぶ」規則より優先する。旧 key がまだ存在する場合、および複数の row が同じ旧 key を主張する場合は transition として扱わない。
+- **Last attached**: `LastAttachedKey` も同様に canonical key へ移る。rename の target も同じ規則で移る。
+- **Pending confirmation**: 確認待ちは transition 前の row の action availability に対して armed されているため、移行せず破棄する。
+- **Pin** (`internal/sessionctl` / `internal/localstate`): catalog を pin state と統合する際、`PreviousKeys` の key に pin があれば canonical key へ移す。移行は `localstate` の atomic な操作であり、旧 key の pin は残らず、canonical key に既に pin があっても重複しない。移行は catalog を統合するたびに評価する。pin 操作と snapshot の到着順が入れ替わっても、旧 key の pin が canonical key へ収束する。移行後の canonical key は通常の session と同じく unpin でき、旧 key によって再び pin されることはない。local state への書き込みに失敗した場合も、pin は canonical key 上に表示され続け、次回の統合で再試行する。
+
+Agent View は local persistence の表現を知らない。pin の移行は `sessionctl` が `PinStore` を通じて行い、`Dispatch` が返す `Starting` row を catalog へ即時に挿入する仕組みには依存しない (reload 後の catalog が identity transition を運ぶ)。
 
 #### PTY attach and redraw
 
@@ -1080,6 +1108,12 @@ PID reuse により、無関係な process を操作する可能性がある。
 - Stop
 
 binding を一意に証明できない場合は、unbound のまま扱う。
+
+### Agent View が Starting row と thread row を同一 session と推測する
+
+**不採用。**
+
+RunID、CWD、作成時刻、row position などから Agent View が identity transition を再構築すると、Codex 固有の知識が UI に入り、誤った session へ selection や pin を移す可能性がある。continuity は provider が binding を証明できた場合にのみ `PreviousKeys` として明示する。
 
 ### 単発の redraw signal を送る
 
