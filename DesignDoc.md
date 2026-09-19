@@ -281,6 +281,7 @@ Codex は最初の model turn まで listed / resumable な thread を公開し�
 ```
 
 - bootstrap prompt は固定文とし、name を含めない。name は user-controlled な文字列であり、model への指示に埋め込まない。
+- bootstrap run が real thread に bind されるまでは attach できない (Open 不可、Stop は可)。first model turn が作る thread を reconciliation が bind する前に provisional run へ attach すると、run と thread の identity が分裂しうるためである。この制約は session の action availability と attach の準備の両方で守り、bind 後は通常の session と同じく Open できる。通常の `Starting` session には適用しない。
 - 保持した name は managed run (local run state) に属し、Starting → real thread の identity 移行の上に載るだけである。別の identity 機構は持たない。
 - 適用は1回だけ行う。失敗しても thread は実在するため破棄せず、失敗を run に記録して session 上に示す。再試行は通常の Rename であり、自動 retry は持たない。
 - bootstrap turn は実際に model turn を1回消費する。rate limit 等で失敗する場合も、特別な回避はしない。
