@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -56,8 +57,19 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	runs, _ := p.Store.Runs()
 	managed := map[string]localstate.Run{}
+	// provisional collects, per thread, the keys its bound runs were listed
+	// under while still unbound (see the unbound-run rows below). Only a
+	// run whose SessionID is set -- i.e. one reconcile proved to this
+	// thread, or one started to resume it -- contributes, regardless of
+	// the run's state: a run that already stopped must not orphan the
+	// Starting row's identity.
+	provisional := map[string][]session.Key{}
 	for _, r := range runs {
-		if r.Provider == "codex" && r.SessionID != "" && (r.State == "running" || r.State == "starting") {
+		if r.Provider != "codex" || r.SessionID == "" {
+			continue
+		}
+		provisional[r.SessionID] = append(provisional[r.SessionID], session.Key{Provider: session.ProviderCodex, ID: r.ID})
+		if r.State == "running" || r.State == "starting" {
 			managed[r.SessionID] = r
 		}
 	}
@@ -84,13 +96,17 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			actions[session.ActionOpen] = session.Availability{Reason: reason}
 			actions[session.ActionStop] = session.Availability{Reason: reason}
 		}
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, Actions: actions})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
 	if !archived {
 		for _, r := range runs {
 			if r.Provider != "codex" || r.SessionID != "" {
 				continue
 			}
+			// An unbound run is listed under its run ID, a provisional Key:
+			// once reconcile proves the run to a thread, the thread's row
+			// (Key.ID = thread ID) replaces it and names this Key in
+			// PreviousKeys above. Nothing here guesses that link.
 			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, "Starting"
 			actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
 			if isTerminalRunState(r.State) {
@@ -111,6 +127,14 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	return rows, nil
 }
+
+// sortedKeys returns keys ordered by ID so PreviousKeys does not depend on
+// Go's randomized map iteration order over the run records.
+func sortedKeys(keys []session.Key) []session.Key {
+	sort.Slice(keys, func(i, j int) bool { return keys[i].ID < keys[j].ID })
+	return keys
+}
+
 func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
 	before, err := p.API.List(ctx, false)
 	if err != nil {

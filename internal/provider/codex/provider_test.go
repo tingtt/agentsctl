@@ -554,3 +554,138 @@ func TestCodexNativeStatusMapping(t *testing.T) {
 		})
 	}
 }
+
+func codexKey(id string) session.Key { return session.Key{Provider: session.ProviderCodex, ID: id} }
+
+// TestStartingRunBindingPublishesProvisionalKeyContinuity fixes the
+// Starting -> bound transition end to end through the provider: before
+// binding the run is listed under its run ID; once reconcile proves the
+// run to a thread, only the thread row remains and it names the run's key
+// in PreviousKeys, so a consumer never has to infer that they are one
+// session.
+func TestStartingRunBindingPublishesProvisionalKeyContinuity(t *testing.T) {
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", Baseline: []string{"old"}}); err != nil {
+		t.Fatal(err)
+	}
+	api := &fakeAPI{rows: []Thread{{ID: "old", CWD: "/work"}}}
+	p := Provider{Store: store, API: api, WriterOwner: func(string, process.Identity) (bool, error) { return true, nil }}
+
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var starting *session.Session
+	for i := range rows {
+		if rows[i].Key == codexKey("run-1") {
+			starting = &rows[i]
+		}
+		if len(rows[i].PreviousKeys) != 0 {
+			t.Fatalf("no transition happened yet, but %v reports PreviousKeys=%v", rows[i].Key, rows[i].PreviousKeys)
+		}
+	}
+	if starting == nil || starting.Activity != session.ActivityStarting {
+		t.Fatalf("want a Starting row keyed by the run ID, got %+v", rows)
+	}
+
+	api.rows = append(api.rows, Thread{ID: "thread-1", CWD: "/work", Status: ThreadStatus{Type: "active"}})
+	rows, err = p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := map[session.Key]session.Session{}
+	for _, r := range rows {
+		byKey[r.Key] = r
+	}
+	if _, stale := byKey[codexKey("run-1")]; stale {
+		t.Fatalf("bound run must no longer be listed under its provisional key: %+v", rows)
+	}
+	bound, ok := byKey[codexKey("thread-1")]
+	if !ok {
+		t.Fatalf("thread row missing: %+v", rows)
+	}
+	if len(bound.PreviousKeys) != 1 || bound.PreviousKeys[0] != codexKey("run-1") {
+		t.Fatalf("PreviousKeys=%v, want [codex:run-1]", bound.PreviousKeys)
+	}
+	if len(byKey[codexKey("old")].PreviousKeys) != 0 {
+		t.Fatalf("an unrelated thread must not claim a provisional key: %+v", byKey[codexKey("old")])
+	}
+}
+
+// TestBoundRunKeepsPublishingContinuityAfterItStops covers a run that
+// stopped before any List observed its binding: the Starting row must
+// still be attributed to the thread, and it must keep being so on later
+// Lists (continuity is durable, not a one-shot event).
+func TestBoundRunKeepsPublishingContinuityAfterItStops(t *testing.T) {
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", SessionID: "thread-1", CWD: "/work", State: "stopped"}); err != nil {
+		t.Fatal(err)
+	}
+	p := Provider{Store: store, API: &fakeAPI{rows: []Thread{{ID: "thread-1", CWD: "/work"}}}}
+	for range 2 {
+		rows, err := p.List(context.Background(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || len(rows[0].PreviousKeys) != 1 || rows[0].PreviousKeys[0] != codexKey("run-1") {
+			t.Fatalf("rows=%+v, want thread-1 with PreviousKeys [codex:run-1]", rows)
+		}
+	}
+}
+
+// TestUnboundRunsNeverPublishContinuity keeps the fail-closed binding
+// rules visible at the catalog boundary: an ambiguous binding (several
+// candidate threads) and a run with no candidate at all both stay listed
+// under the run ID, and no thread row claims the run's key.
+func TestUnboundRunsNeverPublishContinuity(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		threads []Thread
+		owned   bool
+	}{
+		{name: "ambiguous", threads: []Thread{{ID: "new-1", CWD: "/work"}, {ID: "new-2", CWD: "/work"}}, owned: true},
+		{name: "no candidate", threads: []Thread{{ID: "old", CWD: "/work"}}, owned: true},
+		{name: "ownership unproven", threads: []Thread{{ID: "new-1", CWD: "/work"}}, owned: false},
+		{name: "other cwd", threads: []Thread{{ID: "new-1", CWD: "/elsewhere"}}, owned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+			if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", Baseline: []string{"old"}}); err != nil {
+				t.Fatal(err)
+			}
+			owned := tc.owned
+			p := Provider{Store: store, API: &fakeAPI{rows: tc.threads}, WriterOwner: func(string, process.Identity) (bool, error) { return owned, nil }}
+			rows, err := p.List(context.Background(), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sawRun := false
+			for _, r := range rows {
+				if len(r.PreviousKeys) != 0 {
+					t.Fatalf("%v claims continuity %v without a confirmed binding", r.Key, r.PreviousKeys)
+				}
+				sawRun = sawRun || r.Key == codexKey("run-1")
+			}
+			if !sawRun {
+				t.Fatalf("unbound run must stay listed under its run ID: %+v", rows)
+			}
+		})
+	}
+}
+
+// TestUnboundTerminalRunKeepsRunKeyWithoutContinuity: a run that never
+// bound stays an "Unbound run" under its own ID, with no PreviousKeys.
+func TestUnboundTerminalRunKeepsRunKeyWithoutContinuity(t *testing.T) {
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "failed"}); err != nil {
+		t.Fatal(err)
+	}
+	p := Provider{Store: store, API: &fakeAPI{}}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Key != codexKey("run-1") || rows[0].Name != "Unbound run" || len(rows[0].PreviousKeys) != 0 {
+		t.Fatalf("rows=%+v", rows)
+	}
+}

@@ -100,6 +100,16 @@ type Session struct {
 	// RunID is set only for a Codex session with an agentsctl-managed run
 	// (see the DesignDoc's Codex run-to-thread binding); empty otherwise.
 	RunID string `json:"runId,omitempty"`
+	// PreviousKeys lists provisional Keys this session was previously
+	// presented under, when its Key changed once its canonical identity was
+	// established (a Codex managed run is listed under its run ID until it
+	// is bound to a thread -- see the DesignDoc's Codex provisional session
+	// identity). It is a provider's explicit statement that each listed Key
+	// and Key are the same session; consumers migrate selection and local
+	// metadata along it and must never derive such continuity themselves
+	// (from CWD, timestamps, row position, ...). A provider lists a Key here
+	// only for a confirmed transition; nil means no transition to report.
+	PreviousKeys []Key `json:"previousKeys,omitempty"`
 }
 
 // DisplayName is the title Agent View shows: the provider-assigned name,
