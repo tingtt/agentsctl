@@ -120,7 +120,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			// (Key.ID = thread ID) replaces it and names this Key in
 			// PreviousKeys above. Nothing here guesses that link.
 			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, "Starting"
-			actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
+			actions := session.Actions{session.ActionOpen: openWhileStarting(awaitingBootstrapBind(r)), session.ActionStop: {Available: true}}
 			if isTerminalRunState(r.State) {
 				// This row never became a real Codex app-server thread — its
 				// Key.ID is agentsctl's own run ID, not a thread ID
@@ -177,8 +177,32 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		}
 	}
 	createdAt := time.Now()
-	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
+	actions := session.Actions{session.ActionOpen: openWhileStarting(pendingRename != ""), session.ActionStop: {Available: true}}
 	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
+}
+
+// awaitingBootstrapBind reports whether r is a rename-only bootstrap run
+// that reconcile has not yet bound to its real thread.
+//
+// Invariant: a rename-only bootstrap run must not be attached while it is
+// still unbound. Its first model turn is what creates the listed/resumable
+// thread that reconciliation must bind before the session can safely be
+// treated as a normal Codex session; attaching the provisional run earlier
+// can split the run and the thread into separate identities. Stop stays
+// available. Ordinary Starting runs carry no PendingRename and are
+// unaffected.
+func awaitingBootstrapBind(r localstate.Run) bool {
+	return r.PendingRename != "" && r.SessionID == ""
+}
+
+// openWhileStarting is the Open availability of a provisional Starting row:
+// available, except while the run is a rename-only bootstrap awaiting its
+// thread (see awaitingBootstrapBind).
+func openWhileStarting(awaitingBind bool) session.Availability {
+	if awaitingBind {
+		return session.Availability{Reason: "Codex rename-only session is still starting"}
+	}
+	return session.Availability{Available: true}
 }
 
 // recordPendingRename attaches name to the just-started run runID. It runs
@@ -397,6 +421,16 @@ func (p *Provider) clearRenameError(threadID string) {
 
 func (p *Provider) PrepareAttach(ctx context.Context, s session.Session) (string, error) {
 	if s.RunID != "" {
+		// The row's Actions are advisory: a stale or hand-built session
+		// still reaches here, so the invariant is enforced on the current
+		// run record rather than on what the caller believes.
+		runs, err := p.Store.Runs()
+		if err != nil {
+			return "", fmt.Errorf("check managed run before attach: %w", err)
+		}
+		if awaitingBootstrapBind(runs[s.RunID]) {
+			return "", errors.New("codex rename-only session is still starting and cannot be attached until its thread is bound")
+		}
 		return s.RunID, nil
 	}
 	if !p.writerAbsent(s.Key.ID) {

@@ -43,6 +43,7 @@ type fakeDispatcher struct {
 	// set the run is recorded there like the supervisor does; dispatchErr
 	// fails the start instead. stopped lists the runs Stop was asked for.
 	dispatches  int
+	resumes     int
 	prompt      string
 	store       *localstate.Store
 	dispatchErr error
@@ -67,6 +68,7 @@ func (f *fakeDispatcher) Dispatch(_ context.Context, prompt, cwd string, baselin
 }
 
 func (f *fakeDispatcher) ResumeExisting(_ context.Context, _, _ string, environment map[string]string) (localstate.Run, error) {
+	f.resumes++
 	f.resumeEnvironment = cloneEnvironment(environment)
 	return localstate.Run{ID: "resume-run"}, nil
 }

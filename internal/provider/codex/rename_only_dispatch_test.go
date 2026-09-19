@@ -228,3 +228,179 @@ func TestCancelledListKeepsPendingRename(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// A rename-only bootstrap run must not be attachable until reconcile binds
+// it to its real thread: attaching the provisional run earlier split the run
+// and the thread into separate identities (a stale Starting row plus a real
+// thread no managed run owned). These tests pin that at all three places the
+// invariant lives -- the Dispatch row, List's provisional row, and
+// PrepareAttach itself.
+
+func requireOpen(t *testing.T, s session.Session, want bool) {
+	t.Helper()
+	open := s.Actions[session.ActionOpen]
+	if open.Available != want {
+		t.Fatalf("%v Open = %+v, want available=%v", s.Key, open, want)
+	}
+	if !want && open.Reason == "" {
+		t.Fatalf("%v Open is unavailable without a reason", s.Key)
+	}
+}
+
+func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
+	p, _, _, _ := newRenameTestProvider(t)
+	s, err := p.Dispatch(context.Background(), "/rename foo", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Activity != session.ActivityStarting || s.RunID == "" {
+		t.Fatalf("want a Starting row with a RunID, got %+v", s)
+	}
+	requireOpen(t, s, false)
+	if !s.Actions[session.ActionStop].Available {
+		t.Fatalf("Stop must stay available: %+v", s.Actions)
+	}
+
+	p, _, _, _ = newRenameTestProvider(t)
+	s, err = p.Dispatch(context.Background(), "implement issue #46", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOpen(t, s, true)
+}
+
+func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
+	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
+	for _, r := range []localstate.Run{
+		{ID: "run-rename", Provider: "codex", CWD: "/work", State: "running", PendingRename: "foo"},
+		{ID: "run-plain", Provider: "codex", CWD: "/work", State: "running"},
+	} {
+		if err := store.StartRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := &Provider{Store: store, API: &fakeAPI{}, WriterOwner: func(string, process.Identity) (bool, error) { return false, nil }}
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byKey := map[session.Key]session.Session{}
+	for _, row := range rows {
+		byKey[row.Key] = row
+	}
+	pending, plain := byKey[codexKey("run-rename")], byKey[codexKey("run-plain")]
+	if pending.Activity != session.ActivityStarting || plain.Activity != session.ActivityStarting {
+		t.Fatalf("want two Starting rows: %+v", rows)
+	}
+	requireOpen(t, pending, false)
+	requireOpen(t, plain, true)
+	for _, row := range []session.Session{pending, plain} {
+		if !row.Actions[session.ActionStop].Available {
+			t.Fatalf("%v: Stop must stay available: %+v", row.Key, row.Actions)
+		}
+	}
+}
+
+func TestPrepareAttachRefusesUnboundRenameBootstrapEvenFromStaleRow(t *testing.T) {
+	p, rt, _, store := newRenameTestProvider(t)
+	if err := store.StartRun(localstate.Run{ID: "run-rename", Provider: "codex", CWD: "/work", State: "running", PendingRename: "foo"}); err != nil {
+		t.Fatal(err)
+	}
+	// A row built by hand -- as a stale UI row or another caller might --
+	// claiming Open is available.
+	stale := session.Session{Key: codexKey("run-rename"), RunID: "run-rename", CWD: "/work",
+		Actions: session.Actions{session.ActionOpen: {Available: true}}}
+	runID, err := p.PrepareAttach(context.Background(), stale)
+	if err == nil || runID != "" {
+		t.Fatalf("PrepareAttach = (%q, %v), want a refusal and no run to attach", runID, err)
+	}
+	if rt.resumes != 0 {
+		t.Fatalf("refused attach must not resume anything (%d calls)", rt.resumes)
+	}
+}
+
+func TestPrepareAttachStillAllowsOrdinaryAndBoundRuns(t *testing.T) {
+	p, rt, _, store := newRenameTestProvider(t)
+	for _, r := range []localstate.Run{
+		{ID: "run-plain", Provider: "codex", CWD: "/work", State: "running"},
+		{ID: "run-bound", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-1", PendingRename: "foo"},
+		{ID: "run-applied", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-2"},
+	} {
+		if err := store.StartRun(r); err != nil {
+			t.Fatal(err)
+		}
+		got, err := p.PrepareAttach(context.Background(), session.Session{Key: codexKey(r.ID), RunID: r.ID})
+		if err != nil || got != r.ID {
+			t.Fatalf("%s: PrepareAttach = (%q, %v), want the run to attach", r.ID, got, err)
+		}
+	}
+	if rt.resumes != 0 {
+		t.Fatalf("attaching an existing run must not resume: %d", rt.resumes)
+	}
+}
+
+// TestRenameOnlySessionBecomesOpenableOnceBound walks the whole lifecycle:
+// not attachable while unbound (also across Lists before the thread exists),
+// then, once the thread appears, one List binds it, applies the name, drops
+// the provisional row and offers Open on the real thread.
+func TestRenameOnlySessionBecomesOpenableOnceBound(t *testing.T) {
+	p, rt, api, _ := newRenameTestProvider(t)
+	api.rows = []Thread{{ID: "old", CWD: "/work"}}
+	starting, err := p.Dispatch(context.Background(), "/rename foo", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireOpen(t, starting, false)
+
+	for range 2 { // the thread has not appeared yet
+		rows, err := p.List(context.Background(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got session.Session
+		for _, row := range rows {
+			if row.Key == starting.Key {
+				got = row
+			}
+		}
+		if got.Activity != session.ActivityStarting {
+			t.Fatalf("want the Starting row still listed: %+v", rows)
+		}
+		requireOpen(t, got, false)
+		if _, err := p.PrepareAttach(context.Background(), got); err == nil {
+			t.Fatal("attach must stay refused before binding")
+		}
+	}
+
+	api.rows = append(api.rows, Thread{ID: "thread-1", CWD: "/work", Status: ThreadStatus{Type: "active"}})
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bound *session.Session
+	for i, row := range rows {
+		if row.Key == starting.Key {
+			t.Fatalf("provisional row must disappear once bound: %+v", rows)
+		}
+		if row.Key == codexKey("thread-1") {
+			bound = &rows[i]
+		}
+	}
+	if bound == nil {
+		t.Fatalf("real thread row missing: %+v", rows)
+	}
+	if api.renamed != "thread-1:foo" || bound.Name != "foo" {
+		t.Fatalf("pending rename not applied: renamed=%q Name=%q", api.renamed, bound.Name)
+	}
+	if len(bound.PreviousKeys) != 1 || bound.PreviousKeys[0] != starting.Key || bound.RunID != starting.RunID {
+		t.Fatalf("identity continuity lost: %+v", bound)
+	}
+	requireOpen(t, *bound, true)
+	got, err := p.PrepareAttach(context.Background(), *bound)
+	if err != nil || got != starting.RunID {
+		t.Fatalf("PrepareAttach(bound) = (%q, %v), want the managed run %q", got, err, starting.RunID)
+	}
+	if rt.resumes != 0 {
+		t.Fatalf("bound rename-only session must attach to its managed run, not resume: %d", rt.resumes)
+	}
+}
