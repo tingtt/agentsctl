@@ -86,25 +86,10 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 	var wg sync.WaitGroup
 	for _, p := range c.Providers {
 		p := p
-		_, observes := p.(Observer)
-		listOwnsStatus := !observes
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rows, err := p.List(ctx, false)
-			if err != nil {
-				out <- ProviderSnapshot{Provider: p.ID(), Err: err, ListOwnsStatus: listOwnsStatus}
-				return
-			}
-			// A fresh slice, never rows itself: a provider whose List
-			// returns a live reference into its own mutable state (a
-			// test double, typically) must never be mutated here.
-			enriched := make([]session.Session, len(rows))
-			for i := range rows {
-				enriched[i] = rows[i]
-				enriched[i].Actions = actionsFor(p, rows[i])
-			}
-			out <- ProviderSnapshot{Provider: p.ID(), Sessions: enriched, ListOwnsStatus: listOwnsStatus}
+			out <- c.loadProvider(ctx, p)
 		}()
 	}
 	go func() {
@@ -112,6 +97,42 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 		close(out)
 	}()
 	return out
+}
+
+// LoadProvider is LoadStream's single-provider counterpart: it Lists only
+// the provider id and returns the same ProviderSnapshot a LoadStream arrival
+// for it would carry (actionsFor-narrowed, ListOwnsStatus set), leaving
+// every other provider untouched. A caller (Agent View) uses it to refresh
+// one provider's catalog without a full reload -- in particular without the
+// Refresher/Observer background refresh a full reload requests. An id that
+// is not configured yields a snapshot whose Err says so.
+func (c Controller) LoadProvider(ctx context.Context, id session.ProviderID) ProviderSnapshot {
+	p, err := c.provider(id)
+	if err != nil {
+		return ProviderSnapshot{Provider: id, Err: err, ListOwnsStatus: true}
+	}
+	return c.loadProvider(ctx, p)
+}
+
+// loadProvider is the one place a provider's List becomes a ProviderSnapshot,
+// shared by LoadStream and LoadProvider so the two can never disagree on
+// narrowing or status ownership.
+func (c Controller) loadProvider(ctx context.Context, p Source) ProviderSnapshot {
+	_, observes := p.(Observer)
+	listOwnsStatus := !observes
+	rows, err := p.List(ctx, false)
+	if err != nil {
+		return ProviderSnapshot{Provider: p.ID(), Err: err, ListOwnsStatus: listOwnsStatus}
+	}
+	// A fresh slice, never rows itself: a provider whose List returns a
+	// live reference into its own mutable state (a test double, typically)
+	// must never be mutated here.
+	enriched := make([]session.Session, len(rows))
+	for i := range rows {
+		enriched[i] = rows[i]
+		enriched[i].Actions = actionsFor(p, rows[i])
+	}
+	return ProviderSnapshot{Provider: p.ID(), Sessions: enriched, ListOwnsStatus: listOwnsStatus}
 }
 
 // ObserverUpdate is one Observer-sourced provider update, mirroring
