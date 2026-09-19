@@ -418,3 +418,18 @@ func TestMigratePinnedToSameKeyKeepsPin(t *testing.T) {
 		t.Fatalf("pins=%v", pins)
 	}
 }
+
+func TestRunPendingRenameRoundTripsAcrossReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	want := Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", PendingRename: "日本語 name", RenameError: "boom"}
+	if err := New(path).StartRun(want); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := New(path).Runs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runs["run-1"]; got.PendingRename != want.PendingRename || got.RenameError != want.RenameError {
+		t.Fatalf("run = %+v, want pending rename state preserved", got)
+	}
+}

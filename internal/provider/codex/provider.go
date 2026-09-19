@@ -54,9 +54,11 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	if !archived {
 		_ = p.reconcile(threads)
+		p.applyPendingRenames(ctx, threads)
 	}
 	runs, _ := p.Store.Runs()
 	managed := map[string]localstate.Run{}
+	renameFailed := map[string]string{}
 	// provisional collects, per thread, the keys its bound runs were listed
 	// under while still unbound (see the unbound-run rows below). Only a
 	// run whose SessionID is set -- i.e. one reconcile proved to this
@@ -69,6 +71,9 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			continue
 		}
 		provisional[r.SessionID] = append(provisional[r.SessionID], session.Key{Provider: session.ProviderCodex, ID: r.ID})
+		if r.RenameError != "" {
+			renameFailed[r.SessionID] = r.RenameError
+		}
 		if r.State == "running" || r.State == "starting" {
 			managed[r.SessionID] = r
 		}
@@ -76,6 +81,13 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	rows := make([]session.Session, 0, len(threads)+len(runs))
 	for _, t := range threads {
 		run, ok := managed[t.ID]
+		summary := value(t.Preview)
+		if msg, failed := renameFailed[t.ID]; failed && value(t.Name) == "" {
+			// A rename-only session whose name could not be applied would
+			// otherwise show only its bootstrap preview, with no hint the
+			// requested name was lost.
+			summary = msg
+		}
 		runtime := session.RuntimeNone
 		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: {Available: true}}
 		switch {
@@ -96,7 +108,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			actions[session.ActionOpen] = session.Availability{Reason: reason}
 			actions[session.ActionStop] = session.Availability{Reason: reason}
 		}
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: value(t.Preview), CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
 	if !archived {
 		for _, r := range runs {
@@ -136,6 +148,17 @@ func sortedKeys(keys []session.Key) []session.Key {
 }
 
 func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
+	// A composer input that is only `/rename <name>` is never forwarded to
+	// Codex: as an initial prompt it would reach the model as plain text.
+	// The requested name stays with agentsctl (see recordPendingRename) and
+	// the model only ever sees a fixed bootstrap prompt.
+	var pendingRename string
+	if name, isRename := parseRenameOnly(prompt); isRename {
+		if name == "" {
+			return session.Session{}, errors.New("name must not be empty")
+		}
+		prompt, pendingRename = renameBootstrapPrompt, name
+	}
 	before, err := p.API.List(ctx, false)
 	if err != nil {
 		return session.Session{}, err
@@ -148,10 +171,89 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	if err != nil {
 		return session.Session{}, err
 	}
+	if pendingRename != "" {
+		if err := p.recordPendingRename(ctx, r.ID, pendingRename); err != nil {
+			return session.Session{}, err
+		}
+	}
 	createdAt := time.Now()
 	actions := session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}
 	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
 }
+
+// recordPendingRename attaches name to the just-started run runID. It runs
+// after the supervisor has recorded the run, so the name lives in the same
+// local run state reconciliation already reads; a concurrent bind of the
+// run only ever adds SessionID, which this update leaves alone. If the name
+// cannot be recorded the run is stopped rather than left running a
+// bootstrap turn nothing will ever rename.
+func (p *Provider) recordPendingRename(ctx context.Context, runID, name string) error {
+	applied, err := p.Store.UpdateRunIf(runID,
+		func(localstate.Run) bool { return true },
+		func(r localstate.Run) localstate.Run { r.PendingRename = name; return r },
+	)
+	if err == nil && !applied {
+		err = errors.New("started run is not tracked")
+	}
+	if err == nil {
+		return nil
+	}
+	err = fmt.Errorf("record pending rename: %w", err)
+	if stopErr := p.Runtime.Stop(ctx, runID); stopErr != nil {
+		err = errors.Join(err, fmt.Errorf("stop run: %w", stopErr))
+	}
+	return err
+}
+
+// applyPendingRenames renames, through the same native rename an existing
+// session uses, each thread that reconcile has just bound to a run still
+// carrying a PendingRename, and clears the pending state. There is one
+// attempt: the thread exists whatever happens, so a failure is recorded on
+// the run (RenameError, surfaced by List) and an ordinary rename of the
+// thread is the retry -- no retry loop of its own. A List cancelled
+// mid-attempt says nothing about the rename, so it leaves the name pending.
+// The applied name is written into threads so the same List already shows
+// it.
+func (p *Provider) applyPendingRenames(ctx context.Context, threads []Thread) {
+	runs, err := p.Store.Runs()
+	if err != nil {
+		return
+	}
+	index := make(map[string]int, len(threads))
+	for i, t := range threads {
+		index[t.ID] = i
+	}
+	for id, r := range runs {
+		if r.Provider != "codex" || r.PendingRename == "" || r.SessionID == "" {
+			continue
+		}
+		i, listed := index[r.SessionID]
+		if !listed {
+			continue
+		}
+		name, threadID := r.PendingRename, r.SessionID
+		renameErr := p.Rename(ctx, session.Key{Provider: session.ProviderCodex, ID: threadID}, name)
+		if renameErr != nil && ctx.Err() != nil {
+			continue
+		}
+		if renameErr == nil {
+			threads[i].Name = &name
+		}
+		_, _ = p.Store.UpdateRunIf(id,
+			func(current localstate.Run) bool {
+				return current.PendingRename == name && current.SessionID == threadID
+			},
+			func(current localstate.Run) localstate.Run {
+				current.PendingRename = ""
+				if renameErr != nil {
+					current.RenameError = fmt.Sprintf("rename to %q failed: %v", name, renameErr)
+				}
+				return current
+			},
+		)
+	}
+}
+
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	runs, err := p.Store.Runs()
 	if err != nil {
@@ -264,7 +366,33 @@ func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")
 	}
-	return p.API.Rename(ctx, k.ID, name)
+	if err := p.API.Rename(ctx, k.ID, name); err != nil {
+		return err
+	}
+	p.clearRenameError(k.ID)
+	return nil
+}
+
+// clearRenameError forgets a failed pending rename of threadID once the
+// thread has been renamed by hand: the failure it recorded is resolved. Best
+// effort -- the rename itself already succeeded.
+func (p *Provider) clearRenameError(threadID string) {
+	if p.Store == nil {
+		return
+	}
+	runs, err := p.Store.Runs()
+	if err != nil {
+		return
+	}
+	for id, r := range runs {
+		if r.SessionID != threadID || r.RenameError == "" {
+			continue
+		}
+		_, _ = p.Store.UpdateRunIf(id,
+			func(current localstate.Run) bool { return current.SessionID == threadID && current.RenameError != "" },
+			func(current localstate.Run) localstate.Run { current.RenameError = ""; return current },
+		)
+	}
 }
 
 func (p *Provider) PrepareAttach(ctx context.Context, s session.Session) (string, error) {
