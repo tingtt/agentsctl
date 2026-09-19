@@ -375,3 +375,124 @@ func TestComposerCWDFallsBackToStartupWhenNoSessionSelectable(t *testing.T) {
 		t.Fatalf("ComposerCWD()=%q, want StartupCWD fallback %q", got, "/start")
 	}
 }
+
+func codexKey(id string) session.Key { return session.Key{Provider: session.ProviderCodex, ID: id} }
+
+func startingRow(id string) session.Session {
+	return session.Session{Key: codexKey(id), Name: "Starting", CWD: "/work", Activity: session.ActivityStarting}
+}
+
+func boundRow(id string, previous ...string) session.Session {
+	row := session.Session{Key: codexKey(id), CWD: "/work", Activity: session.ActivityWorking}
+	for _, p := range previous {
+		row.PreviousKeys = append(row.PreviousKeys, codexKey(p))
+	}
+	return row
+}
+
+// TestSetRowsSelectionFollowsProviderStatedIdentityTransition: a selected
+// Starting row whose key is listed in a successor row's PreviousKeys keeps
+// the selection on that successor, instead of the nearby-session fallback.
+func TestSetRowsSelectionFollowsProviderStatedIdentityTransition(t *testing.T) {
+	s := NewState()
+	// Neighbours on both sides, so the fallback would clearly pick another row.
+	s.SetRows([]session.Session{{Key: key("a")}, startingRow("run-1"), {Key: key("z")}})
+	s.selectIndex(1)
+
+	s.SetRows([]session.Session{{Key: key("z")}, boundRow("thread-1", "run-1"), {Key: key("a")}})
+	got, ok := s.SelectedRow()
+	if !ok || got.Key != codexKey("thread-1") {
+		t.Fatalf("selection=%+v ok=%v, want codex:thread-1", got, ok)
+	}
+	// Later refreshes with the same continuity metadata leave it alone.
+	s.SetRows([]session.Session{boundRow("thread-1", "run-1"), {Key: key("a")}})
+	if got, _ := s.SelectedRow(); got.Key != codexKey("thread-1") {
+		t.Fatalf("selection moved on a later refresh: %+v", got)
+	}
+}
+
+// Without provider-stated continuity the successor is never guessed, even
+// when it looks like the same session (same CWD, appears exactly where the
+// Starting row was): ordinary disappearance rules apply.
+func TestSetRowsDoesNotInferIdentityTransition(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, startingRow("run-1"), {Key: key("z")}})
+	s.selectIndex(1)
+	s.SetRows([]session.Session{{Key: key("a")}, boundRow("thread-1"), {Key: key("z")}})
+	if got, _ := s.SelectedRow(); got.Key != key("z") {
+		t.Fatalf("selection=%+v, want the ordinary neighbour fallback (claude:z)", got)
+	}
+}
+
+// A key claimed as "previous" by two rows is ambiguous: not followed.
+func TestSetRowsAmbiguousContinuityIsNotFollowed(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{startingRow("run-1"), {Key: key("z")}})
+	s.selectIndex(0)
+	s.SetRows([]session.Session{boundRow("thread-1", "run-1"), boundRow("thread-2", "run-1"), {Key: key("z")}})
+	if got, _ := s.SelectedRow(); got.Key == codexKey("thread-1") || got.Key == codexKey("thread-2") {
+		t.Fatalf("ambiguous continuity was followed: %+v", got)
+	}
+}
+
+// If the old key still exists, selection stays on it: it is not a
+// transition.
+func TestSetRowsExistingKeyWinsOverContinuityClaim(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{startingRow("run-1"), {Key: key("z")}})
+	s.selectIndex(0)
+	s.SetRows([]session.Session{startingRow("run-1"), boundRow("thread-1", "run-1")})
+	if got, _ := s.SelectedRow(); got.Key != codexKey("run-1") {
+		t.Fatalf("selection=%+v, want codex:run-1", got)
+	}
+}
+
+// When the successor is not in the new rows at all (e.g. scoped out), the
+// ordinary neighbour fallback still works from the old position.
+func TestSetRowsTransitionToHiddenSuccessorFallsBackToNeighbour(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a")}, startingRow("run-1"), {Key: key("z")}})
+	s.selectIndex(1)
+	s.SetRows([]session.Session{{Key: key("a")}, {Key: key("z")}})
+	if got, _ := s.SelectedRow(); got.Key != key("z") {
+		t.Fatalf("selection=%+v", got)
+	}
+}
+
+func TestSetRowsIdentityTransitionMigratesRenameTargetAndLastAttached(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{startingRow("run-1"), {Key: key("a")}})
+	s.selectIndex(0)
+	s.MarkAttached(codexKey("run-1"))
+	s.Rename = Rename{Active: true, Target: codexKey("run-1"), Draft: "x"}
+
+	s.SetRows([]session.Session{{Key: key("a")}, boundRow("thread-1", "run-1")})
+	if s.LastAttachedKey != codexKey("thread-1") || !s.HasLastAttached {
+		t.Fatalf("LastAttachedKey=%v", s.LastAttachedKey)
+	}
+	if s.Rename.Target != codexKey("thread-1") || !s.Rename.Active {
+		t.Fatalf("Rename=%+v", s.Rename)
+	}
+	if got, _ := s.SelectedRow(); got.Key != codexKey("thread-1") {
+		t.Fatalf("selection=%+v", got)
+	}
+}
+
+// A pending confirmation belongs to the pre-transition row's action
+// availability and is dropped rather than carried to the canonical row;
+// one on an unrelated session is untouched.
+func TestSetRowsIdentityTransitionDropsConfirmationOnlyForMovedKey(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{startingRow("run-1"), {Key: key("a")}})
+	s.Confirmation = &PendingConfirmation{Key: codexKey("run-1"), Action: session.ActionArchive}
+	s.SetRows([]session.Session{boundRow("thread-1", "run-1"), {Key: key("a")}})
+	if s.Confirmation != nil {
+		t.Fatalf("confirmation=%+v, want dropped", s.Confirmation)
+	}
+
+	s.Confirmation = &PendingConfirmation{Key: key("a"), Action: session.ActionArchive}
+	s.SetRows([]session.Session{boundRow("thread-1", "run-1"), {Key: key("a")}})
+	if s.Confirmation == nil || s.Confirmation.Key != key("a") {
+		t.Fatalf("unrelated confirmation lost: %+v", s.Confirmation)
+	}
+}

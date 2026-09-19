@@ -348,3 +348,123 @@ func TestRuntimeStopAndArchiveReachProviderAndReload(t *testing.T) {
 		t.Fatalf("archived session must be gone after reload: %+v", rt.State.Rows)
 	}
 }
+
+// codexIdentityRuntime builds a Runtime over a Codex-shaped fake provider
+// and the real Controller, starting with only the Starting row for run-1.
+// bind swaps the provider's catalog to the bound thread row that names
+// run-1 in PreviousKeys, exactly what a real Codex provider lists once the
+// run-to-thread binding is confirmed.
+func codexIdentityRuntime(t *testing.T) (rt *Runtime, pins *fakePins, bind func()) {
+	t.Helper()
+	runKey := session.Key{Provider: session.ProviderCodex, ID: "run-1"}
+	threadKey := session.Key{Provider: session.ProviderCodex, ID: "thread-1"}
+	starting := session.Session{Key: runKey, Name: "Starting", CWD: "/work", Activity: session.ActivityStarting, RunID: "run-1",
+		Actions: session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}}
+	bound := session.Session{Key: threadKey, CWD: "/work", Activity: session.ActivityWorking, RunID: "run-1", PreviousKeys: []session.Key{runKey},
+		Actions: session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}}
+	other := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "other"}, CWD: "/work", Activity: session.ActivityIdle}
+	p := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{starting, other}}
+	pins = &fakePins{}
+	rt = &Runtime{
+		Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: pins},
+		State:      NewState(),
+		CWD:        "/work",
+	}
+	rt.syncReload(context.Background())
+	return rt, pins, func() { p.rows = []session.Session{bound, other} }
+}
+
+// TestRuntimeStartingRowSelectionSurvivesBinding is Issue #44's core
+// regression through the real Runtime and Controller: the Starting row is
+// selected, its run binds to a thread, the catalog reloads, and the
+// selection is still the same session (now under its thread key).
+func TestRuntimeStartingRowSelectionSurvivesBinding(t *testing.T) {
+	rt, _, bind := codexIdentityRuntime(t)
+	for i, r := range rt.State.Rows {
+		if r.Key.ID == "run-1" {
+			rt.State.selectIndex(i)
+		}
+	}
+	if got, _ := rt.State.SelectedRow(); got.Activity != session.ActivityStarting {
+		t.Fatalf("setup: selected=%+v", got)
+	}
+
+	bind()
+	rt.syncReload(context.Background())
+
+	got, ok := rt.State.SelectedRow()
+	if !ok || got.Key.ID != "thread-1" || got.Activity != session.ActivityWorking {
+		t.Fatalf("selected=%+v ok=%v, want the bound codex:thread-1 row", got, ok)
+	}
+	for _, r := range rt.State.Rows {
+		if r.Key.ID == "run-1" {
+			t.Fatalf("provisional row still listed: %+v", rt.State.Rows)
+		}
+	}
+}
+
+// TestRuntimeStartingRowPinSurvivesBinding pins the Starting row through
+// the real key handling, then binds: the row stays pinned, the persisted
+// pin lives only under the thread key, and it can then be unpinned like
+// any other session.
+func TestRuntimeStartingRowPinSurvivesBinding(t *testing.T) {
+	rt, pins, bind := codexIdentityRuntime(t)
+	for i, r := range rt.State.Rows {
+		if r.Key.ID == "run-1" {
+			rt.State.selectIndex(i)
+		}
+	}
+	if err := rt.act(context.Background(), rt.State.Handle(KeyEvent{Key: KeyCtrlT})); err != nil {
+		t.Fatal(err)
+	}
+	if !pins.pinned["codex:run-1"] {
+		t.Fatalf("setup: pins=%v", pins.pinned)
+	}
+
+	bind()
+	rt.syncReload(context.Background())
+
+	got, ok := rt.State.SelectedRow()
+	if !ok || got.Key.ID != "thread-1" || !got.Pinned {
+		t.Fatalf("selected=%+v ok=%v, want pinned codex:thread-1", got, ok)
+	}
+	if len(pins.pinned) != 1 || !pins.pinned["codex:thread-1"] {
+		t.Fatalf("pins=%v, want only codex:thread-1", pins.pinned)
+	}
+
+	if err := rt.act(context.Background(), rt.State.Handle(KeyEvent{Key: KeyCtrlT})); err != nil {
+		t.Fatal(err)
+	}
+	rt.syncReload(context.Background())
+	for _, r := range rt.State.Rows {
+		if r.Pinned {
+			t.Fatalf("still pinned after unpin: %+v pins=%v", r, pins.pinned)
+		}
+	}
+	if len(pins.pinned) != 0 {
+		t.Fatalf("pins=%v, want none", pins.pinned)
+	}
+}
+
+// TestRuntimeLastAttachedFollowsBinding: opening the Starting row and
+// returning to the overview, then a catalog reload that shows the binding,
+// keeps the "last attached" marker on the same session.
+func TestRuntimeLastAttachedFollowsBinding(t *testing.T) {
+	rt, _, bind := codexIdentityRuntime(t)
+	for i, r := range rt.State.Rows {
+		if r.Key.ID == "run-1" {
+			rt.State.selectIndex(i)
+		}
+	}
+	if err := rt.act(context.Background(), rt.State.Handle(KeyEvent{Key: KeyEnter})); err != nil {
+		t.Fatal(err)
+	}
+	// Open's Result.Reload started a background reload; let it finish
+	// before mutating the fake provider's catalog.
+	rt.drainCatalog(context.Background())
+	bind()
+	rt.syncReload(context.Background())
+	if !rt.State.HasLastAttached || rt.State.LastAttachedKey.ID != "thread-1" {
+		t.Fatalf("LastAttachedKey=%v", rt.State.LastAttachedKey)
+	}
+}
