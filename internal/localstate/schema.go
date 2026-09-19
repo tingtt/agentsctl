@@ -21,6 +21,15 @@ type Run struct {
 	Error     string
 	Baseline  []string
 	StartedAt time.Time
+	// PendingRename is a session name a rename-only dispatch is still
+	// waiting to apply: it belongs to the run until the run is bound to a
+	// thread that can be renamed, and is cleared after the one attempt to
+	// apply it (see provider/codex.Provider.applyPendingRenames).
+	PendingRename string
+	// RenameError records why that attempt failed, so the failure is
+	// surfaced instead of lost; it is not retried automatically -- the
+	// thread exists, so an ordinary rename of it is the retry.
+	RenameError string
 }
 
 // data is the raw persisted schema: package-private so no external package
@@ -63,6 +72,9 @@ type run struct {
 	Error     string    `json:"error,omitempty"`
 	Baseline  []string  `json:"baseline,omitempty"`
 	StartedAt time.Time `json:"startedAt"`
+
+	PendingRename string `json:"pendingRename,omitempty"`
+	RenameError   string `json:"renameError,omitempty"`
 }
 
 // chatGPTCatalog is data.ChatGPTCatalogs' persisted element shape,
@@ -81,10 +93,10 @@ type chatGPTConversation struct {
 }
 
 func toRun(r run) Run {
-	return Run{ID: r.ID, Provider: r.Provider, SessionID: r.SessionID, CWD: r.CWD, PID: r.PID, StartTime: r.StartTime, UID: r.UID, Socket: r.Socket, State: r.State, Error: r.Error, Baseline: r.Baseline, StartedAt: r.StartedAt}
+	return Run{ID: r.ID, Provider: r.Provider, SessionID: r.SessionID, CWD: r.CWD, PID: r.PID, StartTime: r.StartTime, UID: r.UID, Socket: r.Socket, State: r.State, Error: r.Error, Baseline: r.Baseline, StartedAt: r.StartedAt, PendingRename: r.PendingRename, RenameError: r.RenameError}
 }
 func fromRun(r Run) run {
-	return run{ID: r.ID, Provider: r.Provider, SessionID: r.SessionID, CWD: r.CWD, PID: r.PID, StartTime: r.StartTime, UID: r.UID, Socket: r.Socket, State: r.State, Error: r.Error, Baseline: r.Baseline, StartedAt: r.StartedAt}
+	return run{ID: r.ID, Provider: r.Provider, SessionID: r.SessionID, CWD: r.CWD, PID: r.PID, StartTime: r.StartTime, UID: r.UID, Socket: r.Socket, State: r.State, Error: r.Error, Baseline: r.Baseline, StartedAt: r.StartedAt, PendingRename: r.PendingRename, RenameError: r.RenameError}
 }
 
 func emptyData() data {

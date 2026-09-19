@@ -102,6 +102,10 @@ type Runtime struct {
 	// eventLoop's select rather than busy-looping on a closed channel.
 	observerCh <-chan sessionctl.ObserverUpdate
 
+	// transient is the targeted-refresh state for providers that still list a
+	// transient (Starting) session -- see transient_unix.go.
+	transient transientRefresh
+
 	terminal        overviewLifecycle
 	runPromptEditor promptEditorRunner
 }
@@ -267,6 +271,10 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent, error)) error {
 	keyCh := make(chan keyResult, 1)
 	startKeyRead(reader, readKeyFn, keyCh)
+	// Targeted refreshes run under this loop's own context, so none outlives
+	// the loop (see transientRefresh).
+	loopCtx, stopLoop := context.WithCancel(ctx)
+	defer stopLoop()
 	for {
 		select {
 		case kr := <-keyCh:
@@ -336,6 +344,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				// cycle.
 				r.refreshUsageAsync(ctx)
 			}
+			r.transient.schedule(r)
 			r.render()
 		case update, ok := <-r.observerCh:
 			// Independent of catalogGen/reload cycles by design (see
@@ -350,7 +359,14 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 			}
 			r.applyObserverUpdate(update.Provider, update.Sessions, update.Err, update.Warning)
 			r.recomputeRows()
+			r.transient.schedule(r)
 			r.render()
+		case <-r.transient.tick:
+			r.transient.refresh(loopCtx, r)
+		case ev := <-r.transient.results:
+			if r.transient.apply(r, ev) {
+				r.render()
+			}
 		}
 	}
 }
@@ -433,6 +449,9 @@ func normalizeTerminalNewlines(value string) string {
 // eventLoop's observerCh case) -- Refresh itself is fire-and-forget here.
 func (r *Runtime) requestReload(ctx context.Context) {
 	r.State.StartupCWD = r.CWD
+	// The reload lists every provider itself: targeted refreshes started
+	// before it are obsolete (see transientRefresh.supersede).
+	r.transient.supersede()
 	cwd, dirScope, worktrees := r.CWD, r.State.Scope, r.Worktrees
 
 	if r.catalogCh == nil {

@@ -267,6 +267,26 @@ provider ごとの起動方法は異なるが、Agent View 上では同じ Dispa
 - TUI 自身は Codex CLI process を直接保持しない。
 - 起動後に追加された Codex thread と managed run を対応付け、通常の session として catalog に統合する。
 
+###### Rename-only new session (Codex)
+
+新規 session の Composer 入力が単独の `/rename <name>` である場合、その文字列を Codex の initial prompt として渡さない。Codex には通常 prompt として渡る (slash command としては処理されない) ためである。認識するのは、入力全体がこの1コマンドである場合に限る (`/renamex foo`、他の text を含む入力、複数行入力は通常の prompt)。name が空の場合は Codex を起動せず validation error とする。
+
+Codex は最初の model turn まで listed / resumable な thread を公開しない (rollout が存在せず、`thread/list` に現れず、`thread/resume` できない)。このため、rename だけでは agentsctl が bind できる thread は作られず、最小の bootstrap turn を1回実行する。
+
+```text
+/rename <name>
+  -> 固定の bootstrap prompt で Codex を起動 (name は managed run が保持する)
+  -> 「Codex run-to-thread binding」で run を real thread へ bind
+  -> native な thread rename を適用し、保持していた name を破棄
+```
+
+- bootstrap prompt は固定文とし、name を含めない。name は user-controlled な文字列であり、model への指示に埋め込まない。
+- bootstrap run が real thread に bind されるまでは attach できない (Open 不可、Stop は可)。first model turn が作る thread を reconciliation が bind する前に provisional run へ attach すると、run と thread の identity が分裂しうるためである。この制約は session の action availability と attach の準備の両方で守り、bind 後は通常の session と同じく Open できる。通常の `Starting` session には適用しない。
+- bind 前の row は `Starting (Waiting rename)` と表示する (Activity は `ActivityStarting` のまま。Codex 固有の lifecycle の詳細は表示名で表し、共通の Activity は増やさない)。bootstrap turn の完了後は、上の「Transient session の自動 refresh」により、ユーザーの操作なしに requested name の thread row へ移行する。
+- 保持した name は managed run (local run state) に属し、Starting → real thread の identity 移行の上に載るだけである。別の identity 機構は持たない。
+- 適用は1回だけ行う。失敗しても thread は実在するため破棄せず、失敗を run に記録して session 上に示す。再試行は通常の Rename であり、自動 retry は持たない。
+- bootstrap turn は実際に model turn を1回消費する。rate limit 等で失敗する場合も、特別な回避はしない。
+
 ##### Composer directory context
 
 Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、選択中 session 自身の CWD に追従する。
@@ -534,6 +554,7 @@ Rename は、既存 session の表示名を変更する。
 **Codex**
 
 - app-server の native rename を利用する。
+- 新規 session の `/rename <name>` は、thread が存在しないため直接は適用できない。「Rename-only new session (Codex)」を参照。
 
 #### Directory scope
 
@@ -983,6 +1004,17 @@ event loop
 - 最新の reload generation の結果だけが State を更新できる。scope 変更や連続した Ctrl+L で古い generation の Snapshot (途中経過・最終いずれも) が後から届いても無視される。
 - 新しい reload は直前の reload の子 context を cancel する (ただし provider/runtime 自体の context ではない)。これにより ChatGPT のような browser-backed discovery walk が破棄される結果のために動き続けることを防ぐが、次の reload で同じ runtime を再利用できることは変わらない。
 - `LoadStream` 自身は pin 付与・scope filter・overview 順序付けを行わない。これらは `MergeSessions` として切り出されており、呼び出し側 (Agent View、あるいは `Load` 自身) がそこまでの累積結果に対して都度再適用する。
+
+##### Transient session の自動 refresh
+
+provider は、まだ別の状態へ移る途中の session (`ActivityStarting`。例: Codex の `Starting` は、後続の `Provider.List` が thread へ bind するまで provisional な key で列挙される) を返すことがある。catalog は1回の load では確定せず、provider 側で何かが起きても Agent View に通知する経路はない。そのため Agent View は、ユーザーに Ctrl+L を要求せず、この状態が続く間だけ自動で追従する。
+
+- いずれかの provider の retained catalog (providerSnapshots) に `ActivityStarting` の session がある間だけ、その provider を `sessionctl.Controller.LoadProvider` で targeted に List し直す。Agent View は「Starting の session を持つ provider は少し後に再取得する」ことだけを知り、何が session を確定させるか (reconciliation、native rename) は知らない。それらは引き続き provider の `List` の責務である。
+- これは reload ではない。他の provider は List せず、`Refresher` / `Observer` の background refresh も要求しない (ChatGPT の browser-backed refresh を定期実行しない)。`LoadStream` と `LoadProvider` は同じ「List → `actionsFor` による narrowing → `ProviderSnapshot`」の経路を共有する。
+- 結果は reload の到着と同じ `applyLoadSnapshot` → `recomputeRows` を通る。selection・pin・scope・順序・`PreviousKeys` による identity 移行・last-known-good (失敗しても既存 rows を消さず warning にする) は reload と同一に振る舞う。reload 開始前に始まった結果は、その reload が同じ provider を List するため破棄する。
+- full reload は in-flight の targeted refresh より優先する。reload は全 provider を自ら List するため、reload 開始時にそれ以前の targeted refresh を cancel し、その in-flight 状態も解放する (返ってこない List が後続の round を止めないため)。cancel 済みの List が結果を返しても、rows・進行中の refresh・timer のいずれにも触れず破棄する。reload の完了後に transient な session が残っていれば、新しい targeted round を開始する。
+- 対象 provider に transient な session がなくなれば、次の round は schedule しない (self-terminating)。同じ provider の targeted List は同時に1つしか走らせず、reload の実行中は起動しない。決して settle しない session (bind できない run など) が provider を無期限に List し続けないよう、reload ごとに round の回数へ上限を置く。次の reload で上限は戻る。
+- timer は event loop の側にあり、provider の lifecycle には sleep を持ち込まない。targeted List は event loop の context の下で走り、loop の終了とともに止まる。
 
 ##### Provider catalog observer と provider snapshot store
 

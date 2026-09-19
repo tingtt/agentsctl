@@ -27,6 +27,8 @@ type fakeAPI struct {
 	archived   string
 	unarchived string
 	renamed    string
+	renameErr  error
+	renames    int
 
 	rateLimits    AccountRateLimits
 	rateLimitsErr error
@@ -35,19 +37,46 @@ type fakeAPI struct {
 type fakeDispatcher struct {
 	dispatchEnvironment map[string]string
 	resumeEnvironment   map[string]string
+
+	// dispatches counts Dispatch calls; prompt is the last one's prompt, i.e.
+	// what the Codex CLI would receive as its initial prompt. When store is
+	// set the run is recorded there like the supervisor does; dispatchErr
+	// fails the start instead. stopped lists the runs Stop was asked for.
+	dispatches  int
+	resumes     int
+	prompt      string
+	store       *localstate.Store
+	dispatchErr error
+	stopped     []string
 }
 
-func (f *fakeDispatcher) Dispatch(_ context.Context, _, _ string, _ []string, environment map[string]string) (localstate.Run, error) {
+func (f *fakeDispatcher) Dispatch(_ context.Context, prompt, cwd string, baseline []string, environment map[string]string) (localstate.Run, error) {
+	f.dispatches++
+	f.prompt = prompt
+	if f.dispatchErr != nil {
+		return localstate.Run{}, f.dispatchErr
+	}
 	f.dispatchEnvironment = cloneEnvironment(environment)
-	return localstate.Run{ID: "dispatch-run"}, nil
+	r := localstate.Run{ID: "dispatch-run"}
+	if f.store != nil {
+		r = localstate.Run{ID: "run-1", Provider: "codex", CWD: cwd, State: "running", Baseline: baseline}
+		if err := f.store.StartRun(r); err != nil {
+			return localstate.Run{}, err
+		}
+	}
+	return r, nil
 }
 
 func (f *fakeDispatcher) ResumeExisting(_ context.Context, _, _ string, environment map[string]string) (localstate.Run, error) {
+	f.resumes++
 	f.resumeEnvironment = cloneEnvironment(environment)
 	return localstate.Run{ID: "resume-run"}, nil
 }
 
-func (f *fakeDispatcher) Stop(context.Context, string) error { return nil }
+func (f *fakeDispatcher) Stop(_ context.Context, id string) error {
+	f.stopped = append(f.stopped, id)
+	return nil
+}
 
 func (f *fakeDispatcher) Attach(context.Context, string, *os.File, io.Writer) error { return nil }
 
@@ -309,6 +338,10 @@ func (f *fakeAPI) List(context.Context, bool) ([]Thread, error) {
 	return append([]Thread(nil), f.rows...), nil
 }
 func (f *fakeAPI) Rename(_ context.Context, id, name string) error {
+	f.renames++
+	if f.renameErr != nil {
+		return f.renameErr
+	}
 	f.renamed = id + ":" + name
 	return nil
 }
