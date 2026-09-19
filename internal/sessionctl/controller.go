@@ -15,6 +15,9 @@ import (
 type PinStore interface {
 	ListPinned() (map[string]bool, error)
 	TogglePinned(key string) (bool, error)
+	// MigratePinned atomically carries a pin from one key to another (see
+	// session.Session.PreviousKeys); a no-op if from is not pinned.
+	MigratePinned(from, to string) error
 }
 
 // Controller is the provider-neutral session control boundary Agent View
@@ -171,8 +174,9 @@ func (c Controller) Observe(ctx context.Context) <-chan ObserverUpdate {
 	return out
 }
 
-// MergeSessions applies Load's pin-enrichment, scope filtering, and
-// overview ordering to an arbitrary collection of already actionsFor-
+// MergeSessions applies Load's pin-enrichment (including migrating a pin
+// held under a session's PreviousKeys to its current Key, see
+// migratePins), scope filtering, and overview ordering to an arbitrary collection of already actionsFor-
 // narrowed sessions -- the same post-processing Load itself applies to
 // its one complete batch, factored out so a caller accumulating
 // LoadStream's incremental ProviderSnapshots can re-run it over its own
@@ -183,6 +187,7 @@ func (c Controller) MergeSessions(sessions []session.Session, scope session.Scop
 	if c.Pins != nil {
 		if values, err := c.Pins.ListPinned(); err == nil {
 			pinned = values
+			c.migratePins(sessions, pinned)
 		}
 	}
 	merged := make([]session.Session, len(sessions))
@@ -193,6 +198,35 @@ func (c Controller) MergeSessions(sessions []session.Session, scope session.Scop
 	merged = session.Filter(merged, scope)
 	session.SortOverview(merged)
 	return merged
+}
+
+// migratePins follows each session's provider-stated identity continuity
+// (session.Session.PreviousKeys) in the pin store: a pin left on a
+// provisional key -- pinned while the session was still Starting, or pinned
+// on a stale view after its binding -- moves to the session's current Key,
+// so no provisional pin metadata outlives the transition. It is applied on
+// every merge rather than as a one-shot event, which makes the outcome
+// independent of how pin operations and catalog arrivals interleave: the
+// store move is atomic and idempotent, and once the provisional pin is gone
+// there is nothing left to do. pinned is the caller's ListPinned snapshot
+// and is updated in place to reflect the moves. If the store cannot persist
+// a move the pin is still shown on the current Key (the persisted
+// provisional pin is kept, so the next merge retries) rather than
+// disappearing from the UI.
+func (c Controller) migratePins(sessions []session.Session, pinned map[string]bool) {
+	for _, s := range sessions {
+		to := s.Key.String()
+		for _, prev := range s.PreviousKeys {
+			from := prev.String()
+			if from == to || !pinned[from] {
+				continue
+			}
+			if err := c.Pins.MigratePinned(from, to); err == nil {
+				delete(pinned, from)
+			}
+			pinned[to] = true
+		}
+	}
 }
 
 // Load fetches every provider's sessions concurrently (so one provider's

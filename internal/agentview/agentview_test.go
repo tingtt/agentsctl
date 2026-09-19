@@ -93,6 +93,14 @@ func (p *fakePins) TogglePinned(k string) (bool, error) {
 	return next, nil
 }
 
+func (p *fakePins) MigratePinned(from, to string) error {
+	if p.pinned[from] {
+		delete(p.pinned, from)
+		p.pinned[to] = true
+	}
+	return nil
+}
+
 func newTestRuntime(provider *fakeProvider) *Runtime {
 	rt := &Runtime{
 		Controller: sessionctl.Controller{Providers: []sessionctl.Source{provider}, Pins: &fakePins{}},

@@ -351,3 +351,70 @@ func TestStoreSerializesConcurrentProcessOwners(t *testing.T) {
 		t.Fatalf("runs=%d", len(runs))
 	}
 }
+
+func TestMigratePinnedMovesPinAndIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := New(path)
+	if _, err := s.TogglePinned("codex:run-1"); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := s.MigratePinned("codex:run-1", "codex:thread-1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pins, err := New(path).ListPinned()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(pins, map[string]bool{"codex:thread-1": true}) {
+		t.Fatalf("pins=%v, want only codex:thread-1", pins)
+	}
+}
+
+func TestMigratePinnedWithoutSourcePinChangesNothing(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "state.json"))
+	// A destination the user pinned or deliberately left unpinned must not
+	// be altered by a migration that has no source pin to carry over.
+	if _, err := s.TogglePinned("codex:pinned"); err != nil {
+		t.Fatal(err)
+	}
+	for _, to := range []string{"codex:pinned", "codex:unpinned"} {
+		if err := s.MigratePinned("codex:run-1", to); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pins, _ := s.ListPinned()
+	if !reflect.DeepEqual(pins, map[string]bool{"codex:pinned": true}) {
+		t.Fatalf("pins=%v", pins)
+	}
+}
+
+func TestMigratePinnedMergesWithAlreadyPinnedDestination(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "state.json"))
+	for _, k := range []string{"codex:run-1", "codex:thread-1"} {
+		if _, err := s.TogglePinned(k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.MigratePinned("codex:run-1", "codex:thread-1"); err != nil {
+		t.Fatal(err)
+	}
+	pins, _ := s.ListPinned()
+	if !reflect.DeepEqual(pins, map[string]bool{"codex:thread-1": true}) {
+		t.Fatalf("pins=%v, want a single codex:thread-1 pin", pins)
+	}
+}
+
+func TestMigratePinnedToSameKeyKeepsPin(t *testing.T) {
+	s := New(filepath.Join(t.TempDir(), "state.json"))
+	if _, err := s.TogglePinned("codex:a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MigratePinned("codex:a", "codex:a"); err != nil {
+		t.Fatal(err)
+	}
+	if pins, _ := s.ListPinned(); !pins["codex:a"] {
+		t.Fatalf("pins=%v", pins)
+	}
+}

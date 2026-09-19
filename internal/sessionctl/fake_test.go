@@ -98,7 +98,21 @@ func (f *fakeFullProvider) Archive(_ context.Context, key session.Key) error {
 type fakePinStore struct {
 	pinned map[string]bool
 	listErr,
-	toggleErr error
+	toggleErr,
+	migrateErr error
+	migrations [][2]string
+}
+
+func (p *fakePinStore) MigratePinned(from, to string) error {
+	if p.migrateErr != nil {
+		return p.migrateErr
+	}
+	p.migrations = append(p.migrations, [2]string{from, to})
+	if p.pinned[from] {
+		delete(p.pinned, from)
+		p.pinned[to] = true
+	}
+	return nil
 }
 
 func (p *fakePinStore) ListPinned() (map[string]bool, error) {
