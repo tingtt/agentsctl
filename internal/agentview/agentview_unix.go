@@ -449,7 +449,9 @@ func normalizeTerminalNewlines(value string) string {
 // eventLoop's observerCh case) -- Refresh itself is fire-and-forget here.
 func (r *Runtime) requestReload(ctx context.Context) {
 	r.State.StartupCWD = r.CWD
-	r.transient.attempts = 0
+	// The reload lists every provider itself: targeted refreshes started
+	// before it are obsolete (see transientRefresh.supersede).
+	r.transient.supersede()
 	cwd, dirScope, worktrees := r.CWD, r.State.Scope, r.Worktrees
 
 	if r.catalogCh == nil {

@@ -48,9 +48,16 @@ type transientRefresh struct {
 	tick <-chan time.Time
 	// results receives each targeted List's outcome; lazily created.
 	results chan transientResult
-	// inFlight holds the providers with a targeted List still running, so a
-	// provider is never Listed twice at once.
-	inFlight map[session.ProviderID]bool
+	// inFlight holds the providers with a targeted List still running, each
+	// with the reload generation (Runtime.catalogGen) that started it, so a
+	// provider is never targeted twice at once and only the result of the
+	// List that owns an entry can release it.
+	inFlight map[session.ProviderID]int
+	// cancel ends the context every targeted List of the current reload
+	// generation runs under (a child of the event loop's); nil while none
+	// has started. supersede cancels it.
+	cancel   context.CancelFunc
+	roundCtx context.Context
 	// attempts counts the rounds since the last reload (see
 	// maxTransientRefreshes).
 	attempts int
@@ -63,6 +70,23 @@ type transientResult struct {
 	ps  sessionctl.ProviderSnapshot
 }
 
+// supersede ends everything targeted refresh started so far. A reload is
+// about to List every provider itself and is authoritative, so a targeted
+// List begun earlier is obsolete: it is cancelled, its in-flight entry is
+// released (a List that never returns must not stop later rounds from
+// being scheduled), any pending round is dropped and the round budget starts
+// over. Whatever such a List still returns is discarded by apply, which
+// recognizes it by its older generation and touches nothing.
+func (t *transientRefresh) supersede() {
+	if t.cancel != nil {
+		t.cancel()
+		t.cancel = nil
+	}
+	t.inFlight = nil
+	t.tick = nil
+	t.attempts = 0
+}
+
 // providers returns, in configuration order, the providers whose retained
 // catalog still lists a Starting session and that have no targeted List
 // running.
@@ -70,7 +94,7 @@ func (t *transientRefresh) providers(r *Runtime) []session.ProviderID {
 	var ids []session.ProviderID
 	for _, p := range r.Controller.Providers {
 		id := p.ID()
-		if t.inFlight[id] {
+		if _, running := t.inFlight[id]; running {
 			continue
 		}
 		for _, s := range r.providerSnapshots[id].sessions {
@@ -106,7 +130,9 @@ func (t *transientRefresh) schedule(r *Runtime) {
 }
 
 // refresh runs one round: a targeted List of each provider that still lists
-// a Starting session, in the background under ctx.
+// a Starting session, in the background. The Lists run under a context
+// derived from ctx (the event loop's), so they end with the loop and, via
+// supersede, with the next reload.
 func (t *transientRefresh) refresh(ctx context.Context, r *Runtime) {
 	t.tick = nil
 	if r.State.CatalogLoading {
@@ -121,16 +147,19 @@ func (t *transientRefresh) refresh(ctx context.Context, r *Runtime) {
 		t.results = make(chan transientResult, len(r.Controller.Providers))
 	}
 	if t.inFlight == nil {
-		t.inFlight = make(map[session.ProviderID]bool)
+		t.inFlight = make(map[session.ProviderID]int)
 	}
-	gen, results := r.catalogGen, t.results
+	if t.cancel == nil {
+		t.roundCtx, t.cancel = context.WithCancel(ctx)
+	}
+	roundCtx, gen, results := t.roundCtx, r.catalogGen, t.results
 	for _, id := range ids {
-		t.inFlight[id] = true
+		t.inFlight[id] = gen
 		go func() {
-			res := transientResult{gen: gen, ps: r.Controller.LoadProvider(ctx, id)}
+			res := transientResult{gen: gen, ps: r.Controller.LoadProvider(roundCtx, id)}
 			select {
 			case results <- res:
-			case <-ctx.Done():
+			case <-roundCtx.Done():
 			}
 		}()
 	}
@@ -140,17 +169,20 @@ func (t *transientRefresh) refresh(ctx context.Context, r *Runtime) {
 // arrival (applyLoadSnapshot, then recomputeRows), so selection, pins,
 // scope, ordering, identity transitions and last-known-good rows on error
 // all behave exactly as they do there, then arms the next round if a
-// transient session remains. A result started before the latest reload is
-// dropped: that reload lists the provider itself. It reports whether State
-// changed.
+// transient session remains. A result from before the latest reload was
+// superseded (see supersede): it is dropped without touching anything --
+// not the rows, not the in-flight entry a newer List may now own, not the
+// timer -- since that reload lists the provider itself and re-arms the
+// refresh when it completes. It reports whether State changed.
 func (t *transientRefresh) apply(r *Runtime, res transientResult) bool {
-	delete(t.inFlight, res.ps.Provider)
-	changed := false
-	if res.gen == r.catalogGen {
-		r.applyLoadSnapshot(res.ps.Provider, res.ps.Sessions, res.ps.Err, res.ps.ListOwnsStatus)
-		r.recomputeRows()
-		changed = true
+	if res.gen != r.catalogGen {
+		return false
 	}
+	if t.inFlight[res.ps.Provider] == res.gen {
+		delete(t.inFlight, res.ps.Provider)
+	}
+	r.applyLoadSnapshot(res.ps.Provider, res.ps.Sessions, res.ps.Err, res.ps.ListOwnsStatus)
+	r.recomputeRows()
 	t.schedule(r)
-	return changed
+	return true
 }

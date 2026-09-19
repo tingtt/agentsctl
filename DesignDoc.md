@@ -1012,6 +1012,7 @@ provider は、まだ別の状態へ移る途中の session (`ActivityStarting`�
 - いずれかの provider の retained catalog (providerSnapshots) に `ActivityStarting` の session がある間だけ、その provider を `sessionctl.Controller.LoadProvider` で targeted に List し直す。Agent View は「Starting の session を持つ provider は少し後に再取得する」ことだけを知り、何が session を確定させるか (reconciliation、native rename) は知らない。それらは引き続き provider の `List` の責務である。
 - これは reload ではない。他の provider は List せず、`Refresher` / `Observer` の background refresh も要求しない (ChatGPT の browser-backed refresh を定期実行しない)。`LoadStream` と `LoadProvider` は同じ「List → `actionsFor` による narrowing → `ProviderSnapshot`」の経路を共有する。
 - 結果は reload の到着と同じ `applyLoadSnapshot` → `recomputeRows` を通る。selection・pin・scope・順序・`PreviousKeys` による identity 移行・last-known-good (失敗しても既存 rows を消さず warning にする) は reload と同一に振る舞う。reload 開始前に始まった結果は、その reload が同じ provider を List するため破棄する。
+- full reload は in-flight の targeted refresh より優先する。reload は全 provider を自ら List するため、reload 開始時にそれ以前の targeted refresh を cancel し、その in-flight 状態も解放する (返ってこない List が後続の round を止めないため)。cancel 済みの List が結果を返しても、rows・進行中の refresh・timer のいずれにも触れず破棄する。reload の完了後に transient な session が残っていれば、新しい targeted round を開始する。
 - 対象 provider に transient な session がなくなれば、次の round は schedule しない (self-terminating)。同じ provider の targeted List は同時に1つしか走らせず、reload の実行中は起動しない。決して settle しない session (bind できない run など) が provider を無期限に List し続けないよう、reload ごとに round の回数へ上限を置く。次の reload で上限は戻る。
 - timer は event loop の側にあり、provider の lifecycle には sleep を持ち込まない。targeted List は event loop の context の下で走り、loop の終了とともに止まる。
 

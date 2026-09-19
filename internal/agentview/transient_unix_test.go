@@ -28,10 +28,24 @@ type scriptedProvider struct {
 	calls  atomic.Int32
 	gate   chan struct{}
 	err    error
+	// blockCall, when > 0, is the 1-based List call that never returns on
+	// its own: it waits for its context to end (counting that in cancelled)
+	// or for release.
+	blockCall int
+	release   chan struct{}
+	cancelled atomic.Int32
 }
 
 func (p *scriptedProvider) List(ctx context.Context, _ bool) ([]session.Session, error) {
 	n := int(p.calls.Add(1)) - 1
+	if p.blockCall == n+1 {
+		select {
+		case <-ctx.Done():
+			p.cancelled.Add(1)
+			return nil, ctx.Err()
+		case <-p.release:
+		}
+	}
 	if p.gate != nil {
 		select {
 		case <-p.gate:
@@ -320,4 +334,181 @@ func TestRenameOnlySessionConvergesWithoutManualReload(t *testing.T) {
 	if rt.transient.tick != nil {
 		t.Fatal("polling must have stopped")
 	}
+}
+
+// TestReloadSupersedesBlockedTargetedRefresh is the race between a targeted
+// refresh whose List never returns and a full reload: the reload must cancel
+// that List and release its in-flight ownership, so that once the reload
+// (which still lists Starting) completes, a fresh targeted round can run and
+// the session converges -- with no manual key besides the reload itself.
+func TestReloadSupersedesBlockedTargetedRefresh(t *testing.T) {
+	runKey := session.Key{Provider: session.ProviderCodex, ID: "run-1"}
+	starting := codexRow("run-1", "Starting (Waiting rename)", session.ActivityStarting)
+	named := codexRow("thread-1", "foo", session.ActivityIdle, runKey)
+	p := &scriptedProvider{
+		fakeProvider: &fakeProvider{id: session.ProviderCodex},
+		// 1: initial reload, 2: targeted A (blocked), 3: reload (Ctrl+L), 4: targeted B
+		script:    [][]session.Session{{starting}, {starting}, {starting}, {named}},
+		blockCall: 2,
+		release:   make(chan struct{}),
+	}
+	defer close(p.release)
+
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	out := &syncBuffer{}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: &fakePins{}}, State: NewState(), CWD: "/work", Input: inR, Output: out}
+	clock := newManualClock(rt)
+	fire := func(what string) {
+		t.Helper()
+		select {
+		case clock.fire <- time.Now():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: the loop never armed a refresh round", what)
+		}
+	}
+
+	rt.requestReload(context.Background())
+	keyIn := make(chan keyResult)
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) { r := <-keyIn; return r.ev, r.err })
+	}()
+	waitFor(t, 2*time.Second, func() bool { return strings.Contains(latestFrame(out.String()), "Starting (Waiting rename)") })
+
+	fire("first round")
+	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 2 }) // A is running and never returns
+
+	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlL}} // full reload while A is in flight
+	waitFor(t, 2*time.Second, func() bool { return p.cancelled.Load() == 1 })
+
+	fire("round after the reload") // only armed once the reload completed with Starting still listed
+	waitFor(t, 2*time.Second, func() bool {
+		f := latestFrame(out.String())
+		return p.calls.Load() == 4 && strings.Contains(f, "foo") && !strings.Contains(f, "Starting")
+	})
+
+	keyIn <- keyResult{err: io.EOF}
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("eventLoop did not exit")
+	}
+	got, ok := rt.State.SelectedRow()
+	if !ok || got.Key.ID != "thread-1" || got.Name != "foo" {
+		t.Fatalf("selected = %+v ok=%v, want the settled thread", got, ok)
+	}
+	if rt.transient.tick != nil || len(rt.transient.inFlight) != 0 {
+		t.Fatalf("polling must have stopped and released everything: tick=%v inFlight=%v", rt.transient.tick != nil, rt.transient.inFlight)
+	}
+}
+
+func TestSupersedeCancelsAndReleasesInFlightTargetedRefresh(t *testing.T) {
+	p := &scriptedProvider{
+		fakeProvider: &fakeProvider{id: session.ProviderCodex},
+		script:       [][]session.Session{{codexRow("run-1", "Starting", session.ActivityStarting)}},
+		blockCall:    2,
+		release:      make(chan struct{}),
+	}
+	defer close(p.release)
+	rt := transientRuntime(p)
+	newManualClock(rt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rt.transient.schedule(rt)
+	rt.transient.refresh(ctx, rt)
+	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 2 })
+	if len(rt.transient.providers(rt)) != 0 {
+		t.Fatal("setup: the provider must be in flight")
+	}
+
+	rt.requestReload(ctx)
+	waitFor(t, 2*time.Second, func() bool { return p.cancelled.Load() == 1 })
+	if rt.transient.tick != nil || len(rt.transient.inFlight) != 0 {
+		t.Fatalf("supersede must drop the pending round and release the in-flight entry: %+v", rt.transient)
+	}
+	rt.drainCatalog(ctx)
+	rt.transient.schedule(rt)
+	if rt.transient.tick == nil {
+		t.Fatal("after the reload the still-Starting provider must be schedulable again")
+	}
+}
+
+// TestSupersededResultNeverTouchesCurrentLifecycle covers the race the
+// cancellation cannot exclude: the old List returns its result anyway. It
+// must not overwrite rows, release the entry the newer targeted List owns, or
+// disturb the pending round.
+func TestSupersededResultNeverTouchesCurrentLifecycle(t *testing.T) {
+	p := &scriptedProvider{
+		fakeProvider: &fakeProvider{id: session.ProviderCodex},
+		script:       [][]session.Session{{codexRow("run-1", "Starting", session.ActivityStarting)}},
+	}
+	rt := transientRuntime(p)
+	newManualClock(rt)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	oldGen := rt.catalogGen
+	rt.syncReload(ctx) // supersedes anything from oldGen
+	p.gate = make(chan struct{})
+	rt.transient.schedule(rt)
+	rt.transient.refresh(ctx, rt) // targeted B, held open
+	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 3 })
+
+	stale := transientResult{gen: oldGen, ps: sessionctl.ProviderSnapshot{Provider: session.ProviderCodex, Sessions: []session.Session{codexRow("thread-x", "stale", session.ActivityIdle)}, ListOwnsStatus: true}}
+	if rt.transient.apply(rt, stale) {
+		t.Fatal("a superseded result must not change State")
+	}
+	if got := rt.transient.inFlight[session.ProviderCodex]; got != rt.catalogGen {
+		t.Fatalf("the stale result released B's in-flight entry (%d, want %d)", got, rt.catalogGen)
+	}
+	if len(rt.transient.providers(rt)) != 0 {
+		t.Fatal("B is still running: the provider must not be targeted again")
+	}
+	if rt.State.Rows[0].Key.ID != "run-1" {
+		t.Fatalf("rows overwritten: %+v", rt.State.Rows)
+	}
+	p.gate <- struct{}{} // let B finish so its goroutine ends
+	rt.transient.apply(rt, <-rt.transient.results)
+}
+
+// TestEventLoopExitCancelsTargetedRefresh: a targeted List still running
+// when the event loop ends is cancelled with it, not left behind.
+func TestEventLoopExitCancelsTargetedRefresh(t *testing.T) {
+	p := &scriptedProvider{
+		fakeProvider: &fakeProvider{id: session.ProviderCodex},
+		script:       [][]session.Session{{codexRow("run-1", "Starting", session.ActivityStarting)}},
+		blockCall:    2,
+		release:      make(chan struct{}),
+	}
+	defer close(p.release)
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inR.Close()
+	defer inW.Close()
+	out := &syncBuffer{}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: &fakePins{}}, State: NewState(), CWD: "/work", Input: inR, Output: out}
+	clock := newManualClock(rt)
+	rt.requestReload(context.Background())
+	keyIn := make(chan keyResult)
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) { r := <-keyIn; return r.ev, r.err })
+	}()
+	select {
+	case clock.fire <- time.Now():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the loop never armed a refresh round")
+	}
+	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 2 })
+	keyIn <- keyResult{err: io.EOF}
+	<-loopDone
+	waitFor(t, 2*time.Second, func() bool { return p.cancelled.Load() == 1 })
 }
