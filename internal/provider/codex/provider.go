@@ -119,7 +119,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			// once reconcile proves the run to a thread, the thread's row
 			// (Key.ID = thread ID) replaces it and names this Key in
 			// PreviousKeys above. Nothing here guesses that link.
-			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, "Starting"
+			activity, runtime, name := session.ActivityStarting, session.RuntimeDetached, startingName(awaitingBootstrapBind(r))
 			actions := session.Actions{session.ActionOpen: openWhileStarting(awaitingBootstrapBind(r)), session.ActionStop: {Available: true}}
 			if isTerminalRunState(r.State) {
 				// This row never became a real Codex app-server thread — its
@@ -178,7 +178,7 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 	}
 	createdAt := time.Now()
 	actions := session.Actions{session.ActionOpen: openWhileStarting(pendingRename != ""), session.ActionStop: {Available: true}}
-	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: "Starting", CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
+	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: startingName(pendingRename != ""), CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
 }
 
 // awaitingBootstrapBind reports whether r is a rename-only bootstrap run
@@ -193,6 +193,16 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 // unaffected.
 func awaitingBootstrapBind(r localstate.Run) bool {
 	return r.PendingRename != "" && r.SessionID == ""
+}
+
+// startingName is the display name of a provisional Starting row. A rename-only
+// bootstrap run says what it is waiting for; Activity stays
+// session.ActivityStarting either way.
+func startingName(awaitingRename bool) string {
+	if awaitingRename {
+		return "Starting (Waiting rename)"
+	}
+	return "Starting"
 }
 
 // openWhileStarting is the Open availability of a provisional Starting row:

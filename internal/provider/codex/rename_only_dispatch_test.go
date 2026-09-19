@@ -260,6 +260,9 @@ func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
 	if !s.Actions[session.ActionStop].Available {
 		t.Fatalf("Stop must stay available: %+v", s.Actions)
 	}
+	if s.Name != "Starting (Waiting rename)" {
+		t.Fatalf("Name = %q, want the waiting-rename display name", s.Name)
+	}
 
 	p, _, _, _ = newRenameTestProvider(t)
 	s, err = p.Dispatch(context.Background(), "implement issue #46", "/work")
@@ -267,6 +270,9 @@ func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireOpen(t, s, true)
+	if s.Name != "Starting" || s.Activity != session.ActivityStarting {
+		t.Fatalf("an ordinary Starting row keeps its plain name and Activity: %+v", s)
+	}
 }
 
 func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
@@ -294,6 +300,9 @@ func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
 	}
 	requireOpen(t, pending, false)
 	requireOpen(t, plain, true)
+	if pending.Name != "Starting (Waiting rename)" || plain.Name != "Starting" {
+		t.Fatalf("names = %q / %q, want the waiting-rename name only for the pending run", pending.Name, plain.Name)
+	}
 	for _, row := range []session.Session{pending, plain} {
 		if !row.Actions[session.ActionStop].Available {
 			t.Fatalf("%v: Stop must stay available: %+v", row.Key, row.Actions)
@@ -367,6 +376,9 @@ func TestRenameOnlySessionBecomesOpenableOnceBound(t *testing.T) {
 			t.Fatalf("want the Starting row still listed: %+v", rows)
 		}
 		requireOpen(t, got, false)
+		if got.Name != "Starting (Waiting rename)" {
+			t.Fatalf("Name = %q while waiting for the rename", got.Name)
+		}
 		if _, err := p.PrepareAttach(context.Background(), got); err == nil {
 			t.Fatal("attach must stay refused before binding")
 		}
