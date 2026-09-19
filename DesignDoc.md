@@ -267,6 +267,24 @@ provider ごとの起動方法は異なるが、Agent View 上では同じ Dispa
 - TUI 自身は Codex CLI process を直接保持しない。
 - 起動後に追加された Codex thread と managed run を対応付け、通常の session として catalog に統合する。
 
+###### Rename-only new session (Codex)
+
+新規 session の Composer 入力が単独の `/rename <name>` である場合、その文字列を Codex の initial prompt として渡さない。Codex には通常 prompt として渡る (slash command としては処理されない) ためである。認識するのは、入力全体がこの1コマンドである場合に限る (`/renamex foo`、他の text を含む入力、複数行入力は通常の prompt)。name が空の場合は Codex を起動せず validation error とする。
+
+Codex は最初の model turn まで listed / resumable な thread を公開しない (rollout が存在せず、`thread/list` に現れず、`thread/resume` できない)。このため、rename だけでは agentsctl が bind できる thread は作られず、最小の bootstrap turn を1回実行する。
+
+```text
+/rename <name>
+  -> 固定の bootstrap prompt で Codex を起動 (name は managed run が保持する)
+  -> 「Codex run-to-thread binding」で run を real thread へ bind
+  -> native な thread rename を適用し、保持していた name を破棄
+```
+
+- bootstrap prompt は固定文とし、name を含めない。name は user-controlled な文字列であり、model への指示に埋め込まない。
+- 保持した name は managed run (local run state) に属し、Starting → real thread の identity 移行の上に載るだけである。別の identity 機構は持たない。
+- 適用は1回だけ行う。失敗しても thread は実在するため破棄せず、失敗を run に記録して session 上に示す。再試行は通常の Rename であり、自動 retry は持たない。
+- bootstrap turn は実際に model turn を1回消費する。rate limit 等で失敗する場合も、特別な回避はしない。
+
 ##### Composer directory context
 
 Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、選択中 session 自身の CWD に追従する。
@@ -534,6 +552,7 @@ Rename は、既存 session の表示名を変更する。
 **Codex**
 
 - app-server の native rename を利用する。
+- 新規 session の `/rename <name>` は、thread が存在しないため直接は適用できない。「Rename-only new session (Codex)」を参照。
 
 #### Directory scope
 
