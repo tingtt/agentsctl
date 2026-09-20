@@ -471,6 +471,12 @@ Agent View が overview を所有している間は bracketed paste mode (DECSET
 
 PasteEvent は現在の text-edit target の cursor 位置へ挿入する。既存の内容は置き換えず、cursor は挿入した text の末尾へ移り、位置は Composer と同じ rune index で数える。inline rename 中は rename の入力欄が target になる。rename は単一行であり (Claude の native rename は PTY へ `/rename <name>` を入力するため、name 内の改行は途中で submit されてしまう)、貼り付けた改行は空でない行を1つの空白で連結して取り込む。confirmation の pending 中は、通常の文字入力と同様に paste は何もしない。
 
+paste / input の decode は model data を変更せずに保持する。ただし、user が制御する text (composer の prompt、rename の draft、session title、外部由来の error / warning / directory の文字列) は、Agent View 自身の trusted な ANSI styling と合成される前に、terminal-safe な表示可能表現へ符号化する。model の text が ESC / C0 / C1 文字を含むというだけで terminal control として実行されてはならない。
+
+- 符号化は描画の境界 (user text が ANSI と合成される直前) で行い、完成した frame 全体から ESC を除去することはしない。Agent View 自身が color・cursor・alternate screen などに ANSI を使うためである。以降の `styleText` / `clipLine` / `lineCells` は、ESC を trusted な application ANSI の開始としてだけ扱う。
+- 表示は 1 rune を 1 rune へ写す。C0 (U+0000-U+001F) は Control Pictures (U+2400-U+241F)、DEL は U+2421、C1 (U+0080-U+009F) は U+FFFD とし、それ以外は変更しない。model 上の rune index (composer / rename の cursor、reserved command の span) が表示上でもそのまま同じ位置を指す。
+- model data は保持する。paste した TAB や ESC も `Composer.Prompt` と dispatch の payload にそのまま残り、表示だけが変わる。provider が保持する session title も書き換えず、描画時にだけ符号化する。
+
 paste は editor の変更だけであり、payload の改行が何個含まれていても dispatch / open / rename を生成しない。貼り付けた全文を1つの prompt として送るのは、その後に物理的な plain Enter が押されたときだけである。
 
 ##### Multiline cursor navigation
