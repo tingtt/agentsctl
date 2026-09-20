@@ -18,6 +18,16 @@ import (
 	"golang.org/x/term"
 )
 
+// Bracketed-paste mode (DECSET 2004) on the outer terminal. The managed
+// process enables it once, at its own startup, which can be long before any
+// attach subscriber exists; output produced then is not replayed (see the
+// DesignDoc's PTY attach and redraw section), so an attach cannot rely on
+// having seen it.
+const (
+	bracketedPasteEnable  = "\x1b[?2004h"
+	bracketedPasteDisable = "\x1b[?2004l"
+)
+
 type lockedFrames struct {
 	mu sync.Mutex
 	w  io.Writer
@@ -85,6 +95,17 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 		return err
 	}
 	defer restore()
+	// While this attach owns the terminal, the outer terminal must bracket
+	// pastes for the attached process, which is already running in
+	// bracketed-paste mode and will not announce it again. The mode is
+	// established before any forwarding starts and released only after all
+	// forwarding has stopped (this defer runs after the join defer below,
+	// and before restore), whichever way the attach ends. Sequences the
+	// process itself emits during the attach are forwarded untouched.
+	defer func() { _, _ = io.WriteString(out, bracketedPasteDisable) }()
+	if _, err := io.WriteString(out, bracketedPasteEnable); err != nil {
+		return err
+	}
 	frames := &lockedFrames{w: conn}
 	sendSize := func(redraw bool) {
 		cols, rows, err := term.GetSize(int(in.Fd()))

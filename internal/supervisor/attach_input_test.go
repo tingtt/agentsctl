@@ -208,6 +208,35 @@ func TestAttachInputWriteFailureEndsAttachWithFailureAndKeepsProcess(t *testing.
 	}
 }
 
+// serveAttach listens on a fresh Unix socket and hands its one accepted
+// connection, after the attach Request, to srv.attach for runID.
+func serveAttach(t *testing.T, srv *Server, runID string) (socket string) {
+	t.Helper()
+	// Short path: see fakeSupervisorSocket.
+	dir, err := os.MkdirTemp("/tmp", "supervisor-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	ln, err := net.Listen("unix", dir+"/s.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		if kind, _, err := protocol.Read(conn); err != nil || kind != protocol.Request {
+			_ = conn.Close()
+			return
+		}
+		srv.attach(conn, runID)
+	}()
+	return dir + "/s.sock"
+}
+
 // TestClientAttachKeepsLongPasteIntactThroughDetachScanning drives the real
 // client path -- terminal bytes, 4 KiB reads, DetachScanner, Input frames,
 // Server.attach, PTY writer -- with a paste whose payload contains detach
@@ -230,30 +259,10 @@ func TestClientAttachKeepsLongPasteIntactThroughDetachScanning(t *testing.T) {
 	p := &process{run: localstate.Run{ID: "r"}, input: w, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
 	srv := &Server{runs: map[string]*process{"r": p}}
 
-	dir, err := os.MkdirTemp("/tmp", "supervisor-sock-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	ln, err := net.Listen("unix", dir+"/s.sock")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		if kind, _, err := protocol.Read(conn); err != nil || kind != protocol.Request {
-			_ = conn.Close()
-			return
-		}
-		srv.attach(conn, "r")
-	}()
+	sock := serveAttach(t, srv, "r")
 
 	done := make(chan error, 1)
-	go func() { done <- (Client{Socket: dir + "/s.sock"}).Attach(context.Background(), "r", slave, io.Discard) }()
+	go func() { done <- (Client{Socket: sock}).Attach(context.Background(), "r", slave, io.Discard) }()
 
 	paste := pasteStream(20 << 10)
 	// Written from a goroutine: if Attach ends early, master.Write would

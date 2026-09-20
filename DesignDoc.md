@@ -965,6 +965,14 @@ Codex Attach では、過去の PTY output を replay しない。
 
 新しい attach client は接続後の output のみ受け取るため、画面復元は Codex CLI 自身の redraw に依存する。
 
+##### Terminal mode ownership
+
+Attach は、managed process が subscriber の存在前に出力した terminal mode 変更の escape sequence に依存しない。managed process は起動時に bracketed paste mode を有効化するが、その output は attach 時に replay されず、後から attach しても再送されるとは限らないためである。
+
+attach client が terminal の ownership を取得するとき、attached process との対話に必要な outer terminal の mode (bracketed paste) を自ら確立する。この確立は input / output の転送を開始する前に行い、転送をすべて止めた後、terminal を返す前に解除する。解除は Detach、process の終了、Failure、socket error、cancel のいずれの終了経路でも行う。Attach ごとに確立と解除を繰り返し、前回の attach や Agent View が残した状態には依存しない。
+
+attach 中に process 自身が出力する mode 変更 (外部 editor 実行のための bracketed paste 解除・再開など) は、filter も override もせずそのまま転送する。agentsctl が確立するのは attach 開始時点の状態だけで、child の terminal 状態を replay・emulate することはしない。
+
 ##### Same-size reattach
 
 再 Attach 時に terminal size が前回と同じ場合でも、確実に redraw させる必要がある。

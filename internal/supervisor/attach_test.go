@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,6 +27,11 @@ type blockingWriter struct {
 }
 
 func (w *blockingWriter) Write(b []byte) (int, error) {
+	// Only forwarded session output models a stalled terminal; the mode
+	// sequences Attach itself writes around the session are not output.
+	if s := string(b); s == bracketedPasteEnable || s == bracketedPasteDisable {
+		return len(b), nil
+	}
 	w.once.Do(func() { close(w.entered) })
 	<-w.release
 	return len(b), nil
@@ -159,8 +165,8 @@ func TestClientAttachForwardsBurstOutputWhileInputIsBlocked(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("burst output remained gated by blocked terminal input")
 	}
-	if output.Len() != frameCount {
-		t.Fatalf("wrote %d output bytes, want %d", output.Len(), frameCount)
+	if want := bracketedPasteEnable + strings.Repeat("x", frameCount) + bracketedPasteDisable; output.String() != want {
+		t.Fatalf("terminal output=%q, want %q", output.String(), want)
 	}
 }
 
