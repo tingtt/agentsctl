@@ -21,6 +21,14 @@ func cursorStyle(glyph string) string {
 // point; if cursor is at the end of value, a trailing reverse-video space
 // cell marks it instead.
 func cursorWindow(value string, cursor, width int) string {
+	return cursorWindowSpan(value, cursor, width, runeSpan{})
+}
+
+// cursorWindowSpan is cursorWindow with the runes inside span -- a rune
+// range of value -- additionally colored as a reserved command. The span is
+// applied to the raw runes before any ANSI is added, so it survives the
+// cursor splitting the token and horizontal scrolling cutting into it.
+func cursorWindowSpan(value string, cursor, width int, span runeSpan) string {
 	if width <= 0 {
 		return ""
 	}
@@ -37,8 +45,8 @@ func cursorWindow(value string, cursor, width int) string {
 	for start < cursor && lineCells(string(runes[start:cursor])) > budget {
 		start++
 	}
-	prefix := string(runes[start:cursor])
-	result := clipLine(prefix+cursorStyle(glyph)+string(suffix), width)
+	prefix := paintReservedCommand(runes[start:cursor], start, span)
+	result := clipLine(prefix+cursorStyle(glyph)+paintReservedCommand(suffix, cursor+1, span), width)
 	return fitCells(result, width)
 }
 
@@ -47,20 +55,25 @@ func cursorWindow(value string, cursor, width int) string {
 // row instead of a literal control character folded into one
 // horizontally-scrolled line. The first row carries prefix; continuation
 // rows are left-padded to the same cell width so the prompt body stays
-// visually aligned under it.
+// visually aligned under it. A reserved command at the start of prompt (see
+// reservedCommandSpan) is colored.
 func composerLines(prompt string, cursor int, prefix string, width int) []string {
 	lines := strings.Split(prompt, "\n")
+	command, _ := reservedCommandSpan(prompt)
 	cursorLine, cursorCol := promptCursorPosition(lines, cursor)
 	indent := strings.Repeat(" ", lineCells(prefix))
 	available := max(1, width-lineCells(prefix))
 	rows := make([]string, len(lines))
+	lineStart := 0 // rune index of line i within prompt
 	for i, line := range lines {
+		lineSpan := runeSpan{start: command.start - lineStart, end: command.end - lineStart}
 		var rendered string
 		if i == cursorLine {
-			rendered = cursorWindow(line, cursorCol, available)
+			rendered = cursorWindowSpan(line, cursorCol, available, lineSpan)
 		} else {
-			rendered = fitCells(line, available)
+			rendered = fitCells(paintReservedCommand([]rune(line), 0, lineSpan), available)
 		}
+		lineStart += len([]rune(line)) + 1 // +1 for the "\n" after this line
 		leader := prefix
 		if i > 0 {
 			leader = indent
