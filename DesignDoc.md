@@ -851,6 +851,16 @@ socket 上では、length-prefixed frame protocol を使用する。
 
 control request / response と PTY stream を、同じ framing mechanism で扱う。
 
+##### PTY input
+
+Input frame 列は、1本の順序付き PTY byte stream を成す。terminal から読んだ byte は、agentsctl が所有する detach 操作を除き、変更・欠落・重複・並べ替えなく PTY に届く。
+
+read の境界と frame の境界に意味はない。Codex が見る byte stream は、境界がどこにあっても同じになる。したがって、境界の位置で挙動を変えること (sleep、size による特別扱い、bracketed paste を1 frame にまとめる buffering、paste の分割) はしない。
+
+supervisor は、1つの Input payload を PTY へ書き切ってから次の frame を処理する。PTY への write が完了できない場合は、残りを黙って捨てず、Failure frame を伝えて attach を終了する。managed process の lifetime には関与しない。
+
+detach の検出が解釈してよいのは、agentsctl が所有する detach sequence (`Ctrl+]` とその escape 表現) だけであり、bracketed paste の payload の外側に限る。bracketed paste の begin / end marker の内側は key input ではなく貼り付けられた内容であり、detach 相当の byte 列を含んでいても、marker を含めて verbatim に転送する。scanner が知るのは paste の begin / end という framing だけで、内容の解釈 (改行の正規化、UTF-8 の解釈など) は行わない。end marker が届くまで paste は続いているものとして扱い、その間は detach しない。
+
 ##### Compatibility
 
 supervisor とは以下の compatibility を確認する。
@@ -954,6 +964,14 @@ Agent View は local persistence の表現を知らない。pin の移行は `se
 Codex Attach では、過去の PTY output を replay しない。
 
 新しい attach client は接続後の output のみ受け取るため、画面復元は Codex CLI 自身の redraw に依存する。
+
+##### Terminal mode ownership
+
+Attach は、managed process が subscriber の存在前に出力した terminal mode 変更の escape sequence に依存しない。managed process は起動時に bracketed paste mode を有効化するが、その output は attach 時に replay されず、後から attach しても再送されるとは限らないためである。
+
+attach client が terminal の ownership を取得するとき、attached process との対話に必要な outer terminal の mode (bracketed paste) を自ら確立する。この確立は input / output の転送を開始する前に行い、転送をすべて止めた後、terminal を返す前に解除する。解除は Detach、process の終了、Failure、socket error、cancel のいずれの終了経路でも行う。Attach ごとに確立と解除を繰り返し、前回の attach や Agent View が残した状態には依存しない。
+
+attach 中に process 自身が出力する mode 変更 (外部 editor 実行のための bracketed paste 解除・再開など) は、filter も override もせずそのまま転送する。agentsctl が確立するのは attach 開始時点の状態だけで、child の terminal 状態を replay・emulate することはしない。
 
 ##### Same-size reattach
 

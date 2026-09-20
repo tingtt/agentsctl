@@ -54,22 +54,27 @@ type Response struct {
 
 const ProtocolVersion = 3
 
-// BuildVersion changed here to attach-backpressure-2026-09-10: the wire
-// format itself (frame layout, Request/Response shapes, the Failure frame
-// kind) is unchanged from the previous build, so ProtocolVersion did not
-// move -- but subscriber.writeTo's backpressure, disconnect, and error-
-// reporting behavior changed enough (see issue #31) that a client built
-// against this behavior must never keep talking to an already-running
-// daemon still running the old implementation. See compatible and
+// BuildVersion is the supervisor's build generation. It is bumped, and
+// ProtocolVersion is not, when only runtime behavior changes: the wire
+// format (frame layout, Request/Response shapes, frame kinds) stays
+// compatible, but a client must never keep talking to an already-running
+// daemon still running the old behavior. It is now
+// attach-input-integrity-2026-09-20 because attach Input payloads are
+// written to the PTY completely and a failed write ends the attach with a
+// Failure frame (issue #29), where the previous attach-backpressure-
+// 2026-09-10 build (issue #31: byte-bounded subscriber buffering, explicit
+// disconnect reasons) dropped a failed write silently. See compatible and
 // Client.restartOwned: an incompatible owned daemon with no active
 // managed run is restarted automatically; one with an active run is left
 // alone rather than silently discarding it.
-const BuildVersion = "attach-backpressure-2026-09-10"
+const BuildVersion = "attach-input-integrity-2026-09-20"
 
 type process struct {
-	run          localstate.Run
-	cmd          *exec.Cmd
-	ptmx         *os.File
+	run  localstate.Run
+	cmd  *exec.Cmd
+	ptmx *os.File
+	// input receives attach Input payloads; it is ptmx for a real process.
+	input        io.Writer
 	mu           sync.Mutex
 	resizeMu     sync.Mutex
 	subscribers  map[*subscriber]struct{}
@@ -125,6 +130,7 @@ const (
 	subscriberClosedByProcessExit
 	subscriberClosedByOverflow
 	subscriberClosedByStall
+	subscriberClosedByInputFailure
 )
 
 // subscriber is one attach connection's PTY output pump. broadcast never
@@ -139,7 +145,7 @@ type subscriber struct {
 	buf      []byte
 	inFlight int // bytes writeTo currently holds outside buf, not yet confirmed delivered
 	reason   subscriberCloseReason
-	detail   string // set for subscriberClosedByOverflow and subscriberClosedByStall
+	detail   string // set for every reason that sends a Failure frame
 }
 
 func newSubscriber() *subscriber {
@@ -184,6 +190,19 @@ func (s *subscriber) close(reason subscriberCloseReason) {
 	s.cond.Broadcast()
 }
 
+// closeWithFailure is close for a reason that must reach the client as a
+// protocol.Failure frame carrying detail. Like close, it never overwrites
+// a reason that already won the race.
+func (s *subscriber) closeWithFailure(reason subscriberCloseReason, detail string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reason != subscriberOpen {
+		return
+	}
+	s.reason, s.detail = reason, detail
+	s.cond.Broadcast()
+}
+
 // writeTo drains the subscriber's buffered output to conn until it is
 // closed, sends the terminal frame its close reason calls for, and always
 // closes conn itself. Closing conn unconditionally -- not just on a
@@ -213,7 +232,7 @@ func (s *subscriber) writeTo(conn net.Conn) {
 			_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
 			_ = protocol.Write(conn, protocol.Exit, nil)
 			return
-		case subscriberClosedByOverflow, subscriberClosedByStall:
+		case subscriberClosedByOverflow, subscriberClosedByStall, subscriberClosedByInputFailure:
 			s.sendFailure(conn, detail)
 			return
 		default: // subscriberClosedByDetach
@@ -276,7 +295,7 @@ func (s *subscriber) handleFlushFailure(conn net.Conn, torn bool) {
 		return // framing is desynchronized: never write anything else to conn
 	}
 	switch reason {
-	case subscriberClosedByOverflow, subscriberClosedByStall:
+	case subscriberClosedByOverflow, subscriberClosedByStall, subscriberClosedByInputFailure:
 		s.sendFailure(conn, detail)
 	case subscriberClosedByProcessExit:
 		_ = conn.SetWriteDeadline(time.Now().Add(subscriberFailureFlushTimeout))
@@ -472,7 +491,7 @@ func (s *Server) start(c net.Conn, req Request) {
 	} else {
 		r.Error = "process identity unavailable: " + observeErr.Error()
 	}
-	p := &process{run: r, cmd: cmd, ptmx: ptmx, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
+	p := &process{run: r, cmd: cmd, ptmx: ptmx, input: ptmx, subscribers: map[*subscriber]struct{}{}, done: make(chan struct{})}
 	p.editorRedraw = newExternalEditorRedrawDetector(req.Provider, cmd.Process.Pid)
 	s.mu.Lock()
 	s.runs[r.ID] = p
@@ -546,7 +565,14 @@ func (s *Server) attach(c net.Conn, id string) {
 		}
 		switch kind {
 		case protocol.Input:
-			_, _ = p.ptmx.Write(b)
+			// A failed input write leaves the PTY byte stream missing
+			// bytes the client already consumed, so the attach ends with
+			// an explicit reason instead of continuing on a corrupted
+			// stream. The managed process itself is not touched.
+			if err := writeInput(p.input, b); err != nil {
+				sub.closeWithFailure(subscriberClosedByInputFailure, "attach input write to the managed session failed: "+err.Error())
+				return
+			}
 		case protocol.Resize:
 			var sz protocol.TerminalSize
 			if json.Unmarshal(b, &sz) == nil {
@@ -556,6 +582,25 @@ func (s *Server) attach(c net.Conn, id string) {
 			return
 		}
 	}
+}
+
+// writeInput writes all of payload to w, retrying after a short write, so
+// one Input frame always reaches the PTY whole and in order before the
+// next frame is processed. A write error, or a write that makes no
+// progress without reporting one, is a failure: the rest of the payload is
+// never dropped silently.
+func writeInput(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		payload = payload[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (p *process) broadcast(chunk []byte) {
