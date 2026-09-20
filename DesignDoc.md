@@ -474,7 +474,7 @@ PasteEvent は現在の text-edit target の cursor 位置へ挿入する。既�
 paste / input の decode は model data を変更せずに保持する。ただし、user が制御する text (composer の prompt、rename の draft、session title、外部由来の error / warning / directory の文字列) は、Agent View 自身の trusted な ANSI styling と合成される前に、terminal-safe な表示可能表現へ符号化する。model の text が ESC / C0 / C1 文字を含むというだけで terminal control として実行されてはならない。
 
 - 符号化は描画の境界 (user text が ANSI と合成される直前) で行い、完成した frame 全体から ESC を除去することはしない。Agent View 自身が color・cursor・alternate screen などに ANSI を使うためである。以降の `styleText` / `clipLine` / `lineCells` は、ESC を trusted な application ANSI の開始としてだけ扱う。
-- 表示は 1 rune を 1 rune へ写す。C0 (U+0000-U+001F) は Control Pictures (U+2400-U+241F)、DEL は U+2421、C1 (U+0080-U+009F) は U+FFFD とし、それ以外は変更しない。model 上の rune index (composer / rename の cursor、reserved command の span) が表示上でもそのまま同じ位置を指す。
+- 表示は 1 rune を 1 rune へ写す。C0 (U+0000-U+001F) は Control Pictures (U+2400-U+241F)、DEL は U+2421、C1 (U+0080-U+009F) は U+FFFD とし、それ以外は変更しない。不正な UTF-8 の byte (8-bit の C1 制御として解釈され得る単独の 0x80-0x9F を含む) も 1 byte ごとに U+FFFD となり、表示は常に妥当な UTF-8 になる。model 上の rune index (composer / rename の cursor、reserved command の span) が表示上でもそのまま同じ位置を指す。
 - model data は保持する。paste した TAB や ESC も `Composer.Prompt` と dispatch の payload にそのまま残り、表示だけが変わる。provider が保持する session title も書き換えず、描画時にだけ符号化する。
 
 paste は editor の変更だけであり、payload の改行が何個含まれていても dispatch / open / rename を生成しない。貼り付けた全文を1つの prompt として送るのは、その後に物理的な plain Enter が押されたときだけである。

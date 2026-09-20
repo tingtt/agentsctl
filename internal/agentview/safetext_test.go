@@ -1,10 +1,12 @@
 package agentview
 
 import (
+	"bytes"
 	"errors"
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
@@ -15,9 +17,18 @@ var trustedSGR = regexp.MustCompile("\x1b\\[[0-9;]*m")
 // assertOnlyTrustedControls fails if out contains any control byte other than
 // the newline row separator and Agent View's own SGR styling: no raw ESC
 // (CSI/OSC/DCS/...), BEL, TAB, CR, DEL, or C1 control.
+//
+// The output must also be valid UTF-8 outside that styling. Ranging over an
+// invalid string yields U+FFFD for every bad byte, so a raw 0x9B (8-bit CSI)
+// would look like a harmless replacement rune to the rune loop below; the
+// validity check is what catches it.
 func assertOnlyTrustedControls(t *testing.T, out string) {
 	t.Helper()
-	for _, r := range trustedSGR.ReplaceAllString(out, "") {
+	clean := trustedSGR.ReplaceAllString(out, "")
+	if !utf8.ValidString(clean) {
+		t.Fatalf("rendered output is not valid UTF-8 (raw invalid byte, e.g. an 8-bit C1 control, reached the terminal):\n%q", out)
+	}
+	for _, r := range clean {
 		if r != '\n' && (r < 0x20 || r >= 0x7f && r < 0xa0) {
 			t.Fatalf("rendered output carries untrusted control %U:\n%q", r, out)
 		}
@@ -56,6 +67,48 @@ func TestSafeTextKeepsPrintableTextUntouched(t *testing.T) {
 	}
 	if got := safeText("a\x1b[2Jb\tc"); got != "a␛[2Jb␉c" {
 		t.Errorf("safeText=%q", got)
+	}
+}
+
+// Invalid UTF-8 is model data too, but must not reach the terminal as-is: a raw
+// 0x80..0x9F byte is an 8-bit C1 control on terminals that honor it, and Go
+// ranges over an invalid byte as U+FFFD, which hides it from a rune loop.
+func TestSafeTextCanonicalizesInvalidUTF8(t *testing.T) {
+	cases := []struct{ name, in, want string }{
+		{"raw 8-bit CSI", "c1\x9b2J", "c1\uFFFD2J"},
+		{"raw 8-bit OSC and ST", "\x9d0;t\x9c", "\uFFFD0;t\uFFFD"},
+		{"every raw C1 byte", "\x80\x85\x9f", "\uFFFD\uFFFD\uFFFD"},
+		{"stray continuation and truncated sequence", "a\xbfb\xe6\x97", "a\uFFFDb\uFFFD\uFFFD"},
+		{"invalid byte next to valid text and a control", "日\xffx\x1b", "日\uFFFDx␛"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := safeText(tc.in)
+			if got != tc.want {
+				t.Fatalf("safeText(%q)=%q, want %q", tc.in, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("safeText(%q)=%q is not valid UTF-8", tc.in, got)
+			}
+			// Valid UTF-8 cannot hold a lone 0x80..0x9F byte, but it can hold
+			// them as continuation bytes of ordinary characters (日, ─), so
+			// the check is on runes, not on bytes.
+			for _, r := range got {
+				if r >= 0x80 && r < 0xa0 {
+					t.Fatalf("safeText(%q)=%q contains C1 rune %U", tc.in, got, r)
+				}
+			}
+		})
+	}
+	// Byte level: the raw 8-bit CSI byte is gone from the output.
+	if got := safeText("c1\x9b2J"); bytes.IndexByte([]byte(got), 0x9b) >= 0 || !bytes.Equal([]byte(got), []byte("c1\xef\xbf\xbd2J")) {
+		t.Fatalf("safeText(c1<0x9B>2J) bytes=% x, want 63 31 ef bf bd 32 4a", got)
+	}
+	// The model string is not rewritten: only the returned display text is.
+	in := "c1\x9b2J"
+	_ = safeText(in)
+	if in != "c1\x9b2J" || !bytes.Contains([]byte(in), []byte{0x9b}) {
+		t.Fatal("safeText changed its input")
 	}
 }
 
@@ -230,6 +283,38 @@ func TestSessionTitleFromProviderDoesNotEmitControls(t *testing.T) {
 	}
 	if s.Rows[0].Summary != "sum\x1b[2Jmary" {
 		t.Fatal("rendering rewrote the session model")
+	}
+}
+
+func TestInvalidUTF8ControlByteInTitleIsShownAsReplacementRune(t *testing.T) {
+	const name = "c1\x9b2J"
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: name, CWD: "/work"}})
+	out := s.View(80, 24)
+	assertOnlyTrustedControls(t, out) // valid UTF-8, so no lone 0x9B byte
+	if !strings.Contains(out, "c1\uFFFD2J") {
+		t.Fatalf("title display=%q, want c1�2J", out)
+	}
+	if s.Rows[0].Name != name {
+		t.Fatalf("rendering rewrote the session model: %q", s.Rows[0].Name)
+	}
+}
+
+func TestInvalidUTF8InExternalTextDoesNotReachTerminal(t *testing.T) {
+	s := NewState()
+	s.SetRows([]session.Session{{Key: key("a"), Name: "n", CWD: "/wo\x9b2Jrk"}})
+	s.Error = "failed: \x9d0;x\x9c"
+	s.Warnings = map[session.ProviderID]error{
+		session.ProviderClaude: errors.New("bad \x9b2J"),
+		session.ProviderCodex:  errors.New("bad \x9b2J"),
+	}
+	out := s.View(120, 24)
+	assertOnlyTrustedControls(t, out)
+	if strings.Count(out, "\uFFFD") < 5 {
+		t.Fatalf("invalid bytes are not shown as replacement runes:\n%q", out)
+	}
+	if s.Error != "failed: \x9d0;x\x9c" || s.Rows[0].CWD != "/wo\x9b2Jrk" {
+		t.Fatal("rendering rewrote the source strings")
 	}
 }
 

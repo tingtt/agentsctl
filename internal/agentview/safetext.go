@@ -49,9 +49,17 @@ func safeRunes(text string) []rune {
 	return runes
 }
 
-// safeText returns text encoded for display (see safeRune). Text with nothing
-// to encode is returned as is.
+// safeText returns text encoded for display (see safeRune). Valid UTF-8 with
+// nothing to encode is returned as is. Invalid UTF-8 is never returned as is:
+// ranging over a string decodes each invalid byte as U+FFFD, which safeRune
+// leaves alone, so without the explicit validity check a raw 0x80..0x9F byte
+// (an 8-bit C1 control such as CSI 0x9B) would pass through undetected.
+// safeRunes turns each invalid byte into one U+FFFD, so the result is always
+// valid UTF-8.
 func safeText(text string) string {
+	if !utf8.ValidString(text) {
+		return string(safeRunes(text))
+	}
 	for _, r := range text {
 		if safeRune(r) != r {
 			return string(safeRunes(text))
