@@ -5,8 +5,11 @@ import "unicode"
 // reservedCommands are the composer commands agentsctl owns itself. The
 // composer marks one visually while it is typed; this is token syntax only,
 // not a check that the rest of the prompt makes the command executable.
+// Whether a command is also handled inside agentsctl rather than dispatched
+// to a provider is a separate matter (see updateCommand).
 var reservedCommands = map[string]bool{
-	"/rename": true,
+	"/rename":     true,
+	updateCommand: true,
 }
 
 // runeSpan is a half-open [start, end) range of rune indexes. The zero

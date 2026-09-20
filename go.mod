@@ -9,3 +9,5 @@ require (
 )
 
 require github.com/BurntSushi/toml v1.6.0
+
+require golang.org/x/mod v0.37.0

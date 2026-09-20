@@ -20,6 +20,8 @@ Then start it from the directory you want to work in:
 agentsctl
 ```
 
+A GitHub Release binary checks for a newer release at startup and shows a notice above the prompt. With Go installed, type `/update` and press `Enter` to install the announced version with `go install` and restart; without Go, the notice links to the releases page. Builds that carry no release version, including plain `go install` and `go build`, skip the check.
+
 ## Managing Claude and Codex sessions
 
 agentsctl combines Claude and Codex sessions into one list.
