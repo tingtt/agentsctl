@@ -369,7 +369,7 @@ func (s *State) handleRenameKey(ev KeyEvent) Intent {
 	case bindingEscape.Matches(ev.Key):
 		// The inline editor closing and the row reverting to its
 		// committed name is the feedback; no notification.
-		s.Rename.cancel()
+		s.finishRename()
 		s.Error = ""
 	case ev.Key == KeyHome:
 		s.Rename.home()

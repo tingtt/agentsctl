@@ -100,6 +100,8 @@ Composer が空のとき、`}` は次の visible group の先頭 selectable row 
 
 Refresh / reorder 後も、選択中 session の `session.Key` が catalog に残る限り同じ identity を維持し、その session が表示されるところまで group を開く。control row は stable group/control identity で維持し、control が消えた場合は変更前の visual order で次、前、先頭の順に surviving selectable row へ移る。
 
+Composer から dispatch が成功したときだけ、`Dispatch` が返した `session.Key` を Agent View 内の一時的な選択要求として保持する。catalog は provider が所有する権威であり続けるため、Agent View は返された row を `Rows` へ挿入せず、その identity が catalog に現れるのを待つ。要求した key、または provider が明示した identity transition (`session.IdentityTransitions` で検証済み) によって canonical key へ移った先が catalog に現れた時点で、その session を選択して要求を消費する。選択時は既存の group visibility の仕組みで、その session が見えるのに必要な分だけ group を開く。要求された session が現れるまでは現在の選択に影響せず、後から dispatch が成功すれば古い未解決の要求は置き換える。rename 入力中は cursor を rename 対象に保つため解決を保留し、rename の確定または取消で入力が終了した時点で、reload を待たずに現在の catalog に対して再度解決する。通常の refresh、status 更新、rename、既存 session の更新は選択要求を作らないため、選択を奪わない。
+
 ##### Pin / Unpin
 
 Pin 状態は agentsctl が永続化する。key は `session.Key` (`<provider>:<ID>`) である。session が identity transition を経た場合、provisional key に対する pin は canonical key へ移行され、provisional key の pin は残らない (「Codex provisional session identity」を参照)。

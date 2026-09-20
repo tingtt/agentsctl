@@ -677,10 +677,14 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 	}
 	switch x.Kind {
 	case IntentDispatch:
-		_, result, err := r.Controller.Dispatch(ctx, x.Provider, x.Prompt, r.State.ComposerCWD())
+		created, result, err := r.Controller.Dispatch(ctx, x.Provider, x.Prompt, r.State.ComposerCWD())
 		if err != nil {
 			return err
 		}
+		// The catalog stays authoritative: only the identity is kept, to
+		// select the session when the reload requested by result exposes
+		// it. Registered before applyResult so the reload cannot race it.
+		r.State.RequestSelection(created.Key)
 		r.State.Composer.Clear()
 		r.applyResult(ctx, result)
 	case IntentOpenPromptEditor:
@@ -717,7 +721,7 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 		if err != nil {
 			return err
 		}
-		r.State.Rename.cancel()
+		r.State.finishRename()
 		r.applyResult(ctx, result)
 	case IntentPin:
 		result, err := r.Controller.TogglePin(x.Key)

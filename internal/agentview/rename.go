@@ -18,6 +18,15 @@ func (s *State) startRename(row session.Session) {
 	s.Error = ""
 }
 
+// finishRename leaves rename mode, whether the rename was cancelled or
+// applied, and retries a selection request that SetRows deferred while the
+// editor was active. The catalog it is retried against is the one already
+// installed in Rows: no reload or SetRows follows a rename exit.
+func (s *State) finishRename() {
+	s.Rename.cancel()
+	s.resolveRequestedSelection(session.IdentityTransitions(s.Rows))
+}
+
 // Cancel discards the in-progress rename without applying it.
 func (r *Rename) cancel() { *r = Rename{} }
 
