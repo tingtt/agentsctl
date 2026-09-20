@@ -851,6 +851,16 @@ socket 上では、length-prefixed frame protocol を使用する。
 
 control request / response と PTY stream を、同じ framing mechanism で扱う。
 
+##### PTY input
+
+Input frame 列は、1本の順序付き PTY byte stream を成す。terminal から読んだ byte は、agentsctl が所有する detach 操作を除き、変更・欠落・重複・並べ替えなく PTY に届く。
+
+read の境界と frame の境界に意味はない。Codex が見る byte stream は、境界がどこにあっても同じになる。したがって、境界の位置で挙動を変えること (sleep、size による特別扱い、bracketed paste を1 frame にまとめる buffering、paste の分割) はしない。
+
+supervisor は、1つの Input payload を PTY へ書き切ってから次の frame を処理する。PTY への write が完了できない場合は、残りを黙って捨てず、Failure frame を伝えて attach を終了する。managed process の lifetime には関与しない。
+
+detach の検出が解釈してよいのは、agentsctl が所有する detach sequence (`Ctrl+]` とその escape 表現) だけであり、bracketed paste の payload の外側に限る。bracketed paste の begin / end marker の内側は key input ではなく貼り付けられた内容であり、detach 相当の byte 列を含んでいても、marker を含めて verbatim に転送する。scanner が知るのは paste の begin / end という framing だけで、内容の解釈 (改行の正規化、UTF-8 の解釈など) は行わない。end marker が届くまで paste は続いているものとして扱い、その間は detach しない。
+
 ##### Compatibility
 
 supervisor とは以下の compatibility を確認する。
