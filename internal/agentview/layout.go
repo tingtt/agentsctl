@@ -249,15 +249,17 @@ func skipANSI(value string, i int) int {
 	return j
 }
 
-func viewportStart(lines []displayLine, selected, height int) int {
+func viewportStart(lines []displayLine, selected listItemID, hasSelection bool, height int) int {
 	if height <= 0 || len(lines) <= height {
 		return 0
 	}
 	selectedLine := 0
-	for i, line := range lines {
-		if line.rowIndex == selected {
-			selectedLine = i
-			break
+	if hasSelection {
+		for i, line := range lines {
+			if line.selectable && line.itemID == selected {
+				selectedLine = i
+				break
+			}
 		}
 	}
 	start := selectedLine - height/2

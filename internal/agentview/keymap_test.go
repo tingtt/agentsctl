@@ -30,6 +30,15 @@ func TestBindingMatchesOwnsPhysicalKeyMembership(t *testing.T) {
 	if bindingNavigate.Matches(KeyLeft) {
 		t.Fatal("bindingNavigate must not match KeyLeft")
 	}
+	if !bindingFoldExpand.Matches(KeyLeft) || !bindingFoldExpand.Matches(KeyRight) {
+		t.Fatal("bindingFoldExpand must match Left and Right")
+	}
+	if !bindingGroupNavigate.MatchesEvent(KeyEvent{Key: KeyRune, Rune: '{'}) || !bindingGroupNavigate.MatchesEvent(KeyEvent{Key: KeyRune, Rune: '}'}) {
+		t.Fatal("bindingGroupNavigate must match brace runes")
+	}
+	if bindingGroupNavigate.MatchesEvent(KeyEvent{Key: KeyRune, Rune: '['}) {
+		t.Fatal("bindingGroupNavigate must not match unrelated runes")
+	}
 	if !bindingStopArchive.Matches(KeyCtrlX) {
 		t.Fatal("bindingStopArchive must match KeyCtrlX")
 	}
@@ -166,7 +175,7 @@ func TestBindingsCoverEveryShortcutKey(t *testing.T) {
 	// carry no Binding.
 	nonShortcut := map[Key]bool{
 		KeyRune: true, KeyBackspace: true, KeyDelete: true, KeyHome: true,
-		KeyEnd: true, KeyLeft: true, KeyRight: true, KeyUnknown: true,
+		KeyEnd: true, KeyUnknown: true,
 	}
 	documented := map[Key]bool{}
 	for _, b := range allBindings {

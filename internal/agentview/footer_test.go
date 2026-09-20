@@ -353,7 +353,7 @@ func TestUsageLineTextExpiresExhaustedAtReadTimeWithoutNewRefresh(t *testing.T) 
 // retyped key.
 func TestHelpLinesDeriveKeysFromBindings(t *testing.T) {
 	lines := strings.Join(helpLines(200), "\n")
-	for _, b := range []Binding{bindingPin, bindingStopArchive, bindingScope, bindingStash, bindingPromptEditor, bindingEscape} {
+	for _, b := range []Binding{bindingNavigate, bindingFoldExpand, bindingGroupNavigate, bindingPin, bindingStopArchive, bindingScope, bindingStash, bindingPromptEditor, bindingEscape} {
 		if !strings.Contains(lines, strings.ToLower(b.Label)) {
 			t.Fatalf("help text missing binding %q:\n%s", b.Label, lines)
 		}

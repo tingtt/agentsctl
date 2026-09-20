@@ -5,12 +5,13 @@ import (
 	"strings"
 )
 
-// displayLine is one rendered terminal row: rowIndex is the Rows index it
-// corresponds to, or -1 for a heading/blank spacer line not tied to any
-// session.
+// displayLine is one rendered terminal row. Selectable rows carry the exact
+// Agent View cursor identity used by navigation; headings and separators do
+// not.
 type displayLine struct {
-	text     string
-	rowIndex int
+	text       string
+	itemID     listItemID
+	selectable bool
 }
 
 // View renders the full Agent View frame: the session list, composer, and
@@ -24,14 +25,33 @@ func (s State) View(width, height int) string {
 		headerText += styleText(" · loading sessions…", colorGray)
 	}
 	header := []string{clipLine(headerText, width), ""}
-	list := make([]displayLine, 0, len(s.Rows)+4)
-	selectedIndex := s.SelectedIndex()
-	for _, g := range groupRows(s.Rows) {
-		list = append(list, displayLine{text: clipLine(styleText(g.title, colorGray), width), rowIndex: -1})
-		for _, i := range g.indices {
+	model := s.selectableList()
+	list := make([]displayLine, 0, len(model.items)+len(model.groups)*2)
+	for _, g := range model.groups {
+		list = append(list, displayLine{text: clipLine(styleText(g.title, colorGray), width)})
+		for _, item := range g.items {
+			selected := s.hasCursor && s.cursor == item.id
+			if item.id.kind != listItemSession {
+				label := "Show more"
+				if item.id.kind == listItemShowSessions {
+					label = "Show sessions"
+				}
+				cursor := " "
+				if selected {
+					cursor = ">"
+				}
+				line := cursor + " " + label
+				if selected {
+					line = styleText(line, selectedRowBackgroundCode)
+				}
+				list = append(list, displayLine{text: clipLine(line, width), itemID: item.id, selectable: true})
+				continue
+			}
+
+			i := item.rowIndex
 			row := s.Rows[i]
 			cursor := " "
-			if i == selectedIndex {
+			if selected {
 				cursor = ">"
 			}
 			if s.Confirmation != nil && row.Key == s.Confirmation.Key {
@@ -53,7 +73,6 @@ func (s State) View(width, height int) string {
 			} else {
 				name = fitCells(row.DisplayName(), titleWidth)
 			}
-			selected := i == selectedIndex
 			lastAttached := s.HasLastAttached && row.Key == s.LastAttachedKey
 			name = styleText(name, titleStyleCodes(selected, lastAttached)...)
 			noticeSegment := ""
@@ -70,9 +89,9 @@ func (s State) View(width, height int) string {
 			if selected {
 				line = styleText(line, selectedRowBackgroundCode)
 			}
-			list = append(list, displayLine{text: clipLine(line, width), rowIndex: i})
+			list = append(list, displayLine{text: clipLine(line, width), itemID: item.id, selectable: true})
 		}
-		list = append(list, displayLine{text: "", rowIndex: -1})
+		list = append(list, displayLine{text: ""})
 	}
 
 	footer := s.composerLines(width)
@@ -94,7 +113,7 @@ func (s State) View(width, height int) string {
 		header = nil
 	}
 	listHeight := max(0, height-len(header)-len(footer))
-	start := viewportStart(list, selectedIndex, listHeight)
+	start := viewportStart(list, s.cursor, s.hasCursor, listHeight)
 	end := min(len(list), start+listHeight)
 	var b strings.Builder
 	for _, line := range header {

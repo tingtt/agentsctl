@@ -366,3 +366,78 @@ func TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth(t *testing.T) {
 		_ = s.View(width, 12)
 	}
 }
+
+func TestSelectedControlRowsRenderCursorAndBackground(t *testing.T) {
+	background := "\x1b[" + selectedRowBackgroundCode + "m"
+	tests := []struct {
+		name string
+		fold bool
+		text string
+	}{
+		{name: "Show more", text: "Show more"},
+		{name: "Show sessions", fold: true, text: "Show sessions"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(foldingRows(11, "/work/repo", false))
+			group := groupID{directory: "/work/repo"}
+			if tt.fold {
+				s.selectIndex(0)
+				s.Handle(KeyEvent{Key: KeyLeft})
+			} else {
+				focusControl(t, &s, listItemShowMore, group)
+			}
+			view := s.View(80, 30)
+			line := renderedSessionLine(t, view, tt.text)
+			if !strings.HasPrefix(line, background) || !strings.HasPrefix(visibleText(line), "> ") {
+				t.Fatalf("selected control lacks cursor/background: %q", line)
+			}
+			if strings.Contains(visibleText(line), "claude") {
+				t.Fatalf("control masquerades as a session row: %q", line)
+			}
+		})
+	}
+}
+
+func TestViewPaginatesDirectoryRowsFromSelectableModel(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(11, "/work/repo", false))
+	view := visibleText(s.View(80, 30))
+	if !strings.Contains(view, "session 10") || !strings.Contains(view, "Show more") {
+		t.Fatalf("initial page missing session 10 or Show more:\n%s", view)
+	}
+	if strings.Contains(view, "session 11") {
+		t.Fatalf("initial page rendered hidden session 11:\n%s", view)
+	}
+}
+
+func TestViewportTracksSelectedControlRows(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(35, "/work/repo", false))
+	focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+	view := visibleText(s.View(80, 8))
+	if !strings.Contains(view, "> Show more") {
+		t.Fatalf("viewport did not follow selected Show more:\n%s", view)
+	}
+
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyLeft})
+	view = visibleText(s.View(80, 8))
+	if !strings.Contains(view, "> Show sessions") {
+		t.Fatalf("viewport did not follow selected Show sessions:\n%s", view)
+	}
+}
+
+func TestNarrowSelectedControlsDoNotLeakANSI(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(11, "/work/repo", false))
+	focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+	for width := 1; width <= 20; width++ {
+		for _, line := range strings.Split(s.View(width, 12), "\n") {
+			if ansiOpenAtLineEnd(line) {
+				t.Fatalf("width=%d: control line leaked ANSI styling: %q", width, line)
+			}
+		}
+	}
+}
