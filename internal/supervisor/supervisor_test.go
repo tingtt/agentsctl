@@ -164,10 +164,13 @@ func TestCompatibilityRejectsSupervisorWithoutEnvironmentOverrides(t *testing.T)
 // queue kept overflowing attach connections even after the client
 // binary itself had been upgraded, because ProtocolVersion alone hadn't
 // changed and the old BuildVersion was never distinguished from the new
-// one.
+// one; and #29, where a still-running daemon would keep writing attach
+// input to the PTY without the completeness guarantee.
 func TestCompatibilityRequiresExactBuildVersionMatch(t *testing.T) {
-	if compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: "child-environment-2026-09-09"}) {
-		t.Fatal("a same-protocol daemon on the previous BuildVersion was treated as compatible")
+	for _, previous := range []string{"child-environment-2026-09-09", "attach-backpressure-2026-09-10"} {
+		if compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: previous}) {
+			t.Fatalf("a same-protocol daemon on the older BuildVersion %q was treated as compatible", previous)
+		}
 	}
 	if !compatible(Response{ProtocolVersion: ProtocolVersion, BuildVersion: BuildVersion}) {
 		t.Fatal("current supervisor protocol/build was treated as incompatible")
