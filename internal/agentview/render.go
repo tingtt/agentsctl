@@ -37,10 +37,12 @@ func (s State) View(width, height int) string {
 					label = "Show sessions"
 				}
 				cursor := " "
+				foreground := colorGray
 				if selected {
 					cursor = ">"
+					foreground = colorWhite
 				}
-				line := cursor + " " + styleText(label, colorGray)
+				line := cursor + " " + styleText(label, foreground)
 				if selected {
 					line = styleText(fitCells(line, width), selectedRowBackgroundCode)
 				}

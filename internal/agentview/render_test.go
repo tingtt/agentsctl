@@ -429,8 +429,11 @@ func TestSelectedControlRowsRenderCursorAndBackground(t *testing.T) {
 				if ansiOpenAtLineEnd(line) {
 					t.Fatalf("width=%d: selected control leaves dangling ANSI style: %q", width, line)
 				}
-				if width >= lineCells("> "+tt.text) && !strings.Contains(line, styleText(tt.text, colorGray)) {
-					t.Fatalf("width=%d: selected control text is not gray: %q", width, line)
+				if width > 2 && (!strings.Contains(line, "\x1b["+colorWhite+"m") || strings.Contains(line, "\x1b["+colorGray+"m")) {
+					t.Fatalf("width=%d: selected control text is not exclusively white: %q", width, line)
+				}
+				if width >= lineCells("> "+tt.text) && !strings.Contains(line, styleText(tt.text, colorWhite)) {
+					t.Fatalf("width=%d: selected control label is not white: %q", width, line)
 				}
 				if width >= 2 && !strings.HasPrefix(visibleText(line), "> ") {
 					t.Fatalf("width=%d: selected control lacks cursor: %q", width, line)
@@ -477,6 +480,9 @@ func TestUnselectedControlRowsRenderGray(t *testing.T) {
 			line := renderedSessionLine(t, s.View(80, 30), tt.text)
 			if !strings.Contains(line, styleText(tt.text, colorGray)) {
 				t.Fatalf("unselected control text is not gray: %q", line)
+			}
+			if strings.Contains(line, "\x1b["+colorWhite+"m") {
+				t.Fatalf("unselected control text is white: %q", line)
 			}
 			if strings.HasPrefix(line, "\x1b["+selectedRowBackgroundCode+"m") {
 				t.Fatalf("unselected control has selected background: %q", line)
