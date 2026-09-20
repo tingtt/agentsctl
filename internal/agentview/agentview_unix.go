@@ -106,6 +106,24 @@ type Runtime struct {
 	// transient (Starting) session -- see transient_unix.go.
 	transient transientRefresh
 
+	// Updater performs the startup release check and /update installation.
+	// Nil (a development build) disables both: no check is started and
+	// /update reports that no update is available. See selfupdate_unix.go.
+	Updater Updater
+
+	// checkCh/installCh carry background self-update results back to
+	// eventLoop, which alone applies them to State. Lazily initialized (nil
+	// is a valid zero value) the same way usageCh is.
+	checkCh   chan updateCheckEvent
+	installCh chan updateInstallEvent
+	// updateCtx bounds every self-update goroutine; updateCancel ends them
+	// when Run returns (see stopUpdate).
+	updateCtx    context.Context
+	updateCancel context.CancelFunc
+	// restart is set by eventLoop once an update was installed; Run's caller
+	// reads it through Restart after the terminal has been restored.
+	restart *Restart
+
 	terminal        overviewLifecycle
 	runPromptEditor promptEditorRunner
 }
@@ -255,6 +273,11 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	r.observerCh = r.Controller.Observe(observeCtx)
 	r.requestReload(ctx)
 	r.render()
+	// The release check runs in the background after the first frame, so
+	// neither rendering nor input ever waits on GitHub; it is torn down with
+	// the overview like every other goroutine Run starts.
+	defer r.stopUpdate()
+	r.startUpdateCheck(ctx)
 	reader := bufio.NewReader(r.Input)
 	readInputFn := r.ReadInput
 	if readInputFn == nil {
@@ -361,6 +384,17 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readInput
 			r.applyObserverUpdate(update.Provider, update.Sessions, update.Err, update.Warning)
 			r.recomputeRows()
 			r.transient.schedule(r)
+			r.render()
+		case ev := <-r.checkCh:
+			r.applyUpdateCheck(ev)
+			r.render()
+		case ev := <-r.installCh:
+			if r.applyUpdateInstall(ev) {
+				// Ending the loop returns from Run, whose deferred terminal
+				// close restores the terminal; the caller replaces the
+				// process afterwards (see Restart).
+				return nil
+			}
 			r.render()
 		case <-r.transient.tick:
 			r.transient.refresh(loopCtx, r)
@@ -690,6 +724,8 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 		r.applyResult(ctx, result)
 	case IntentOpenPromptEditor:
 		return r.editPrompt(ctx)
+	case IntentUpdate:
+		return r.startUpdateInstall(ctx, x.Version)
 	case IntentOpen:
 		row, ok := r.findRow(x.Key)
 		if !ok {

@@ -23,6 +23,7 @@ const (
 	IntentRename
 	IntentPin
 	IntentRefresh
+	IntentUpdate
 	IntentQuit
 )
 
@@ -37,6 +38,7 @@ type Intent struct {
 	Provider session.ProviderID // IntentDispatch's target provider
 	Prompt   string             // IntentDispatch
 	Name     string             // IntentRename
+	Version  string             // IntentUpdate: the exact advertised release to install
 }
 
 // HandleInput resolves one decoded InputEvent: a key goes through Handle, a
@@ -176,6 +178,11 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		return Intent{}
 	case bindingSubmit.Matches(ev.Key):
 		if strings.TrimSpace(s.Composer.Prompt) != "" {
+			// agentsctl-owned commands are resolved here and never reach a
+			// provider's Dispatch.
+			if intent, handled := s.handleUpdateCommand(s.Composer.Prompt); handled {
+				return intent
+			}
 			return Intent{Kind: IntentDispatch, Provider: s.Provider, Prompt: s.Composer.Prompt}
 		}
 		if s.expandSelectedControl() {

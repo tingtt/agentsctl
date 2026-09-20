@@ -4,6 +4,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/tingtt/agentsctl/internal/selfupdate"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -53,15 +54,25 @@ type State struct {
 	// Runtime.CWD.
 	StartupCWD string
 
-	// Error holds the most recent action failure. It is the only thing
-	// ever rendered in the composer-top notification area, reserved for
-	// errors exclusively -- an operation whose result is already visible
+	// Error holds the most recent action failure. It has the highest
+	// priority in the composer-top notification area: while it is set, only
+	// it is rendered there -- an operation whose result is already visible
 	// elsewhere in the UI (pin/unpin reordering a row, a rename changing
 	// its title, an archive removing it) gets no notification at all,
-	// error or otherwise. See RowNotice for the session-scoped, non-error
-	// counterpart.
+	// error or otherwise. See UpdateAvailable for the persistent notice
+	// shown once Error is cleared, and RowNotice for the session-scoped,
+	// non-error counterpart.
 	Error    string
 	Warnings map[session.ProviderID]error
+
+	// UpdateAvailable is the newer agentsctl release found by the startup
+	// check, nil while none is known. It is independent of Error: an action
+	// error hides the update notice only while it is displayed and never
+	// discards this state. See Updating and updateNotice.
+	UpdateAvailable *selfupdate.Availability
+	// Updating is true while an installation of UpdateAvailable is in
+	// flight; it only guards against a second concurrent /update.
+	Updating bool
 
 	Rename Rename
 

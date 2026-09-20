@@ -97,10 +97,12 @@ func (s State) View(width, height int) string {
 	}
 
 	footer := s.composerLines(width)
-	// The composer-top notification area is reserved for Error
-	// exclusively -- there is no generic non-error notice here.
+	// Composer-top notification area, by priority: Error, then the update
+	// notice (which survives an Error being cleared), then nothing.
 	if s.Error != "" {
 		footer = append([]string{clipLine("! "+safeText(s.Error), width)}, footer...)
+	} else if notice, ok := s.updateNotice(); ok {
+		footer = append([]string{clipLine("! "+safeText(notice), width)}, footer...)
 	}
 	if height < 0 {
 		height = 0

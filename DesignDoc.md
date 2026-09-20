@@ -673,16 +673,22 @@ operation の結果が UI の変化から明確に分かる場合、追加 notif
 - pin によって行が移動する
 - archive confirmation が消える
 
-##### Global errors
+##### Composer 上部の notification area
 
-Composer 上部の notification area は error 用とする。
+Composer 上部の notification area は、global な通知を1行だけ表示する。内容は以下で、上ほど優先する。
 
-例:
+1. Error (`State.Error`)
+2. Update available notice (`State.UpdateAvailable`)
+3. 何も表示しない
+
+Error の例:
 
 - 操作が拒否された
 - provider が利用できない
 - capability がない
 - 入力値が不正
+
+Update available notice は通知ではなく状態であり、Error とは独立に保持する。一時的な action error が表示されている間だけ隠れ、Error が消えると再び表示される。generic な通知を `State.Error` に載せない。
 
 ##### Row notice
 
@@ -708,6 +714,52 @@ terminal width が不足する場合、表示優先度を設ける。
 4. Title
 
 session の識別に必要な情報を優先し、補助情報から省略する。
+
+#### Self-update
+
+agentsctl は、起動時に GitHub Releases の最新安定版を1回だけ非同期に確認し、より新しい version があれば notification area に表示する。
+
+```text
+! agentsctl update available (v1.0.0 -> v1.1.0): /update to update
+! agentsctl update available (v1.0.0 -> v1.1.0): https://github.com/tingtt/agentsctl/releases
+```
+
+上は `go` が使える場合、下は使えない場合である。自動 update は「新しい release を検出済み」かつ「`go` が使える」場合に限る。
+
+##### Application version
+
+running version の source of truth は `internal/version.Version` (既定値 `dev`) であり、ldflags の `-X` で埋め込む。
+
+- Release build: `.github/workflows/release.yml` が push された tag を埋め込む。
+- `/update`: `go install` に通知した version と同じ値を `-ldflags -X` で渡す。
+- 埋め込みのない build (`dev`) は update check を行わず、`/update` も利用できない。
+
+Go の build info は fallback として使わない。この version は release version であり、supervisor の互換性を表す `supervisor.BuildVersion` とは別物で、統合しない。
+
+##### Update check
+
+- `internal/selfupdate` が GitHub の latest release API から tag を取得し、semantic version として検証してから running version と比較する。latest が新しい場合のみ通知する。
+- check は background で行い、結果は event channel 経由で Agent View の event loop だけが State に反映する。初回描画とキー入力は待たない。
+- network error、timeout、不正な response、不正な version はすべて非 fatal とし、`State.Error` にも表示しない。draft / prerelease は対象外とする。
+
+##### `/update`
+
+`/update` は agentsctl が所有する reserved command であり、Claude / Codex の Dispatch には到達しない。command token が認識された時点で agentsctl 内で処理を完結する。
+
+- 引数付き (`/update foo`)、update 未検出、`go` なし、実行中の重複は、provider へ送らず local error とする。
+- `/update-foo` は `/update` ではなく通常の prompt として扱う (reserved command の token 規則は `/rename` と同じ)。
+- 通知に表示した version をそのまま `go install <module>/cmd/agentsctl@<version>` に渡す (`@latest` は使わない)。install 中に新しい release が出ても version は変わらない。
+- `go install` は background で実行し、Agent View を止めない。二重実行は防ぐ。
+- install の失敗は通常の error として表示し、現在の process は動き続ける。
+
+##### Restart
+
+install 成功時、event loop は `Restart` request を保持して終了する。`Runtime.Run` の defer が overview terminal (raw mode、alternate screen) を復元した後に、`cmd/agentsctl` が process replacement (`exec`) を行う。Agent View が terminal を所有している間は `exec` しない。
+
+- 新しい binary は Go の install 先 (`GOBIN`、なければ最初の `GOPATH/bin`) の `agentsctl` であり、`PATH` 上の `agentsctl` とは限らない。
+- 引数 (`os.Args[1:]`)、環境変数全体 (`CODEX_EDITOR`、`AGENTSCTL_STATE_DIR` を含む)、working directory を引き継ぐ。
+
+supervisor は update のために停止・再起動しない。新しい agentsctl が起動時に行う既存の compatibility 確認 (Supervisor の Compatibility) に従い、active managed run を持つ daemon は維持される。
 
 ### Implementation Design
 
@@ -897,7 +949,9 @@ supervisor とは以下の compatibility を確認する。
 - Protocol version
 - Build generation
 
-Protocol version は wire format (frame 構造・request/response の contract) の互換性を表す。Build generation は、wire format が同じでも supervisor 実装や runtime の振る舞いが異なる場合に区別するために用いる。振る舞いのみの変更は Protocol version を上げず、Build generation のみを更新する。
+Protocol version は wire format (frame 構造・request/response の contract) の互換性を表す。Build generation (`supervisor.BuildVersion`) は、wire format が同じでも supervisor 実装や runtime の振る舞いが異なる場合に区別するために用いる。振る舞いのみの変更は Protocol version を上げず、Build generation のみを更新する。
+
+Build generation は互換性の marker であり、agentsctl の release version (`internal/version.Version`、Self-update 参照) とは無関係である。
 
 互換性を確認できない daemon を、そのまま再利用しない。
 

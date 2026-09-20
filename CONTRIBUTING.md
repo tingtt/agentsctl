@@ -54,4 +54,6 @@ git tag v1.2.0
 git push origin v1.2.0
 ```
 
+The release workflow embeds the pushed tag as the running version with `-ldflags "-X github.com/tingtt/agentsctl/internal/version.Version=<tag>"`. A build without it reports `dev` and never checks for updates.
+
 The tag push starts GitHub Actions, which builds the Linux amd64, Linux arm64, macOS Intel, and macOS Apple Silicon binaries and creates the GitHub Release with those binaries attached.
