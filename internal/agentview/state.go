@@ -392,15 +392,15 @@ func (s *State) MarkAttached(key session.Key) {
 // to the matching row -- see sessionctl.Result's doc comment for why Pin
 // and Rename use this instead of a full reload. Pin changes re-sort because
 // pin state affects ordering. Pinning preserves selection identity, while
-// unpinning the selected pinned row selects its previous Pinned-group
-// neighbor (or the following group's first row). Rename never affects
-// ordering.
+// unpinning the selected pinned row selects its next (else previous)
+// Pinned-group neighbor, or -- when Pinned becomes empty -- the first row of
+// the post-unpin list. Rename never affects ordering.
 func (s *State) ApplyPatch(p sessionctl.Patch) {
 	if p.Pinned != nil {
 		var replacement listItemID
-		var replaceSelection bool
+		var replaceSelection, selectPostUnpinHead bool
 		if !*p.Pinned {
-			replacement, replaceSelection = s.selectionReplacementForUnpin(p.Key)
+			replacement, selectPostUnpinHead, replaceSelection = s.selectionReplacementForUnpin(p.Key)
 		}
 		rows := append([]session.Session(nil), s.Rows...)
 		for i := range rows {
@@ -410,8 +410,21 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 		}
 		session.SortOverview(rows)
 		s.Rows = rows
+		if replaceSelection && selectPostUnpinHead {
+			// Pinned became empty: resolve the fallback against the
+			// post-unpin visual model, where the unpinned session may itself
+			// be the new head.
+			if model := s.selectableList(); len(model.items) > 0 {
+				replacement = model.items[0].id
+			} else {
+				replaceSelection = false
+			}
+		}
 		if replaceSelection {
 			s.cursor, s.hasCursor = replacement, true
+			if replacement.kind == listItemSession {
+				s.ensureSessionVisible(replacement.sessionKey)
+			}
 		} else if s.hasCursor && s.cursor.kind == listItemSession {
 			s.ensureSessionVisible(s.cursor.sessionKey)
 		}
@@ -426,18 +439,20 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 	}
 }
 
-// selectionReplacementForUnpin returns the replacement identity for unpinning key
-// when key is the selected pinned row. Candidates come from the current
-// rendered grouping, before the patch can move key into an unpinned group:
-// the next Pinned row, the previous Pinned row, then the first row of the
-// following group.
-func (s State) selectionReplacementForUnpin(key session.Key) (listItemID, bool) {
+// selectionReplacementForUnpin returns the replacement selection for unpinning
+// key when key is the selected pinned row. While other Pinned rows remain, the
+// replacement is the next Pinned row, else the previous one, taken from the
+// current rendered grouping. When key is the only pinned row, Pinned disappears
+// and the fallback (postUnpinHead) must be resolved by the caller from the
+// post-unpin model -- the first selectable item, which is the head of the group
+// following the removed Pinned group -- because the patch can reorder rows.
+func (s State) selectionReplacementForUnpin(key session.Key) (id listItemID, postUnpinHead, ok bool) {
 	if !s.hasCursor || s.cursor != sessionItemID(key) {
-		return listItemID{}, false
+		return listItemID{}, false, false
 	}
 
 	model := s.selectableList()
-	for groupIndex, group := range model.groups {
+	for _, group := range model.groups {
 		for position, item := range group.items {
 			if item.id.kind != listItemSession {
 				continue
@@ -447,20 +462,15 @@ func (s State) selectionReplacementForUnpin(key session.Key) (listItemID, bool) 
 				continue
 			}
 			if position+1 < len(group.items) {
-				return group.items[position+1].id, true
+				return group.items[position+1].id, false, true
 			}
 			if position > 0 {
-				return group.items[position-1].id, true
+				return group.items[position-1].id, false, true
 			}
-			for _, following := range model.groups[groupIndex+1:] {
-				if len(following.items) > 0 {
-					return following.items[0].id, true
-				}
-			}
-			return listItemID{}, false
+			return listItemID{}, true, true
 		}
 	}
-	return listItemID{}, false
+	return listItemID{}, false, false
 }
 
 // ApplyUsageUpdate incorporates one provider's incremental usage result
