@@ -32,6 +32,28 @@ func countListItems(model selectableList, kind listItemKind) int {
 	return count
 }
 
+func listGroupItems(t *testing.T, model selectableList, id groupID) []selectableItem {
+	t.Helper()
+	for _, group := range model.groups {
+		if group.id == id {
+			return group.items
+		}
+	}
+	t.Fatalf("group %+v not found", id)
+	return nil
+}
+
+func countGroupItems(t *testing.T, model selectableList, id groupID, kind listItemKind) int {
+	t.Helper()
+	count := 0
+	for _, item := range listGroupItems(t, model, id) {
+		if item.id.kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
 func TestDirectoryGroupsInitiallyShowTenSessionBlocks(t *testing.T) {
 	tests := []struct {
 		count        int
@@ -95,5 +117,64 @@ func TestPinnedNeverPaginates(t *testing.T) {
 	}
 	if got := countListItems(model, listItemShowMore); got != 0 {
 		t.Fatalf("Pinned must not contain Show more: got %d", got)
+	}
+}
+
+func TestDirectoryPageCapacitySurvivesGrowthAndScopeAbsence(t *testing.T) {
+	groupA := groupID{directory: "/work/repo-a"}
+	repoB := foldingRows(1, "/work/repo-b", false)
+	s := NewState()
+	s.SetRows(append(foldingRows(15, "/work/repo-a", false), repoB...))
+	focusControl(t, &s, listItemShowMore, groupA)
+	s.Handle(KeyEvent{Key: KeyEnter})
+	if got := s.groupStates[groupA].visibleCount; got != 20 {
+		t.Fatalf("opened page capacity=%d, want 20", got)
+	}
+	s.Handle(KeyEvent{Key: KeyRune, Rune: '}'})
+	requireSelectedSession(t, s, repoB[0].Key)
+
+	for _, tt := range []struct {
+		count        int
+		wantSessions int
+		wantMore     int
+	}{
+		{count: 16, wantSessions: 16},
+		{count: 20, wantSessions: 20},
+		{count: 21, wantSessions: 20, wantMore: 1},
+	} {
+		s.SetRows(append(foldingRows(tt.count, "/work/repo-a", false), repoB...))
+		model := s.selectableList()
+		if got := countGroupItems(t, model, groupA, listItemSession); got != tt.wantSessions {
+			t.Fatalf("%d sessions after refresh: visible=%d, want %d", tt.count, got, tt.wantSessions)
+		}
+		if got := countGroupItems(t, model, groupA, listItemShowMore); got != tt.wantMore {
+			t.Fatalf("%d sessions after refresh: Show more=%d, want %d", tt.count, got, tt.wantMore)
+		}
+	}
+
+	s.SetRows(repoB)
+	s.SetRows(append(foldingRows(21, "/work/repo-a", false), repoB...))
+	model := s.selectableList()
+	if got := countGroupItems(t, model, groupA, listItemSession); got != 20 {
+		t.Fatalf("visible sessions after scope return=%d, want 20", got)
+	}
+	if got := s.groupStates[groupA].visibleCount; got != 20 {
+		t.Fatalf("page capacity after scope return=%d, want 20", got)
+	}
+}
+
+func TestFullyOpenedPartialPageRetainsFullPageCapacity(t *testing.T) {
+	group := groupID{directory: "/work/repo"}
+	s := NewState()
+	s.SetRows(foldingRows(35, "/work/repo", false))
+	for range 3 {
+		focusControl(t, &s, listItemShowMore, group)
+		s.Handle(KeyEvent{Key: KeyEnter})
+	}
+	if got := countGroupItems(t, s.selectableList(), group, listItemSession); got != 35 {
+		t.Fatalf("visible sessions=%d, want 35", got)
+	}
+	if got := s.groupStates[group].visibleCount; got != 40 {
+		t.Fatalf("fully opened page capacity=%d, want 40", got)
 	}
 }

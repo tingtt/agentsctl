@@ -299,12 +299,11 @@ Codex は最初の model turn まで listed / resumable な thread を公開し�
 
 ##### Composer directory context
 
-Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、選択中 session 自身の CWD に追従する。
+Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、list cursor が持つ一意な directory context に追従する。
 
-- 起動 directory 自体 (`Runtime.CWD`) は directory scope の anchor としてのみ機能し、Composer の表示・dispatch context としては使わない。
-- 選択中 session が存在する限り、その CWD が Composer `<cwd>` と dispatch context の両方の source of truth になる。
-- Directory group の `Show more` / `Show sessions` が選択中なら、その group の normalized directory を使う。Pinned の `Show sessions` は一意な directory を持たないため、起動 directory を使う。
-- 選択可能な session が一つもない場合 (空 catalog) に限り、起動 directory を fallback として使う。これにより空 catalog からでも新規 prompt を dispatch できる。
+- session が選択中なら、その CWD を使う。
+- Directory group の `Show more` / `Show sessions` が選択中なら、その group の normalized directory を使う。
+- Pinned の `Show sessions` または選択可能な item がない場合は、一意な session / directory context がないため `StartupCWD` を使う (`StartupCWD` は runtime の `Runtime.CWD` から設定する)。起動 directory は、一意な context がある場合にその代わりとしては使わない。
 
 表示 (`<cwd>`) と実際の dispatch context が異なる値を参照することは絶対に避ける — 同じ導出結果 (`State.ComposerCWD`) を両方が読む。
 

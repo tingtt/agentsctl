@@ -40,7 +40,7 @@ func (s State) View(width, height int) string {
 				if selected {
 					cursor = ">"
 				}
-				line := cursor + " " + label
+				line := cursor + " " + styleText(label, colorGray)
 				if selected {
 					line = styleText(line, selectedRowBackgroundCode)
 				}

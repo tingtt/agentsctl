@@ -118,18 +118,14 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	case ev.Key == KeyRight && s.Composer.Prompt != "":
 		s.Composer.Right()
 		return Intent{}
-	case bindingFoldExpand.Matches(ev.Key):
-		if ev.Key == KeyLeft {
-			s.foldSelectedGroup()
-		} else {
-			s.expandSelectedControl()
-		}
+	case s.isIssue48Navigation(ev):
+		s.handleIssue48Navigation(ev)
 		return Intent{}
 	case bindingStash.Matches(ev.Key):
 		s.Composer.ToggleStash()
 		return Intent{}
 	case bindingSubmit.Matches(ev.Key):
-		if s.Composer.Prompt != "" {
+		if strings.TrimSpace(s.Composer.Prompt) != "" {
 			return Intent{Kind: IntentDispatch, Provider: s.Provider, Prompt: s.Composer.Prompt}
 		}
 		if s.expandSelectedControl() {
@@ -188,18 +184,30 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 		// is a plain prompt rune -- see the generic KeyRune case below.
 		s.HelpVisible = true
 		return Intent{}
-	case s.Composer.Prompt == "" && bindingGroupNavigate.MatchesEvent(ev):
-		if ev.Rune == '{' {
-			s.moveGroup(-1)
-		} else {
-			s.moveGroup(1)
-		}
-		return Intent{}
 	case ev.Key == KeyRune:
 		s.Composer.InsertAtCursor(string(ev.Rune))
 		return Intent{}
 	}
 	return Intent{}
+}
+
+func (s State) isIssue48Navigation(ev KeyEvent) bool {
+	return s.Composer.Prompt == "" && (bindingFoldExpand.Matches(ev.Key) || bindingGroupNavigate.MatchesEvent(ev))
+}
+
+func (s *State) handleIssue48Navigation(ev KeyEvent) bool {
+	switch {
+	case ev.Key == KeyLeft:
+		return s.foldSelectedGroup()
+	case ev.Key == KeyRight:
+		return s.expandSelectedControl()
+	case ev.Rune == '{':
+		return s.moveGroup(-1)
+	case ev.Rune == '}':
+		return s.moveGroup(1)
+	default:
+		return false
+	}
 }
 
 func (s *State) foldSelectedGroup() bool {
@@ -265,7 +273,7 @@ func (s *State) expandSelectedControl() bool {
 			return false
 		}
 		state.folded = false
-		state.visibleCount = min(visible+directoryPageSize, len(group.indices))
+		state.visibleCount = visible + directoryPageSize
 		s.setGroupState(group.id, state)
 		s.cursor = sessionItemID(s.Rows[group.indices[visible]].Key)
 		return true
@@ -347,6 +355,11 @@ func (s *State) handleConfirmationKey(ev KeyEvent) Intent {
 		// normal navigation this key would otherwise perform.
 		s.Confirmation = nil
 		return s.handleNormalKey(ev)
+	case s.isIssue48Navigation(ev):
+		if s.handleIssue48Navigation(ev) {
+			s.Confirmation = nil
+		}
+		return Intent{}
 	}
 	return Intent{}
 }

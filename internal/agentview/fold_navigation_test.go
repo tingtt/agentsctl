@@ -1,6 +1,7 @@
 package agentview
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -206,6 +207,97 @@ func TestBraceNavigationMovesBetweenExpandedAndFoldedGroups(t *testing.T) {
 	requireControlCursor(t, s, listItemShowSessions, groupID{directory: "/work/repo-a"})
 }
 
+func TestConfirmationAllowsIssue48NavigationThatMovesCursor(t *testing.T) {
+	t.Run("next group", func(t *testing.T) {
+		rows := []session.Session{
+			{Key: key("a"), CWD: "/work/repo-a", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+			{Key: key("b"), CWD: "/work/repo-b"},
+		}
+		s := NewState()
+		s.SetRows(rows)
+		s.Handle(KeyEvent{Key: KeyCtrlX})
+		s.Handle(KeyEvent{Key: KeyRune, Rune: '}'})
+		if s.Confirmation != nil {
+			t.Fatal("successful group navigation must cancel confirmation")
+		}
+		requireSelectedSession(t, s, key("b"))
+	})
+
+	t.Run("previous group", func(t *testing.T) {
+		rows := []session.Session{
+			{Key: key("a"), CWD: "/work/repo-a"},
+			{Key: key("b"), CWD: "/work/repo-b", Actions: session.Actions{session.ActionArchive: {Available: true}}},
+		}
+		s := NewState()
+		s.SetRows(rows)
+		s.selectIndex(1)
+		s.Handle(KeyEvent{Key: KeyCtrlX})
+		s.Handle(KeyEvent{Key: KeyRune, Rune: '{'})
+		if s.Confirmation != nil {
+			t.Fatal("successful group navigation must cancel confirmation")
+		}
+		requireSelectedSession(t, s, key("a"))
+	})
+
+	t.Run("fold group", func(t *testing.T) {
+		rows := []session.Session{{
+			Key: key("a"), CWD: "/work/repo", Actions: session.Actions{session.ActionArchive: {Available: true}},
+		}}
+		s := NewState()
+		s.SetRows(rows)
+		s.Handle(KeyEvent{Key: KeyCtrlX})
+		s.Handle(KeyEvent{Key: KeyLeft})
+		if s.Confirmation != nil {
+			t.Fatal("successful fold must cancel confirmation")
+		}
+		requireControlCursor(t, s, listItemShowSessions, groupID{directory: "/work/repo"})
+	})
+
+	t.Run("expand control", func(t *testing.T) {
+		rows := foldingRows(11, "/work/repo", false)
+		rows[0].Actions = session.Actions{session.ActionArchive: {Available: true}}
+		s := NewState()
+		s.SetRows(rows)
+		s.Handle(KeyEvent{Key: KeyCtrlX})
+		focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+		s.Handle(KeyEvent{Key: KeyRight})
+		if s.Confirmation != nil {
+			t.Fatal("successful expansion must cancel confirmation")
+		}
+		requireSelectedSession(t, s, rows[10].Key)
+	})
+}
+
+func TestConfirmationSurvivesIssue48NavigationNoOp(t *testing.T) {
+	for _, ev := range []KeyEvent{
+		{Key: KeyLeft},
+		{Key: KeyRight},
+		{Key: KeyRune, Rune: '{'},
+		{Key: KeyRune, Rune: '}'},
+	} {
+		t.Run(fmt.Sprintf("key_%d_rune_%q", ev.Key, ev.Rune), func(t *testing.T) {
+			s := NewState()
+			s.SetRows([]session.Session{{
+				Key: key("a"), CWD: "/work/repo", Actions: session.Actions{session.ActionArchive: {Available: true}},
+			}})
+			s.Handle(KeyEvent{Key: KeyCtrlX})
+			if ev.Key == KeyLeft {
+				group := groupID{directory: "/work/repo"}
+				s.setGroupState(group, groupDisplayState{folded: true})
+				focusControl(t, &s, listItemShowSessions, group)
+			}
+			before := s.cursor
+			s.Handle(ev)
+			if s.Confirmation == nil {
+				t.Fatal("no-op navigation must preserve confirmation")
+			}
+			if s.cursor != before {
+				t.Fatalf("no-op navigation moved cursor from %+v to %+v", before, s.cursor)
+			}
+		})
+	}
+}
+
 func TestNonEmptyComposerKeepsEditingAndDispatchPriority(t *testing.T) {
 	s := NewState()
 	s.SetRows(foldingRows(11, "/work/repo", false))
@@ -232,6 +324,35 @@ func TestNonEmptyComposerKeepsEditingAndDispatchPriority(t *testing.T) {
 	if got := countListItems(s.selectableList(), listItemSession); got != 10 {
 		t.Fatalf("non-empty composer changed folding: visible=%d", got)
 	}
+}
+
+func TestWhitespaceOnlyEnterUsesEmptyPromptBehavior(t *testing.T) {
+	for _, prompt := range []string{"   ", "\n", " \n "} {
+		t.Run(fmt.Sprintf("prompt_%q", prompt), func(t *testing.T) {
+			s := NewState()
+			s.SetRows([]session.Session{{
+				Key: key("a"), CWD: "/work/repo", Actions: session.Actions{session.ActionOpen: {Available: true}},
+			}})
+			s.Composer.Prompt = prompt
+			intent := s.Handle(KeyEvent{Key: KeyEnter})
+			if intent.Kind != IntentOpen || intent.Key != key("a") {
+				t.Fatalf("intent=%+v, want empty-prompt Open behavior", intent)
+			}
+		})
+	}
+}
+
+func TestWhitespaceOnlyEnterStillExpandsSelectedControl(t *testing.T) {
+	rows := foldingRows(11, "/work/repo", false)
+	s := NewState()
+	s.SetRows(rows)
+	focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+	s.Composer.Prompt = "   "
+	intent := s.Handle(KeyEvent{Key: KeyEnter})
+	if intent.Kind == IntentDispatch {
+		t.Fatalf("whitespace-only prompt dispatched: %+v", intent)
+	}
+	requireSelectedSession(t, s, rows[10].Key)
 }
 
 func TestComposerCWDForControlRows(t *testing.T) {

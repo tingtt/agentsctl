@@ -393,8 +393,53 @@ func TestSelectedControlRowsRenderCursorAndBackground(t *testing.T) {
 			if !strings.HasPrefix(line, background) || !strings.HasPrefix(visibleText(line), "> ") {
 				t.Fatalf("selected control lacks cursor/background: %q", line)
 			}
+			if !strings.Contains(line, styleText(tt.text, colorGray)) {
+				t.Fatalf("selected control text is not gray: %q", line)
+			}
 			if strings.Contains(visibleText(line), "claude") {
 				t.Fatalf("control masquerades as a session row: %q", line)
+			}
+		})
+	}
+}
+
+func TestUnselectedControlRowsRenderGray(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*State)
+		text  string
+	}{
+		{
+			name: "Show more",
+			setup: func(s *State) {
+				s.SetRows(foldingRows(11, "/work/repo", false))
+			},
+			text: "Show more",
+		},
+		{
+			name: "Show sessions",
+			setup: func(s *State) {
+				s.SetRows(append(
+					foldingRows(11, "/work/repo-a", false),
+					foldingRows(1, "/work/repo-b", false)...,
+				))
+				s.selectIndex(0)
+				s.Handle(KeyEvent{Key: KeyLeft})
+				s.Handle(KeyEvent{Key: KeyRune, Rune: '}'})
+			},
+			text: "Show sessions",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			tt.setup(&s)
+			line := renderedSessionLine(t, s.View(80, 30), tt.text)
+			if !strings.Contains(line, styleText(tt.text, colorGray)) {
+				t.Fatalf("unselected control text is not gray: %q", line)
+			}
+			if strings.HasPrefix(line, "\x1b["+selectedRowBackgroundCode+"m") {
+				t.Fatalf("unselected control has selected background: %q", line)
 			}
 		})
 	}
