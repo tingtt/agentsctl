@@ -42,7 +42,11 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           OUTPUT="agentsctl-${GOOS}-${GOARCH}"
-          go build -trimpath -ldflags="-s -w" -o "$OUTPUT" ./cmd/agentsctl
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X github.com/tingtt/agentsctl/internal/version.Version=${GITHUB_REF_NAME}" \
+            -o "$OUTPUT" \
+            ./cmd/agentsctl
           echo "OUTPUT=$OUTPUT" >> "$GITHUB_ENV"
 
       - name: Upload artifact
