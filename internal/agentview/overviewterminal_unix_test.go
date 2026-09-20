@@ -62,10 +62,13 @@ func TestOverviewTerminalSuspendsAndResumesOwnership(t *testing.T) {
 		t.Fatalf("closed mode=%q, want original %q", got, original)
 	}
 
-	want := "\x1b[?1049h\x1b[?25l" +
-		"\x1b[0m\x1b[?25h\x1b[?1049l" +
-		"\x1b[?1049h\x1b[?25l" +
-		"\x1b[0m\x1b[?25h\x1b[?1049l"
+	// Bracketed paste is the overview's last mode in and first mode out, so it
+	// is never enabled outside the alternate screen the overview owns.
+	const (
+		start = "\x1b[?1049h" + "\x1b[?25l" + "\x1b[?2004h"
+		stop  = "\x1b[?2004l" + "\x1b[0m" + "\x1b[?25h" + "\x1b[?1049l"
+	)
+	want := start + stop + start + stop
 	if got := output.String(); got != want {
 		t.Fatalf("terminal sequence order=%q, want %q", got, want)
 	}

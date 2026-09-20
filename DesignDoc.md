@@ -454,6 +454,25 @@ temporary file は prompt 本文だけを private file として保持する。l
 
 Vim 起動前の Composer を snapshot とし、Vim が正常終了して temporary file を読み戻せた場合だけ保存内容へ置き換える。`:q!` の未保存変更、Vim の起動・終了失敗、file read failure では snapshot を維持する。editor から戻ること自体は dispatch / session start を一切生成せず、送信には従来どおり明示的な submit が必要となる。stash は Vim の保存内容を適用しても変更しない。
 
+##### Multiline paste
+
+terminal の入力は、物理 key か貼り付けかのどちらか1つの event に decode され、その後で Agent View の state が Intent へ解決する。
+
+```text
+terminal bytes
+  -> physical KeyEvent or PasteEvent
+  -> Agent View state
+  -> Intent
+```
+
+Agent View が overview を所有している間は bracketed paste mode (DECSET 2004) を有効にする。terminal からの `ESC[200~ ... ESC[201~` は、read の境界にかかわらずちょうど1つの PasteEvent になる。PasteEvent は物理 key ではないため `Key` の値としては表さない。marker は内容に含まれず、payload の内側は CR / LF / ESC / 制御 byte / escape sequence を含めてすべて貼り付けられた内容であり、key や escape sequence としては解釈しない。payload の長さに固定の上限は設けず、終端 marker の前に入力が尽きた paste は破棄して読み取りを終える。
+
+改行の正規化は terminal decoder ではなく、貼り付けた text を editor model へ適用する境界で行う (CRLF、次に単独の CR、を `\n` へ)。decoder は payload を加工せず渡す。
+
+PasteEvent は現在の text-edit target の cursor 位置へ挿入する。既存の内容は置き換えず、cursor は挿入した text の末尾へ移り、位置は Composer と同じ rune index で数える。inline rename 中は rename の入力欄が target になる。rename は単一行であり (Claude の native rename は PTY へ `/rename <name>` を入力するため、name 内の改行は途中で submit されてしまう)、貼り付けた改行は空でない行を1つの空白で連結して取り込む。confirmation の pending 中は、通常の文字入力と同様に paste は何もしない。
+
+paste は editor の変更だけであり、payload の改行が何個含まれていても dispatch / open / rename を生成しない。貼り付けた全文を1つの prompt として送るのは、その後に物理的な plain Enter が押されたときだけである。
+
 ##### Multiline cursor navigation
 
 prompt が複数行になっている間は、`↑` / `↓` は session selection ではなく Composer 内の行移動を優先する。単一行 (空を含む) の間は従来どおり session selection を移動する。
@@ -467,6 +486,10 @@ Attach すると、Agent View から対象 CLI へ terminal を明け渡す。
 Detach すると、session を停止せず Agent View へ戻る。
 
 Agent View の raw mode と overview 固有 terminal mode は1つの lifecycle boundary が所有する。foreground の Vim へ terminal を明け渡す場合は overview mode を解除して Agent View 起動前の terminal mode を復元し、Vim の終了後は raw / overview mode を再取得して full redraw する。Vim の実行中は Agent View の key read を開始せず、terminal ownership の再取得に失敗した場合は次の key loop を開始せず cleanup して終了する。overview 固有 mode が増える場合も、この同じ boundary の enter / leave に集約する。
+
+overview が所有する terminal mode は raw mode、alternate screen、cursor の非表示、bracketed paste である。overview が active な間だけこれらを所有し、foreground の Open / 外部 editor は overview の suspend の後にはじめて terminal を受け取る。Open は provider を区別しない共通の foreground handoff であり、`suspend -> Open -> resume` の順に実行する。Open が失敗しても resume は必ず試み、suspend に失敗した場合は Open を実行しない。resume に失敗した場合は Open の error と合わせて (どちらも失わずに) terminal ownership の失敗として扱う。戻ったときの resume が overview 所有の mode (bracketed paste を含む) をすべて再確立する。
+
+attach client が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
 
 **Claude**
 

@@ -106,6 +106,7 @@ func newTestRuntime(provider *fakeProvider) *Runtime {
 		Controller: sessionctl.Controller{Providers: []sessionctl.Source{provider}, Pins: &fakePins{}},
 		State:      NewState(),
 		CWD:        "/work",
+		terminal:   &fakeOverviewLifecycle{},
 	}
 	rt.syncReload(context.Background())
 	return rt
@@ -369,6 +370,7 @@ func codexIdentityRuntime(t *testing.T) (rt *Runtime, pins *fakePins, bind func(
 		Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: pins},
 		State:      NewState(),
 		CWD:        "/work",
+		terminal:   &fakeOverviewLifecycle{},
 	}
 	rt.syncReload(context.Background())
 	return rt, pins, func() { p.rows = []session.Session{bound, other} }

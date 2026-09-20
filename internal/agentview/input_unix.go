@@ -12,7 +12,9 @@ package agentview
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
+	"io"
 	"os"
 	"syscall"
 
@@ -67,16 +69,50 @@ type KeyEvent struct {
 	Rune rune // valid only when Key == KeyRune
 }
 
-// readKey decodes one KeyEvent from r, blocking for at least one byte.
-func readKey(r *bufio.Reader) (KeyEvent, error) {
-	return readKeyWithEscapeWait(r, nil)
+// InputEventKind tells which payload of an InputEvent is meaningful.
+type InputEventKind int
+
+const (
+	// InputKey is one physical key press (InputEvent.Key).
+	InputKey InputEventKind = iota
+	// InputPaste is one whole bracketed paste (InputEvent.Paste).
+	InputPaste
+)
+
+// InputEvent is one decoded terminal input: either a physical key or a
+// bracketed paste. A paste is deliberately not a Key -- it is not a physical
+// key, and its payload (CR, LF, ESC, control bytes, ...) is content that
+// carries no key semantics. See the DesignDoc's terminal bytes -> KeyEvent or
+// PasteEvent -> State -> Intent pipeline.
+type InputEvent struct {
+	Kind InputEventKind
+	Key  KeyEvent // valid only when Kind == InputKey
+	// Paste is the raw payload between the bracketed paste markers, exactly as
+	// the terminal sent it: no marker bytes, no newline normalization.
+	Paste string // valid only when Kind == InputPaste
 }
 
-// readTerminalKey is readKey with a real poll-based wait for a bare ESC's
+func keyInput(ev KeyEvent) InputEvent { return InputEvent{Kind: InputKey, Key: ev} }
+
+func pasteInput(text string) InputEvent { return InputEvent{Kind: InputPaste, Paste: text} }
+
+// Bracketed paste framing (DECSET 2004): the terminal wraps pasted text in
+// these markers.
+const (
+	bracketedPasteBeginCSI = "200~"
+	bracketedPasteEnd      = "\x1b[201~"
+)
+
+// readInput decodes one InputEvent from r, blocking for at least one byte.
+func readInput(r *bufio.Reader) (InputEvent, error) {
+	return readInputWithEscapeWait(r, nil)
+}
+
+// readTerminalInput is readInput with a real poll-based wait for a bare ESC's
 // possible following bytes, distinguishing a standalone Esc press from the
 // start of a multi-byte escape sequence racing this read.
-func readTerminalKey(r *bufio.Reader, input *os.File) (KeyEvent, error) {
-	return readKeyWithEscapeWait(r, func() (bool, error) {
+func readTerminalInput(r *bufio.Reader, input *os.File) (InputEvent, error) {
+	return readInputWithEscapeWait(r, func() (bool, error) {
 		fds := []unix.PollFd{{Fd: int32(input.Fd()), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 30)
 		if errors.Is(err, syscall.EINTR) {
@@ -86,38 +122,60 @@ func readTerminalKey(r *bufio.Reader, input *os.File) (KeyEvent, error) {
 	})
 }
 
-// readKeyWithEscapeWait is the single physical-decoding entry point:
-// terminal bytes in, KeyEvent out, nothing else. wait (nil in tests that
-// don't care about the standalone-Esc race) reports whether more input is
-// ready without blocking indefinitely.
-func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (KeyEvent, error) {
+// readBracketedPaste reads a paste payload up to and including its end
+// marker, after the begin marker has already been consumed. Everything before
+// the end marker is content -- never re-fed to the key decoder -- and there is
+// no size limit: only the end marker or a read error (including EOF, which
+// discards the unterminated paste) ends it, so no read boundary matters.
+func readBracketedPaste(r *bufio.Reader) (InputEvent, error) {
+	var payload []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return InputEvent{}, err
+		}
+		payload = append(payload, b)
+		if b == bracketedPasteEnd[len(bracketedPasteEnd)-1] && bytes.HasSuffix(payload, []byte(bracketedPasteEnd)) {
+			return pasteInput(string(payload[:len(payload)-len(bracketedPasteEnd)])), nil
+		}
+	}
+}
+
+// readInputWithEscapeWait is the single terminal decoding entry point: bytes
+// in, one InputEvent out (a physical key, or one whole bracketed paste),
+// nothing else. wait (nil in tests that don't care about the standalone-Esc
+// race) reports whether more input is ready without blocking indefinitely.
+func readInputWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (InputEvent, error) {
 	b, err := r.ReadByte()
 	if err != nil {
-		return KeyEvent{}, err
+		return InputEvent{}, err
 	}
 	switch b {
 	case 0x1b:
 		if r.Buffered() == 0 {
 			if wait == nil {
-				return KeyEvent{Key: KeyEsc}, nil
+				return keyInput(KeyEvent{Key: KeyEsc}), nil
 			}
 			ready, err := wait()
 			if err != nil {
-				return KeyEvent{}, err
+				return InputEvent{}, err
 			}
 			if !ready {
-				return KeyEvent{Key: KeyEsc}, nil
+				return keyInput(KeyEvent{Key: KeyEsc}), nil
 			}
 		}
 		next, err := r.ReadByte()
 		if err != nil {
-			return KeyEvent{}, err
+			return InputEvent{}, err
 		}
 		if next == '\r' || next == '\n' {
 			// Option+Enter: the Option key follows the classic "meta sends
 			// escape" convention, so it arrives as ESC followed by
 			// whatever byte that terminal sends for plain Enter.
-			return KeyEvent{Key: KeyNewline}, nil
+			return keyInput(KeyEvent{Key: KeyNewline}), nil
 		}
 		if next == 'O' {
 			// SS3-form keys (ESC O <letter>), not just the CSI form. The
@@ -126,90 +184,92 @@ func readKeyWithEscapeWait(r *bufio.Reader, wait func() (bool, error)) (KeyEvent
 			// DECCKM/application-cursor-key mode.
 			final, err := r.ReadByte()
 			if err != nil {
-				return KeyEvent{}, err
+				return InputEvent{}, err
 			}
 			switch final {
 			case 'H':
-				return KeyEvent{Key: KeyHome}, nil
+				return keyInput(KeyEvent{Key: KeyHome}), nil
 			case 'F':
-				return KeyEvent{Key: KeyEnd}, nil
+				return keyInput(KeyEvent{Key: KeyEnd}), nil
 			case 'A':
-				return KeyEvent{Key: KeyUp}, nil
+				return keyInput(KeyEvent{Key: KeyUp}), nil
 			case 'B':
-				return KeyEvent{Key: KeyDown}, nil
+				return keyInput(KeyEvent{Key: KeyDown}), nil
 			case 'C':
-				return KeyEvent{Key: KeyRight}, nil
+				return keyInput(KeyEvent{Key: KeyRight}), nil
 			case 'D':
-				return KeyEvent{Key: KeyLeft}, nil
+				return keyInput(KeyEvent{Key: KeyLeft}), nil
 			}
-			return KeyEvent{Key: KeyUnknown}, nil
+			return keyInput(KeyEvent{Key: KeyUnknown}), nil
 		}
 		if next != '[' {
-			return KeyEvent{Key: KeyUnknown}, nil
+			return keyInput(KeyEvent{Key: KeyUnknown}), nil
 		}
 		sequence, err := readCSI(r)
 		if err != nil {
-			return KeyEvent{}, err
+			return InputEvent{}, err
 		}
 		switch sequence {
+		case bracketedPasteBeginCSI:
+			return readBracketedPaste(r)
 		case "Z":
-			return KeyEvent{Key: KeyShiftTab}, nil
+			return keyInput(KeyEvent{Key: KeyShiftTab}), nil
 		case "A":
-			return KeyEvent{Key: KeyUp}, nil
+			return keyInput(KeyEvent{Key: KeyUp}), nil
 		case "B":
-			return KeyEvent{Key: KeyDown}, nil
+			return keyInput(KeyEvent{Key: KeyDown}), nil
 		case "C":
-			return KeyEvent{Key: KeyRight}, nil
+			return keyInput(KeyEvent{Key: KeyRight}), nil
 		case "D":
-			return KeyEvent{Key: KeyLeft}, nil
+			return keyInput(KeyEvent{Key: KeyLeft}), nil
 		case "H", "1~", "7~":
-			return KeyEvent{Key: KeyHome}, nil
+			return keyInput(KeyEvent{Key: KeyHome}), nil
 		case "F", "4~", "8~":
-			return KeyEvent{Key: KeyEnd}, nil
+			return keyInput(KeyEvent{Key: KeyEnd}), nil
 		case "3~":
-			return KeyEvent{Key: KeyDelete}, nil
+			return keyInput(KeyEvent{Key: KeyDelete}), nil
 		}
-		return KeyEvent{Key: KeyUnknown}, nil
+		return keyInput(KeyEvent{Key: KeyUnknown}), nil
 	case '\r':
-		return KeyEvent{Key: KeyEnter}, nil
+		return keyInput(KeyEvent{Key: KeyEnter}), nil
 	case '\n':
 		// Shift+Enter: plain Enter sends CR, Shift+Enter sends a bare LF
 		// instead -- the same CR-vs-LF distinction readline/fish/tmux rely
 		// on for this key combination.
-		return KeyEvent{Key: KeyNewline}, nil
+		return keyInput(KeyEvent{Key: KeyNewline}), nil
 	case 0x7f, 0x08:
-		return KeyEvent{Key: KeyBackspace}, nil
+		return keyInput(KeyEvent{Key: KeyBackspace}), nil
 	case 0x0f:
-		return KeyEvent{Key: KeyCtrlO}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlO}), nil
 	case 0x14:
-		return KeyEvent{Key: KeyCtrlT}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlT}), nil
 	case 0x07:
-		return KeyEvent{Key: KeyCtrlG}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlG}), nil
 	case 0x1f:
-		return KeyEvent{Key: KeyCtrlSlash}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlSlash}), nil
 	case 0x18:
-		return KeyEvent{Key: KeyCtrlX}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlX}), nil
 	case 0x12:
-		return KeyEvent{Key: KeyCtrlR}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlR}), nil
 	case 0x13:
-		return KeyEvent{Key: KeyCtrlS}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlS}), nil
 	case 0x0c:
-		return KeyEvent{Key: KeyCtrlL}, nil
+		return keyInput(KeyEvent{Key: KeyCtrlL}), nil
 	}
 	if b < 0x20 {
-		return KeyEvent{Key: KeyUnknown}, nil
+		return keyInput(KeyEvent{Key: KeyUnknown}), nil
 	}
 	if b >= 0x80 {
 		if err := r.UnreadByte(); err != nil {
-			return KeyEvent{}, err
+			return InputEvent{}, err
 		}
 		rn, _, err := r.ReadRune()
 		if err != nil {
-			return KeyEvent{}, err
+			return InputEvent{}, err
 		}
-		return KeyEvent{Key: KeyRune, Rune: rn}, nil
+		return keyInput(KeyEvent{Key: KeyRune, Rune: rn}), nil
 	}
-	return KeyEvent{Key: KeyRune, Rune: rune(b)}, nil
+	return keyInput(KeyEvent{Key: KeyRune, Rune: rune(b)}), nil
 }
 
 func readCSI(r *bufio.Reader) (string, error) {

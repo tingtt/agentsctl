@@ -295,7 +295,7 @@ func TestRenameOnlySessionConvergesWithoutManualReload(t *testing.T) {
 	keyIn := make(chan keyResult)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) { r := <-keyIn; return r.ev, r.err })
+		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (InputEvent, error) { r := <-keyIn; return r.ev, r.err })
 	}()
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(latestFrame(out.String()), "Starting (Waiting rename)") })
 
@@ -376,14 +376,14 @@ func TestReloadSupersedesBlockedTargetedRefresh(t *testing.T) {
 	keyIn := make(chan keyResult)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) { r := <-keyIn; return r.ev, r.err })
+		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (InputEvent, error) { r := <-keyIn; return r.ev, r.err })
 	}()
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(latestFrame(out.String()), "Starting (Waiting rename)") })
 
 	fire("first round")
 	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 2 }) // A is running and never returns
 
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlL}} // full reload while A is in flight
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlL})} // full reload while A is in flight
 	waitFor(t, 2*time.Second, func() bool { return p.cancelled.Load() == 1 })
 
 	fire("round after the reload") // only armed once the reload completed with Starting still listed
@@ -500,7 +500,7 @@ func TestEventLoopExitCancelsTargetedRefresh(t *testing.T) {
 	keyIn := make(chan keyResult)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) { r := <-keyIn; return r.ev, r.err })
+		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (InputEvent, error) { r := <-keyIn; return r.ev, r.err })
 	}()
 	select {
 	case clock.fire <- time.Now():

@@ -166,9 +166,9 @@ func TestPromptEditorFailureUsesAgentViewErrorPath(t *testing.T) {
 		return errors.New("cannot start")
 	}
 	inputs := make(chan keyResult, 2)
-	inputs <- keyResult{ev: KeyEvent{Key: KeyCtrlG}}
+	inputs <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlG})}
 	inputs <- keyResult{err: io.EOF}
-	err := rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) {
+	err := rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (InputEvent, error) {
 		result := <-inputs
 		return result.ev, result.err
 	})
@@ -261,7 +261,7 @@ func TestEventLoopHandsTerminalToPromptEditorAndAcceptsLaterInput(t *testing.T) 
 	}
 	var reads atomic.Int32
 	inputs := make(chan keyResult, 3)
-	readKey := func(*bufio.Reader) (KeyEvent, error) {
+	readKey := func(*bufio.Reader) (InputEvent, error) {
 		reads.Add(1)
 		result := <-inputs
 		return result.ev, result.err
@@ -285,8 +285,8 @@ func TestEventLoopHandsTerminalToPromptEditorAndAcceptsLaterInput(t *testing.T) 
 		}
 		return os.WriteFile(path, []byte("保存済み\nnext\n"), 0o600)
 	}
-	inputs <- keyResult{ev: KeyEvent{Key: KeyCtrlG}}
-	inputs <- keyResult{ev: KeyEvent{Key: KeyRune, Rune: '!'}}
+	inputs <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlG})}
+	inputs <- keyResult{ev: keyInput(KeyEvent{Key: KeyRune, Rune: '!'})}
 	inputs <- keyResult{err: io.EOF}
 	if err := rt.eventLoop(context.Background(), bufio.NewReader(slave), readKey); !errors.Is(err, io.EOF) {
 		t.Fatalf("eventLoop error=%v, want EOF after verification input", err)
@@ -309,10 +309,10 @@ func TestEventLoopHandsTerminalToPromptEditorAndAcceptsLaterInput(t *testing.T) 
 
 	sequence := out.String()
 	controls := []string{
-		"\x1b[?1049h\x1b[?25l",
-		"\x1b[0m\x1b[?25h\x1b[?1049l",
-		"\x1b[?1049h\x1b[?25l",
-		"\x1b[0m\x1b[?25h\x1b[?1049l",
+		overviewBeginModes,
+		overviewEndModes,
+		overviewBeginModes,
+		overviewEndModes,
 	}
 	for _, control := range controls {
 		index := strings.Index(sequence, control)
@@ -330,10 +330,10 @@ func TestEventLoopStopsReadingWhenTerminalResumeFails(t *testing.T) {
 		return os.WriteFile(path, []byte("saved\n"), 0o600)
 	}
 	inputs := make(chan keyResult, 2)
-	inputs <- keyResult{ev: KeyEvent{Key: KeyCtrlG}}
-	inputs <- keyResult{ev: KeyEvent{Key: KeyRune, Rune: '!'}}
+	inputs <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlG})}
+	inputs <- keyResult{ev: keyInput(KeyEvent{Key: KeyRune, Rune: '!'})}
 	var reads atomic.Int32
-	err := rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (KeyEvent, error) {
+	err := rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), func(*bufio.Reader) (InputEvent, error) {
 		reads.Add(1)
 		result := <-inputs
 		return result.ev, result.err

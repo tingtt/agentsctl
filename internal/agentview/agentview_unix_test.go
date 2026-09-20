@@ -106,13 +106,13 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-// fakeReadKey returns an eventLoop-compatible readKeyFn driven entirely by
+// fakeReadKey returns an eventLoop-compatible readInputFn driven entirely by
 // ch: each call blocks until the test sends one keyResult, giving the test
 // deterministic, one-key-at-a-time control over what Run's one-shot
 // key-read goroutine (see startKeyRead) observes -- never a real terminal
 // or a time-based guess.
-func fakeReadKey(ch <-chan keyResult) func(*bufio.Reader) (KeyEvent, error) {
-	return func(*bufio.Reader) (KeyEvent, error) {
+func fakeReadKey(ch <-chan keyResult) func(*bufio.Reader) (InputEvent, error) {
+	return func(*bufio.Reader) (InputEvent, error) {
 		r := <-ch
 		return r.ev, r.err
 	}
@@ -369,7 +369,7 @@ func TestEventLoopHandlesExactlyOneReloadPerKey(t *testing.T) {
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlSlash}}
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlSlash})}
 	waitFor(t, 2*time.Second, func() bool { return p.listCalls.Load() == baseline+1 })
 
 	// Give any errant duplicate a bounded window to show up, then confirm
@@ -425,7 +425,7 @@ func TestEventLoopHasNoOutstandingReaderWhileOpenOwnsInput(t *testing.T) {
 		openCalled:   make(chan struct{}),
 		readDone:     make(chan struct{}),
 	}
-	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: &fakePins{}}, State: NewState(), Input: inR, Output: &syncBuffer{}, CWD: "/work"}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{p}, Pins: &fakePins{}}, State: NewState(), Input: inR, Output: &syncBuffer{}, CWD: "/work", terminal: &fakeOverviewLifecycle{}}
 	rt.syncReload(context.Background())
 	rt.State.selectIndex(0)
 
@@ -435,7 +435,7 @@ func TestEventLoopHasNoOutstandingReaderWhileOpenOwnsInput(t *testing.T) {
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyEnter}} // empty composer + selection -> IntentOpen
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyEnter})} // empty composer + selection -> IntentOpen
 
 	select {
 	case <-p.openCalled:
@@ -554,7 +554,7 @@ func TestInitialCatalogLoadDoesNotBlockInput(t *testing.T) {
 
 	// Typing is purely local UI state (IntentNone) -- it must reach
 	// rendered output on its own, with the catalog List still blocked.
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyRune, Rune: 'H'}}
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyRune, Rune: 'H'})}
 	waitFor(t, 2*time.Second, func() bool { return bytes.Contains([]byte(out.String()), []byte("H")) })
 
 	close(call.release) // let the blocked List finish, rather than leak it
@@ -602,7 +602,7 @@ func TestCtrlLRefreshKeepsOldRowsVisibleAndInputResponsive(t *testing.T) {
 		loopDone <- rt.eventLoop(context.Background(), bufio.NewReader(rt.Input), fakeReadKey(keyIn))
 	}()
 
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyCtrlL}} // bindingRefresh
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyCtrlL})} // bindingRefresh
 	refresh := awaitCall(t, p.calls, 2*time.Second)
 
 	waitFor(t, 2*time.Second, func() bool {
@@ -613,7 +613,7 @@ func TestCtrlLRefreshKeepsOldRowsVisibleAndInputResponsive(t *testing.T) {
 	})
 
 	// Input keeps working while the refresh is still blocked.
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyRune, Rune: 'Z'}}
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyRune, Rune: 'Z'})}
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(latestFrame(out.String()), "Z") })
 
 	// Release the refresh with different content -- the old rows must be
@@ -826,7 +826,7 @@ func TestFastProviderRowsAppearBeforeSlowProviderCompletes(t *testing.T) {
 
 	// It must also stay actionable: typing into the composer works while
 	// ChatGPT's List is still blocked.
-	keyIn <- keyResult{ev: KeyEvent{Key: KeyRune, Rune: 'Q'}}
+	keyIn <- keyResult{ev: keyInput(KeyEvent{Key: KeyRune, Rune: 'Q'})}
 	waitFor(t, 2*time.Second, func() bool { return strings.Contains(latestFrame(out.String()), "Q") })
 
 	slowFP.rows = []session.Session{{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "SlowRow", CWD: "/work"}}

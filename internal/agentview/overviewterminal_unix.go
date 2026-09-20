@@ -81,12 +81,22 @@ func (t *overviewTerminal) close() error {
 	return errors.Join(terminalErr, restoreErr)
 }
 
+// Terminal modes owned by the overview while it is active. Bracketed paste
+// (DECSET 2004) is one of them: it is enabled last on start/resume and
+// disabled first on suspend/close, so a foreground child (external editor,
+// attached session) never inherits it from the overview and establishes its
+// own.
+const (
+	overviewBeginModes = "\x1b[?1049h\x1b[?25l\x1b[?2004h"
+	overviewEndModes   = "\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l"
+)
+
 func beginTerminal(w io.Writer) error {
-	_, err := io.WriteString(w, "\x1b[?1049h\x1b[?25l")
+	_, err := io.WriteString(w, overviewBeginModes)
 	return err
 }
 
 func endTerminal(w io.Writer) error {
-	_, err := io.WriteString(w, "\x1b[0m\x1b[?25h\x1b[?1049l")
+	_, err := io.WriteString(w, overviewEndModes)
 	return err
 }

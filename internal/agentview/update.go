@@ -39,6 +39,56 @@ type Intent struct {
 	Name     string             // IntentRename
 }
 
+// HandleInput resolves one decoded InputEvent: a key goes through Handle, a
+// paste through HandlePaste. The two never convert into each other -- a
+// paste's newlines are content, not Enter.
+func (s *State) HandleInput(ev InputEvent) Intent {
+	if ev.Kind == InputPaste {
+		return s.HandlePaste(ev.Paste)
+	}
+	return s.Handle(ev.Key)
+}
+
+// HandlePaste applies one bracketed paste to the current text-edit target
+// (the inline rename editor while one is active, otherwise the composer) at
+// its cursor. A paste only ever mutates an editor: it never returns a
+// dispatch, open, or rename intent, however many newlines it contains --
+// submitting is a separate, later physical Enter.
+func (s *State) HandlePaste(text string) Intent {
+	text = normalizePastedNewlines(text)
+	switch {
+	case s.Rename.Active:
+		// Session names are single-line (Claude applies a rename by typing
+		// "/rename <name>" into a PTY, where a newline would submit early),
+		// so newlines fold into spaces rather than being stored or submitting.
+		s.Rename.insert(foldPastedLines(text))
+	case s.Confirmation != nil:
+		// Like typed runes, text has no meaning while a confirmation is pending.
+	default:
+		s.Composer.InsertAtCursor(text)
+	}
+	return Intent{}
+}
+
+// normalizePastedNewlines converts pasted text to the editor's internal "\n"
+// newline: CRLF first (so it never becomes two newlines), then a lone CR.
+func normalizePastedNewlines(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.ReplaceAll(text, "\r", "\n")
+}
+
+// foldPastedLines joins the non-empty lines of newline-normalized text with
+// one space each, dropping leading, trailing, and repeated newlines.
+func foldPastedLines(text string) string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, " ")
+}
+
 // Handle resolves one physically-decoded KeyEvent into an Intent, given
 // the current State -- the only place a key's meaning is decided. The
 // same KeyEsc means "cancel rename" while renaming, "cancel confirmation"
