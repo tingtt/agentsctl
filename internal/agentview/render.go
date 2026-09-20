@@ -42,7 +42,7 @@ func (s State) View(width, height int) string {
 				}
 				line := cursor + " " + styleText(label, colorGray)
 				if selected {
-					line = styleText(line, selectedRowBackgroundCode)
+					line = styleText(fitCells(line, width), selectedRowBackgroundCode)
 				}
 				list = append(list, displayLine{text: clipLine(line, width), itemID: item.id, selectable: true})
 				continue

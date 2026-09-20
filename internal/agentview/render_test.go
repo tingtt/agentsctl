@@ -3,6 +3,7 @@ package agentview
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
@@ -349,6 +350,31 @@ func ansiOpenAtLineEnd(line string) bool {
 	return open
 }
 
+func backgroundCoversLastCell(line, backgroundCode string) bool {
+	active := false
+	lastCellCovered := false
+	background := "\x1b[" + backgroundCode + "m"
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b {
+			j := skipANSI(line, i)
+			switch line[i:j] {
+			case "\x1b[0m":
+				active = false
+			case background:
+				active = true
+			}
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if runeCells(r) > 0 {
+			lastCellCovered = active
+		}
+		i += size
+	}
+	return lastCellCovered
+}
+
 // TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth is a
 // representative narrow-terminal guarantee for #14's new list rendering:
 // a Pinned row's directory column, a directory group heading, the
@@ -388,16 +414,30 @@ func TestSelectedControlRowsRenderCursorAndBackground(t *testing.T) {
 			} else {
 				focusControl(t, &s, listItemShowMore, group)
 			}
-			view := s.View(80, 30)
-			line := renderedSessionLine(t, view, tt.text)
-			if !strings.HasPrefix(line, background) || !strings.HasPrefix(visibleText(line), "> ") {
-				t.Fatalf("selected control lacks cursor/background: %q", line)
-			}
-			if !strings.Contains(line, styleText(tt.text, colorGray)) {
-				t.Fatalf("selected control text is not gray: %q", line)
-			}
-			if strings.Contains(visibleText(line), "claude") {
-				t.Fatalf("control masquerades as a session row: %q", line)
+			for _, width := range []int{1, 2, 3, 8, 20, 80} {
+				view := s.View(width, 30)
+				line := renderedSessionLine(t, view, background)
+				if !strings.HasPrefix(line, background) {
+					t.Fatalf("width=%d: selected control lacks background: %q", width, line)
+				}
+				if got := lineCells(line); got != width {
+					t.Fatalf("width=%d: selected control width=%d: %q", width, got, line)
+				}
+				if !backgroundCoversLastCell(line, selectedRowBackgroundCode) {
+					t.Fatalf("width=%d: selected background does not cover final cell: %q", width, line)
+				}
+				if ansiOpenAtLineEnd(line) {
+					t.Fatalf("width=%d: selected control leaves dangling ANSI style: %q", width, line)
+				}
+				if width >= lineCells("> "+tt.text) && !strings.Contains(line, styleText(tt.text, colorGray)) {
+					t.Fatalf("width=%d: selected control text is not gray: %q", width, line)
+				}
+				if width >= 2 && !strings.HasPrefix(visibleText(line), "> ") {
+					t.Fatalf("width=%d: selected control lacks cursor: %q", width, line)
+				}
+				if strings.Contains(visibleText(line), "claude") {
+					t.Fatalf("width=%d: control masquerades as a session row: %q", width, line)
+				}
 			}
 		})
 	}
