@@ -26,6 +26,12 @@ type State struct {
 	// localstate or the session domain.
 	groupStates map[groupID]groupDisplayState
 
+	// requested is the one-shot desired selection registered after a
+	// successful composer dispatch (see RequestSelection). It is kept apart
+	// from cursor: it has no effect on the visible selection until the
+	// authoritative catalog exposes the identity.
+	requested requestedSelection
+
 	// Provider is the composer's current dispatch target, cycled by
 	// Shift+Tab.
 	Provider session.ProviderID
@@ -117,6 +123,23 @@ func NewState() State {
 	}
 }
 
+// requestedSelection is a transient "select this session once it appears"
+// request. The zero value means no request.
+type requestedSelection struct {
+	key     session.Key
+	pending bool
+}
+
+// RequestSelection registers key -- the identity a successful dispatch
+// returned -- as the session to select once the authoritative catalog
+// exposes it (see SetRows). It never touches Rows: the catalog stays
+// provider-owned, and until key (or its provider-stated successor) appears
+// the current selection is unaffected. A newer request replaces an
+// unresolved older one; the request is consumed on resolution.
+func (s *State) RequestSelection(key session.Key) {
+	s.requested = requestedSelection{key: key, pending: true}
+}
+
 // SetRows installs rows as the current catalog snapshot, preserving
 // selection identity (see the DesignDoc's "selection identity は
 // session.Key"): if the previously-selected session (or, while renaming,
@@ -138,6 +161,13 @@ func NewState() State {
 // provider-stated transitions; it never derives an old/new relationship
 // itself.
 //
+// A pending RequestSelection is resolved here too, ahead of everything
+// above: once its key -- or the canonical key session.IdentityTransitions
+// maps it to -- is in rows, that session is revealed (see
+// ensureSessionVisible), selected, and the request is consumed. While
+// neither is present the request is left intact and reconciliation runs
+// unchanged, so unrelated snapshots never move the selection.
+//
 // Pending confirmations are NOT cleared here: the DesignDoc requires a
 // row notice to follow its session across a Refresh, not just a local
 // Pin/reorder (see PendingConfirmation) -- it naturally stops rendering
@@ -154,6 +184,9 @@ func (s *State) SetRows(rows []session.Session) {
 	s.Rows = rows
 	moved := session.IdentityTransitions(rows)
 	s.followIdentity(moved)
+	if s.resolveRequestedSelection(moved) {
+		return
+	}
 	if tracking && target.kind == listItemSession {
 		if next, ok := moved[target.sessionKey]; ok {
 			target = sessionItemID(next)
@@ -180,6 +213,26 @@ func (s *State) SetRows(rows []session.Session) {
 		return
 	}
 	s.cursor, s.hasCursor = listItemID{}, false
+}
+
+// resolveRequestedSelection selects the requested session if the catalog now
+// exposes it, directly or through a validated identity transition, and
+// consumes the request. A rename in progress defers resolution so the
+// cursor is not pulled away from the rename target.
+func (s *State) resolveRequestedSelection(moved map[session.Key]session.Key) bool {
+	if !s.requested.pending || s.Rename.Active {
+		return false
+	}
+	target := s.requested.key
+	if next, ok := moved[target]; ok {
+		target = next
+	}
+	if !s.ensureSessionVisible(target) {
+		return false
+	}
+	s.cursor, s.hasCursor = sessionItemID(target), true
+	s.requested = requestedSelection{}
+	return true
 }
 
 func nearbySurvivingItem(oldModel, newModel selectableList, target listItemID) (listItemID, bool) {
