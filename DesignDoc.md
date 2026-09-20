@@ -90,6 +90,16 @@ session は作成時刻が新しい順に並べる。Activity や runtime status
 
 grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺へ selection を移す。また、provider が session の identity transition (provisional key から canonical key への変更) を明示した場合は、selection は canonical key へ移る (「Codex provisional session identity」を参照)。
 
+Directory group は session を10件単位で表示する。初期状態は先頭10件までとし、残りがあれば selectable な `Show more` row を末尾に置く。Composer が空のとき、`Show more` 上の `Enter` または `→` は次の最大10件を開き、最初に追加された session へ cursor を移す。session 上の `←` はその session を含む10件 block 以降を閉じ、先頭 block 上では group 全体を selectable な `Show sessions` row へ畳む。`Show sessions` 上の `Enter` または `→` は初期状態へ戻し、先頭 session を選ぶ。Pinned group は pagination せず、全 session を表示する状態と `Show sessions` だけを表示する状態の2つだけを持つ。
+
+Fold / expansion level は永続化しない Agent View-local な runtime state であり、通常の catalog refresh、reorder、directory scope の切り替えをまたいで保持する。Pinned は固定 identity、directory group は grouping と同じ normalized directory key を identity とし、`Recently created` と directory path の heading 表示が切り替わっても同じ logical group として扱う。
+
+List cursor は Agent View 内だけに存在し、session row の `session.Key`、または group identity と `Show more` / `Show sessions` kind の組を保持する。control row を fake `session.Session` や fake `session.Key` として表さない。session action は session cursor にだけ適用し、control cursor 上では session 未選択として扱う。rendering、Up / Down、`{` / `}`、viewport、fold / expansion、refresh 後の cursor reconciliation は、group heading と separator を含まない同一の derived selectable-list model を参照する。
+
+Composer が空のとき、`}` は次の visible group の先頭 selectable row へ、`{` は前の visible group の末尾 visible session (fold 済みなら `Show sessions`) へ移る。前 group の末尾が `Show more` でも、その control は飛ばして最後の visible session を選ぶ。両方とも端で wrap しない。Composer が空でなければ、`←` / `→` は prompt cursor を動かし、`{` / `}` は通常の文字として挿入し、`Enter` は prompt を dispatch する。
+
+Refresh / reorder 後も、選択中 session の `session.Key` が catalog に残る限り同じ identity を維持し、その session が表示されるところまで group を開く。control row は stable group/control identity で維持し、control が消えた場合は変更前の visual order で次、前、先頭の順に surviving selectable row へ移る。
+
 ##### Pin / Unpin
 
 Pin 状態は agentsctl が永続化する。key は `session.Key` (`<provider>:<ID>`) である。session が identity transition を経た場合、provisional key に対する pin は canonical key へ移行され、provisional key の pin は残らない (「Codex provisional session identity」を参照)。
@@ -289,11 +299,11 @@ Codex は最初の model turn まで listed / resumable な thread を公開し�
 
 ##### Composer directory context
 
-Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、選択中 session 自身の CWD に追従する。
+Composer が表示する `<cwd>` と、新規 dispatch が実行される directory context は、list cursor が持つ一意な directory context に追従する。
 
-- 起動 directory 自体 (`Runtime.CWD`) は directory scope の anchor としてのみ機能し、Composer の表示・dispatch context としては使わない。
-- 選択中 session が存在する限り、その CWD が Composer `<cwd>` と dispatch context の両方の source of truth になる。
-- 選択可能な session が一つもない場合 (空 catalog) に限り、起動 directory を fallback として使う。これにより空 catalog からでも新規 prompt を dispatch できる。
+- session が選択中なら、その CWD を使う。
+- Directory group の `Show more` / `Show sessions` が選択中なら、その group の normalized directory を使う。
+- Pinned の `Show sessions` または選択可能な item がない場合は、一意な session / directory context がないため `StartupCWD` を使う (`StartupCWD` は runtime の `Runtime.CWD` から設定する)。起動 directory は、一意な context がある場合にその代わりとしては使わない。
 
 表示 (`<cwd>`) と実際の dispatch context が異なる値を参照することは絶対に避ける — 同じ導出結果 (`State.ComposerCWD`) を両方が読む。
 

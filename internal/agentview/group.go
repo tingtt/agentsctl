@@ -10,9 +10,59 @@ import (
 // whether its rows carry an inline CWD column, and the indices into the
 // caller's row slice it covers, in display order.
 type rowGroup struct {
+	id      groupID
 	title   string
 	showCWD bool
 	indices []int
+}
+
+type groupID struct {
+	pinned    bool
+	directory string
+}
+
+type groupDisplayState struct {
+	folded       bool
+	visibleCount int
+}
+
+type listItemKind uint8
+
+const (
+	listItemSession listItemKind = iota
+	listItemShowMore
+	listItemShowSessions
+)
+
+type listItemID struct {
+	kind       listItemKind
+	sessionKey session.Key
+	group      groupID
+}
+
+type selectableItem struct {
+	id       listItemID
+	rowIndex int
+}
+
+type selectableGroup struct {
+	rowGroup
+	items []selectableItem
+}
+
+type selectableList struct {
+	groups []selectableGroup
+	items  []selectableItem
+}
+
+const directoryPageSize = 10
+
+func sessionItemID(key session.Key) listItemID {
+	return listItemID{kind: listItemSession, sessionKey: key}
+}
+
+func controlItemID(group groupID, kind listItemKind) listItemID {
+	return listItemID{kind: kind, group: group}
 }
 
 // groupRows partitions rows (already sorted by session.SortOverview:
@@ -30,9 +80,9 @@ type rowGroup struct {
 // rows span more than one directory: a row's own group heading already
 // says its directory otherwise (see the DesignDoc's Session list section).
 // groupRows performs no I/O; it only reads Pinned/CWD off the rows it's
-// given and preserves their relative order within each group (selection
-// stays keyed by session.Key regardless of how rows are regrouped -- see
-// State.SelectedIndex).
+// given and preserves their relative order within each group. Group identity
+// uses the fixed Pinned identity or the same normalized directory key used for
+// grouping, independently of the rendered heading.
 func groupRows(rows []session.Session) []rowGroup {
 	multi := multiDirectory(rows)
 	var groups []rowGroup
@@ -44,7 +94,7 @@ func groupRows(rows []session.Session) []rowGroup {
 		}
 	}
 	if len(pinned) > 0 {
-		groups = append(groups, rowGroup{title: "Pinned", showCWD: multi, indices: pinned})
+		groups = append(groups, rowGroup{id: groupID{pinned: true}, title: "Pinned", showCWD: multi, indices: pinned})
 	}
 
 	if multi {
@@ -61,7 +111,7 @@ func groupRows(rows []session.Session) []rowGroup {
 			buckets[k] = append(buckets[k], i)
 		}
 		for _, k := range order {
-			groups = append(groups, rowGroup{title: displayCWD(k), indices: buckets[k]})
+			groups = append(groups, rowGroup{id: groupID{directory: k}, title: displayCWD(k), indices: buckets[k]})
 		}
 		return groups
 	}
@@ -73,7 +123,8 @@ func groupRows(rows []session.Session) []rowGroup {
 		}
 	}
 	if len(unpinned) > 0 {
-		groups = append(groups, rowGroup{title: "Recently created", indices: unpinned})
+		directory := directoryKey(rows[unpinned[0]].CWD)
+		groups = append(groups, rowGroup{id: groupID{directory: directory}, title: "Recently created", indices: unpinned})
 	}
 	return groups
 }
@@ -95,17 +146,58 @@ func multiDirectory(rows []session.Session) bool {
 
 func directoryKey(path string) string { return filepath.Clean(path) }
 
-// visualRowIndices flattens groupRows' output into the single ordered list
-// of selectable row indices the list actually renders top-to-bottom --
-// group headings and blank separators contribute nothing, since groupRows
-// never puts them in a group's own indices. This is the one source render
-// (View) and selection navigation (update.go's moveSelection) share for
-// "row order as seen on screen", so a raw State.Rows index and its on-
-// screen neighbor can never disagree.
-func visualRowIndices(rows []session.Session) []int {
-	var indices []int
-	for _, g := range groupRows(rows) {
-		indices = append(indices, g.indices...)
+// deriveSelectableList is the single presentation model for list rendering,
+// keyboard navigation, viewport tracking, and fold transitions. It contains
+// real session references and Agent View-only control identities; headings and
+// separators are deliberately absent from its selectable item sequence.
+func deriveSelectableList(rows []session.Session, states map[groupID]groupDisplayState) selectableList {
+	var model selectableList
+	for _, rawGroup := range groupRows(rows) {
+		group := selectableGroup{rowGroup: rawGroup}
+		state := states[rawGroup.id]
+		if state.folded {
+			group.items = []selectableItem{{id: controlItemID(rawGroup.id, listItemShowSessions), rowIndex: -1}}
+		} else {
+			visible := len(rawGroup.indices)
+			if !rawGroup.id.pinned {
+				visible = state.visibleCount
+				if visible <= 0 {
+					visible = directoryPageSize
+				}
+				visible = min(visible, len(rawGroup.indices))
+			}
+			for _, rowIndex := range rawGroup.indices[:visible] {
+				group.items = append(group.items, selectableItem{
+					id:       sessionItemID(rows[rowIndex].Key),
+					rowIndex: rowIndex,
+				})
+			}
+			if visible < len(rawGroup.indices) {
+				group.items = append(group.items, selectableItem{id: controlItemID(rawGroup.id, listItemShowMore), rowIndex: -1})
+			}
+		}
+		model.groups = append(model.groups, group)
+		model.items = append(model.items, group.items...)
 	}
-	return indices
+	return model
+}
+
+func (m selectableList) item(id listItemID) (selectableItem, bool) {
+	for _, item := range m.items {
+		if item.id == id {
+			return item, true
+		}
+	}
+	return selectableItem{}, false
+}
+
+func (m selectableList) groupForItem(id listItemID) (int, selectableGroup, bool) {
+	for i, group := range m.groups {
+		for _, item := range group.items {
+			if item.id == id {
+				return i, group, true
+			}
+		}
+	}
+	return -1, selectableGroup{}, false
 }

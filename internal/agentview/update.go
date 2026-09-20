@@ -112,11 +112,14 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	case ev.Key == KeyEnd:
 		s.Composer.End()
 		return Intent{}
-	case ev.Key == KeyLeft:
+	case ev.Key == KeyLeft && s.Composer.Prompt != "":
 		s.Composer.Left()
 		return Intent{}
-	case ev.Key == KeyRight:
+	case ev.Key == KeyRight && s.Composer.Prompt != "":
 		s.Composer.Right()
+		return Intent{}
+	case s.isIssue48Navigation(ev):
+		s.handleIssue48Navigation(ev)
 		return Intent{}
 	case bindingStash.Matches(ev.Key):
 		s.Composer.ToggleStash()
@@ -124,6 +127,9 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	case bindingSubmit.Matches(ev.Key):
 		if strings.TrimSpace(s.Composer.Prompt) != "" {
 			return Intent{Kind: IntentDispatch, Provider: s.Provider, Prompt: s.Composer.Prompt}
+		}
+		if s.expandSelectedControl() {
+			return Intent{}
 		}
 		return s.openSelected()
 	case bindingNewline.Matches(ev.Key):
@@ -185,22 +191,138 @@ func (s *State) handleNormalKey(ev KeyEvent) Intent {
 	return Intent{}
 }
 
-// moveSelection steps selection by delta (+1/-1) through the visual row
-// order groupRows/View actually renders top-to-bottom (see
-// visualRowIndices), rather than State.Rows' raw catalog order -- so
-// Up/Down always lands on the row immediately above/below the current one
-// on screen, even when a group heading, a blank separator, or another
-// group's rows sit between them in Rows. It reports whether selection
-// actually moved (false at either end of the visual list, or if the
-// current selection isn't a visible row), mirroring the in-range guard
-// this replaces; selection identity itself is still stored as a
-// session.Key via selectIndex, never as a raw or visual index.
+func (s State) isIssue48Navigation(ev KeyEvent) bool {
+	return s.Composer.Prompt == "" && (bindingFoldExpand.Matches(ev.Key) || bindingGroupNavigate.MatchesEvent(ev))
+}
+
+func (s *State) handleIssue48Navigation(ev KeyEvent) bool {
+	switch {
+	case ev.Key == KeyLeft:
+		return s.foldSelectedGroup()
+	case ev.Key == KeyRight:
+		return s.expandSelectedControl()
+	case ev.Rune == '{':
+		return s.moveGroup(-1)
+	case ev.Rune == '}':
+		return s.moveGroup(1)
+	default:
+		return false
+	}
+}
+
+func (s *State) foldSelectedGroup() bool {
+	if !s.hasCursor || s.cursor.kind != listItemSession {
+		return false
+	}
+	model := s.selectableList()
+	_, group, ok := model.groupForItem(s.cursor)
+	if !ok {
+		return false
+	}
+	position := -1
+	for i, rowIndex := range group.indices {
+		if s.Rows[rowIndex].Key == s.cursor.sessionKey {
+			position = i
+			break
+		}
+	}
+	if position < 0 {
+		return false
+	}
+	state := s.groupStates[group.id]
+	if group.id.pinned || position < directoryPageSize {
+		state.folded = true
+		s.setGroupState(group.id, state)
+		s.cursor = controlItemID(group.id, listItemShowSessions)
+		return true
+	}
+	state.folded = false
+	state.visibleCount = position / directoryPageSize * directoryPageSize
+	s.setGroupState(group.id, state)
+	s.cursor = controlItemID(group.id, listItemShowMore)
+	return true
+}
+
+func (s *State) expandSelectedControl() bool {
+	if !s.hasCursor || s.cursor.kind == listItemSession {
+		return false
+	}
+	model := s.selectableList()
+	_, group, ok := model.groupForItem(s.cursor)
+	if !ok || len(group.indices) == 0 {
+		return false
+	}
+	state := s.groupStates[group.id]
+	switch s.cursor.kind {
+	case listItemShowSessions:
+		state.folded = false
+		if !group.id.pinned {
+			state.visibleCount = directoryPageSize
+		}
+		s.setGroupState(group.id, state)
+		s.cursor = sessionItemID(s.Rows[group.indices[0]].Key)
+		return true
+	case listItemShowMore:
+		visible := 0
+		for _, item := range group.items {
+			if item.id.kind == listItemSession {
+				visible++
+			}
+		}
+		if visible >= len(group.indices) {
+			return false
+		}
+		state.folded = false
+		state.visibleCount = visible + directoryPageSize
+		s.setGroupState(group.id, state)
+		s.cursor = sessionItemID(s.Rows[group.indices[visible]].Key)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *State) moveGroup(delta int) bool {
+	if !s.hasCursor || delta == 0 {
+		return false
+	}
+	model := s.selectableList()
+	current, _, ok := model.groupForItem(s.cursor)
+	if !ok {
+		return false
+	}
+	target := current + delta
+	if target < 0 || target >= len(model.groups) {
+		return false
+	}
+	group := model.groups[target]
+	if len(group.items) == 0 {
+		return false
+	}
+	if delta > 0 {
+		s.cursor = group.items[0].id
+		s.hasCursor = true
+		return true
+	}
+	for i := len(group.items) - 1; i >= 0; i-- {
+		if group.items[i].id.kind == listItemShowMore {
+			continue
+		}
+		s.cursor = group.items[i].id
+		s.hasCursor = true
+		return true
+	}
+	return false
+}
+
+// moveSelection steps the list cursor through the same selectable model View
+// renders. Headings and separators are absent, while group controls are real
+// destinations alongside sessions.
 func (s *State) moveSelection(delta int) bool {
-	indices := visualRowIndices(s.Rows)
-	current := s.SelectedIndex()
+	model := s.selectableList()
 	pos := -1
-	for i, idx := range indices {
-		if idx == current {
+	for i, item := range model.items {
+		if s.hasCursor && item.id == s.cursor {
 			pos = i
 			break
 		}
@@ -209,10 +331,10 @@ func (s *State) moveSelection(delta int) bool {
 		return false
 	}
 	next := pos + delta
-	if next < 0 || next >= len(indices) {
+	if next < 0 || next >= len(model.items) {
 		return false
 	}
-	s.selectIndex(indices[next])
+	s.cursor, s.hasCursor = model.items[next].id, true
 	return true
 }
 
@@ -233,6 +355,11 @@ func (s *State) handleConfirmationKey(ev KeyEvent) Intent {
 		// normal navigation this key would otherwise perform.
 		s.Confirmation = nil
 		return s.handleNormalKey(ev)
+	case s.isIssue48Navigation(ev):
+		if s.handleIssue48Navigation(ev) {
+			s.Confirmation = nil
+		}
+		return Intent{}
 	}
 	return Intent{}
 }

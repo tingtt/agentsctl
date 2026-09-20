@@ -3,6 +3,7 @@ package agentview
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/tingtt/agentsctl/internal/session"
 )
@@ -349,6 +350,31 @@ func ansiOpenAtLineEnd(line string) bool {
 	return open
 }
 
+func backgroundCoversLastCell(line, backgroundCode string) bool {
+	active := false
+	lastCellCovered := false
+	background := "\x1b[" + backgroundCode + "m"
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b {
+			j := skipANSI(line, i)
+			switch line[i:j] {
+			case "\x1b[0m":
+				active = false
+			case background:
+				active = true
+			}
+			i = j
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(line[i:])
+		if runeCells(r) > 0 {
+			lastCellCovered = active
+		}
+		i += size
+	}
+	return lastCellCovered
+}
+
 // TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth is a
 // representative narrow-terminal guarantee for #14's new list rendering:
 // a Pinned row's directory column, a directory group heading, the
@@ -364,5 +390,145 @@ func TestNarrowTerminalHandlesMultiDirectoryPinnedAndFullwidth(t *testing.T) {
 	s.Handle(KeyEvent{Key: KeyCtrlX}) // arms a row notice on row "a"
 	for width := 1; width <= 40; width++ {
 		_ = s.View(width, 12)
+	}
+}
+
+func TestSelectedControlRowsRenderCursorAndBackground(t *testing.T) {
+	background := "\x1b[" + selectedRowBackgroundCode + "m"
+	tests := []struct {
+		name string
+		fold bool
+		text string
+	}{
+		{name: "Show more", text: "Show more"},
+		{name: "Show sessions", fold: true, text: "Show sessions"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(foldingRows(11, "/work/repo", false))
+			group := groupID{directory: "/work/repo"}
+			if tt.fold {
+				s.selectIndex(0)
+				s.Handle(KeyEvent{Key: KeyLeft})
+			} else {
+				focusControl(t, &s, listItemShowMore, group)
+			}
+			for _, width := range []int{1, 2, 3, 8, 20, 80} {
+				view := s.View(width, 30)
+				line := renderedSessionLine(t, view, background)
+				if !strings.HasPrefix(line, background) {
+					t.Fatalf("width=%d: selected control lacks background: %q", width, line)
+				}
+				if got := lineCells(line); got != width {
+					t.Fatalf("width=%d: selected control width=%d: %q", width, got, line)
+				}
+				if !backgroundCoversLastCell(line, selectedRowBackgroundCode) {
+					t.Fatalf("width=%d: selected background does not cover final cell: %q", width, line)
+				}
+				if ansiOpenAtLineEnd(line) {
+					t.Fatalf("width=%d: selected control leaves dangling ANSI style: %q", width, line)
+				}
+				if width > 2 && (!strings.Contains(line, "\x1b["+colorWhite+"m") || strings.Contains(line, "\x1b["+colorGray+"m")) {
+					t.Fatalf("width=%d: selected control text is not exclusively white: %q", width, line)
+				}
+				if width >= lineCells("> "+tt.text) && !strings.Contains(line, styleText(tt.text, colorWhite)) {
+					t.Fatalf("width=%d: selected control label is not white: %q", width, line)
+				}
+				if width >= 2 && !strings.HasPrefix(visibleText(line), "> ") {
+					t.Fatalf("width=%d: selected control lacks cursor: %q", width, line)
+				}
+				if strings.Contains(visibleText(line), "claude") {
+					t.Fatalf("width=%d: control masquerades as a session row: %q", width, line)
+				}
+			}
+		})
+	}
+}
+
+func TestUnselectedControlRowsRenderGray(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*State)
+		text  string
+	}{
+		{
+			name: "Show more",
+			setup: func(s *State) {
+				s.SetRows(foldingRows(11, "/work/repo", false))
+			},
+			text: "Show more",
+		},
+		{
+			name: "Show sessions",
+			setup: func(s *State) {
+				s.SetRows(append(
+					foldingRows(11, "/work/repo-a", false),
+					foldingRows(1, "/work/repo-b", false)...,
+				))
+				s.selectIndex(0)
+				s.Handle(KeyEvent{Key: KeyLeft})
+				s.Handle(KeyEvent{Key: KeyRune, Rune: '}'})
+			},
+			text: "Show sessions",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			tt.setup(&s)
+			line := renderedSessionLine(t, s.View(80, 30), tt.text)
+			if !strings.Contains(line, styleText(tt.text, colorGray)) {
+				t.Fatalf("unselected control text is not gray: %q", line)
+			}
+			if strings.Contains(line, "\x1b["+colorWhite+"m") {
+				t.Fatalf("unselected control text is white: %q", line)
+			}
+			if strings.HasPrefix(line, "\x1b["+selectedRowBackgroundCode+"m") {
+				t.Fatalf("unselected control has selected background: %q", line)
+			}
+		})
+	}
+}
+
+func TestViewPaginatesDirectoryRowsFromSelectableModel(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(11, "/work/repo", false))
+	view := visibleText(s.View(80, 30))
+	if !strings.Contains(view, "session 10") || !strings.Contains(view, "Show more") {
+		t.Fatalf("initial page missing session 10 or Show more:\n%s", view)
+	}
+	if strings.Contains(view, "session 11") {
+		t.Fatalf("initial page rendered hidden session 11:\n%s", view)
+	}
+}
+
+func TestViewportTracksSelectedControlRows(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(35, "/work/repo", false))
+	focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+	view := visibleText(s.View(80, 8))
+	if !strings.Contains(view, "> Show more") {
+		t.Fatalf("viewport did not follow selected Show more:\n%s", view)
+	}
+
+	s.selectIndex(0)
+	s.Handle(KeyEvent{Key: KeyLeft})
+	view = visibleText(s.View(80, 8))
+	if !strings.Contains(view, "> Show sessions") {
+		t.Fatalf("viewport did not follow selected Show sessions:\n%s", view)
+	}
+}
+
+func TestNarrowSelectedControlsDoNotLeakANSI(t *testing.T) {
+	s := NewState()
+	s.SetRows(foldingRows(11, "/work/repo", false))
+	focusControl(t, &s, listItemShowMore, groupID{directory: "/work/repo"})
+	for width := 1; width <= 20; width++ {
+		for _, line := range strings.Split(s.View(width, 12), "\n") {
+			if ansiOpenAtLineEnd(line) {
+				t.Fatalf("width=%d: control line leaked ANSI styling: %q", width, line)
+			}
+		}
 	}
 }

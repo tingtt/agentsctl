@@ -226,6 +226,9 @@ func helpLines(width int) []string {
 	line := func(text string) string { return clipLine(styleText(text, colorGray), width) }
 	return []string{
 		line("  manage sessions"),
+		line("    " + bindingNavigate.String() + " to move between rows"),
+		line("    " + bindingFoldExpand.String()),
+		line("    " + bindingGroupNavigate.String()),
 		line("    " + strings.ToLower(bindingPin.Label) + " to pin/unpin session"),
 		line("    " + strings.ToLower(bindingStopArchive.Label) + " to stop session"),
 		line("    " + strings.ToLower(bindingScope.Label) + " to cycle session listing target directory scope"),

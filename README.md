@@ -30,6 +30,8 @@ With an empty prompt, select an existing session and press `Enter` to open it. `
 
 The session list can be scoped to the current directory, its descendants and Git worktrees, or all directories with `Ctrl+/`.
 
+Directory groups initially show 10 sessions at a time with selectable `Show more` rows. Pinned sessions stay together and can be folded or restored as one group.
+
 To use Codex's native external editor shortcut, set `CODEX_EDITOR` when starting agentsctl:
 
 ```sh
@@ -40,11 +42,13 @@ CODEX_EDITOR=nvim agentsctl
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Dispatch a prompt, or open the selected session when the prompt is empty |
+| `Enter` | Dispatch a prompt, or open/expand the selected row when the prompt is empty |
 | `Ctrl+]` | Detach and return to Agent View |
 | `Shift+Tab` | Switch the prompt provider between Claude and Codex |
 | `Option+Enter` / `Shift+Enter` | Insert a newline |
-| `↑` / `↓` | Move the selection or cursor |
+| `↑` / `↓` | Move between session/control rows, or move the multiline prompt cursor |
+| `←` / `→` | Fold/expand a session group when the prompt is empty; otherwise move the prompt cursor |
+| `{` / `}` | Move to the previous/next session group when the prompt is empty |
 | `Ctrl+S` | Swap the prompt with the in-memory stash |
 | `Ctrl+G` | Edit the prompt in Vim |
 | `Ctrl+O` | Attach the selected session |

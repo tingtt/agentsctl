@@ -15,12 +15,13 @@ package agentview
 // This is deliberately not a configurable keybinding system -- there is no
 // lookup from Key to behavior here, only a fixed, small list of named
 // values Matches tests membership against and footer.go/help text reads
-// labels from. Keys lists every physical Key (see input_unix.go) the
-// binding covers, e.g. both KeyUp and KeyDown for the combined "↑↓" label.
+// labels from. Keys lists physical non-rune keys; Runes lists printable
+// shortcuts that the decoder intentionally leaves as KeyRune values.
 type Binding struct {
 	Label string
 	Desc  string // empty when the binding's meaning is obvious from Label alone
 	Keys  []Key
+	Runes []rune
 }
 
 // String renders b as "Label" alone, or "Label Desc" when Desc is set.
@@ -44,6 +45,24 @@ func (b Binding) Matches(key Key) bool {
 	return false
 }
 
+// MatchesEvent extends physical-key membership to printable rune shortcuts.
+// Runes remain KeyRune values in the terminal decoder; their state-dependent
+// meaning belongs to State.Handle.
+func (b Binding) MatchesEvent(ev KeyEvent) bool {
+	if b.Matches(ev.Key) {
+		return true
+	}
+	if ev.Key != KeyRune {
+		return false
+	}
+	for _, r := range b.Runes {
+		if r == ev.Rune {
+			return true
+		}
+	}
+	return false
+}
+
 // Named bindings are the source of truth for each shortcut's physical
 // Key(s), label, and description. State.Handle (update.go) references
 // these by name instead of the raw Key constants, and footer.go's
@@ -53,13 +72,15 @@ func (b Binding) Matches(key Key) bool {
 // change.
 var (
 	bindingProviderCycle = Binding{Label: "Shift+Tab", Keys: []Key{KeyShiftTab}}
-	bindingSubmit        = Binding{Label: "Enter", Desc: "send/open", Keys: []Key{KeyEnter}}
+	bindingSubmit        = Binding{Label: "Enter", Desc: "send/open/expand", Keys: []Key{KeyEnter}}
 	bindingNewline       = Binding{Label: "Option+Enter/Shift+Enter", Desc: "newline", Keys: []Key{KeyNewline}}
 	bindingStash         = Binding{Label: "Ctrl+S", Desc: "stash", Keys: []Key{KeyCtrlS}}
 	bindingPromptEditor  = Binding{Label: "Ctrl+G", Desc: "Vim", Keys: []Key{KeyCtrlG}}
 	bindingOpen          = Binding{Label: "Ctrl+O", Keys: []Key{KeyCtrlO}}
 	bindingPin           = Binding{Label: "Ctrl+T", Desc: "pin", Keys: []Key{KeyCtrlT}}
 	bindingNavigate      = Binding{Label: "↑↓", Keys: []Key{KeyUp, KeyDown}}
+	bindingFoldExpand    = Binding{Label: "←/→", Desc: "fold/expand", Keys: []Key{KeyLeft, KeyRight}}
+	bindingGroupNavigate = Binding{Label: "{/}", Desc: "previous/next group", Runes: []rune{'{', '}'}}
 	bindingScope         = Binding{Label: "Ctrl+/", Desc: "scope", Keys: []Key{KeyCtrlSlash}}
 	bindingRename        = Binding{Label: "Ctrl+R", Desc: "rename", Keys: []Key{KeyCtrlR}}
 	bindingStopArchive   = Binding{Label: "Ctrl+X", Desc: "stop/archive", Keys: []Key{KeyCtrlX}}
@@ -73,6 +94,6 @@ var (
 // key -- see TestBindingsCoverEveryShortcutKey).
 var allBindings = []Binding{
 	bindingProviderCycle, bindingSubmit, bindingNewline, bindingStash,
-	bindingPromptEditor, bindingOpen, bindingPin, bindingNavigate, bindingScope, bindingRename,
+	bindingPromptEditor, bindingOpen, bindingPin, bindingNavigate, bindingFoldExpand, bindingGroupNavigate, bindingScope, bindingRename,
 	bindingStopArchive, bindingRefresh, bindingEscape,
 }

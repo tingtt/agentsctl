@@ -11,15 +11,20 @@ import (
 // State is Agent View's Root Owner: the single mutable UI state struct
 // every input decision, render, and orchestrated operation reads and
 // writes through (see the DesignDoc's "Treat Agent View state as a Root
-// Owner"). Selection is keyed by session.Key (see selectedKey/hasSelection
-// and SelectedRow), never by row index, so it survives refresh, pin,
+// Owner"). The list cursor is either a session.Key or an Agent View-only
+// group control identity, never a row index, so it survives refresh, pin,
 // reordering, and provider reload intact. Unpinning the selected pinned
 // row deliberately replaces that identity; see ApplyPatch.
 type State struct {
 	Rows []session.Session
 
-	selectedKey  session.Key
-	hasSelection bool
+	cursor    listItemID
+	hasCursor bool
+
+	// groupStates owns transient fold and directory-page state by stable
+	// group identity. It is intentionally process-local and is not part of
+	// localstate or the session domain.
+	groupStates map[groupID]groupDisplayState
 
 	// Provider is the composer's current dispatch target, cycled by
 	// Shift+Tab.
@@ -104,18 +109,24 @@ type State struct {
 // NewState returns a freshly-initialized State: Claude as the initial
 // composer provider target, matching the pre-refactor default.
 func NewState() State {
-	return State{Provider: session.ProviderClaude, Warnings: map[session.ProviderID]error{}, UsageUpdatedAt: map[session.ProviderID]time.Time{}}
+	return State{
+		Provider:       session.ProviderClaude,
+		Warnings:       map[session.ProviderID]error{},
+		UsageUpdatedAt: map[session.ProviderID]time.Time{},
+		groupStates:    map[groupID]groupDisplayState{},
+	}
 }
 
 // SetRows installs rows as the current catalog snapshot, preserving
 // selection identity (see the DesignDoc's "selection identity は
 // session.Key"): if the previously-selected session (or, while renaming,
 // the rename target) is still present, selection stays on it regardless
-// of its new position. If it disappeared, selection moves to the first
-// surviving session after it in the previous visual order, or walks
-// backward from its previous position if none survive after it. The
-// selected session remains identified by key; visual positions are used
-// only to choose a replacement identity.
+// of its new position and its group opens far enough to keep it visible.
+// A control cursor is preserved by group/control identity while meaningful.
+// If the cursor target disappears, selection moves to the first surviving
+// selectable item after it in the previous visual order, or walks backward
+// if none survive after it. Visual positions are used only to choose a
+// replacement identity.
 //
 // Selection also follows a provider-stated identity transition: when a row
 // in rows lists the tracked key in its PreviousKeys (e.g. a Codex Starting
@@ -134,60 +145,65 @@ func NewState() State {
 // a confirmation armed on a key that just went through an identity
 // transition: it is dropped (see followIdentity).
 func (s *State) SetRows(rows []session.Session) {
-	target, tracking := s.selectedKey, s.hasSelection
+	oldModel := s.selectableList()
+	target, tracking := s.cursor, s.hasCursor
 	if s.Rename.Active {
-		target, tracking = s.Rename.Target, true
-	}
-	oldRows := s.Rows
-	oldVisualIndices := visualRowIndices(oldRows)
-	targetVisualIndex := -1
-	for i, rowIndex := range oldVisualIndices {
-		if oldRows[rowIndex].Key == target {
-			targetVisualIndex = i
-			break
-		}
+		target, tracking = sessionItemID(s.Rename.Target), true
 	}
 
 	s.Rows = rows
 	moved := session.IdentityTransitions(rows)
 	s.followIdentity(moved)
-	if tracking {
-		for _, r := range rows {
-			if r.Key == target {
-				s.selectedKey, s.hasSelection = target, true
-				return
-			}
+	if tracking && target.kind == listItemSession {
+		if next, ok := moved[target.sessionKey]; ok {
+			target = sessionItemID(next)
 		}
-		if next, ok := moved[target]; ok {
-			s.selectedKey, s.hasSelection = next, true
+		if s.ensureSessionVisible(target.sessionKey) {
+			s.cursor, s.hasCursor = target, true
 			return
 		}
 	}
-	if tracking && targetVisualIndex >= 0 {
-		remaining := make(map[session.Key]struct{}, len(rows))
-		for _, row := range rows {
-			remaining[row.Key] = struct{}{}
+
+	newModel := s.selectableList()
+	if tracking {
+		if _, ok := newModel.item(target); ok {
+			s.cursor, s.hasCursor = target, true
+			return
 		}
-		for _, rowIndex := range oldVisualIndices[targetVisualIndex+1:] {
-			candidate := oldRows[rowIndex].Key
-			if _, ok := remaining[candidate]; ok {
-				s.selectedKey, s.hasSelection = candidate, true
-				return
-			}
-		}
-		for i := targetVisualIndex - 1; i >= 0; i-- {
-			candidate := oldRows[oldVisualIndices[i]].Key
-			if _, ok := remaining[candidate]; ok {
-				s.selectedKey, s.hasSelection = candidate, true
-				return
-			}
+		if next, ok := nearbySurvivingItem(oldModel, newModel, target); ok {
+			s.cursor, s.hasCursor = next, true
+			return
 		}
 	}
-	if indices := visualRowIndices(rows); len(indices) > 0 {
-		s.selectedKey, s.hasSelection = rows[indices[0]].Key, true
+	if len(newModel.items) > 0 {
+		s.cursor, s.hasCursor = newModel.items[0].id, true
 		return
 	}
-	s.selectedKey, s.hasSelection = session.Key{}, false
+	s.cursor, s.hasCursor = listItemID{}, false
+}
+
+func nearbySurvivingItem(oldModel, newModel selectableList, target listItemID) (listItemID, bool) {
+	position := -1
+	for i, item := range oldModel.items {
+		if item.id == target {
+			position = i
+			break
+		}
+	}
+	if position < 0 {
+		return listItemID{}, false
+	}
+	for _, item := range oldModel.items[position+1:] {
+		if _, ok := newModel.item(item.id); ok {
+			return item.id, true
+		}
+	}
+	for i := position - 1; i >= 0; i-- {
+		if _, ok := newModel.item(oldModel.items[i].id); ok {
+			return oldModel.items[i].id, true
+		}
+	}
+	return listItemID{}, false
 }
 
 // followIdentity re-keys the transient UI state that holds a session.Key
@@ -223,11 +239,11 @@ func (s *State) followIdentity(moved map[session.Key]session.Key) {
 
 // SelectedRow returns the currently-selected session, if any.
 func (s State) SelectedRow() (session.Session, bool) {
-	if !s.hasSelection {
+	if !s.hasCursor || s.cursor.kind != listItemSession {
 		return session.Session{}, false
 	}
 	for _, r := range s.Rows {
-		if r.Key == s.selectedKey {
+		if r.Key == s.cursor.sessionKey {
 			return r, true
 		}
 	}
@@ -236,27 +252,28 @@ func (s State) SelectedRow() (session.Session, bool) {
 
 // ComposerCWD is the directory context the composer displays and any new
 // prompt dispatches into (see the DesignDoc's composer cwd section /
-// #14): the selected session's own CWD, so both display and dispatch
-// follow selection as it moves across directories. StartupCWD is only a
-// safe fallback for when no session is selectable at all (an empty
-// catalog) -- it never overrides an actual selection, even one outside
-// the current listing scope's own anchor directory.
+// #14): a selected session uses its own CWD, a directory control uses its
+// stable normalized directory, and Pinned's directory-ambiguous control
+// uses StartupCWD. StartupCWD also remains the empty-catalog fallback.
 func (s State) ComposerCWD() string {
 	if row, ok := s.SelectedRow(); ok {
 		return row.CWD
+	}
+	if s.hasCursor && s.cursor.kind != listItemSession && !s.cursor.group.pinned {
+		return s.cursor.group.directory
 	}
 	return s.StartupCWD
 }
 
 // SelectedIndex returns the row index of the current selection for
-// rendering/navigation purposes, or -1 if there is none. Index is always
-// a value derived from selectedKey, never the other way around.
+// rendering/navigation purposes, or -1 if there is none. A control cursor
+// has no session-row index and also returns -1.
 func (s State) SelectedIndex() int {
-	if !s.hasSelection {
+	if !s.hasCursor || s.cursor.kind != listItemSession {
 		return -1
 	}
 	for i, r := range s.Rows {
-		if r.Key == s.selectedKey {
+		if r.Key == s.cursor.sessionKey {
 			return i
 		}
 	}
@@ -268,7 +285,46 @@ func (s *State) selectIndex(i int) {
 	if i < 0 || i >= len(s.Rows) {
 		return
 	}
-	s.selectedKey, s.hasSelection = s.Rows[i].Key, true
+	s.cursor, s.hasCursor = sessionItemID(s.Rows[i].Key), true
+	s.ensureSessionVisible(s.Rows[i].Key)
+}
+
+func (s State) selectableList() selectableList {
+	return deriveSelectableList(s.Rows, s.groupStates)
+}
+
+func (s *State) setGroupState(id groupID, state groupDisplayState) {
+	if s.groupStates == nil {
+		s.groupStates = map[groupID]groupDisplayState{}
+	}
+	s.groupStates[id] = state
+}
+
+// ensureSessionVisible expands the selected session's group only as far as
+// needed to keep its identity represented in the selectable list.
+func (s *State) ensureSessionVisible(key session.Key) bool {
+	for _, group := range groupRows(s.Rows) {
+		for position, rowIndex := range group.indices {
+			if s.Rows[rowIndex].Key != key {
+				continue
+			}
+			state := s.groupStates[group.id]
+			state.folded = false
+			if group.id.pinned {
+				state.visibleCount = 0
+			} else {
+				visible := state.visibleCount
+				if visible <= 0 {
+					visible = directoryPageSize
+				}
+				required := (position/directoryPageSize + 1) * directoryPageSize
+				state.visibleCount = max(visible, required)
+			}
+			s.setGroupState(group.id, state)
+			return true
+		}
+	}
+	return false
 }
 
 // MarkAttached records key as the session most recently Opened from the
@@ -288,7 +344,7 @@ func (s *State) MarkAttached(key session.Key) {
 // ordering.
 func (s *State) ApplyPatch(p sessionctl.Patch) {
 	if p.Pinned != nil {
-		var replacement session.Key
+		var replacement listItemID
 		var replaceSelection bool
 		if !*p.Pinned {
 			replacement, replaceSelection = s.selectionReplacementForUnpin(p.Key)
@@ -302,7 +358,9 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 		session.SortOverview(rows)
 		s.Rows = rows
 		if replaceSelection {
-			s.selectedKey = replacement
+			s.cursor, s.hasCursor = replacement, true
+		} else if s.hasCursor && s.cursor.kind == listItemSession {
+			s.ensureSessionVisible(s.cursor.sessionKey)
 		}
 		return
 	}
@@ -320,33 +378,36 @@ func (s *State) ApplyPatch(p sessionctl.Patch) {
 // rendered grouping, before the patch can move key into an unpinned group:
 // the next Pinned row, the previous Pinned row, then the first row of the
 // following group.
-func (s State) selectionReplacementForUnpin(key session.Key) (session.Key, bool) {
-	if !s.hasSelection || s.selectedKey != key {
-		return session.Key{}, false
+func (s State) selectionReplacementForUnpin(key session.Key) (listItemID, bool) {
+	if !s.hasCursor || s.cursor != sessionItemID(key) {
+		return listItemID{}, false
 	}
 
-	groups := groupRows(s.Rows)
-	for groupIndex, group := range groups {
-		for position, rowIndex := range group.indices {
-			row := s.Rows[rowIndex]
+	model := s.selectableList()
+	for groupIndex, group := range model.groups {
+		for position, item := range group.items {
+			if item.id.kind != listItemSession {
+				continue
+			}
+			row := s.Rows[item.rowIndex]
 			if row.Key != key || !row.Pinned {
 				continue
 			}
-			if position+1 < len(group.indices) {
-				return s.Rows[group.indices[position+1]].Key, true
+			if position+1 < len(group.items) {
+				return group.items[position+1].id, true
 			}
 			if position > 0 {
-				return s.Rows[group.indices[position-1]].Key, true
+				return group.items[position-1].id, true
 			}
-			for _, following := range groups[groupIndex+1:] {
-				if len(following.indices) > 0 {
-					return s.Rows[following.indices[0]].Key, true
+			for _, following := range model.groups[groupIndex+1:] {
+				if len(following.items) > 0 {
+					return following.items[0].id, true
 				}
 			}
-			return session.Key{}, false
+			return listItemID{}, false
 		}
 	}
-	return session.Key{}, false
+	return listItemID{}, false
 }
 
 // ApplyUsageUpdate incorporates one provider's incremental usage result
