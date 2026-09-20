@@ -1,5 +1,6 @@
 package terminal
 
+import "bytes"
 import "strconv"
 import "strings"
 
@@ -47,9 +48,29 @@ const DetachKey byte = 0x1d
 // Read() calls, and the scanner holds back a possibly-incomplete trailing
 // escape sequence across Feed calls rather than risk forwarding partial
 // escape bytes to the child or splitting a real match in two.
+//
+// Bytes between a bracketed-paste begin (`ESC [ 200 ~`) and end (`ESC [ 201
+// ~`) marker are pasted content, not physical key input, so none of the
+// detach encodings above may be recognized inside them. The scanner
+// tracks only that framing: it forwards a paste's bytes (markers
+// included) unchanged and immediately, without interpreting, buffering,
+// or normalizing them, and resumes detach detection after the end marker.
+// Where reads split a paste, or the markers themselves, has no effect on
+// what is delivered.
 type DetachScanner struct {
 	pending []byte
+	// inPaste is true between a paste begin marker and its end marker.
+	inPaste bool
+	// endMatched is how many leading bytes of pasteEnd the most recent
+	// paste bytes have matched; it survives across Feed calls so an end
+	// marker split over reads is still recognized.
+	endMatched int
 }
+
+var (
+	pasteBegin = []byte("\x1b[200~")
+	pasteEnd   = []byte("\x1b[201~")
+)
 
 // Feed processes one new chunk of raw terminal input and returns the bytes
 // that should be forwarded to the child right now (deliver) and whether
@@ -60,6 +81,10 @@ func (d *DetachScanner) Feed(chunk []byte) (deliver []byte, detach bool) {
 	buf := append(d.pending, chunk...)
 	d.pending = nil
 	for i := 0; i < len(buf); i++ {
+		if d.inPaste {
+			d.trackPasteEnd(buf[i])
+			continue
+		}
 		if buf[i] == DetachKey {
 			return buf[:i], true
 		}
@@ -77,9 +102,30 @@ func (d *DetachScanner) Feed(chunk []byte) (deliver []byte, detach bool) {
 		if isDetachEscape(buf[i : i+n]) {
 			return buf[:i], true
 		}
+		if bytes.Equal(buf[i:i+n], pasteBegin) {
+			d.inPaste, d.endMatched = true, 0
+		}
 		i += n - 1 // -1 to offset the loop's i++
 	}
 	return buf, false
+}
+
+// trackPasteEnd advances the paste end-marker match by one paste byte and
+// leaves paste state once the whole marker has been seen. pasteEnd's only
+// ESC is its first byte, so a mismatch can restart the match at most at
+// the mismatching byte itself.
+func (d *DetachScanner) trackPasteEnd(b byte) {
+	switch {
+	case b == pasteEnd[d.endMatched]:
+		d.endMatched++
+	case b == pasteEnd[0]:
+		d.endMatched = 1
+	default:
+		d.endMatched = 0
+	}
+	if d.endMatched == len(pasteEnd) {
+		d.inPaste, d.endMatched = false, 0
+	}
 }
 
 // scanEscape reports how many leading bytes of buf (which starts with ESC)
