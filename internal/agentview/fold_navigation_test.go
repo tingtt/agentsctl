@@ -505,6 +505,8 @@ func TestPinExpandsFoldedPinnedToKeepSelectedSessionVisible(t *testing.T) {
 
 func TestUnpinSelectedPinnedCanChooseFoldedFollowingGroupControl(t *testing.T) {
 	rows := append(foldingRows(1, "/work/pinned", true), foldingRows(1, "/work/repo", false)...)
+	// Older than the repo session, so the post-unpin head is the folded repo group.
+	rows[0].CreatedAt = time.Unix(0, 0)
 	s := NewState()
 	s.SetRows(rows)
 	s.selectIndex(1)

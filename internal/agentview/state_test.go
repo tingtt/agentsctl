@@ -224,37 +224,64 @@ func TestApplyPatchUnpinSelectsNeighborFromPreviousPinnedGroup(t *testing.T) {
 	}
 }
 
-func TestApplyPatchUnpinOnlyPinnedSelectsFormerRecentlyCreatedHead(t *testing.T) {
-	s := NewState()
-	s.SetRows([]session.Session{
-		{Key: key("a"), Pinned: true, CWD: "/repo", CreatedAt: time.Unix(3, 0)},
-		{Key: key("b"), CWD: "/repo", CreatedAt: time.Unix(2, 0)},
-		{Key: key("c"), CWD: "/repo", CreatedAt: time.Unix(1, 0)},
-	})
-
-	unpinned := false
-	s.ApplyPatch(sessionctl.Patch{Key: key("a"), Pinned: &unpinned})
-
-	got, ok := s.SelectedRow()
-	if !ok || got.Key != key("b") {
-		t.Fatalf("selected row=%+v ok=%v, want previous Recently created head b", got, ok)
+func TestApplyPatchUnpinOnlyPinnedSelectsPostUnpinGroupHead(t *testing.T) {
+	tests := []struct {
+		name string
+		rows []session.Session
+		want session.Key
+	}{
+		{
+			name: "same directory newest session becomes Recently created head",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CWD: "/repo", CreatedAt: time.Unix(3, 0)},
+				{Key: key("b"), CWD: "/repo", CreatedAt: time.Unix(2, 0)},
+				{Key: key("c"), CWD: "/repo", CreatedAt: time.Unix(1, 0)},
+			},
+			want: key("a"),
+		},
+		{
+			name: "same directory newer unpinned session stays head",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CWD: "/repo", CreatedAt: time.Unix(2, 0)},
+				{Key: key("b"), CWD: "/repo", CreatedAt: time.Unix(3, 0)},
+				{Key: key("c"), CWD: "/repo", CreatedAt: time.Unix(1, 0)},
+			},
+			want: key("b"),
+		},
+		{
+			name: "multi directory newest session becomes first folder group head",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CWD: "/repo-a", CreatedAt: time.Unix(4, 0)},
+				{Key: key("b"), CWD: "/repo-b", CreatedAt: time.Unix(3, 0)},
+				{Key: key("c"), CWD: "/repo-c", CreatedAt: time.Unix(2, 0)},
+			},
+			want: key("a"),
+		},
+		{
+			name: "multi directory newer unpinned session's group stays first",
+			rows: []session.Session{
+				{Key: key("a"), Pinned: true, CWD: "/repo-a", CreatedAt: time.Unix(2, 0)},
+				{Key: key("b"), CWD: "/repo-b", CreatedAt: time.Unix(4, 0)},
+				{Key: key("c"), CWD: "/repo-c", CreatedAt: time.Unix(3, 0)},
+			},
+			want: key("b"),
+		},
 	}
-}
 
-func TestApplyPatchUnpinOnlyPinnedSelectsFormerFirstFolderGroupHead(t *testing.T) {
-	s := NewState()
-	s.SetRows([]session.Session{
-		{Key: key("a"), Pinned: true, CWD: "/repo-a", CreatedAt: time.Unix(4, 0)},
-		{Key: key("b"), CWD: "/repo-b", CreatedAt: time.Unix(3, 0)},
-		{Key: key("c"), CWD: "/repo-c", CreatedAt: time.Unix(2, 0)},
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(tt.rows)
+			s.selectIndex(0) // the only pinned session sorts first
 
-	unpinned := false
-	s.ApplyPatch(sessionctl.Patch{Key: key("a"), Pinned: &unpinned})
+			unpinned := false
+			s.ApplyPatch(sessionctl.Patch{Key: key("a"), Pinned: &unpinned})
 
-	got, ok := s.SelectedRow()
-	if !ok || got.Key != key("b") {
-		t.Fatalf("selected row=%+v ok=%v, want previous first folder-group session b", got, ok)
+			got, ok := s.SelectedRow()
+			if !ok || got.Key != tt.want {
+				t.Fatalf("selected row=%+v ok=%v, want post-unpin group head %s", got, ok, tt.want)
+			}
+		})
 	}
 }
 

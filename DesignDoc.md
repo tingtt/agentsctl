@@ -88,7 +88,7 @@ session は作成時刻が新しい順に並べる。Activity や runtime status
 - Pinned session は directory scope に関わらず常に単一の `Pinned` group へ集約する。scope が複数 directory を含む場合、Pinned row には directory path を表示する (directory を跨ぐため group heading だけでは判別できない)。
 - Unpinned session は、表示対象の directory がすべて同一なら単一の `Recently created` group、複数 directory を含むなら directory ごとの group に分ける。directory ごとの group では、その heading が directory を示すため row 自体に directory を表示しない。
 
-grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺へ selection を移す。また、provider が session の identity transition (provisional key から canonical key への変更) を明示した場合は、selection は canonical key へ移る (「Codex provisional session identity」を参照)。
+grouping は表示専用の分割であり、session domain には持ち込まない (`internal/session.Session` に group の概念は存在しない) 。selection identity は `session.Key` で保持し、scope cycling、refresh、pin、通常の reorder では同じ session を追従する。例外として、選択中の pinned session を unpin した場合は、移動した session を追わず、変更前の Pinned group 周辺、または unpin 後の visual order の先頭へ selection を移す。また、provider が session の identity transition (provisional key から canonical key への変更) を明示した場合は、selection は canonical key へ移る (「Codex provisional session identity」を参照)。
 
 Directory group は session を10件単位で表示する。初期状態は先頭10件までとし、残りがあれば selectable な `Show more` row を末尾に置く。Composer が空のとき、`Show more` 上の `Enter` または `→` は次の最大10件を開き、最初に追加された session へ cursor を移す。session 上の `←` はその session を含む10件 block 以降を閉じ、先頭 block 上では group 全体を selectable な `Show sessions` row へ畳む。`Show sessions` 上の `Enter` または `→` は初期状態へ戻し、先頭 session を選ぶ。Pinned group は pagination せず、全 session を表示する状態と `Show sessions` だけを表示する状態の2つだけを持つ。
 
@@ -108,7 +108,7 @@ Pin 状態は agentsctl が永続化する。key は `session.Key` (`<provider>:
 
 Pin / Unpin 操作は即時に表示へ反映するため、provider の catalog を再取得せず、現在の一覧へ ordering rule を再適用する。
 
-選択中の pinned session を Unpin した場合、変更前の Pinned group で1つ下、下がなければ1つ上にあった session を選択する。他の pinned session がなければ、変更前に Pinned の直後へ表示されていた `Recently created` または最初の directory group の先頭 session を選択する。これらの候補がある限り、unpin により移動した session 自体は追従しない。Pin 操作と refresh/reload は引き続き同じ `session.Key` を追従する。
+選択中の pinned session を Unpin した場合、変更前の Pinned group で1つ下、下がなければ1つ上にあった session を選択する。他の pinned session がなく Pinned group が空になる場合は、pin state の変更、overview の再ソート、grouping / selectable list の再構築を行った後の visual order で先頭となる selectable row を選択する。unpin した session 自体がその先頭であれば、結果としてその session が再選択されるが、これは `session.Key` の追従ではなく unpin 後の visual position による選択である。Pin 操作と refresh/reload は引き続き同じ `session.Key` を追従する。
 
 #### Lifecycle
 
