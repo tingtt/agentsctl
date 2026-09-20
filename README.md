@@ -8,10 +8,13 @@ ChatGPT Project conversations can also be listed and opened with optional config
 
 agentsctl supports macOS and Linux.
 
-Install `claude` and/or `codex` first, then install agentsctl from a [GitHub Release](https://github.com/tingtt/agentsctl/releases) or with Go 1.25 or later:
+Install `claude` and/or `codex` first, then install agentsctl from a [GitHub Release](https://github.com/tingtt/agentsctl/releases) or with Go 1.25 or later. The command below installs the latest release and embeds its version, which enables update checks:
 
 ```sh
-go install github.com/tingtt/agentsctl/cmd/agentsctl@latest
+VERSION=$(go list -m -f '{{.Version}}' github.com/tingtt/agentsctl@latest)
+go install \
+  -ldflags="-X github.com/tingtt/agentsctl/internal/version.Version=${VERSION}" \
+  github.com/tingtt/agentsctl/cmd/agentsctl@${VERSION}
 ```
 
 Then start it from the directory you want to work in:
@@ -20,7 +23,7 @@ Then start it from the directory you want to work in:
 agentsctl
 ```
 
-A GitHub Release binary checks for a newer release at startup and shows a notice above the prompt. With Go installed, type `/update` and press `Enter` to install the announced version with `go install` and restart; without Go, the notice links to the releases page. Builds that carry no release version, including plain `go install` and `go build`, skip the check.
+A GitHub Release binary, or one installed with the command above, checks for a newer release at startup and shows a notice above the prompt. With Go installed, type `/update` and press `Enter` to install the announced version with `go install` and restart; without Go, the notice links to the releases page. Local builds without an embedded version, such as `go build ./cmd/agentsctl`, stay at `dev` and skip the check.
 
 ## Managing Claude and Codex sessions
 
