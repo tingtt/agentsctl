@@ -13,7 +13,7 @@ import (
 // the composer's directory context -- green, per #14's Colors section --
 // right-aligned near the end, exactly width cells wide.
 func topRule(cwd string, width int) string {
-	label := " " + cwd + " "
+	label := " " + safeText(cwd) + " "
 	tail := styleText(label, colorGreen) + styleText("─", colorGray)
 	tailCells := lineCells(label) + 1
 	dashes := max(0, width-tailCells)
@@ -50,7 +50,7 @@ func ctrlXHint(row session.Session) (label string, ok bool) {
 func contextualFooterText(s State) string {
 	provider := styleText(providerName(s.Provider), providerColor(s.Provider))
 	if err := s.Warnings[s.Provider]; err != nil {
-		provider += styleText(" (unavailable: "+err.Error()+")", colorGray)
+		provider += styleText(" (unavailable: "+safeText(err.Error())+")", colorGray)
 	}
 	segments := []string{provider + styleText(" (shift+tab to cycle)", colorGray)}
 	var warningProviders []string
@@ -62,7 +62,7 @@ func contextualFooterText(s State) string {
 	sort.Strings(warningProviders)
 	for _, providerID := range warningProviders {
 		err := s.Warnings[session.ProviderID(providerID)]
-		segments = append(segments, styleText(providerID+" unavailable: "+err.Error(), colorGray))
+		segments = append(segments, styleText(providerID+" unavailable: "+safeText(err.Error()), colorGray))
 	}
 	segments = append(segments, styleText(strings.ToLower(bindingPromptEditor.Label)+" to edit in vim", colorGray))
 	if row, ok := s.SelectedRow(); ok {

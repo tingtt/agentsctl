@@ -73,7 +73,7 @@ func (s State) View(width, height int) string {
 			if s.Rename.Active && row.Key == s.Rename.Target {
 				name = cursorWindow(s.Rename.Draft, s.Rename.Cursor, titleWidth)
 			} else {
-				name = fitCells(row.DisplayName(), titleWidth)
+				name = fitCells(safeText(row.DisplayName()), titleWidth)
 			}
 			lastAttached := s.HasLastAttached && row.Key == s.LastAttachedKey
 			name = styleText(name, titleStyleCodes(selected, lastAttached)...)
@@ -100,7 +100,7 @@ func (s State) View(width, height int) string {
 	// The composer-top notification area is reserved for Error
 	// exclusively -- there is no generic non-error notice here.
 	if s.Error != "" {
-		footer = append([]string{clipLine("! "+s.Error, width)}, footer...)
+		footer = append([]string{clipLine("! "+safeText(s.Error), width)}, footer...)
 	}
 	if height < 0 {
 		height = 0

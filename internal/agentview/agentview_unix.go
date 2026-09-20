@@ -28,7 +28,7 @@ type Runtime struct {
 	Input      *os.File
 	Output     io.Writer
 	CWD        string
-	ReadKey    func(*bufio.Reader) (KeyEvent, error)
+	ReadInput  func(*bufio.Reader) (InputEvent, error)
 	// Worktrees discovers the additional ScopeDescendants roots for CWD
 	// (see session.Scope.WorktreeDirectories) -- e.g.
 	// internal/workspace.Worktrees in production. Nil skips discovery,
@@ -164,22 +164,23 @@ type catalogEvent struct {
 	done  bool
 }
 
-// keyResult is one physically-decoded key read (or read error), carried
-// over Run's one-shot key-read channel (see startKeyRead).
+// keyResult is one decoded input read -- a key or a whole paste -- (or read
+// error), carried over Run's one-shot input-read channel (see startKeyRead).
 type keyResult struct {
-	ev  KeyEvent
+	ev  InputEvent
 	err error
 }
 
-// startKeyRead performs exactly one blocking key read in its own
+// startKeyRead performs exactly one blocking input read (one KeyEvent or one
+// whole bracketed paste) in its own
 // goroutine and sends the result to out, then exits -- Run never has more
 // than one such goroutine outstanding at a time while it owns the overview
 // (see Run's doc comment on input ownership), so IntentOpen handing the
 // real terminal to a provider's Open never races a leftover reader still
 // consuming bytes meant for the attached child.
-func startKeyRead(reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent, error), out chan<- keyResult) {
+func startKeyRead(reader *bufio.Reader, readInputFn func(*bufio.Reader) (InputEvent, error), out chan<- keyResult) {
 	go func() {
-		ev, err := readKeyFn(reader)
+		ev, err := readInputFn(reader)
 		out <- keyResult{ev: ev, err: err}
 	}()
 }
@@ -255,22 +256,22 @@ func (r *Runtime) Run(ctx context.Context) (runErr error) {
 	r.requestReload(ctx)
 	r.render()
 	reader := bufio.NewReader(r.Input)
-	readKeyFn := r.ReadKey
-	if readKeyFn == nil {
-		readKeyFn = func(reader *bufio.Reader) (KeyEvent, error) { return readTerminalKey(reader, r.Input) }
+	readInputFn := r.ReadInput
+	if readInputFn == nil {
+		readInputFn = func(reader *bufio.Reader) (InputEvent, error) { return readTerminalInput(reader, r.Input) }
 	}
-	return r.eventLoop(ctx, reader, readKeyFn)
+	return r.eventLoop(ctx, reader, readInputFn)
 }
 
 // eventLoop is Run's select loop, factored out so it can be driven
-// directly by a test with a fake reader/readKeyFn and no real terminal --
+// directly by a test with a fake reader/readInputFn and no real terminal --
 // unlike Run itself, it performs no raw-mode setup (term.MakeRaw), and
 // render's own term.GetSize call already tolerates a non-tty r.Input by
 // falling back to a fixed size. See Run's doc comment for the input-
 // ownership and usage-never-blocks-render guarantees this implements.
-func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn func(*bufio.Reader) (KeyEvent, error)) error {
+func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readInputFn func(*bufio.Reader) (InputEvent, error)) error {
 	keyCh := make(chan keyResult, 1)
-	startKeyRead(reader, readKeyFn, keyCh)
+	startKeyRead(reader, readInputFn, keyCh)
 	// Targeted refreshes run under this loop's own context, so none outlives
 	// the loop (see transientRefresh).
 	loopCtx, stopLoop := context.WithCancel(ctx)
@@ -281,7 +282,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 			if kr.err != nil {
 				return kr.err
 			}
-			intent := r.State.Handle(kr.ev)
+			intent := r.State.HandleInput(kr.ev)
 			if intent.Kind == IntentQuit {
 				return nil
 			}
@@ -298,7 +299,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readKeyFn
 				r.State.Error = ""
 			}
 			r.render()
-			startKeyRead(reader, readKeyFn, keyCh)
+			startKeyRead(reader, readInputFn, keyCh)
 		case upd := <-r.usageCh:
 			// A usage update from an older, superseded reload cycle (e.g.
 			// two reloads triggered in quick succession) is dropped: it
@@ -694,7 +695,11 @@ func (r *Runtime) act(ctx context.Context, x Intent) error {
 		if !ok {
 			return fmt.Errorf("session %s is no longer in the catalog", x.Key)
 		}
-		result, err := r.Controller.Open(ctx, row, r.Input, r.Output)
+		// Open is a foreground terminal handoff: the overview releases every
+		// mode it owns (raw mode, alt screen, bracketed paste) before the
+		// provider takes the terminal, and re-establishes them afterwards --
+		// even when Open fails. See withForegroundTerminal.
+		result, err := r.openForeground(ctx, row)
 		if err != nil {
 			return err
 		}

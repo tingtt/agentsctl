@@ -306,7 +306,7 @@ func TestOpenCachedSessionDoesNotWaitForInFlightReload(t *testing.T) {
 
 	chatgptFP := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{{Key: session.Key{Provider: session.ProviderChatGPT, ID: "c"}, Name: "C", CWD: "/work"}}}
 	chatgpt := newGatedProvider(chatgptFP)
-	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), Input: inR, Output: &syncBuffer{}, CWD: "/work"}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), Input: inR, Output: &syncBuffer{}, CWD: "/work", terminal: &fakeOverviewLifecycle{}}
 
 	rt.requestReload(context.Background())
 	initial := awaitCall(t, chatgpt.calls, 2*time.Second)

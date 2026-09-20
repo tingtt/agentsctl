@@ -15,8 +15,9 @@ func cursorStyle(glyph string) string {
 	return "\x1b[30;47m" + glyph + "\x1b[0m"
 }
 
-// cursorWindow renders value with a horizontally-scrolled window around a
-// rune-index cursor, fit into width terminal cells. The rune at the
+// cursorWindow renders value -- untrusted text, shown through safeRunes -- with
+// a horizontally-scrolled window around a rune-index cursor, fit into width
+// terminal cells. The rune at the
 // cursor position is recolored via cursorStyle to mark the insertion
 // point; if cursor is at the end of value, a trailing reverse-video space
 // cell marks it instead.
@@ -32,7 +33,11 @@ func cursorWindowSpan(value string, cursor, width int, span runeSpan) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(value)
+	// The display boundary for the rename editor and the composer's cursor
+	// row: value is encoded before any ANSI is added, one rune to one rune, so
+	// cursor and span (rune indexes on the model text) still address the same
+	// runes.
+	runes := safeRunes(value)
 	cursor = min(max(cursor, 0), len(runes))
 	glyph := " "
 	var suffix []rune
@@ -50,7 +55,8 @@ func cursorWindowSpan(value string, cursor, width int, span runeSpan) string {
 	return fitCells(result, width)
 }
 
-// composerLines renders prompt as one visual row per logical line (split
+// composerLines renders prompt -- untrusted text, encoded by safeRunes row by
+// row -- as one visual row per logical line (split
 // on embedded "\n"), so an embedded newline shows as a separate terminal
 // row instead of a literal control character folded into one
 // horizontally-scrolled line. The first row carries prefix; continuation
@@ -71,7 +77,7 @@ func composerLines(prompt string, cursor int, prefix string, width int) []string
 		if i == cursorLine {
 			rendered = cursorWindowSpan(line, cursorCol, available, lineSpan)
 		} else {
-			rendered = fitCells(paintReservedCommand([]rune(line), 0, lineSpan), available)
+			rendered = fitCells(paintReservedCommand(safeRunes(line), 0, lineSpan), available)
 		}
 		lineStart += len([]rune(line)) + 1 // +1 for the "\n" after this line
 		leader := prefix
@@ -170,7 +176,7 @@ func padCells(value string, width int) string {
 // same-directory scope, or its full abbreviated path in a multi-directory
 // scope).
 func displayCWD(path string) string {
-	return shortHome(path)
+	return safeText(shortHome(path))
 }
 
 // shortHome renders path with the user's home directory abbreviated to
