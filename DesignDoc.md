@@ -1050,11 +1050,13 @@ Codex Attach では、過去の PTY output を replay しない。
 
 ##### Terminal mode ownership
 
-Attach は、managed process が subscriber の存在前に出力した terminal mode 変更の escape sequence に依存しない。managed process は起動時に bracketed paste mode を有効化するが、その output は attach 時に replay されず、後から attach しても再送されるとは限らないためである。
+Attach は、managed process が subscriber の存在前に出力した terminal mode 変更の escape sequence に依存しない。managed process は起動時に alternate screen と bracketed paste mode を有効化するが、その output は attach 時に replay されず、後から attach しても再送されるとは限らないためである。
 
-attach client が terminal の ownership を取得するとき、attached process との対話に必要な outer terminal の mode (bracketed paste) を自ら確立する。この確立は input / output の転送を開始する前に行い、転送をすべて止めた後、terminal を返す前に解除する。解除は Detach、process の終了、Failure、socket error、cancel のいずれの終了経路でも行う。Attach ごとに確立と解除を繰り返し、前回の attach や Agent View が残した状態には依存しない。
+attach client が terminal の ownership を取得するとき、outer terminal の alternate screen を取得してから bracketed paste を有効化する。この確立は input / output の転送を開始する前に行う。終了時は転送をすべて止め、bracketed paste、alternate screen、raw mode の順に解除してから terminal を返す。解除は Detach、process の終了、Failure、socket error、cancel、terminal write error のいずれの終了経路でも行う。Attach ごとに確立と解除を繰り返し、前回の attach や Agent View が残した状態には依存しない。
 
-attach 中に process 自身が出力する mode 変更 (外部 editor 実行のための bracketed paste 解除・再開など) は、filter も override もせずそのまま転送する。agentsctl が確立するのは attach 開始時点の状態だけで、child の terminal 状態を replay・emulate することはしない。
+attach-level alternate screen は、外部 editor が出力する alternate-screen leave より長く存続する。terminal の alternate screen は ownership stack ではないため、managed process が出力した `ESC[?1049l` を物理 outer terminal へ渡すと attach-level ownership まで解除される。そこで client は、supervisor から受信した output を物理 terminal へ書く最終境界で、この完全一致 sequence だけを除外する。sequence が複数の Output frame に分割されても同じ byte stream として扱い、不完全な prefix は stream 終端で失わず出力する。bracketed paste の変更、alternate-screen enter、その他の output は順序を変えずに転送する。一般的な ANSI parsing や child terminal state の emulation は行わない。
+
+supervisor が managed PTY から読み取る byte stream は変更しない。外部 editor の lifecycle detector は元の alternate-screen leave と Codex の resume を観測し、既存の PTY resize による redraw を実行する。redraw は attach-level alternate screen 上に描画され、user が Agent View 起動前に使用していた main screen を描画先にしない。
 
 ##### Same-size reattach
 

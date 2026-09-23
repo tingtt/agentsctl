@@ -3,6 +3,7 @@
 package supervisor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,15 +19,83 @@ import (
 	"golang.org/x/term"
 )
 
-// Bracketed-paste mode (DECSET 2004) on the outer terminal. The managed
-// process enables it once, at its own startup, which can be long before any
+// Terminal modes owned by a managed Codex attach on the outer terminal. The
+// process establishes these modes at startup, which can be long before any
 // attach subscriber exists; output produced then is not replayed (see the
-// DesignDoc's PTY attach and redraw section), so an attach cannot rely on
-// having seen it.
+// DesignDoc's PTY attach and redraw section), so every attach establishes its
+// own screen and paste state.
 const (
-	bracketedPasteEnable  = "\x1b[?2004h"
-	bracketedPasteDisable = "\x1b[?2004l"
+	alternateScreenEnable  = "\x1b[?1049h"
+	alternateScreenDisable = "\x1b[?1049l"
+	bracketedPasteEnable   = "\x1b[?2004h"
+	bracketedPasteDisable  = "\x1b[?2004l"
 )
+
+// alternateScreenLeaveFilter removes only a managed process's DECRST 1049
+// from the physical-terminal stream. Attach owns the outer alternate screen,
+// and terminal screen modes are not nested: forwarding a child leave would
+// release Attach's screen and expose the user's main buffer. The supervisor
+// still observes and broadcasts the original PTY bytes; this filter exists
+// only at the final client-to-terminal boundary.
+type alternateScreenLeaveFilter struct {
+	out     io.Writer
+	pending []byte
+}
+
+func newAlternateScreenLeaveFilter(out io.Writer) *alternateScreenLeaveFilter {
+	return &alternateScreenLeaveFilter{out: out}
+}
+
+func (f *alternateScreenLeaveFilter) Write(chunk []byte) error {
+	sequence := []byte(alternateScreenDisable)
+	data := append(f.pending, chunk...)
+	f.pending = f.pending[:0]
+	for len(data) > 0 {
+		if index := bytes.Index(data, sequence); index >= 0 {
+			if err := writeFull(f.out, data[:index]); err != nil {
+				return err
+			}
+			data = data[index+len(sequence):]
+			continue
+		}
+		keep := longestSuffixPrefix(data, sequence)
+		if err := writeFull(f.out, data[:len(data)-keep]); err != nil {
+			return err
+		}
+		f.pending = append(f.pending, data[len(data)-keep:]...)
+		return nil
+	}
+	return nil
+}
+
+func (f *alternateScreenLeaveFilter) Flush() error {
+	err := writeFull(f.out, f.pending)
+	f.pending = f.pending[:0]
+	return err
+}
+
+func longestSuffixPrefix(data, sequence []byte) int {
+	for length := min(len(data), len(sequence)-1); length > 0; length-- {
+		if bytes.Equal(data[len(data)-length:], sequence[:length]) {
+			return length
+		}
+	}
+	return 0
+}
+
+func writeFull(out io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := out.Write(data)
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
 
 type lockedFrames struct {
 	mu sync.Mutex
@@ -66,7 +135,7 @@ func (c Client) Attach(ctx context.Context, runID string, in *os.File, out io.Wr
 	return c.attach(ctx, runID, in, out, pumpAttachInput)
 }
 
-func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Writer, pumpInput attachInputPump) error {
+func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Writer, pumpInput attachInputPump) (retErr error) {
 	conn, err := net.Dial("unix", c.Socket)
 	if err != nil {
 		return err
@@ -95,17 +164,21 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 		return err
 	}
 	defer restore()
-	// While this attach owns the terminal, the outer terminal must bracket
-	// pastes for the attached process, which is already running in
-	// bracketed-paste mode and will not announce it again. The mode is
-	// established before any forwarding starts and released only after all
-	// forwarding has stopped (this defer runs after the join defer below,
-	// and before restore), whichever way the attach ends. Sequences the
-	// process itself emits during the attach are forwarded untouched.
-	defer func() { _, _ = io.WriteString(out, bracketedPasteDisable) }()
-	if _, err := io.WriteString(out, bracketedPasteEnable); err != nil {
+	// The attach-level alternate screen keeps every managed redraw away from
+	// the user's main buffer. Cleanup defers are registered before forwarding
+	// starts; because the pump join is registered later, LIFO order is:
+	// stop/join forwarding, flush a partial child sequence, disable paste,
+	// leave this screen, then restore the terminal mode.
+	defer func() { retErr = errors.Join(retErr, writeFull(out, []byte(alternateScreenDisable))) }()
+	if err := writeFull(out, []byte(alternateScreenEnable)); err != nil {
 		return err
 	}
+	defer func() { retErr = errors.Join(retErr, writeFull(out, []byte(bracketedPasteDisable))) }()
+	if err := writeFull(out, []byte(bracketedPasteEnable)); err != nil {
+		return err
+	}
+	filteredOutput := newAlternateScreenLeaveFilter(out)
+	defer func() { retErr = errors.Join(retErr, filteredOutput.Flush()) }()
 	frames := &lockedFrames{w: conn}
 	sendSize := func(redraw bool) {
 		cols, rows, err := term.GetSize(int(in.Fd()))
@@ -184,7 +257,7 @@ func (c Client) attach(ctx context.Context, runID string, in *os.File, out io.Wr
 			}
 			switch msg.kind {
 			case protocol.Output:
-				if _, err := out.Write(msg.data); err != nil {
+				if err := filteredOutput.Write(msg.data); err != nil {
 					return err
 				}
 			case protocol.Exit:
