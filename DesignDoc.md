@@ -1009,6 +1009,8 @@ candidate が以下の場合は binding しない。
 
 session ID を推測して割り当てることはしない。
 
+writer ownership は、managed run 自身の process identity が thread の writer lock を所有していることで証明する。この前提を保つため、agentsctl が起動する Codex CLI process は、新規起動・resume とも常に `--no-daemon` を付ける (`codex --no-daemon <prompt>`、`codex --no-daemon resume <thread ID>`)。Codex の shared background server を経由すると writer を daemon が所有し、thread が正常に起動していても ownership を証明できず run が `Starting` のまま残るためである。`--no-daemon` を受け付けない Codex CLI では通常の起動失敗とし、flag 無しで再起動する fallback は持たない。
+
 #### Codex provisional session identity
 
 Codex session の実体は app-server thread であり、canonical な session key は `codex:<thread ID>` である。managed run は thread とは別の lifecycle を持つため、run ID を session の恒久的な identity へ昇格させない (existing thread の Resume では新しい managed run が作られうる)。
