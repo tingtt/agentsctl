@@ -37,7 +37,8 @@ type NativeRenamer interface {
 	// that the session can accept composer input, and only then submits
 	// the rename command, returning once that submission is durable.
 	// cleanup is non-nil whenever the client was started -- including
-	// when ready fails after the start -- and nil only if err is non-nil.
+	// when ready fails after the start -- and nil only when the client
+	// could not be started.
 	Send(ctx context.Context, path, id, name string, ready func(context.Context) error) (cleanup func(context.Context, time.Duration) error, err error)
 }
 
