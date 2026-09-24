@@ -35,6 +35,29 @@ type Provider struct {
 	Store       *localstate.Store
 	Runtime     Dispatcher
 	WriterOwner func(string, processinfo.Identity) (bool, error)
+	// ControlSocket overrides the shared app-server control socket the
+	// Observer connects to; empty means the default under the resolved
+	// Codex home (see resolveCodexHome).
+	ControlSocket string
+
+	// writerFree replaces the writer-lock probe (see writerAbsent); tests
+	// only.
+	writerFree func(threadID string) bool
+	obs        observerHub
+}
+
+// codexHome is the Codex home the app-server reported, or, before any
+// short-lived app-server call has reported one, the one resolved the way
+// Codex itself resolves it.
+func (p *Provider) codexHome() string {
+	if home := p.API.CodexHome(); home != "" {
+		return home
+	}
+	home, err := resolveCodexHome(os.Getenv, os.UserHomeDir)
+	if err != nil {
+		return ""
+	}
+	return home
 }
 
 func (p *Provider) ID() session.ProviderID { return session.ProviderCodex }
@@ -48,6 +71,10 @@ func (p *Provider) Available() error {
 }
 
 func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, error) {
+	var fetch uint64
+	if !archived {
+		fetch = p.runtime().beginCatalogFetch()
+	}
 	threads, err := p.API.List(ctx, archived)
 	if err != nil {
 		return nil, err
@@ -57,6 +84,26 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		p.applyPendingRenames(ctx, threads)
 	}
 	runs, _ := p.Store.Runs()
+	rows := p.sessionRows(threads, runs, archived, func(t Thread, writerFree func() bool) observation {
+		return observeThread(t.Status, writerFree)
+	})
+	if !archived {
+		// Until the shared app-server connection replaces them, the rows
+		// the existing execution path produces (provisional runs,
+		// reconciled threads) only become visible through List; keep the
+		// Observer's catalog in step so its snapshots include them.
+		p.syncObservedCatalog(fetch, threads)
+	}
+	return rows, nil
+}
+
+// sessionRows normalizes a thread catalog plus the local managed-run state
+// into session rows. It is shared by List and the Observer snapshot so both
+// build rows the same way; only Activity/Runtime come from observe, the
+// caller's source of runtime observation. Which actions a row offers never
+// depends on observe: it stays with the managed-run and writer-lock rules
+// below.
+func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run, archived bool, observe func(Thread, func() bool) observation) []session.Session {
 	managed := map[string]localstate.Run{}
 	renameFailed := map[string]string{}
 	// provisional collects, per thread, the keys its bound runs were listed
@@ -80,6 +127,9 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	rows := make([]session.Session, 0, len(threads)+len(runs))
 	for _, t := range threads {
+		if hiddenThread(t) {
+			continue
+		}
 		run, ok := managed[t.ID]
 		summary := value(t.Preview)
 		if msg, failed := renameFailed[t.ID]; failed && value(t.Name) == "" {
@@ -88,10 +138,21 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			// requested name was lost.
 			summary = msg
 		}
-		runtime := session.RuntimeNone
+		var free *bool
+		writerFree := func() bool {
+			if free == nil {
+				v := p.writerAbsent(t.ID)
+				free = &v
+			}
+			return *free
+		}
+		observed := observe(t, writerFree)
+		runtime := observed.Runtime
 		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: {Available: true}}
 		switch {
 		case ok:
+			// An agentsctl-managed run keeps its existing Runtime whatever
+			// was observed: it is not the shared app-server's runtime.
 			runtime = session.RuntimeDetached
 			actions[session.ActionOpen] = session.Availability{Available: true}
 			if run.State == "running" || run.State == "starting" {
@@ -99,16 +160,15 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			} else {
 				actions[session.ActionStop] = session.Availability{Reason: "managed run is not currently running"}
 			}
-		case p.writerAbsent(t.ID):
+		case writerFree():
 			actions[session.ActionOpen] = session.Availability{Available: true}
 			actions[session.ActionStop] = session.Availability{Reason: "no agentsctl-managed run is tracking this session"}
 		default:
-			runtime = session.RuntimeExternal
 			reason := "external or unknown Codex writer cannot be attached or stopped safely"
 			actions[session.ActionOpen] = session.Availability{Reason: reason}
 			actions[session.ActionStop] = session.Availability{Reason: reason}
 		}
-		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: codexActivity(t), Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
+		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: observed.Activity, Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
 	if !archived {
 		for _, r := range runs {
@@ -137,7 +197,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 			rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: name, Summary: r.Error, CWD: r.CWD, CreatedAt: r.StartedAt, UpdatedAt: r.StartedAt, Activity: activity, Runtime: runtime, RunID: r.ID, Actions: actions})
 		}
 	}
-	return rows, nil
+	return rows
 }
 
 // sortedKeys returns keys ordered by ID so PreviousKeys does not depend on
@@ -326,8 +386,17 @@ func (p *Provider) Archive(ctx context.Context, k session.Key) error {
 		}
 		return p.Store.DeleteTerminalUnboundRun(k.ID, isTerminalRunState)
 	}
-	return p.API.Archive(ctx, k.ID)
+	if err := p.API.Archive(ctx, k.ID); err != nil {
+		return err
+	}
+	p.catalogChanged()
+	return nil
 }
+
+// catalogChanged asks the Observer's connection to re-read the catalog
+// after a change made through the short-lived app-server, which the shared
+// daemon does not broadcast.
+func (p *Provider) catalogChanged() { p.runtime().requestCatalog() }
 
 // isTerminalRunState reports whether a localstate.Run.State value is
 // terminal — the run reached an end state without (or, for a previously-
@@ -339,7 +408,11 @@ func isTerminalRunState(state string) bool {
 	return state == "failed" || state == "stale" || state == "stopped"
 }
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
-	return p.API.Unarchive(ctx, k.ID)
+	if err := p.API.Unarchive(ctx, k.ID); err != nil {
+		return err
+	}
+	p.catalogChanged()
+	return nil
 }
 
 // fiveHourWindowDurationMins and weeklyWindowDurationMins are the
@@ -403,6 +476,7 @@ func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error
 	if err := p.API.Rename(ctx, k.ID, name); err != nil {
 		return err
 	}
+	p.catalogChanged()
 	p.clearRenameError(k.ID)
 	return nil
 }
@@ -516,7 +590,7 @@ func (p *Provider) reconcile(threads []Thread) error {
 			if owner == nil {
 				owner = writerlock.OwnsWriterLock
 			}
-			owned, _ := owner(filepath.Join(p.API.CodexHome(), "thread-writer-locks", t.ID+".lock"), processinfo.Identity{PID: r.PID, StartTime: r.StartTime, UID: r.UID})
+			owned, _ := owner(writerLockPath(p.API.CodexHome(), t.ID), processinfo.Identity{PID: r.PID, StartTime: r.StartTime, UID: r.UID})
 			if !base[t.ID] && filepath.Clean(t.CWD) == filepath.Clean(r.CWD) && owned {
 				candidates = append(candidates, t.ID)
 			}
@@ -542,12 +616,18 @@ func (p *Provider) reconcile(threads []Thread) error {
 	return nil
 }
 
+// writerAbsent reports whether no process holds threadID's writer lock.
+// Anything it cannot establish (unknown Codex home, an untrusted lock file,
+// an I/O error) reports false: fail closed.
 func (p *Provider) writerAbsent(id string) bool {
-	home := p.API.CodexHome()
+	if p.writerFree != nil {
+		return p.writerFree(id)
+	}
+	home := p.codexHome()
 	if home == "" {
 		return false
 	}
-	path := filepath.Join(home, "thread-writer-locks", id+".lock")
+	path := writerLockPath(home, id)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return true
@@ -571,41 +651,4 @@ func value(v *string) string {
 		return ""
 	}
 	return *v
-}
-func codexActivity(t Thread) session.Activity {
-	status := strings.ToLower(t.Status.Type)
-	for _, f := range t.Status.ActiveFlags {
-		if strings.Contains(strings.ToLower(f), "rate") || strings.Contains(strings.ToLower(f), "quota") {
-			return session.ActivityWaitingQuota
-		}
-	}
-	switch status {
-	case "active", "running", "inprogress":
-		return session.ActivityWorking
-	case "waitingforinput", "needsinput":
-		return session.ActivityNeedsInput
-	case "completed":
-		return session.ActivityCompleted
-	case "failed", "error":
-		return session.ActivityFailed
-	case "idle":
-		return session.ActivityIdle
-	case "notloaded":
-		// notLoaded means the queried app-server instance does not have the
-		// thread loaded; it does not prove that another Codex runtime owning
-		// the thread is idle.
-		return session.ActivityUnknown
-	default:
-		if len(t.Turns) > 0 {
-			switch strings.ToLower(t.Turns[len(t.Turns)-1].Status) {
-			case "inprogress":
-				return session.ActivityWorking
-			case "completed":
-				return session.ActivityCompleted
-			case "failed":
-				return session.ActivityFailed
-			}
-		}
-		return session.ActivityUnknown
-	}
 }
