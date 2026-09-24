@@ -784,3 +784,93 @@ func TestScopeChangeReFiltersObserverOwnedRowsWithoutListReplacement(t *testing.
 		t.Fatalf("C must reappear once scope widens to ScopeAll, purely via re-filtering (List returned nothing new): %v", rowNames(rt.State.Rows))
 	}
 }
+
+// listStatusObserverProvider is a Codex-like Observer provider whose List
+// is a native, fresh read: it states ListOwnsStatus through
+// sessionctl.ListStatusAuthority, and its List can be made to fail.
+type listStatusObserverProvider struct {
+	*observerFakeProvider
+	err error
+}
+
+func (p *listStatusObserverProvider) ListOwnsStatus() bool { return true }
+
+func (p *listStatusObserverProvider) List(ctx context.Context, archived bool) ([]session.Session, error) {
+	if p.err != nil {
+		return nil, p.err
+	}
+	return p.observerFakeProvider.List(ctx, archived)
+}
+
+// TestListOwningStatusRecoversWarningBeforeObserverAuthority fixes that,
+// while the Observer has not published successfully yet, a successful List
+// from a provider stating ListOwnsStatus both refreshes the rows and clears
+// the warning an earlier List failure left -- the warning must not stick
+// until the Observer first connects.
+func TestListOwningStatusRecoversWarningBeforeObserverAuthority(t *testing.T) {
+	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
+	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp), err: errors.New("temporary error")}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if rt.State.Warnings[session.ProviderCodex] == nil {
+		t.Fatal("expected the List failure to surface as a warning")
+	}
+
+	codex.err = nil
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if w := rt.State.Warnings[session.ProviderCodex]; w != nil {
+		t.Fatalf("a successful List owning status must clear the warning before Observer authority: %v", w)
+	}
+	if !contains(rowNames(rt.State.Rows), "A") {
+		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
+	}
+}
+
+// TestListOwningStatusNeverTakesRowsBackFromObserver fixes that
+// ListOwnsStatus is only about warnings: after an Observer success, a
+// successful List -- even one owning status -- neither rolls rows back
+// nor clears the Observer's warning, on repeated reloads.
+func TestListOwningStatusNeverTakesRowsBackFromObserver(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "B", CWD: "/work"}
+	cRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "C", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{bRow}}
+	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	warning := errors.New("observer warning")
+	codex.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{cRow}, Warning: warning}
+	rt.drainObserver(t)
+
+	for range 2 {
+		rt.requestReload(ctx)
+		rt.drainCatalog(ctx)
+		names := rowNames(rt.State.Rows)
+		if !contains(names, "C") || contains(names, "B") {
+			t.Fatalf("a List owning status must not roll back Observer-owned rows: %v", names)
+		}
+		if rt.State.Warnings[session.ProviderCodex] == nil {
+			t.Fatal("a List success must not clear the warning once Observer owns the provider")
+		}
+		if !rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
+			t.Fatal("List success must never reset observerSnapshotSeen")
+		}
+	}
+
+	// A List failure still surfaces, even with Observer authority.
+	codex.err = errors.New("list failed")
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if w := rt.State.Warnings[session.ProviderCodex]; w == nil || w.Error() != "list failed" {
+		t.Fatalf("warning=%v", w)
+	}
+}

@@ -11,22 +11,38 @@ import (
 	"sync"
 )
 
+// ThreadStatus is a thread's native runtime status as reported by the
+// app-server that answered (see nativeActivity). ActiveFlags is only
+// meaningful for "active"; unknown types and flags decode as-is.
 type ThreadStatus struct {
 	Type        string   `json:"type"`
 	ActiveFlags []string `json:"activeFlags"`
 }
-type Turn struct {
-	Status string `json:"status"`
-}
+
+// Thread is the subset of the app-server's Thread this package reads.
+// Ephemeral and ThreadSource identify internal temporary threads that are
+// never user-visible sessions (see hiddenThread).
 type Thread struct {
-	ID        string       `json:"id"`
-	Name      *string      `json:"name"`
-	Preview   *string      `json:"preview"`
-	CWD       string       `json:"cwd"`
-	CreatedAt int64        `json:"createdAt"`
-	UpdatedAt int64        `json:"updatedAt"`
-	Status    ThreadStatus `json:"status"`
-	Turns     []Turn       `json:"turns"`
+	ID           string       `json:"id"`
+	Name         *string      `json:"name"`
+	Preview      *string      `json:"preview"`
+	CWD          string       `json:"cwd"`
+	CreatedAt    int64        `json:"createdAt"`
+	UpdatedAt    int64        `json:"updatedAt"`
+	Status       ThreadStatus `json:"status"`
+	Ephemeral    bool         `json:"ephemeral"`
+	ThreadSource *string      `json:"threadSource"`
+}
+
+// threadSourceTitle is the threadSource of the temporary thread the Codex
+// TUI starts to generate another thread's title.
+const threadSourceTitle = "thread_title"
+
+// hiddenThread reports whether t is an internal temporary thread (title
+// generation) rather than a user session. Only that exact shape is hidden,
+// so no user-visible thread is dropped by a looser guess.
+func hiddenThread(t Thread) bool {
+	return t.Ephemeral && t.ThreadSource != nil && *t.ThreadSource == threadSourceTitle
 }
 
 // RateLimitWindow is one account-level rate-limit window, decoded straight
@@ -112,10 +128,7 @@ func (c *CommandAppServer) withClient(ctx context.Context, fn func(*rpcClient) e
 	var init struct {
 		CodexHome string `json:"codexHome"`
 	}
-	if err := cl.call(ctx, "initialize", map[string]any{"clientInfo": map[string]string{"name": "agentsctl", "version": "dev"}, "capabilities": map[string]bool{"experimentalApi": false}}, &init); err != nil {
-		return err
-	}
-	if err := cl.notify("initialized", struct{}{}); err != nil {
+	if err := initializeRPC(ctx, cl.call, cl.notify, &init); err != nil {
 		return err
 	}
 	c.mu.Lock()
@@ -125,38 +138,49 @@ func (c *CommandAppServer) withClient(ctx context.Context, fn func(*rpcClient) e
 }
 
 func (c *CommandAppServer) List(ctx context.Context, archived bool) ([]Thread, error) {
-	var order []string
-	byID := map[string]Thread{}
+	var rows []Thread
 	err := c.withClient(ctx, func(cl *rpcClient) error {
-		var cursor *string
-		seen := map[string]bool{}
-		for {
-			var res struct {
-				Data []Thread `json:"data"`
-				Next *string  `json:"nextCursor"`
-			}
-			params := map[string]any{"limit": 100, "archived": archived}
-			if cursor != nil {
-				params["cursor"] = *cursor
-			}
-			if err := cl.call(ctx, "thread/list", params, &res); err != nil {
-				return err
-			}
-			for _, t := range res.Data {
-				mergeThread(byID, &order, t)
-			}
-			if res.Next == nil || *res.Next == "" {
-				return nil
-			}
-			if seen[*res.Next] {
-				return errors.New("thread/list repeated cursor")
-			}
-			seen[*res.Next] = true
-			cursor = res.Next
-		}
+		var err error
+		rows, err = listThreads(ctx, cl.call, archived)
+		return err
 	})
 	if err != nil {
 		return nil, err
+	}
+	return rows, nil
+}
+
+// listThreads walks every thread/list page through call, de-duplicating by
+// thread ID (see mergeThread). Shared by the short-lived stdio client and
+// the persistent runtime connection.
+func listThreads(ctx context.Context, call func(context.Context, string, any, any) error, archived bool) ([]Thread, error) {
+	var order []string
+	byID := map[string]Thread{}
+	var cursor *string
+	seen := map[string]bool{}
+	for {
+		var res struct {
+			Data []Thread `json:"data"`
+			Next *string  `json:"nextCursor"`
+		}
+		params := map[string]any{"limit": 100, "archived": archived}
+		if cursor != nil {
+			params["cursor"] = *cursor
+		}
+		if err := call(ctx, "thread/list", params, &res); err != nil {
+			return nil, err
+		}
+		for _, t := range res.Data {
+			mergeThread(byID, &order, t)
+		}
+		if res.Next == nil || *res.Next == "" {
+			break
+		}
+		if seen[*res.Next] {
+			return nil, errors.New("thread/list repeated cursor")
+		}
+		seen[*res.Next] = true
+		cursor = res.Next
 	}
 	rows := make([]Thread, 0, len(order))
 	for _, id := range order {

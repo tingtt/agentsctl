@@ -564,42 +564,33 @@ func (r *Runtime) requestReload(ctx context.Context) {
 // snapshot store): a real Source.List error (misconfiguration, browser
 // unavailable, ...) is never hidden, regardless of listOwnsStatus.
 //
-// A successful List (err == nil) never touches warning when listOwnsStatus
-// is false (see sessionctl.ProviderSnapshot.ListOwnsStatus's doc comment)
-// -- only a subsequent Observer update (see applyObserverUpdate) is
-// entitled to replace or clear a warning for a provider that also
-// implements sessionctl.Observer. This is what fixes one real regression:
-// without it, a routine Ctrl+L (which still calls List for its now-fast
-// cached read) would silently erase an unresolved ChatGPT persistence or
-// refresh-failure warning the moment the cache read itself merely
-// succeeded.
+// A successful List (err == nil) is judged on two independent axes:
 //
-// Whether a successful List is even allowed to replace sessions depends
-// on the same listOwnsStatus split, plus observerSnapshotSeen for the
-// !listOwnsStatus case:
-//
-//   - listOwnsStatus == true (an ordinary Source-only provider): List
-//     always replaces sessions and clears warning, exactly as before any
-//     of this Observer machinery existed.
-//   - listOwnsStatus == false, observerSnapshotSeen == false (an
-//     Observer-capable provider that hasn't yet had a successful Observer
-//     publication -- e.g. right after startup, serving a persisted-cache
-//     hydration): List is still allowed to seed sessions. This is the
-//     restart-bootstrap path -- persisted rows must appear immediately,
-//     before any real refresh has completed.
-//   - listOwnsStatus == false, observerSnapshotSeen == true (Observer has
-//     already published at least one successful full catalog for this
-//     provider): List's own result is now stale/non-authoritative and is
-//     IGNORED for rows. This fixes the second real regression: Observer
-//     publications are independent of any Agent View reload generation
-//     (see the DesignDoc's "Observer generations"), so within one Ctrl+L
-//     cycle a slower LoadStream List(B) arrival can be delivered AFTER a
-//     faster background refresh has already published a newer Observer
-//     catalog C -- catalogGen alone does not protect against this, since
-//     both B and C are individually valid, current-generation-or-
-//     independent-of-generation events. Once Observer owns a provider's
-//     rows, no List result -- however "current" -- may roll them back to
-//     an older snapshot.
+//   - rows: observerSnapshotSeen. Once a successful Observer publication
+//     has been applied for this provider, Observer owns its rows for good
+//     and a successful List is IGNORED entirely -- whatever
+//     listOwnsStatus says. Observer publications are independent of any
+//     Agent View reload generation (see the DesignDoc's "Observer
+//     generations"), so within one Ctrl+L cycle a slower LoadStream
+//     List(B) arrival can be delivered AFTER a faster background refresh
+//     has already published a newer Observer catalog C -- catalogGen
+//     alone does not protect against this, since both B and C are
+//     individually valid, current-generation-or-independent-of-
+//     generation events. Once Observer owns a provider's rows, no List
+//     result -- however "current" -- may roll them back to an older
+//     snapshot. Before that (a Source-only provider, or an Observer
+//     provider with no successful publication yet -- e.g. right after
+//     startup, serving a persisted-cache hydration, or Codex before its
+//     app-server connection is up), List seeds the rows.
+//   - warning: listOwnsStatus (see sessionctl.ProviderSnapshot's doc
+//     comment), consulted only while List still owns the rows. When true,
+//     a successful List proves recovery and clears the warning. When
+//     false (an Observer provider whose List may just read a cache, e.g.
+//     ChatGPT), it never touches the warning -- only a subsequent Observer
+//     update (see applyObserverUpdate) may replace or clear it. Without
+//     that, a routine Ctrl+L (a now-fast cached read) would silently erase
+//     an unresolved ChatGPT persistence or refresh-failure warning the
+//     moment the cache read itself merely succeeded.
 //
 // Only ever called from the eventLoop goroutine. Does not itself update
 // State -- see recomputeRows.
@@ -610,14 +601,15 @@ func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Se
 		r.providerSnapshots[id] = st
 		return
 	}
-	if listOwnsStatus {
-		st.sessions = sessions
-		st.warning = nil
-	} else if !st.observerSnapshotSeen {
-		st.sessions = sessions
+	if st.observerSnapshotSeen {
+		// Observer owns this provider's rows (and, from then on, its
+		// warning): this List result is ignored.
+		return
 	}
-	// else: Observer already owns this provider's rows -- this List
-	// result is ignored for both sessions and warning.
+	st.sessions = sessions
+	if listOwnsStatus {
+		st.warning = nil
+	}
 	r.providerSnapshots[id] = st
 }
 

@@ -408,7 +408,7 @@ func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
 		{ID: "unknown", CreatedAt: 300, UpdatedAt: 700, Status: ThreadStatus{Type: "future"}},
 		{ID: "not-loaded", CreatedAt: 400, UpdatedAt: 600, Status: ThreadStatus{Type: "notLoaded"}},
 	}}
-	p := Provider{API: api, Store: store}
+	p := Provider{API: api, Store: store, writerFree: func(id string) bool { return id != "not-loaded" }}
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
@@ -416,8 +416,13 @@ func TestListUsesAppServerCreatedAtAndPreservesActivityMapping(t *testing.T) {
 	if !rows[0].CreatedAt.Equal(time.Unix(100, 0)) || rows[0].Activity != session.ActivityWorking {
 		t.Fatalf("working=%+v", rows[0])
 	}
-	if rows[1].Activity != session.ActivityIdle || rows[2].Activity != session.ActivityUnknown || rows[3].Activity != session.ActivityUnknown {
+	if rows[1].Activity != session.ActivityIdle || rows[2].Activity != session.ActivityUnknown {
 		t.Fatalf("rows=%+v", rows)
+	}
+	// notLoaded with a writer lock held: a runtime outside the queried
+	// app-server, whose Activity cannot be known.
+	if rows[3].Activity != session.ActivityUnknown || rows[3].Runtime != session.RuntimeExternal {
+		t.Fatalf("not-loaded=%+v", rows[3])
 	}
 }
 
@@ -566,28 +571,65 @@ func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 	}
 }
 
-func TestCodexNativeStatusMapping(t *testing.T) {
+func TestNativeActivityMapping(t *testing.T) {
 	cases := []struct {
 		name   string
-		thread Thread
+		status ThreadStatus
 		want   session.Activity
 	}{
-		{name: "working", thread: Thread{Status: ThreadStatus{Type: "active"}}, want: session.ActivityWorking},
-		{name: "needs input", thread: Thread{Status: ThreadStatus{Type: "needsInput"}}, want: session.ActivityNeedsInput},
-		{name: "quota", thread: Thread{Status: ThreadStatus{Type: "active", ActiveFlags: []string{"rateLimit"}}}, want: session.ActivityWaitingQuota},
-		{name: "idle", thread: Thread{Status: ThreadStatus{Type: "idle"}}, want: session.ActivityIdle},
-		{name: "not loaded is not idle", thread: Thread{Status: ThreadStatus{Type: "notLoaded"}}, want: session.ActivityUnknown},
-		{name: "not loaded ignores persisted turns", thread: Thread{Status: ThreadStatus{Type: "notLoaded"}, Turns: []Turn{{Status: "completed"}}}, want: session.ActivityUnknown},
-		{name: "completed", thread: Thread{Status: ThreadStatus{Type: "completed"}}, want: session.ActivityCompleted},
-		{name: "failed", thread: Thread{Status: ThreadStatus{Type: "failed"}}, want: session.ActivityFailed},
-		{name: "unknown", thread: Thread{Status: ThreadStatus{Type: "future"}}, want: session.ActivityUnknown},
+		{name: "active without flags", status: ThreadStatus{Type: "active", ActiveFlags: []string{}}, want: session.ActivityWorking},
+		{name: "waiting on approval", status: ThreadStatus{Type: "active", ActiveFlags: []string{"waitingOnApproval"}}, want: session.ActivityNeedsInput},
+		{name: "waiting on user input", status: ThreadStatus{Type: "active", ActiveFlags: []string{"waitingOnUserInput"}}, want: session.ActivityNeedsInput},
+		{name: "unknown flag stays working", status: ThreadStatus{Type: "active", ActiveFlags: []string{"futureFlag"}}, want: session.ActivityWorking},
+		{name: "known flag wins over unknown flag", status: ThreadStatus{Type: "active", ActiveFlags: []string{"futureFlag", "waitingOnApproval"}}, want: session.ActivityNeedsInput},
+		{name: "idle", status: ThreadStatus{Type: "idle"}, want: session.ActivityIdle},
+		{name: "system error", status: ThreadStatus{Type: "systemError"}, want: session.ActivityFailed},
+		{name: "unknown type", status: ThreadStatus{Type: "future"}, want: session.ActivityUnknown},
+		{name: "legacy completed is not a native status", status: ThreadStatus{Type: "completed"}, want: session.ActivityUnknown},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := codexActivity(tc.thread); got != tc.want {
+			if got := nativeActivity(tc.status); got != tc.want {
 				t.Fatalf("activity=%s, want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestThreadStatusDecodesUnknownFieldsAndValues(t *testing.T) {
+	var got Thread
+	raw := `{"id":"a","status":{"type":"active","activeFlags":["waitingOnApproval","futureFlag"],"future":1},"turns":[{"status":"completed"}],"futureField":true}`
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatal(err)
+	}
+	if nativeActivity(got.Status) != session.ActivityNeedsInput {
+		t.Fatalf("status=%+v", got.Status)
+	}
+}
+
+func TestObserveThreadConsultsWriterOnlyWhenNotLoaded(t *testing.T) {
+	probe := func(free bool, calls *int) func() bool {
+		return func() bool { *calls++; return free }
+	}
+	var calls int
+	if got := observeThread(ThreadStatus{Type: "notLoaded"}, probe(true, &calls)); got != (observation{session.ActivityIdle, session.RuntimeNone}) {
+		t.Fatalf("notLoaded without writer=%+v", got)
+	}
+	if got := observeThread(ThreadStatus{Type: "notLoaded"}, probe(false, &calls)); got != (observation{session.ActivityUnknown, session.RuntimeExternal}) {
+		t.Fatalf("notLoaded with writer=%+v", got)
+	}
+	if calls != 2 {
+		t.Fatalf("writer probe calls=%d, want 2", calls)
+	}
+	calls = 0
+	for _, status := range []ThreadStatus{{Type: "active"}, {Type: "idle"}, {Type: "systemError"}, {Type: "future"}} {
+		got := observeThread(status, probe(false, &calls))
+		if got.Runtime != session.RuntimeDetached || got.Activity != nativeActivity(status) {
+			t.Fatalf("%s=%+v", status.Type, got)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("a loaded status must never consult the writer lock, calls=%d", calls)
 	}
 }
 

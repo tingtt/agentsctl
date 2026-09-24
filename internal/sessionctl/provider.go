@@ -126,6 +126,22 @@ type Observer interface {
 	Observe(ctx context.Context) <-chan ProviderUpdate
 }
 
+// ListStatusAuthority is an optional capability of an Observer provider
+// whose List is itself a native, fresh read (not a last-known-good cache):
+// a successful List then proves that the provider's refresh status has
+// recovered, even though the provider also implements Observer. It only
+// decides ProviderSnapshot.ListOwnsStatus -- which rows are shown is
+// decided separately, and once an Observer snapshot has succeeded List
+// never gets row authority back (see the DesignDoc's "List と Observer、
+// どちらが warning/rows の authority か").
+//
+// An Observer provider that does not implement it keeps the default:
+// ListOwnsStatus is false (e.g. ChatGPT, whose List may just read its
+// cache).
+type ListStatusAuthority interface {
+	ListOwnsStatus() bool
+}
+
 // Refresher is an optional capability: requests a background catalog
 // refresh without blocking the caller for its result -- the eventual
 // outcome (success or failure) arrives later through Observer, never as
