@@ -145,6 +145,15 @@ func (p *Provider) observedSessions(view runtimeView) []session.Session {
 	return p.sessionRows(view.catalog, runs, false, view.observe)
 }
 
+// ListOwnsStatus implements sessionctl.ListStatusAuthority. Codex's List
+// reads the native catalog through a fresh short-lived app-server, never a
+// cache, so a successful List proves recovery from an earlier List
+// failure even while the Observer has not connected yet. Row authority is
+// unaffected: once an Observer snapshot succeeded, Agent View ignores List
+// rows, and this Provider's own List keeps the Observer's catalog current
+// (see syncObservedCatalog).
+func (p *Provider) ListOwnsStatus() bool { return true }
+
 // syncObservedCatalog installs a catalog List fetched (fetch numbered by
 // beginCatalogFetch) and republishes if it changed, so rows only the
 // existing execution path produces reach the Observer's snapshots.

@@ -89,6 +89,38 @@ func TestLoadStreamMarksObserverProviderListOwnsStatusFalse(t *testing.T) {
 	}
 }
 
+// listStatusObserverSource is a Codex-like Observer whose List is a native,
+// fresh read, stated through ListStatusAuthority.
+type listStatusObserverSource struct {
+	fakeObserverSource
+	owns bool
+}
+
+func (f *listStatusObserverSource) ListOwnsStatus() bool { return f.owns }
+
+// TestListStatusAuthorityDecidesObserverListOwnsStatus fixes the optional
+// capability: an Observer provider stating ListOwnsStatus() == true gets
+// ListOwnsStatus on both LoadStream and LoadProvider (and on failure too);
+// stating false keeps the Observer default.
+func TestListStatusAuthorityDecidesObserverListOwnsStatus(t *testing.T) {
+	for _, owns := range []bool{true, false} {
+		src := &listStatusObserverSource{fakeObserverSource: fakeObserverSource{fakeSource: fakeSource{id: session.ProviderCodex, rows: []session.Session{{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}}}}}, owns: owns}
+		c := Controller{Providers: []Source{src}}
+		for ps := range c.LoadStream(context.Background()) {
+			if ps.ListOwnsStatus != owns {
+				t.Fatalf("LoadStream owns=%v: got %+v", owns, ps)
+			}
+		}
+		if got := c.LoadProvider(context.Background(), session.ProviderCodex); got.ListOwnsStatus != owns {
+			t.Fatalf("LoadProvider owns=%v: got %+v", owns, got)
+		}
+		src.err = errBoom
+		if got := c.LoadProvider(context.Background(), session.ProviderCodex); got.Err == nil || got.ListOwnsStatus != owns {
+			t.Fatalf("failed LoadProvider owns=%v: got %+v", owns, got)
+		}
+	}
+}
+
 // TestLoadStreamMarksNonObserverProviderListOwnsStatusTrue is the
 // converse: an ordinary Source-only provider keeps List as the sole
 // authority on its own status, exactly as before ListOwnsStatus existed.
