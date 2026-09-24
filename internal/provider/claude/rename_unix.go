@@ -15,6 +15,6 @@ func NewNativeRenamer() NativeRenamer { return ptyRenamer{} }
 
 type ptyRenamer struct{}
 
-func (ptyRenamer) Send(ctx context.Context, path, id, name string) (func(context.Context, time.Duration) error, error) {
-	return sendClaudeRename(ctx, path, id, name)
+func (ptyRenamer) Send(ctx context.Context, path, id, name string, ready func(context.Context) error) (func(context.Context, time.Duration) error, error) {
+	return sendClaudeRename(ctx, path, id, name, ready)
 }

@@ -4,6 +4,7 @@ package claude
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,32 +12,46 @@ import (
 	"time"
 )
 
+// readyNow is a sendClaudeRename readiness func for a session whose worker
+// is already live.
+func readyNow(context.Context) error { return nil }
+
 // TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay fixes the
 // mechanical contract of sendClaudeRename against a fake `claude attach
-// <id>` client: the exact "/rename <name>\r" bytes must reach the child,
-// and Send must return as soon as that write succeeds -- not after some
-// fixed settle window. This is the regression test for the latency fix:
-// sendClaudeRename used to wait a fixed 1.5s before writing and another
-// fixed 1.2s after, neither of which was ever load-bearing for
-// correctness (see its doc comment for the real-CLI measurements that
-// proved this).
+// <id>` client: once ready has passed (exactly once), the command must
+// reach the child as a bracketed paste followed by a CR, and Send must
+// return as soon as that write succeeds -- not after some fixed settle
+// window (an earlier design waited a fixed 1.5s before writing and 1.2s
+// after, which was never load-bearing for correctness).
+//
+// The framing is the issue #75 regression: Claude 2.1.281 handles an
+// unbracketed burst of 64 or more characters as a paste, so a bare
+// "/rename <name>\r" with a name like the one below left the command
+// unsubmitted in the composer with the CR inserted as a newline. The name
+// is deliberately over that threshold and non-ASCII. Whether the real CLI
+// actually submits these bytes is covered by the opt-in live test.
 func TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay(t *testing.T) {
 	dir := t.TempDir()
 	outPath := filepath.Join(dir, "got")
-	name := "Test Rename"
-	command := "/rename " + name + "\r"
+	name := "#75 fix(claude): submit /rename correctly for 既存 sessions"
+	command := "\x1b[200~/rename " + name + "\x1b[201~\r"
 	script := writeFakeClaudeAttachScript(t, fmt.Sprintf(
 		`stty raw -echo; dd bs=1 count=%d of="%s" 2>/dev/null; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0`,
 		len(command), outPath))
 
+	readyCalls := 0
+	ready := func(context.Context) error { readyCalls++; return nil }
 	start := time.Now()
-	cleanup, err := sendClaudeRename(context.Background(), script, "id", name)
+	cleanup, err := sendClaudeRename(context.Background(), script, "id", name, ready)
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("sendClaudeRename err=%v", err)
 	}
 	if cleanup == nil {
 		t.Fatal("sendClaudeRename returned a nil cleanup on success")
+	}
+	if readyCalls != 1 {
+		t.Fatalf("ready was called %d times, want 1", readyCalls)
 	}
 	if elapsed > 500*time.Millisecond {
 		t.Fatalf("sendClaudeRename took %v to return -- a fixed settle delay appears to have been reintroduced", elapsed)
@@ -62,6 +77,49 @@ func TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay(t *testing.T) {
 	}
 }
 
+// TestSendClaudeRenameWritesNothingUntilSessionIsReady is the transport
+// half of the issue #75 regression: `claude attach` on a stopped session
+// respawns its worker, and a "/rename <name>\r" that reaches the worker
+// before its REPL is mounted is buffered as composer text with the CR
+// turned into a newline -- never submitted. The command must therefore
+// not be written until ready passes. When ready fails, Send must report
+// the error, write nothing, and still hand back a cleanup for the client
+// it already started: the first byte the fake client ever receives must
+// be cleanup's detach byte (Ctrl+Z), not any part of the command.
+func TestSendClaudeRenameWritesNothingUntilSessionIsReady(t *testing.T) {
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "got")
+	script := writeFakeClaudeAttachScript(t, fmt.Sprintf(
+		`stty raw -echo; dd bs=1 count=1 of="%s" 2>/dev/null; exit 0`, outPath))
+	notReady := errors.New("session worker is not live")
+
+	cleanup, err := sendClaudeRename(context.Background(), script, "id", "Some Name", func(context.Context) error { return notReady })
+	if !errors.Is(err, notReady) {
+		t.Fatalf("sendClaudeRename err=%v, want the readiness error", err)
+	}
+	if cleanup == nil {
+		t.Fatal("a readiness failure after the client started must still return its cleanup")
+	}
+	done := make(chan error, 1)
+	go func() { done <- cleanup(context.Background(), time.Second) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("cleanup err=%v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("cleanup did not return")
+	}
+
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "\x1a" {
+		t.Fatalf("child's first input byte was %q, want only the detach byte -- the command was written before the session was ready", got)
+	}
+}
+
 // TestSendClaudeRenameRejectsControlCharacterWithoutStartingChild fixes the
 // PTY command-injection defense at the transport boundary itself, not just
 // Provider.Rename's own check: a name containing a raw control character
@@ -76,7 +134,11 @@ func TestSendClaudeRenameRejectsControlCharacterWithoutStartingChild(t *testing.
 	marker := filepath.Join(dir, "started")
 	script := writeFakeClaudeAttachScript(t, fmt.Sprintf(`: > "%s"; stty raw -echo; exit 0`, marker))
 
-	cleanup, err := sendClaudeRename(context.Background(), script, "id", "evil\rhi there")
+	ready := func(context.Context) error {
+		t.Error("ready was consulted for a rejected name")
+		return nil
+	}
+	cleanup, err := sendClaudeRename(context.Background(), script, "id", "evil\rhi there", ready)
 	if err == nil {
 		t.Fatal("a name containing a raw CR was accepted")
 	}
@@ -106,7 +168,7 @@ func TestSendClaudeRenameDoesNotHangOrPanicOnEarlyClientExit(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		cleanup, err := sendClaudeRename(context.Background(), script, "id", "Some Name")
+		cleanup, err := sendClaudeRename(context.Background(), script, "id", "Some Name", readyNow)
 		done <- result{cleanup, err}
 	}()
 	var r result

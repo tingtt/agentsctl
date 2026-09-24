@@ -33,10 +33,13 @@ import (
 // latency (see sendClaudeRename's doc comment for the real-CLI
 // measurements behind this).
 type NativeRenamer interface {
-	// Send starts a transient attach client and submits the rename
-	// command, returning once that submission is durable. cleanup is nil
-	// only if err is non-nil.
-	Send(ctx context.Context, path, id, name string) (cleanup func(context.Context, time.Duration) error, err error)
+	// Send starts a transient attach client, waits for ready to report
+	// that the session can accept composer input, and only then submits
+	// the rename command, returning once that submission is durable.
+	// cleanup is non-nil whenever the client was started -- including
+	// when ready fails after the start -- and nil only when the client
+	// could not be started.
+	Send(ctx context.Context, path, id, name string, ready func(context.Context) error) (cleanup func(context.Context, time.Duration) error, err error)
 }
 
 // renameCleanupTimeout is looser than Open's interactive detach timeout
@@ -97,11 +100,12 @@ type Provider struct {
 	// simply omitted from the usage line, per UsageSource's optional-
 	// capability contract) and List skip no rows at all.
 	UsageProbe UsageProbeSource
-	// ConfirmPollInterval and ConfirmMaxWait override confirmRenamed's
-	// native-catalog poll cadence and ceiling; zero uses the documented
-	// defaults (confirmPollInterval/confirmMaxWait). Exposed so a test that
-	// deliberately never confirms doesn't have to wait out the full
-	// production ceiling to stay deterministic.
+	// ConfirmPollInterval and ConfirmMaxWait override the native-catalog
+	// poll cadence and ceiling Rename uses -- both for waitSessionLive
+	// before `/rename` is sent and for confirmRenamed after it; zero uses
+	// the documented defaults (confirmPollInterval/confirmMaxWait).
+	// Exposed so a test that deliberately never confirms doesn't have to
+	// wait out the full production ceiling to stay deterministic.
 	ConfirmPollInterval time.Duration
 	ConfirmMaxWait      time.Duration
 }
@@ -392,7 +396,9 @@ func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error
 	if p.Renamer == nil {
 		return errors.New("claude native rename is not supported on this platform")
 	}
-	cleanup, sendErr := p.Renamer.Send(ctx, p.path(), k.ID, name)
+	cleanup, sendErr := p.Renamer.Send(ctx, p.path(), k.ID, name, func(ctx context.Context) error {
+		return p.waitSessionLive(ctx, k.ID)
+	})
 
 	var cleanupWG sync.WaitGroup
 	if cleanup != nil {
@@ -432,11 +438,49 @@ const (
 // confirmRenamed polls `claude agents --json --all` -- the same native,
 // machine-readable source List() uses, never PTY output -- until it
 // reflects the new name, to confirm the rename actually landed in Claude's
-// own catalog before Rename reports success or touches local state. It is
-// time-bounded (confirmMaxWait) rather than a fixed attempt count, so a
-// slow individual `claude agents` call cannot silently balloon the total
-// wait past what confirmMaxWait actually allows.
+// own catalog before Rename reports success or touches local state.
 func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
+	err := p.pollNativeRow(ctx, id, func(row map[string]any) error {
+		if got := text(row, "name", "displayName"); got != name {
+			return fmt.Errorf("native session name is %q, want %q", got, name)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("could not confirm native rename: %w", err)
+	}
+	return nil
+}
+
+// waitSessionLive polls the native catalog until session id reports a
+// live worker `status` (idle, busy, ...), which Claude only publishes from
+// a running session's REPL. Rename's transient `claude attach` wakes a
+// stopped session by respawning its worker, and until that worker's REPL
+// is mounted, its terminal input goes to Claude's early-input capture
+// instead of the composer: there escape sequences are dropped and a CR is
+// buffered as a newline, so `/rename <name>` would never be submitted
+// (reproduced with claude 2.1.281). A stopped row has no `status` at all;
+// an already-live session has one immediately, so this costs a single
+// catalog read there.
+func (p *Provider) waitSessionLive(ctx context.Context, id string) error {
+	err := p.pollNativeRow(ctx, id, func(row map[string]any) error {
+		if text(row, "status") == "" {
+			return fmt.Errorf("session %s has no live worker status yet", id)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("claude session did not become ready for input: %w", err)
+	}
+	return nil
+}
+
+// pollNativeRow polls `claude agents --json --all` until check accepts
+// session id's row. It is time-bounded (confirmMaxWait) rather than a
+// fixed attempt count, so a slow individual `claude agents` call cannot
+// silently balloon the total wait past what confirmMaxWait actually
+// allows.
+func (p *Provider) pollNativeRow(ctx context.Context, id string, check func(row map[string]any) error) error {
 	maxWait := p.confirmMaxWait()
 	pollInterval := p.confirmPollInterval()
 	deadline := time.Now().Add(maxWait)
@@ -449,16 +493,14 @@ func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
 			var raw []map[string]any
 			if err := json.Unmarshal(res.Stdout, &raw); err != nil {
 				lastErr = fmt.Errorf("decode claude agents JSON: %w", err)
-			} else if got, found := nativeNameByID(raw, id); !found {
-				lastErr = fmt.Errorf("session %s not found in claude agents catalog after rename", id)
-			} else if got != name {
-				lastErr = fmt.Errorf("native session name is %q, want %q", got, name)
-			} else {
+			} else if row, found := nativeRowByID(raw, id); !found {
+				lastErr = fmt.Errorf("session %s not found in claude agents catalog", id)
+			} else if lastErr = check(row); lastErr == nil {
 				return nil
 			}
 		}
 		if !time.Now().Before(deadline) {
-			return fmt.Errorf("could not confirm native rename within %s: %w", maxWait, lastErr)
+			return fmt.Errorf("gave up after %s: %w", maxWait, lastErr)
 		}
 		select {
 		case <-ctx.Done():
@@ -468,13 +510,13 @@ func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
 	}
 }
 
-func nativeNameByID(raw []map[string]any, id string) (name string, found bool) {
+func nativeRowByID(raw []map[string]any, id string) (row map[string]any, found bool) {
 	for _, v := range raw {
 		if text(v, "id", "sessionId") == id {
-			return text(v, "name", "displayName"), true
+			return v, true
 		}
 	}
-	return "", false
+	return nil, false
 }
 
 func text(v map[string]any, keys ...string) string {

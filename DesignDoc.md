@@ -587,7 +587,9 @@ Rename は、既存 session の表示名を変更する。
 
 - Claude 自身が保持する session を native に rename する。
 - 実装上は、agentsctl が transient (使い捨て) な `claude attach <id>` client を起動し、Claude 自身の `/rename` slash command を送信したうえで、その attach client だけを detach する。
-- session ID・sessionId・pid・実行中 process のいずれも変化しない。working session に対して行っても実行を中断しない。
+- session ID・sessionId・pid・実行中 process のいずれも変化しない。working session に対して行っても実行を中断しない。stopped session は `claude attach` 自身が worker を respawn して起こすため pid は新しくなるが、session ID・sessionId は変化しない。
+- `/rename <name>` は bracketed paste で入力し、直後の CR で submit する (1回の write)。bracketed でない入力は、1回の塊が64文字以上だと Claude の composer に paste として扱われ、CR が改行として挿入されるだけで submit されないため (#75)。name は制御文字を含まないことを検証済みのため、paste を途中で閉じることはできない。
+- `/rename` は、native catalog がその session の worker の `status` を報告してから (worker の REPL が起動済みになってから) 送信する。stopped session では REPL の起動前に届いた入力が Claude の early-input capture に取り込まれ、escape sequence は捨てられ、CR は改行になるため submit されない。固定の待ち時間には頼らない。
 - rename 成否は、attach client 自身の終了確認ではなく `claude agents --json --all` による native catalog の再取得で判定する。attach client の detach 自体が失敗しても、catalog が新しい名前を確認できていれば rename は成功として扱う。
 - native catalog confirmation (rename の完了判定) と attach client の cleanup (lifecycle の後始末) は並行して行う。cleanup は rename の成否そのものには関与しないため、user-visible な完了を cleanup の完了で遅延させない。ただし、agentsctl 自身のプロセス寿命内で attach client を残さないため、呼び出しは cleanup の完了も待ち合わせたうえで返る。
 - `claude --bg --resume <id> --name <name>` は使用しない。別 session (別 ID) を生成することが確認されているため。
