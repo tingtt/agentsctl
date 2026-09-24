@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -244,13 +245,13 @@ func (r *codexRuntime) connect(ctx context.Context) (wasLive bool, err error) {
 		return false, err
 	}
 	r.kick()
-	r.serveCatalog(ctx, conn)
-	return true, conn.Err()
+	return true, r.serveCatalog(ctx, conn)
 }
 
 // snapshot rebuilds the observed state from scratch: the catalog
 // (thread/list), the loaded threads (thread/loaded/list) and each one's
-// status (thread/read). A status notification that arrives meanwhile only
+// status (thread/read). Any failed request fails the whole snapshot; only
+// a native notLoaded status makes a thread notLoaded. A status notification that arrives meanwhile only
 // marks its thread dirty; the thread is read again, as often as needed,
 // before the snapshot installs -- a read response is never assumed to be
 // newer or older than a notification. A thread loaded before but missing
@@ -275,11 +276,13 @@ func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 	read := func(id string) error {
 		t, err := readThread(ctx, conn, id)
 		switch {
-		case err != nil && (ctx.Err() != nil || conn.Err() != nil):
-			return err
 		case err != nil:
-			// The thread is gone (or unreadable): nothing is loaded.
-			delete(status, id)
+			// Any failure -- transport or an app-server error, even one
+			// caused by the thread unloading since thread/loaded/list --
+			// leaves the status unestablished. It is never guessed to be
+			// notLoaded (which could publish a false Idle): the snapshot
+			// fails and is retaken on a new connection.
+			return fmt.Errorf("thread/read %s: %w", id, err)
 		case hiddenThread(t):
 			hidden = append(hidden, id)
 			delete(status, id)
@@ -340,8 +343,12 @@ func (r *codexRuntime) installSnapshot(seq uint64, threads []Thread, status map[
 
 // serveCatalog re-reads the catalog whenever a notification asked for it
 // (see requestCatalog), at most once per catalogGap, until the connection
-// or ctx ends.
-func (r *codexRuntime) serveCatalog(ctx context.Context, conn *rpcConn) {
+// or ctx ends. A failed re-read ends serving with its error: the catalog
+// is then known to be stale, and the caller abandons the connection so a
+// fresh snapshot replaces it, rather than keeping the stale catalog until
+// some later notification happens to ask again. It returns nil only when
+// ctx ended.
+func (r *codexRuntime) serveCatalog(ctx context.Context, conn *rpcConn) error {
 	var last time.Time
 	for {
 		r.mu.Lock()
@@ -353,9 +360,9 @@ func (r *codexRuntime) serveCatalog(ctx context.Context, conn *rpcConn) {
 			case <-r.wake:
 				continue
 			case <-conn.Done():
-				return
+				return conn.Err()
 			case <-ctx.Done():
-				return
+				return nil
 			}
 		}
 		if wait := r.catalogGap - time.Since(last); wait > 0 {
@@ -364,19 +371,20 @@ func (r *codexRuntime) serveCatalog(ctx context.Context, conn *rpcConn) {
 			case <-timer.C:
 			case <-conn.Done():
 				timer.Stop()
-				return
+				return conn.Err()
 			case <-ctx.Done():
 				timer.Stop()
-				return
+				return nil
 			}
 		}
 		last = time.Now()
 		seq := r.beginCatalogFetch()
 		threads, err := listThreads(ctx, conn.call, false)
 		if err != nil {
-			// A dead connection ends serving; a failed read on a live one
-			// waits for the next notification to ask again.
-			continue
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("catalog resync: %w", err)
 		}
 		if r.installCatalog(seq, threads) {
 			r.kick()

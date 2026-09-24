@@ -382,3 +382,126 @@ func TestListAndNotificationsRace(t *testing.T) {
 		return activityIs("b", session.ActivityWorking)(u) && activityIs("a", session.ActivityIdle)(u) && len(u.Sessions) == 2
 	})
 }
+
+// A thread/read the app-server answers with an error leaves the status
+// unestablished: the snapshot fails and is retried, and nothing -- in
+// particular no false notLoaded -> Idle -- is published until a snapshot
+// succeeds.
+func TestSnapshotReadErrorFailsClosedBeforeAuthority(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	d.setLoaded("a", active())
+	d.failNext("thread/read", 3)
+	p, _ := newObservedProvider(t, d, nil)
+	ch := observe(t, p)
+
+	u := waitFor(t, ch, "first publication", func(sessionctl.ProviderUpdate) bool { return true })
+	if !activityIs("a", session.ActivityWorking)(u) || u.Warning != nil {
+		t.Fatalf("the first publication must be the confirmed native status, got %+v", u)
+	}
+	if n := d.callCount("thread/read"); n < 4 {
+		t.Fatalf("failed reads must be retried on new snapshots, thread/read calls=%d", n)
+	}
+}
+
+func TestSnapshotReadErrorAfterAuthorityStaysUnavailable(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	d.setLoaded("a", active())
+	p, _ := newObservedProvider(t, d, nil)
+	ch := observe(t, p)
+	d.waitReady(t)
+	waitFor(t, ch, "a working", activityIs("a", session.ActivityWorking))
+
+	d.failNext("thread/read", 3)
+	d.dropAll()
+	var sawUnavailable bool
+	check := func(u sessionctl.ProviderUpdate) {
+		s, _ := rowOf(u, "a")
+		switch {
+		case s.Activity == session.ActivityUnknown && s.Runtime == session.RuntimeUnknown && u.Warning != nil:
+			sawUnavailable = true
+		case s.Activity == session.ActivityWorking && u.Warning == nil && sawUnavailable:
+		default:
+			t.Errorf("neither unavailable nor the confirmed status: %+v (warning %v)", s, u.Warning)
+		}
+	}
+	waitFor(t, ch, "reconverged", func(u sessionctl.ProviderUpdate) bool {
+		return sawUnavailable && activityIs("a", session.ActivityWorking)(u) && u.Warning == nil
+	}, check)
+	if n := d.callCount("thread/read"); n < 5 {
+		t.Fatalf("thread/read calls=%d", n)
+	}
+}
+
+// A failed catalog resync is not dropped: the connection is abandoned and
+// the next snapshot converges on the current catalog without any further
+// notification.
+func TestCatalogResyncFailureReconnectsAndConverges(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	p, _ := newObservedProvider(t, d, nil)
+	ch := observe(t, p)
+	c := d.waitReady(t)
+	waitFor(t, ch, "initial", activityIs("a", session.ActivityIdle))
+
+	d.setThreads(catalogThread("a", 1), catalogThread("b", 2))
+	d.failNext("thread/list", 1)
+	c.notify(notifyStarted, map[string]any{"thread": catalogThread("b", 2)})
+
+	var sawUnavailable bool
+	waitFor(t, ch, "b listed", func(u sessionctl.ProviderUpdate) bool {
+		_, ok := rowOf(u, "b")
+		return ok && u.Warning == nil
+	}, func(u sessionctl.ProviderUpdate) {
+		if u.Warning != nil {
+			sawUnavailable = true
+			if s, _ := rowOf(u, "a"); s.Activity != session.ActivityUnknown || s.Runtime != session.RuntimeUnknown {
+				t.Errorf("unavailable row=%+v", s)
+			}
+		}
+	})
+	if !sawUnavailable {
+		t.Fatal("a failed resync must make the connection unavailable before it converges")
+	}
+	d.waitReady(t) // the reconnect that converged
+}
+
+// Losing the daemon only affects what the daemon observed: provisional
+// runs keep the existing managed-run semantics.
+func TestDisconnectKeepsProvisionalRunSemantics(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 2), catalogThread("m", 1))
+	d.setLoaded("a", active())
+	p, _ := newObservedProvider(t, d, nil)
+	for _, r := range []localstate.Run{
+		{ID: "run-1", Provider: "codex", State: "running", CWD: "/work", StartedAt: time.Unix(5, 0)},
+		{ID: "run-2", Provider: "codex", State: "failed", CWD: "/work", StartedAt: time.Unix(6, 0), Error: "exec failed"},
+		{ID: "run-3", Provider: "codex", State: "running", SessionID: "m", CWD: "/work", StartedAt: time.Unix(1, 0)},
+	} {
+		if err := p.Store.SaveRun(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ch := observe(t, p)
+	d.waitReady(t)
+	waitFor(t, ch, "a working", activityIs("a", session.ActivityWorking))
+
+	d.stop()
+	u := waitFor(t, ch, "unavailable", func(u sessionctl.ProviderUpdate) bool { return u.Err == nil && u.Warning != nil })
+	want := map[string]observation{
+		"a":     {session.ActivityUnknown, session.RuntimeUnknown},
+		"m":     {session.ActivityUnknown, session.RuntimeDetached}, // managed thread: existing Runtime override
+		"run-1": {session.ActivityStarting, session.RuntimeDetached},
+		"run-2": {session.ActivityFailed, session.RuntimeStopped},
+	}
+	if len(u.Sessions) != len(want) {
+		t.Fatalf("rows=%+v", u.Sessions)
+	}
+	for id, w := range want {
+		s, ok := rowOf(u, id)
+		if !ok || (observation{s.Activity, s.Runtime}) != w {
+			t.Fatalf("%s=%+v, want %+v", id, s, w)
+		}
+	}
+}

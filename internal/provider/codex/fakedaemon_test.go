@@ -39,7 +39,10 @@ type fakeDaemon struct {
 	// response reports.
 	beforeRead func(c *fakeConn, id string) *ThreadStatus
 	calls      map[string]int
-	conns      []*fakeConn
+	// failures[method] is how many upcoming requests of method are
+	// answered with a JSON-RPC error instead of being handled.
+	failures map[string]int
+	conns    []*fakeConn
 
 	// ready receives each connection once the client sent initialized.
 	ready chan *fakeConn
@@ -60,7 +63,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, ready: make(chan *fakeConn, 16)}
+	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, ready: make(chan *fakeConn, 16)}
 	d.start()
 	t.Cleanup(d.stop)
 	return d
@@ -115,6 +118,14 @@ func (d *fakeDaemon) setLoaded(id string, status ThreadStatus) {
 	d.loaded[id] = status
 }
 
+// failNext makes the next n requests of method fail with an
+// application-level JSON-RPC error.
+func (d *fakeDaemon) failNext(method string, n int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.failures[method] = n
+}
+
 func (d *fakeDaemon) callCount(method string) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -150,7 +161,15 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		d.mu.Lock()
 		d.calls[msg.Method]++
+		fail := len(msg.ID) > 0 && d.failures[msg.Method] > 0
+		if fail {
+			d.failures[msg.Method]--
+		}
 		d.mu.Unlock()
+		if fail {
+			c.send(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32603, "message": "injected failure"}})
+			continue
+		}
 		if len(msg.ID) == 0 {
 			if msg.Method == "initialized" {
 				d.ready <- c
