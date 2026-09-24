@@ -350,7 +350,20 @@ func (s *State) moveGroup(delta int) bool {
 	}
 	target := current + delta
 	if target < 0 || target >= len(model.groups) {
-		return false
+		group := model.groups[current]
+		if len(group.items) == 0 {
+			return false
+		}
+		targetItem := group.items[0]
+		if delta > 0 {
+			targetItem = group.items[len(group.items)-1]
+		}
+		if targetItem.id == s.cursor {
+			return false
+		}
+		s.cursor = targetItem.id
+		s.hasCursor = true
+		return true
 	}
 	group := model.groups[target]
 	if len(group.items) == 0 {

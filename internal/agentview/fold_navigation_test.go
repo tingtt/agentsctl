@@ -194,7 +194,7 @@ func TestBraceNavigationMovesBetweenExpandedAndFoldedGroups(t *testing.T) {
 	s.Handle(KeyEvent{Key: KeyRune, Rune: '{'})
 	requireSelectedSession(t, s, pinned[1].Key)
 	s.Handle(KeyEvent{Key: KeyRune, Rune: '{'})
-	requireSelectedSession(t, s, pinned[1].Key)
+	requireSelectedSession(t, s, pinned[0].Key)
 
 	s.selectIndex(2)
 	s.Handle(KeyEvent{Key: KeyLeft})
@@ -205,6 +205,107 @@ func TestBraceNavigationMovesBetweenExpandedAndFoldedGroups(t *testing.T) {
 	s.selectIndex(len(rows) - 1)
 	s.Handle(KeyEvent{Key: KeyRune, Rune: '{'})
 	requireControlCursor(t, s, listItemShowSessions, groupID{directory: "/work/repo-a"})
+}
+
+func TestBraceNavigationUsesCurrentGroupSelectableBoundaryAtListEdges(t *testing.T) {
+	pinned := foldingRows(2, "/work/pinned", true)
+	repoA := foldingRows(11, "/work/repo-a", false)
+	repoB := foldingRows(25, "/work/repo-b", false)
+	rows := append(append(pinned, repoA...), repoB...)
+	pinnedGroup := groupID{pinned: true}
+	repoAGroup := groupID{directory: "/work/repo-a"}
+	repoBGroup := groupID{directory: "/work/repo-b"}
+
+	tests := []struct {
+		name   string
+		states map[groupID]groupDisplayState
+		start  listItemID
+		key    rune
+		want   listItemID
+	}{
+		{
+			name:  "previous group keeps existing last visible session behavior",
+			start: sessionItemID(repoA[0].Key),
+			key:   '{',
+			want:  sessionItemID(pinned[1].Key),
+		},
+		{
+			name:  "first group moves to first selectable row",
+			start: sessionItemID(pinned[1].Key),
+			key:   '{',
+			want:  sessionItemID(pinned[0].Key),
+		},
+		{
+			name:  "first group already at first selectable row",
+			start: sessionItemID(pinned[0].Key),
+			key:   '{',
+			want:  sessionItemID(pinned[0].Key),
+		},
+		{
+			name:  "next group keeps existing first selectable row behavior",
+			start: sessionItemID(repoA[5].Key),
+			key:   '}',
+			want:  sessionItemID(repoB[0].Key),
+		},
+		{
+			name:  "last group moves to visible Show more row",
+			start: sessionItemID(repoB[0].Key),
+			key:   '}',
+			want:  controlItemID(repoBGroup, listItemShowMore),
+		},
+		{
+			name:  "last group already at last selectable row",
+			start: controlItemID(repoBGroup, listItemShowMore),
+			key:   '}',
+			want:  controlItemID(repoBGroup, listItemShowMore),
+		},
+		{
+			name:   "partially expanded last group uses visible Show more row",
+			states: map[groupID]groupDisplayState{repoBGroup: {visibleCount: 20}},
+			start:  sessionItemID(repoB[12].Key),
+			key:    '}',
+			want:   controlItemID(repoBGroup, listItemShowMore),
+		},
+		{
+			name:   "folded first group keeps Show sessions boundary",
+			states: map[groupID]groupDisplayState{pinnedGroup: {folded: true}},
+			start:  controlItemID(pinnedGroup, listItemShowSessions),
+			key:    '{',
+			want:   controlItemID(pinnedGroup, listItemShowSessions),
+		},
+		{
+			name:   "folded last group keeps Show sessions boundary",
+			states: map[groupID]groupDisplayState{repoBGroup: {folded: true}},
+			start:  controlItemID(repoBGroup, listItemShowSessions),
+			key:    '}',
+			want:   controlItemID(repoBGroup, listItemShowSessions),
+		},
+		{
+			name:   "previous folded group remains a Show sessions destination",
+			states: map[groupID]groupDisplayState{repoAGroup: {folded: true}},
+			start:  sessionItemID(repoB[0].Key),
+			key:    '{',
+			want:   controlItemID(repoAGroup, listItemShowSessions),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := NewState()
+			s.SetRows(rows)
+			for id, state := range tt.states {
+				s.setGroupState(id, state)
+			}
+			if _, ok := s.selectableList().item(tt.start); !ok {
+				t.Fatalf("start item %+v is not selectable", tt.start)
+			}
+			s.cursor, s.hasCursor = tt.start, true
+			s.Handle(KeyEvent{Key: KeyRune, Rune: tt.key})
+			if !s.hasCursor || s.cursor != tt.want {
+				t.Fatalf("cursor=%+v hasCursor=%v, want %+v", s.cursor, s.hasCursor, tt.want)
+			}
+		})
+	}
 }
 
 func TestConfirmationAllowsIssue48NavigationThatMovesCursor(t *testing.T) {

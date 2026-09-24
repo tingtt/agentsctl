@@ -96,7 +96,7 @@ Fold / expansion level は永続化しない Agent View-local な runtime state 
 
 List cursor は Agent View 内だけに存在し、session row の `session.Key`、または group identity と `Show more` / `Show sessions` kind の組を保持する。control row を fake `session.Session` や fake `session.Key` として表さない。session action は session cursor にだけ適用し、control cursor 上では session 未選択として扱う。rendering、Up / Down、`{` / `}`、viewport、fold / expansion、refresh 後の cursor reconciliation は、group heading と separator を含まない同一の derived selectable-list model を参照する。
 
-Composer が空のとき、`}` は次の visible group の先頭 selectable row へ、`{` は前の visible group の末尾 visible session (fold 済みなら `Show sessions`) へ移る。前 group の末尾が `Show more` でも、その control は飛ばして最後の visible session を選ぶ。両方とも端で wrap しない。Composer が空でなければ、`←` / `→` は prompt cursor を動かし、`{` / `}` は通常の文字として挿入し、`Enter` は prompt を dispatch する。
+Composer が空のとき、`}` は次の visible group の先頭 selectable row へ、`{` は前の visible group の末尾 visible session (fold 済みなら `Show sessions`) へ移る。前 group の末尾が `Show more` でも、その control は飛ばして最後の visible session を選ぶ。前後の group が存在しない端では、代わりに現在 group の先頭または末尾 selectable row へ移り、そこでは `Show sessions` / `Show more` も移動先に含む。両方とも group 間では wrap しない。Composer が空でなければ、`←` / `→` は prompt cursor を動かし、`{` / `}` は通常の文字として挿入し、`Enter` は prompt を dispatch する。
 
 Refresh / reorder 後も、選択中 session の `session.Key` が catalog に残る限り同じ identity を維持し、その session が表示されるところまで group を開く。control row は stable group/control identity で維持し、control が消えた場合は変更前の visual order で次、前、先頭の順に surviving selectable row へ移る。
 
