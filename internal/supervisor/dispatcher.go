@@ -9,13 +9,6 @@ import (
 	"github.com/tingtt/agentsctl/internal/localstate"
 )
 
-// codexNoDaemon keeps every managed Codex CLI process off the shared
-// background server, so the supervised TUI process itself owns the thread
-// writer lock that run-to-thread binding uses as its ownership proof.
-// There is intentionally no retry without it: a Codex CLI that rejects the
-// flag fails to start rather than falling back to a daemon-owned writer.
-const codexNoDaemon = "--no-daemon"
-
 type Dispatcher struct {
 	Client Client
 }
@@ -25,7 +18,7 @@ func (d Dispatcher) Dispatch(ctx context.Context, prompt, cwd string, baseline [
 	if err != nil {
 		return localstate.Run{}, err
 	}
-	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: id, Args: []string{codexNoDaemon, prompt}, CWD: cwd, Provider: "codex", Baseline: baseline, Environment: environment})
+	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: id, Args: []string{prompt}, CWD: cwd, Provider: "codex", Baseline: baseline, Environment: environment})
 	if err != nil {
 		return localstate.Run{}, err
 	}
@@ -35,7 +28,7 @@ func (d Dispatcher) Dispatch(ctx context.Context, prompt, cwd string, baseline [
 	return *res.Run, nil
 }
 func (d Dispatcher) Resume(ctx context.Context, runID, threadID, cwd string, environment map[string]string) (localstate.Run, error) {
-	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: runID, SessionID: threadID, Args: []string{codexNoDaemon, "resume", threadID}, CWD: cwd, Provider: "codex", Environment: environment})
+	res, err := d.Client.Call(ctx, Request{Action: "start", RunID: runID, SessionID: threadID, Args: []string{"resume", threadID}, CWD: cwd, Provider: "codex", Environment: environment})
 	if err != nil {
 		return localstate.Run{}, err
 	}
