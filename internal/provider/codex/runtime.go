@@ -27,8 +27,9 @@ const (
 // codexRuntime observes the shared Codex app-server daemon over one
 // persistent connection (see rpcConn) and keeps what it learned: the
 // thread catalog and the native status of every thread the daemon has
-// loaded. It never starts the daemon; an unreachable daemon is an ordinary
-// state it retries with bounded backoff.
+// loaded. Before every connection attempt it requests a ready endpoint from
+// its lifecycle-independent dependency; an unavailable endpoint or daemon is
+// an ordinary state it retries with bounded backoff.
 //
 // Concurrency: network I/O happens only on the run goroutine (dial,
 // snapshot, catalog resync) and on the connection's reader (which only
@@ -37,7 +38,7 @@ const (
 // signalled on changed, a one-slot channel, so a slow consumer only ever
 // rebuilds from the latest state.
 type codexRuntime struct {
-	socketPath func() (string, error)
+	readySocket func(context.Context) (string, error)
 
 	minBackoff, maxBackoff time.Duration
 	catalogGap             time.Duration
@@ -64,6 +65,7 @@ type codexRuntime struct {
 	// startLifecycle).
 	live, everLive bool
 	lastErr        error
+	lastReadyErr   bool
 	// While snapshotting, status notifications only mark their thread
 	// dirty; the snapshot re-reads it before installing.
 	snapshotting bool
@@ -71,25 +73,26 @@ type codexRuntime struct {
 	needCatalog  bool
 }
 
-func newCodexRuntime(socketPath func() (string, error)) *codexRuntime {
+func newCodexRuntime(readySocket func(context.Context) (string, error)) *codexRuntime {
 	return &codexRuntime{
-		socketPath: socketPath,
-		minBackoff: defaultMinBackoff,
-		maxBackoff: defaultMaxBackoff,
-		catalogGap: defaultCatalogGap,
-		changed:    make(chan struct{}, 1),
-		wake:       make(chan struct{}, 1),
-		hidden:     map[string]bool{},
+		readySocket: readySocket,
+		minBackoff:  defaultMinBackoff,
+		maxBackoff:  defaultMaxBackoff,
+		catalogGap:  defaultCatalogGap,
+		changed:     make(chan struct{}, 1),
+		wake:        make(chan struct{}, 1),
+		hidden:      map[string]bool{},
 	}
 }
 
 // runtimeView is a consistent copy of the observed state.
 type runtimeView struct {
-	catalog  []Thread
-	status   map[string]ThreadStatus
-	live     bool
-	everLive bool
-	lastErr  error
+	catalog      []Thread
+	status       map[string]ThreadStatus
+	live         bool
+	everLive     bool
+	lastErr      error
+	lastReadyErr bool
 }
 
 // observe resolves one catalog thread's observation from this view: a
@@ -114,7 +117,7 @@ func (r *codexRuntime) view() runtimeView {
 	for id, s := range r.status {
 		status[id] = s
 	}
-	return runtimeView{catalog: r.catalog, status: status, live: r.live, everLive: r.everLive, lastErr: r.lastErr}
+	return runtimeView{catalog: r.catalog, status: status, live: r.live, everLive: r.everLive, lastErr: r.lastErr, lastReadyErr: r.lastReadyErr}
 }
 
 // kick signals changed without blocking.
@@ -192,15 +195,15 @@ func (r *codexRuntime) requestCatalog() {
 func (r *codexRuntime) startLifecycle() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.live, r.everLive, r.lastErr, r.status = false, false, nil, nil
+	r.live, r.everLive, r.lastErr, r.lastReadyErr, r.status = false, false, nil, false, nil
 }
 
 // run connects, and reconnects with bounded backoff, until ctx ends.
 func (r *codexRuntime) run(ctx context.Context) {
 	delay := r.minBackoff
 	for {
-		wasLive, err := r.connect(ctx)
-		r.disconnected(err)
+		wasLive, endpointReady, err := r.connect(ctx)
+		r.disconnected(err, !endpointReady)
 		if ctx.Err() != nil {
 			return
 		}
@@ -221,14 +224,14 @@ func (r *codexRuntime) run(ctx context.Context) {
 // disconnected drops everything only a live connection can vouch for. It
 // signals a change only when there is one (the connection was live, or the
 // failure differs), so a long outage does not republish every retry.
-func (r *codexRuntime) disconnected(err error) {
+func (r *codexRuntime) disconnected(err error, readyErr bool) {
 	if err == nil {
 		err = errConnClosed
 	}
 	r.mu.Lock()
-	changed := r.live || r.lastErr == nil || r.lastErr.Error() != err.Error()
+	changed := r.live || r.lastErr == nil || r.lastErr.Error() != err.Error() || r.lastReadyErr != readyErr
 	r.live, r.snapshotting, r.dirty, r.status = false, false, nil, nil
-	r.lastErr = err
+	r.lastErr, r.lastReadyErr = err, readyErr
 	r.mu.Unlock()
 	if changed {
 		r.kick()
@@ -238,27 +241,27 @@ func (r *codexRuntime) disconnected(err error) {
 // connect runs one connection: handshake, snapshot, then catalog resyncs on
 // demand until the connection or ctx ends. wasLive reports whether the
 // snapshot was installed.
-func (r *codexRuntime) connect(ctx context.Context) (wasLive bool, err error) {
-	socket, err := r.socketPath()
+func (r *codexRuntime) connect(ctx context.Context) (wasLive, endpointReady bool, err error) {
+	socket, err := r.readySocket(ctx)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	conn, err := dialRPC(ctx, socket, r.handleNotification)
 	if err != nil {
-		return false, err
+		return false, true, err
 	}
 	defer conn.Close()
 	stop := context.AfterFunc(ctx, conn.Close)
 	defer stop()
 
 	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
-		return false, err
+		return false, true, err
 	}
 	if err := r.snapshot(ctx, conn); err != nil {
-		return false, err
+		return false, true, err
 	}
 	r.kick()
-	return true, r.serveCatalog(ctx, conn)
+	return true, true, r.serveCatalog(ctx, conn)
 }
 
 // snapshot rebuilds the observed state from scratch: the catalog
@@ -350,7 +353,7 @@ func (r *codexRuntime) installSnapshot(seq uint64, threads []Thread, status map[
 	}
 	r.status = installed
 	r.snapshotting, r.dirty = false, nil
-	r.live, r.everLive, r.lastErr = true, true, nil
+	r.live, r.everLive, r.lastErr, r.lastReadyErr = true, true, nil, false
 	return nil
 }
 

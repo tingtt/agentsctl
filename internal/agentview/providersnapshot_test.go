@@ -832,6 +832,33 @@ func TestListOwningStatusRecoversWarningBeforeObserverAuthority(t *testing.T) {
 	}
 }
 
+// TestCodexInitialObserverFailurePreservesListRowsAndAuthority fixes the
+// Codex startup case: daemon Ensure can fail after List has already supplied
+// rows, and its error-only Observer update must add a warning without taking
+// row authority or replacing those rows.
+func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) {
+	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
+	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	codex.updates <- sessionctl.ProviderUpdate{Err: errors.New("ensure codex app-server daemon: unavailable")}
+	rt.drainObserver(t)
+	if !contains(rowNames(rt.State.Rows), "A") {
+		t.Fatalf("List rows must survive the initial Ensure failure: %v", rowNames(rt.State.Rows))
+	}
+	if rt.State.Warnings[session.ProviderCodex] == nil {
+		t.Fatal("Ensure failure must be visible as a warning")
+	}
+	if rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
+		t.Fatal("an error-only update must not transfer row authority")
+	}
+}
+
 // TestListOwningStatusNeverTakesRowsBackFromObserver fixes that
 // ListOwnsStatus is only about warnings: after an Observer success, a
 // successful List -- even one owning status -- neither rolls rows back

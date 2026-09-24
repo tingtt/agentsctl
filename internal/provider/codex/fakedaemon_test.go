@@ -348,9 +348,8 @@ func newObservedProvider(t *testing.T, d *fakeDaemon, api *fakeAPI) (*Provider, 
 		api = &fakeAPI{}
 	}
 	probe := &writerProbe{writers: map[string]bool{}, calls: map[string]int{}}
-	p := &Provider{API: api, Store: localstate.New(filepath.Join(t.TempDir(), "state.json")), writerFree: probe.free}
-	socket := d.socket
-	rt := newCodexRuntime(func() (string, error) { return socket, nil })
+	p := &Provider{API: api, Store: localstate.New(filepath.Join(t.TempDir(), "state.json")), ControlSocket: d.socket, writerFree: probe.free}
+	rt := p.runtime()
 	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 10*time.Millisecond, 50*time.Millisecond, 0
 	p.obs.rt = rt
 	return p, probe

@@ -2,6 +2,8 @@ package codex
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,155 @@ import (
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
+
+type lifecycleResult struct {
+	info DaemonInfo
+	err  error
+	gate <-chan struct{}
+}
+
+type scriptedLifecycle struct {
+	mu      sync.Mutex
+	results []lifecycleResult
+	calls   int
+	called  chan int
+}
+
+func (l *scriptedLifecycle) Ensure(ctx context.Context) (DaemonInfo, error) {
+	l.mu.Lock()
+	i := l.calls
+	l.calls++
+	result := l.results[min(i, len(l.results)-1)]
+	l.mu.Unlock()
+	if l.called != nil {
+		l.called <- i + 1
+	}
+	if result.gate != nil {
+		select {
+		case <-result.gate:
+		case <-ctx.Done():
+			return DaemonInfo{}, ctx.Err()
+		}
+	}
+	return result.info, result.err
+}
+
+func readyDaemon(socket string) lifecycleResult {
+	return lifecycleResult{info: DaemonInfo{Status: "started", SocketPath: socket}}
+}
+
+func TestObserverEnsuresDaemonBeforeConnecting(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	lifecycle := &scriptedLifecycle{results: []lifecycleResult{readyDaemon(d.socket)}, called: make(chan int, 4)}
+	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	rt := p.runtime()
+	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 10*time.Millisecond, 50*time.Millisecond, 0
+	ch := observe(t, p)
+
+	select {
+	case call := <-lifecycle.called:
+		if call != 1 {
+			t.Fatalf("first lifecycle call=%d", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Ensure was not called")
+	}
+	d.waitReady(t)
+	waitFor(t, ch, "snapshot after Ensure", activityIs("a", session.ActivityIdle))
+}
+
+func TestObserverPublishesInitialEnsureFailureThenRecovers(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	second := make(chan struct{})
+	lifecycle := &scriptedLifecycle{results: []lifecycleResult{
+		{err: errors.New("daemon package unavailable")},
+		{info: readyDaemon(d.socket).info, gate: second},
+	}, called: make(chan int, 4)}
+	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	rt := p.runtime()
+	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 20*time.Millisecond, 40*time.Millisecond, 0
+	ch := observe(t, p)
+
+	u := waitFor(t, ch, "initial Ensure error", func(u sessionctl.ProviderUpdate) bool {
+		return u.Err != nil && strings.Contains(u.Err.Error(), "daemon package unavailable")
+	})
+	if u.Sessions != nil {
+		t.Fatalf("initial failure must be error-only: %+v", u)
+	}
+	select {
+	case call := <-lifecycle.called:
+		if call != 1 {
+			t.Fatalf("first lifecycle call=%d", call)
+		}
+	default:
+		t.Fatal("missing first Ensure call")
+	}
+
+	select {
+	case call := <-lifecycle.called:
+		if call != 2 {
+			t.Fatalf("second lifecycle call=%d", call)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not re-run Ensure through backoff")
+	}
+	close(second)
+	d.waitReady(t)
+	u = waitFor(t, ch, "recovered snapshot", activityIs("a", session.ActivityIdle))
+	if u.Err != nil || u.Warning != nil {
+		t.Fatalf("recovered update=%+v", u)
+	}
+}
+
+func TestObserverReEnsuresDaemonAfterAuthorityLoss(t *testing.T) {
+	d := newFakeDaemon(t)
+	d.setThreads(catalogThread("a", 1))
+	d.setLoaded("a", active())
+	third := make(chan struct{})
+	lifecycle := &scriptedLifecycle{results: []lifecycleResult{
+		readyDaemon(d.socket),
+		{err: errors.New("daemon absent")},
+		{info: readyDaemon(d.socket).info, gate: third},
+	}, called: make(chan int, 8)}
+	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	rt := p.runtime()
+	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 20*time.Millisecond, 40*time.Millisecond, 0
+	ch := observe(t, p)
+	d.waitReady(t)
+	waitFor(t, ch, "initial authority", activityIs("a", session.ActivityWorking))
+
+	d.stop()
+	u := waitFor(t, ch, "Ensure failure after authority", func(u sessionctl.ProviderUpdate) bool {
+		return u.Err == nil && u.Warning != nil && strings.Contains(u.Warning.Error(), "daemon absent")
+	})
+	if len(u.Sessions) != 1 || u.Sessions[0].Activity != session.ActivityUnknown || u.Sessions[0].Runtime != session.RuntimeUnknown {
+		t.Fatalf("daemon failure snapshot=%+v", u)
+	}
+
+	for {
+		select {
+		case call := <-lifecycle.called:
+			if call == 3 {
+				d.start()
+				close(third)
+				goto recovering
+			}
+		case <-time.After(time.Second):
+			t.Fatal("reconnect did not Ensure again")
+		}
+	}
+
+recovering:
+	d.waitReady(t)
+	u = waitFor(t, ch, "snapshot after daemon restart", func(u sessionctl.ProviderUpdate) bool {
+		return activityIs("a", session.ActivityWorking)(u) && u.Warning == nil
+	})
+	if u.Err != nil {
+		t.Fatalf("recovered update=%+v", u)
+	}
+}
 
 // A status change of one thread republishes the whole catalog, never a
 // delta holding only the changed thread.
@@ -181,7 +332,7 @@ func TestSnapshotRereadsThreadChangedDuringSnapshot(t *testing.T) {
 func TestObserverWithoutDaemonKeepsListAuthorityAndBacksOff(t *testing.T) {
 	var attempts atomic.Int32
 	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json")}
-	rt := newCodexRuntime(func() (string, error) {
+	rt := newCodexRuntime(func(context.Context) (string, error) {
 		attempts.Add(1)
 		return "/nonexistent/app-server-control.sock", nil
 	})

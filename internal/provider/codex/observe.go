@@ -2,8 +2,8 @@ package codex
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"sync"
 
 	"github.com/tingtt/agentsctl/internal/localstate"
@@ -31,20 +31,23 @@ func (p *Provider) runtime() *codexRuntime {
 	p.obs.mu.Lock()
 	defer p.obs.mu.Unlock()
 	if p.obs.rt == nil {
-		p.obs.rt = newCodexRuntime(p.controlSocket)
+		p.obs.rt = newCodexRuntime(p.readySocket)
 	}
 	return p.obs.rt
 }
 
-func (p *Provider) controlSocket() (string, error) {
+func (p *Provider) readySocket(ctx context.Context) (string, error) {
 	if p.ControlSocket != "" {
 		return p.ControlSocket, nil
 	}
-	home, err := resolveCodexHome(os.Getenv, os.UserHomeDir)
-	if err != nil {
-		return "", err
+	if p.Daemon == nil {
+		return "", errors.New("codex daemon lifecycle is not configured")
 	}
-	return controlSocketPath(home), nil
+	info, err := p.Daemon.Ensure(ctx)
+	if err != nil {
+		return "", fmt.Errorf("ensure codex app-server daemon: %w", err)
+	}
+	return info.SocketPath, nil
 }
 
 // Observe implements sessionctl.Observer from the shared Codex app-server
@@ -53,10 +56,11 @@ func (p *Provider) controlSocket() (string, error) {
 // that changed. Publication is latest-wins; a slow consumer only ever sees
 // the newest state.
 //
-// Nothing is published until the runtime has connected once. Until then
-// List keeps owning the rows in Agent View (a first successful publication
-// transfers that authority for good), so a missing daemon leaves the
-// existing List-based catalog untouched. Once connected, losing the
+// A ready-endpoint failure before the runtime has connected is published as
+// an error-only update, so List keeps owning the rows while Agent View shows
+// the failure. Other connection failures publish nothing until the runtime
+// has connected once. A first successful publication transfers row authority
+// for good. Once connected, losing the
 // connection publishes the full catalog with every thread Unknown plus a
 // Warning, instead of leaving the last observed Activity standing;
 // reconnecting publishes the rebuilt state and clears the Warning.
@@ -121,12 +125,19 @@ func (p *Provider) observeLoop(lifeCtx context.Context, rt *codexRuntime, previo
 func (p *Provider) publishObserved(rt *codexRuntime) {
 	view := rt.view()
 	if !view.everLive {
+		if view.lastReadyErr {
+			p.sendObserved(sessionctl.ProviderUpdate{Err: fmt.Errorf("codex app-server unavailable: %w", view.lastErr)})
+		}
 		return
 	}
 	update := sessionctl.ProviderUpdate{Sessions: p.observedSessions(view)}
 	if !view.live {
 		update.Warning = fmt.Errorf("codex app-server unavailable; activity unknown: %w", view.lastErr)
 	}
+	p.sendObserved(update)
+}
+
+func (p *Provider) sendObserved(update sessionctl.ProviderUpdate) {
 	p.obs.mu.Lock()
 	defer p.obs.mu.Unlock()
 	for ch := range p.obs.subs {

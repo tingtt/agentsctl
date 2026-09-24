@@ -897,8 +897,10 @@ Codex の thread / turn runtime は shared app-server daemon が保持する。a
 ##### Daemon lifecycle
 
 - agentsctl は shared runtime が必要なとき `codex app-server daemon start` を冪等に実行して daemon を確保する。
+- Observer は初回接続だけでなく reconnect attempt の前にも daemon を確保し、lifecycle response の `socketPath` を接続先とする。
+- Observer が row authority を得る前の daemon 確保失敗は error-only update として warning を表示し、List が供給した rows を維持する。
 - implicit daemon auto-start や plain `codex resume` の fallback behavior を correctness の前提にしない。
-- daemon の Stop / Restart を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。
+- daemon の Stop / Restart / Update を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。
 - daemon を確保・観測できない場合、Activity / Runtime を推測せず Unknown とする。
 
 ##### Persistent app-server connection

@@ -34,6 +34,7 @@ type Provider struct {
 	Runner      base.Runner
 	Store       *localstate.Store
 	Runtime     Dispatcher
+	Daemon      DaemonLifecycle
 	WriterOwner func(string, processinfo.Identity) (bool, error)
 	// ControlSocket overrides the shared app-server control socket the
 	// Observer connects to; empty means the default under the resolved
