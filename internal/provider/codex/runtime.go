@@ -135,8 +135,9 @@ func (r *codexRuntime) beginCatalogFetch() uint64 {
 }
 
 // installCatalog replaces the catalog with threads fetched by fetch seq,
-// unless a fetch that started later has already been installed. It
-// reports whether the catalog was replaced. Any source may install --
+// unless a fetch that started later has already been installed -- then
+// nothing changes, the status cache included. It reports whether the
+// catalog was replaced. Any source may install --
 // the persistent connection or Provider.List's short-lived app-server --
 // since both read the same native thread store.
 func (r *codexRuntime) installCatalog(seq uint64, threads []Thread) bool {
@@ -158,6 +159,18 @@ func (r *codexRuntime) installCatalogLocked(seq uint64, threads []Thread) bool {
 		}
 		catalog = append(catalog, t)
 		listed[t.ID] = true
+	}
+	// A thread the replaced catalog listed but this one does not has left
+	// the catalog (archived, deleted, ...): its cached status is dropped
+	// with it, so if the thread comes back without a new status
+	// notification (e.g. unarchived, never loaded again) it is notLoaded,
+	// not whatever the daemon reported before it left. A status for a
+	// thread no catalog has listed yet (a new thread not materialized in
+	// thread/list) is kept; a later catalog that lists it needs it.
+	for id := range r.listed {
+		if !listed[id] {
+			delete(r.status, id)
+		}
 	}
 	r.catalog, r.catalogSeq, r.listed = catalog, seq, listed
 	return true

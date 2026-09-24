@@ -505,3 +505,87 @@ func TestDisconnectKeepsProvisionalRunSemantics(t *testing.T) {
 		}
 	}
 }
+
+// A thread that leaves the catalog loses its cached status: when it comes
+// back without being loaded again (and without any status or closed
+// notification) it is notLoaded, never its old live status. The catalog
+// changes are driven either by the daemon's own broadcasts or by this
+// Provider's short-lived app-server actions.
+func TestCatalogRemovalDropsCachedStatus(t *testing.T) {
+	a := session.Key{Provider: session.ProviderCodex, ID: "a"}
+	paths := map[string]struct{ archive, unarchive func(*Provider, *fakeConn) }{
+		"daemon notifications": {
+			archive:   func(_ *Provider, c *fakeConn) { c.notify(notifyArchived, map[string]any{"threadId": "a"}) },
+			unarchive: func(_ *Provider, c *fakeConn) { c.notify(notifyUnarchived, map[string]any{"threadId": "a"}) },
+		},
+		"provider actions": {
+			archive: func(p *Provider, _ *fakeConn) {
+				if err := p.Archive(context.Background(), a); err != nil {
+					t.Fatal(err)
+				}
+			},
+			unarchive: func(p *Provider, _ *fakeConn) {
+				if err := p.Unarchive(context.Background(), a); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for name, path := range paths {
+		t.Run(name, func(t *testing.T) {
+			d := newFakeDaemon(t)
+			d.setThreads(catalogThread("a", 1))
+			d.setLoaded("a", active())
+			p, _ := newObservedProvider(t, d, nil)
+			ch := observe(t, p)
+			c := d.waitReady(t)
+			waitFor(t, ch, "a working", activityIs("a", session.ActivityWorking))
+
+			// Archived: the daemon tore the runtime down without a
+			// thread/closed notification.
+			d.setThreads()
+			d.mu.Lock()
+			delete(d.loaded, "a")
+			d.mu.Unlock()
+			path.archive(p, c)
+			waitFor(t, ch, "a gone", func(u sessionctl.ProviderUpdate) bool { _, ok := rowOf(u, "a"); return u.Err == nil && !ok })
+
+			d.setThreads(catalogThread("a", 1))
+			path.unarchive(p, c)
+			u := waitFor(t, ch, "a back", func(u sessionctl.ProviderUpdate) bool { _, ok := rowOf(u, "a"); return ok })
+			if s, _ := rowOf(u, "a"); s.Activity != session.ActivityIdle || s.Runtime != session.RuntimeNone {
+				t.Fatalf("an unarchived, unloaded thread must be notLoaded, not its stale status: %s/%s", s.Activity, s.Runtime)
+			}
+		})
+	}
+}
+
+// A catalog install rejected as stale leaves the status cache alone, and a
+// status for a thread no catalog has listed yet survives catalog installs
+// (a later one that lists the thread needs it).
+func TestCatalogStatusPruneOnlyOnInstalledRemoval(t *testing.T) {
+	rt := newCodexRuntime(nil)
+	stale := rt.beginCatalogFetch()
+	current := rt.beginCatalogFetch()
+	rt.installCatalog(current, []Thread{catalogThread("a", 1)})
+	rt.mu.Lock()
+	rt.live = true
+	rt.status = map[string]ThreadStatus{"a": active(), "new": active()}
+	rt.mu.Unlock()
+
+	if rt.installCatalog(stale, nil) {
+		t.Fatal("stale fetch must not install")
+	}
+	if v := rt.view(); v.status["a"].Type != statusActive {
+		t.Fatalf("a stale fetch must not prune the current status: %+v", v.status)
+	}
+
+	rt.installCatalog(rt.beginCatalogFetch(), []Thread{catalogThread("b", 1)})
+	v := rt.view()
+	if _, ok := v.status["a"]; ok {
+		t.Fatalf("a thread removed from the installed catalog must lose its status: %+v", v.status)
+	}
+	if v.status["new"].Type != statusActive {
+		t.Fatalf("a not-yet-listed thread's status must survive: %+v", v.status)
+	}
+}
