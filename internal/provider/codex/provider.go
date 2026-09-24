@@ -588,8 +588,13 @@ func codexActivity(t Thread) session.Activity {
 		return session.ActivityCompleted
 	case "failed", "error":
 		return session.ActivityFailed
-	case "idle", "notloaded":
+	case "idle":
 		return session.ActivityIdle
+	case "notloaded":
+		// notLoaded means the queried app-server instance does not have the
+		// thread loaded; it does not prove that another Codex runtime owning
+		// the thread is idle.
+		return session.ActivityUnknown
 	default:
 		if len(t.Turns) > 0 {
 			switch strings.ToLower(t.Turns[len(t.Turns)-1].Status) {
