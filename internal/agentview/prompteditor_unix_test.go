@@ -297,7 +297,7 @@ func TestEventLoopHandsTerminalToPromptEditorAndAcceptsLaterInput(t *testing.T) 
 	if len(p.rows) != 1 {
 		t.Fatalf("provider rows=%d, want no editor-triggered dispatch", len(p.rows))
 	}
-	if got := strings.Count(out.String(), "\x1b[2J\x1b[H"); got < 2 {
+	if got := strings.Count(out.String(), "\x1b[H"); got < 2 {
 		t.Fatalf("full redraws=%d, want redraw after editor and subsequent input", got)
 	}
 	if err := lifecycle.close(); err != nil {

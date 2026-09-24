@@ -413,11 +413,35 @@ func (r *Runtime) render() {
 	if sizeErr != nil {
 		width, height = 80, 24
 	}
-	fmt.Fprint(r.Output, terminalFrame(r.State.View(width, height)))
+	fmt.Fprint(r.Output, terminalFrame(r.State.View(width, height), width))
 }
 
-func terminalFrame(view string) string {
-	return "\x1b[2J\x1b[H" + normalizeTerminalNewlines(view)
+// terminalFrame turns a View into the bytes that repaint the terminal in
+// place. It never clears the whole screen first: the cursor returns home,
+// each row overwrites the previous frame's row, and only what the new frame
+// does not cover is erased -- the rest of a row narrower than width (EL) and
+// every row below the frame (ED) -- so no cell goes blank between frames.
+//
+// A row that fills width leaves the cursor in the pending-wrap state on the
+// last column, where EL would erase that column's glyph; such a row needs no
+// erase because it already overwrote every cell. View ends every row with a
+// newline, so the final ED always starts on a fresh row.
+func terminalFrame(view string, width int) string {
+	var b strings.Builder
+	b.Grow(len(view) + 16)
+	b.WriteString("\x1b[H")
+	rows := strings.Split(view, "\n")
+	for _, row := range rows[:len(rows)-1] {
+		row = strings.TrimSuffix(row, "\r")
+		b.WriteString(row)
+		if lineCells(row) < width {
+			b.WriteString("\x1b[K")
+		}
+		b.WriteByte('\n')
+	}
+	b.WriteString(rows[len(rows)-1])
+	b.WriteString("\x1b[J")
+	return normalizeTerminalNewlines(b.String())
 }
 
 func normalizeTerminalNewlines(value string) string {
