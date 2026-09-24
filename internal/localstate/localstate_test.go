@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestPinRoundTripsAcrossReload(t *testing.T) {
@@ -40,6 +41,30 @@ func TestClaudeArchiveOverlayRoundTrips(t *testing.T) {
 	archived, _, err = s.ClaudeState()
 	if err != nil || archived["c1"] {
 		t.Fatalf("archived after clear=%v err=%v", archived, err)
+	}
+}
+
+func TestSyncClaudeCreatedAtOverwritesAndForgetsAbsentSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := New(path)
+	t1, t2 := time.UnixMilli(1788438867864), time.UnixMilli(1788439818830)
+	if err := s.SyncClaudeCreatedAt(map[string]time.Time{"a": t1, "b": t1}, map[string]bool{"a": true, "b": true}); err != nil {
+		t.Fatal(err)
+	}
+	// "a" is still listed but running (no authoritative value); "b" is
+	// re-observed stopped with a different value; "c" is new.
+	if err := s.SyncClaudeCreatedAt(map[string]time.Time{"b": t2, "c": t2}, map[string]bool{"a": true, "b": true, "c": true}); err != nil {
+		t.Fatal(err)
+	}
+	known, err := New(path).ClaudeCreatedAt()
+	if err != nil || len(known) != 3 || !known["a"].Equal(t1) || !known["b"].Equal(t2) || !known["c"].Equal(t2) {
+		t.Fatalf("known=%v err=%v, want a=T1 b=T2 c=T2", known, err)
+	}
+	if err := s.SyncClaudeCreatedAt(nil, map[string]bool{"c": true}); err != nil {
+		t.Fatal(err)
+	}
+	if known, err := s.ClaudeCreatedAt(); err != nil || len(known) != 1 || !known["c"].Equal(t2) {
+		t.Fatalf("known=%v err=%v, want only c", known, err)
 	}
 }
 

@@ -1,5 +1,7 @@
 package localstate
 
+import "time"
+
 // ClaudeState returns the Claude archive overlay (session ID -> archived)
 // and the legacy rename-name fallback (session ID -> name), read together
 // since provider/claude's List consults both for every row in one pass.
@@ -39,4 +41,37 @@ func (s *Store) ClearClaudeArchived(id string) error {
 // must not go on hiding the name Claude itself now reports.
 func (s *Store) ClearLegacyClaudeName(id string) error {
 	return s.update(func(d *data) error { delete(d.ClaudeNames, id); return nil })
+}
+
+// ClaudeCreatedAt returns the known authoritative creation time of each
+// Claude session, keyed by its full native sessionId.
+func (s *Store) ClaudeCreatedAt() (map[string]time.Time, error) {
+	d, err := s.view()
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[string]time.Time, len(d.ClaudeCreatedAt))
+	for id, t := range d.ClaudeCreatedAt {
+		known[id] = t
+	}
+	return known, nil
+}
+
+// SyncClaudeCreatedAt records each authoritative creation time --
+// overwriting, not merging with, any earlier value for that sessionId --
+// and forgets every entry whose sessionId is absent from catalog. Callers
+// must only pass the catalog of a complete, successful `claude agents`
+// listing, since every sessionId missing from it is deleted.
+func (s *Store) SyncClaudeCreatedAt(authoritative map[string]time.Time, catalog map[string]bool) error {
+	return s.update(func(d *data) error {
+		for id := range d.ClaudeCreatedAt {
+			if !catalog[id] {
+				delete(d.ClaudeCreatedAt, id)
+			}
+		}
+		for id, t := range authoritative {
+			d.ClaudeCreatedAt[id] = t
+		}
+		return nil
+	})
 }

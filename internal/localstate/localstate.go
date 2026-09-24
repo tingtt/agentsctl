@@ -1,6 +1,7 @@
 // Package localstate is the Root Owner of agentsctl's local persisted
 // state: pin metadata, the Claude archive overlay, the legacy Claude
-// rename-name fallback, and Codex managed-run records (see the DesignDoc's
+// rename-name fallback, known Claude session creation times, and Codex
+// managed-run records (see the DesignDoc's
 // "Native state and local overlays" -- this is supplemental state only,
 // never a substitute for provider-native state).
 //

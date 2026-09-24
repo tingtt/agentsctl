@@ -863,6 +863,8 @@ agentsctl は native session record や transcript を複製せず、agentsctl �
 
 Claude session の表示名 (`ClaudeNames`) は、native rename 導入以前の overlay が migration compatibility として残るのみで、新規 rename の保存先ではない。
 
+Claude の既知作成時刻 (`ClaudeCreatedAt`) は完全な native `sessionId` をキーとする。Claude の `startedAt` は `pid` のない停止中 row では job 作成時刻だが、`pid` のある実行中 row では現在の process 開始時刻であり、attach や respawn のたびに進む。そのため停止中 row の `startedAt` だけを作成時刻として記録し、実行中 row には記録済みの値を `CreatedAt` として使う。未記録の実行中 row は `startedAt` を暫定値として使うが、記録はしない。`claude agents` の取得が成功したときだけ、catalog から消えた session の entry を削除する。
+
 ##### Overlay
 
 overlay は native result の取得後に適用する。

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,13 +31,16 @@ func newStore(t *testing.T) *localstate.Store {
 // `status`/`state` combinations observed from the installed Claude CLI
 // (`claude agents --json --all`) at each point in a real session's
 // lifecycle: freshly dispatched and actively running ({"status":"busy",
-// "state":"working"}), finished ({"status":"idle","state":"done"}), and a
-// legacy pre-daemon-tracking row that carries only `state` ("stopped", no
-// `status` field at all). A native value this build has never seen must
-// fall back to ActivityUnknown rather than be guessed at.
+// "state":"working"}, with a `pid`), finished ({"status":"idle",
+// "state":"done"}), and a legacy pre-daemon-tracking row that carries only
+// `state` ("stopped", no `status` field at all). A native value this build
+// has never seen must fall back to ActivityUnknown rather than be guessed
+// at. startedAt is epoch milliseconds; a stopped row's startedAt is its
+// creation time (see TestListKeepsStoppedCreationTimeAcrossProcessRestarts
+// for a running row's).
 func TestListUsesNativeStartedAtMillisecondsAndStatus(t *testing.T) {
 	r := &fakeRunner{result: base.Result{Stdout: []byte(`[
-		{"id":"working","startedAt":1788438925422,"status":"busy","state":"working"},
+		{"id":"working","startedAt":1788438925422,"pid":4242,"status":"busy","state":"working"},
 		{"id":"done","startedAt":1788438925000,"status":"idle","state":"done"},
 		{"id":"legacy-stopped","startedAt":1788438924500,"state":"stopped"},
 		{"id":"unexpected","startedAt":1788438924000,"status":"new-native-status","state":"new-native-state"}
@@ -46,11 +50,10 @@ func TestListUsesNativeStartedAtMillisecondsAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantCreated := time.UnixMilli(1788438925422)
-	if !rows[0].CreatedAt.Equal(wantCreated) || rows[0].Activity != session.ActivityWorking {
+	if rows[0].Activity != session.ActivityWorking {
 		t.Fatalf("working=%+v", rows[0])
 	}
-	if rows[1].Activity != session.ActivityCompleted || !rows[1].Actions.Available(session.ActionOpen) || rows[1].Runtime != session.RuntimeStopped {
+	if !rows[1].CreatedAt.Equal(time.UnixMilli(1788438925000)) || rows[1].Activity != session.ActivityCompleted || !rows[1].Actions.Available(session.ActionOpen) || rows[1].Runtime != session.RuntimeStopped {
 		t.Fatalf("done=%+v", rows[1])
 	}
 	if rows[2].Activity != session.ActivityCompleted || !rows[2].Actions.Available(session.ActionOpen) || rows[2].Runtime != session.RuntimeStopped {
@@ -58,6 +61,187 @@ func TestListUsesNativeStartedAtMillisecondsAndStatus(t *testing.T) {
 	}
 	if rows[3].Activity != session.ActivityUnknown {
 		t.Fatalf("unexpected=%+v", rows[3])
+	}
+}
+
+// claudeRow is one `claude agents --json --all` row in the installed CLI's
+// shape: a running session carries a `pid` (and its startedAt is that
+// process's start time), a stopped one does not (and its startedAt is the
+// job's creation time).
+func claudeRow(sessionID string, startedAt int64, running bool) string {
+	if running {
+		return fmt.Sprintf(`{"id":%q,"sessionId":%q,"startedAt":%d,"pid":4242,"status":"busy","state":"working"}`, sessionID[:8], sessionID, startedAt)
+	}
+	return fmt.Sprintf(`{"id":%q,"sessionId":%q,"startedAt":%d,"state":"done"}`, sessionID[:8], sessionID, startedAt)
+}
+
+func catalogOf(rows ...string) base.Result {
+	return base.Result{Stdout: []byte("[" + strings.Join(rows, ",") + "]")}
+}
+
+func listCreatedAt(t *testing.T, p *Provider, id string) time.Time {
+	t.Helper()
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Key.ID == id {
+			return row.CreatedAt
+		}
+	}
+	t.Fatalf("session %s not listed: %+v", id, rows)
+	return time.Time{}
+}
+
+func knownCreatedAt(t *testing.T, store *localstate.Store) map[string]time.Time {
+	t.Helper()
+	known, err := store.ClaudeCreatedAt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return known
+}
+
+const (
+	sessionA = "54a3fdb1-4ffe-4592-8a9b-b1ccf20bec23"
+	sessionB = "69e70abe-2d2e-4df2-8406-75e9913d14e4"
+	t1       = int64(1788438867864)
+	t2       = int64(1788439818830)
+	t3       = int64(1788445716817)
+)
+
+// TestListKeepsStoppedCreationTimeAcrossProcessRestarts is the Issue #63
+// regression: attaching to a stopped session (or a respawn) restarts its
+// Claude process and moves startedAt to now, which must not move the
+// session's CreatedAt -- and with it its position in session ordering.
+func TestListKeepsStoppedCreationTimeAcrossProcessRestarts(t *testing.T) {
+	store := newStore(t)
+	r := &fakeRunner{}
+	p := &Provider{Path: "ignored", Runner: r, Store: store}
+	other := claudeRow(sessionB, t1+1, false) // created just after sessionA
+
+	steps := []struct {
+		name string
+		row  string
+	}{
+		{"stopped", claudeRow(sessionA, t1, false)},
+		{"attached", claudeRow(sessionA, t2, true)},
+		{"respawned", claudeRow(sessionA, t3, true)},
+		{"detached", claudeRow(sessionA, t1, false)},
+	}
+	for _, step := range steps {
+		r.result = catalogOf(step.row, other)
+		rows, err := p.List(context.Background(), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		session.SortOverview(rows)
+		if rows[1].Key.ID != sessionA[:8] || !rows[1].CreatedAt.Equal(time.UnixMilli(t1)) {
+			t.Fatalf("%s: order=[%s %s] second CreatedAt=%v, want %s second at T1", step.name, rows[0].Key.ID, rows[1].Key.ID, rows[1].CreatedAt, sessionA[:8])
+		}
+		if got := knownCreatedAt(t, store)[sessionA]; !got.Equal(time.UnixMilli(t1)) {
+			t.Fatalf("%s: known=%v, want T1", step.name, got)
+		}
+	}
+}
+
+// TestListUsesRunningStartedAtOnlyProvisionally fixes that a session first
+// observed while running has no known creation time yet: its process's
+// startedAt is shown but never recorded, and the first stopped
+// observation replaces it for good.
+func TestListUsesRunningStartedAtOnlyProvisionally(t *testing.T) {
+	store := newStore(t)
+	r := &fakeRunner{result: catalogOf(claudeRow(sessionA, t2, true))}
+	p := &Provider{Path: "ignored", Runner: r, Store: store}
+
+	if got := listCreatedAt(t, p, sessionA[:8]); !got.Equal(time.UnixMilli(t2)) {
+		t.Fatalf("running first observation CreatedAt=%v, want T2", got)
+	}
+	if known, ok := knownCreatedAt(t, store)[sessionA]; ok {
+		t.Fatalf("running startedAt recorded as creation time: %v", known)
+	}
+
+	r.result = catalogOf(claudeRow(sessionA, t1, false))
+	if got := listCreatedAt(t, p, sessionA[:8]); !got.Equal(time.UnixMilli(t1)) {
+		t.Fatalf("stopped CreatedAt=%v, want T1", got)
+	}
+	if got := knownCreatedAt(t, store)[sessionA]; !got.Equal(time.UnixMilli(t1)) {
+		t.Fatalf("known=%v, want T1", got)
+	}
+
+	r.result = catalogOf(claudeRow(sessionA, t3, true))
+	if got := listCreatedAt(t, p, sessionA[:8]); !got.Equal(time.UnixMilli(t1)) {
+		t.Fatalf("running again CreatedAt=%v, want T1", got)
+	}
+}
+
+// TestListOverwritesKnownCreationTimeWithStoppedObservation fixes that a
+// stopped observation is authoritative: it replaces a differing known
+// value outright, later or earlier, rather than keeping the minimum.
+func TestListOverwritesKnownCreationTimeWithStoppedObservation(t *testing.T) {
+	store := newStore(t)
+	r := &fakeRunner{result: catalogOf(claudeRow(sessionA, t1, false))}
+	p := &Provider{Path: "ignored", Runner: r, Store: store}
+	listCreatedAt(t, p, sessionA[:8])
+
+	r.result = catalogOf(claudeRow(sessionA, t2, false))
+	if got := listCreatedAt(t, p, sessionA[:8]); !got.Equal(time.UnixMilli(t2)) {
+		t.Fatalf("CreatedAt=%v, want T2", got)
+	}
+	if got := knownCreatedAt(t, store)[sessionA]; !got.Equal(time.UnixMilli(t2)) {
+		t.Fatalf("known=%v, want T2", got)
+	}
+}
+
+// TestListKeysKnownCreationTimeByFullSessionID fixes that two sessions
+// sharing a shortened 8-character `id` never share a creation time.
+func TestListKeysKnownCreationTimeByFullSessionID(t *testing.T) {
+	store := newStore(t)
+	collider := sessionA[:8] + "-0000-0000-0000-000000000000"
+	r := &fakeRunner{result: catalogOf(claudeRow(sessionA, t1, false))}
+	p := &Provider{Path: "ignored", Runner: r, Store: store}
+	listCreatedAt(t, p, sessionA[:8])
+
+	r.result = catalogOf(claudeRow(sessionA, t1, false), claudeRow(collider, t3, true))
+	rows, err := p.List(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || !rows[1].CreatedAt.Equal(time.UnixMilli(t3)) {
+		t.Fatalf("rows=%+v, want the colliding running session at its own T3", rows)
+	}
+	known := knownCreatedAt(t, store)
+	if _, ok := known[collider]; ok || !known[sessionA].Equal(time.UnixMilli(t1)) || len(known) != 1 {
+		t.Fatalf("known=%v, want only %s=T1", known, sessionA)
+	}
+}
+
+// TestListForgetsKnownCreationTimeOnlyAfterSuccessfulListing fixes that a
+// session gone from a complete catalog is forgotten, while a failed or
+// undecodable `claude agents` call leaves known creation times intact.
+func TestListForgetsKnownCreationTimeOnlyAfterSuccessfulListing(t *testing.T) {
+	store := newStore(t)
+	r := &fakeRunner{result: catalogOf(claudeRow(sessionA, t1, false), claudeRow(sessionB, t2, false))}
+	p := &Provider{Path: "ignored", Runner: r, Store: store}
+	listCreatedAt(t, p, sessionA[:8])
+
+	r.result, r.err = base.Result{Stderr: []byte("boom")}, errors.New("exit 1")
+	if _, err := p.List(context.Background(), false); err == nil {
+		t.Fatal("failed claude agents accepted")
+	}
+	r.result, r.err = base.Result{Stdout: []byte("not-json")}, nil
+	if _, err := p.List(context.Background(), false); err == nil {
+		t.Fatal("malformed JSON accepted")
+	}
+	if known := knownCreatedAt(t, store); len(known) != 2 {
+		t.Fatalf("known after failed listings=%v, want both sessions kept", known)
+	}
+
+	r.result = catalogOf(claudeRow(sessionA, t1, false))
+	listCreatedAt(t, p, sessionA[:8])
+	if known := knownCreatedAt(t, store); len(known) != 1 || !known[sessionA].Equal(time.UnixMilli(t1)) {
+		t.Fatalf("known=%v, want only %s", known, sessionA)
 	}
 }
 

@@ -138,6 +138,7 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		return nil, fmt.Errorf("decode claude agents JSON: %w", err)
 	}
 	claudeArchived, legacyNames, _ := p.Store.ClaudeState()
+	knownCreatedAt := p.knownCreatedAt(raw)
 	// Loaded once per List call, not once per row: probeIDs is the full
 	// set of session IDs this probe has ever owned -- its current one and
 	// every one a rotation has since retired (see
@@ -177,13 +178,20 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 		if activity == session.ActivityCompleted || activity == session.ActivityFailed {
 			runtime = session.RuntimeStopped
 		}
-		created := timestamp(v["startedAt"])
+		started := timestamp(v["startedAt"])
 		updated := timestamp(v["updatedAt"])
-		if created.IsZero() {
-			created = updated
+		if started.IsZero() {
+			started = updated
 		}
 		if updated.IsZero() {
-			updated = created
+			updated = started
+		}
+		// A running process's startedAt is not the creation time (see
+		// knownCreatedAt); it is used only until a stopped observation
+		// has supplied the real one.
+		created := started
+		if t, ok := knownCreatedAt[text(v, "sessionId")]; ok {
+			created = t
 		}
 		attachable := runtime == session.RuntimeDetached || activity == session.ActivityCompleted
 		// Claude's own native `name` is canonical (see Provider.Rename):
@@ -221,6 +229,63 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 	}
 	return rows, nil
 }
+
+// knownCreatedAt returns each Claude session's authoritative creation
+// time, keyed by full native sessionId, after recording what raw -- a
+// complete, successfully decoded `claude agents --json --all` listing --
+// reveals.
+//
+// Claude's native startedAt changes meaning over a session's lifecycle:
+// without a `pid` it is the job's creation time, but with one it is the
+// current Claude process's start time, which moves forward on every
+// attach, respawn, or CLI-update restart. A running row's startedAt
+// therefore cannot be the immutable CreatedAt session ordering relies on.
+// Only a row without a `pid` is authoritative, and it overwrites any
+// earlier value (never a min()) so a wrong entry heals on the next stopped
+// observation; a running row's startedAt is never recorded.
+//
+// Entries for sessionIds no longer in raw are forgotten. Local state is
+// written only when that or an authoritative value changes it, since List
+// runs on every catalog refresh.
+func (p *Provider) knownCreatedAt(raw []map[string]any) map[string]time.Time {
+	known, err := p.Store.ClaudeCreatedAt()
+	if err != nil {
+		return nil
+	}
+	authoritative := map[string]time.Time{}
+	catalog := map[string]bool{}
+	changed := false
+	for _, v := range raw {
+		id := text(v, "sessionId")
+		if id == "" {
+			continue
+		}
+		catalog[id] = true
+		if v["pid"] != nil {
+			continue
+		}
+		t := timestamp(v["startedAt"])
+		if t.IsZero() {
+			continue
+		}
+		authoritative[id] = t
+		if prev, ok := known[id]; !ok || !prev.Equal(t) {
+			changed = true
+		}
+		known[id] = t
+	}
+	for id := range known {
+		if !catalog[id] {
+			changed = true
+			delete(known, id)
+		}
+	}
+	if changed {
+		_ = p.Store.SyncClaudeCreatedAt(authoritative, catalog)
+	}
+	return known
+}
+
 func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
 	res, err := p.Runner.Run(ctx, p.path(), []string{"--bg", prompt}, cwd)
 	if err != nil {
