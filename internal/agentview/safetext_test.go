@@ -161,11 +161,14 @@ func TestPastedOSCAndBELDoNotReachTerminal(t *testing.T) {
 }
 
 func TestRenderedFrameKeepsTrustedFramingWhileUserTextIsSafe(t *testing.T) {
-	frame := terminalFrame(composerView("a\x1b[2J", 0))
-	// The frame's own clear-screen prefix is application-generated and stays;
-	// the user's identical sequence does not add a second one.
-	if got := strings.Count(frame, "\x1b[2J"); got != 1 {
-		t.Fatalf("clear-screen sequences in frame=%d, want only the application's own", got)
+	frame := terminalFrame(composerView("a\x1b[2J\x1b[H", 0), 80)
+	// The frame's own cursor-home prefix is application-generated and stays;
+	// the user's clear-screen and cursor-home sequences reach neither.
+	if got := strings.Count(frame, "\x1b[2J"); got != 0 {
+		t.Fatalf("clear-screen sequences in frame=%d, want none", got)
+	}
+	if got := strings.Count(frame, "\x1b[H"); got != 1 {
+		t.Fatalf("cursor-home sequences in frame=%d, want only the application's own", got)
 	}
 }
 

@@ -184,17 +184,50 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 
 // latestFrame returns the most recently rendered frame from a syncBuffer's
 // accumulated output. Runtime.render always prefixes a frame with a
-// clear-screen escape (see terminalFrame), and syncBuffer's Write (unlike
+// cursor-home escape (see terminalFrame), and syncBuffer's Write (unlike
 // a real terminal) never discards earlier frames -- so asserting that some
 // content is ABSENT from the current render (e.g. a stale row that should
 // have been replaced) must only look at the frame after the last
-// clear-screen marker, not the whole accumulated history where that
+// cursor-home marker, not the whole accumulated history where that
 // content legitimately appeared in an earlier frame.
 func latestFrame(output string) string {
-	if i := strings.LastIndex(output, "\x1b[2J\x1b[H"); i >= 0 {
+	if i := strings.LastIndex(output, "\x1b[H"); i >= 0 {
 		return output[i:]
 	}
 	return output
+}
+
+func TestTerminalFrameRepaintsInPlaceWithoutClearingScreen(t *testing.T) {
+	const width = 10
+	full := strings.Repeat("x", width)
+	// A shorter frame drawn over a longer one: the narrower rows and every
+	// row below the frame still hold the previous frame's cells.
+	view := "short\n" + full + "\n\x1b[31mred\x1b[0m\r\n"
+	frame := terminalFrame(view, width)
+
+	if strings.Contains(frame, "\x1b[2J") {
+		t.Fatalf("frame clears the whole screen:\n%q", frame)
+	}
+	if !strings.HasPrefix(frame, "\x1b[H") {
+		t.Fatalf("frame does not start at the home position:\n%q", frame)
+	}
+	if !strings.HasSuffix(frame, "\x1b[J") {
+		t.Fatalf("frame does not erase the rows below it:\n%q", frame)
+	}
+	for _, row := range []string{"short", "\x1b[31mred\x1b[0m"} {
+		if !strings.Contains(frame, row+"\x1b[K\r\n") {
+			t.Fatalf("row %q does not erase the rest of its line:\n%q", row, frame)
+		}
+	}
+	// EL on a full row would erase its last glyph (pending wrap).
+	if !strings.Contains(frame, full+"\r\n") {
+		t.Fatalf("full-width row %q is followed by an erase:\n%q", full, frame)
+	}
+
+	erases := strings.NewReplacer("\x1b[H", "", "\x1b[K", "", "\x1b[J", "")
+	if got, want := erases.Replace(frame), normalizeTerminalNewlines(view); got != want {
+		t.Fatalf("frame content=%q, want %q", got, want)
+	}
 }
 
 // gatedCall is one gatedProvider.List invocation, held open until the test
