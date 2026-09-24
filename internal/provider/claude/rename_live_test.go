@@ -9,29 +9,35 @@ import (
 	"os/exec"
 	"testing"
 	"time"
+
+	base "github.com/tingtt/agentsctl/internal/provider"
 )
 
 // TestRealClaudeRenameMutatesSessionInPlace exercises the actual installed
 // `claude` CLI (never a fake): it dispatches a real, disposable background
-// session, renames it via sendClaudeRename, and confirms -- via `claude
+// session, renames it via sendClaudeRename gated by the same readiness
+// check Provider.Rename uses (waitSessionLive), and confirms -- via `claude
 // agents --json --all`, the same native source List/confirmRenamed use,
-// never PTY output -- that the rename landed on the very same session
-// (same id and sessionId) with no extra session created alongside it.
+// never PTY output -- that the command was actually submitted: the native
+// name changed on the very same session (same id and sessionId) with no
+// extra session created alongside it.
 //
-// It also measures user-visible rename latency (Send -> catalog confirms
-// the new name, mirroring what Provider.Rename's confirmRenamed loop does
-// -- cleanup is deliberately excluded, since Provider.Rename runs it
-// concurrently rather than waiting for it before reporting success) and
-// asserts it stays well under the ~2.7s of fixed settle delay a previous
-// design always paid, without hard-coding a specific millisecond figure
-// that would make this test flaky.
+// It covers two session states:
 //
-// This intentionally exercises only a quick/completed session for
-// determinism and cost; sendClaudeRename's doc comment records what was
-// separately, manually verified during this feature's investigation for a
-// working (mid-tool-call) session: same id/sessionId/pid, no fork, no
-// interruption of the in-flight background execution, and the same
-// sub-second catalog-confirmation latency.
+//   - live: the session's worker is running (its turn has finished). The
+//     user-visible rename latency (Send -> catalog confirms the new name,
+//     mirroring Provider.Rename -- cleanup is excluded, since Rename runs
+//     it concurrently) is asserted to stay well under the ~2.7s of fixed
+//     settle delay a previous design always paid, without hard-coding a
+//     specific millisecond figure that would make this test flaky.
+//   - stopped: `claude attach` must respawn the worker first. This is the
+//     issue #75 regression: `/rename <name>\r` written before the worker's
+//     REPL was mounted was left unsubmitted in the composer, so the native
+//     name never changed and Rename timed out.
+//
+// sendClaudeRename's doc comment records what was separately, manually
+// verified for a working (mid-tool-call) session: same id/sessionId/pid,
+// no fork, no interruption of the in-flight background execution.
 func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 	if os.Getenv("AGENTSCTL_REAL_CLAUDE_RENAME") != "1" {
 		t.Skip("set AGENTSCTL_REAL_CLAUDE_RENAME=1 for the live installed-claude rename test")
@@ -40,14 +46,94 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 	if err != nil {
 		t.Skip("claude CLI not installed")
 	}
+	for _, tc := range []struct {
+		state string
+		stop  bool
+	}{
+		{state: "live", stop: false},
+		{state: "stopped", stop: true},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			id := dispatchRealClaudeSession(t, claudePath)
+			if tc.stop {
+				if out, err := exec.Command(claudePath, "stop", id).CombinedOutput(); err != nil {
+					t.Fatalf("claude stop: %v: %s", err, out)
+				}
+			}
+			before, err := realClaudeAgentsJSON(claudePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeSessionID, _, found := realClaudeRowByID(before, id)
+			if !found {
+				t.Fatalf("dispatched session %s missing from the catalog before rename", id)
+			}
 
+			p := Provider{Path: claudePath, Runner: base.ExecRunner{}}
+			wantName := "検証 Rename テスト " + tc.state
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			cleanup, sendErr := sendClaudeRename(ctx, claudePath, id, wantName, func(ctx context.Context) error {
+				return p.waitSessionLive(ctx, id)
+			})
+			if sendErr != nil {
+				t.Fatalf("sendClaudeRename: %v", sendErr)
+			}
+			cleanupDone := make(chan error, 1)
+			go func() { cleanupDone <- cleanup(ctx, 8*time.Second) }()
+			if !pollUntilNativeName(claudePath, id, wantName, 15*time.Second) {
+				t.Fatalf("native catalog never reflected %q within 15s -- /rename was not submitted", wantName)
+			}
+			userVisibleLatency := time.Since(start)
+			if err := <-cleanupDone; err != nil {
+				t.Logf("cleanup returned an error (does not affect rename correctness): %v", err)
+			}
+			t.Logf("user-visible rename latency (Send -> catalog confirmed, cleanup excluded): %v", userVisibleLatency)
+			if !tc.stop && userVisibleLatency > 2500*time.Millisecond {
+				t.Fatalf("user-visible rename latency was %v -- expected well under the ~2.7s a previous fixed-settle design always paid", userVisibleLatency)
+			}
+
+			after, err := realClaudeAgentsJSON(claudePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSessionID, gotName, found := realClaudeRowByID(after, id)
+			if !found {
+				t.Fatalf("session %s missing from `claude agents --json --all` after rename", id)
+			}
+			if gotName != wantName {
+				t.Fatalf("native name = %q, want %q", gotName, wantName)
+			}
+			if gotSessionID != beforeSessionID {
+				t.Fatalf("sessionId changed from %s to %s -- rename must not replace the session", beforeSessionID, gotSessionID)
+			}
+			// No fork: exactly one row for this id after rename.
+			count := 0
+			for _, row := range after {
+				if id2, _ := row["id"].(string); id2 == id {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("expected exactly one row for id %s after rename, found %d -- rename must not fork a session", id, count)
+			}
+			t.Logf("native rename confirmed in place: id=%s sessionId=%s name=%q", id, gotSessionID, gotName)
+		})
+	}
+}
+
+// dispatchRealClaudeSession starts a disposable background session,
+// registers its removal, and waits for its single turn to finish so the
+// caller starts from a settled session.
+func dispatchRealClaudeSession(t *testing.T, claudePath string) string {
+	t.Helper()
 	before, err := realClaudeAgentsJSON(claudePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	dispatch := exec.Command(claudePath, "--bg", "Reply with exactly the word: ready")
-	out, err := dispatch.CombinedOutput()
+	out, err := exec.Command(claudePath, "--bg", "Reply with exactly the word: ready").CombinedOutput()
 	if err != nil {
 		t.Fatalf("claude --bg: %v: %s", err, out)
 	}
@@ -56,63 +142,22 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 		t.Fatalf("could not parse a session id from claude --bg output: %s", out)
 	}
 	t.Cleanup(func() { _ = exec.Command(claudePath, "rm", id).Run() })
-
-	beforeSessionID, _, found := realClaudeRowByID(before, id)
-	if found {
-		t.Fatalf("dispatched session id %s collided with a pre-existing row (sessionId=%s) -- refusing to touch a session this test did not create", id, beforeSessionID)
+	if sessionID, _, found := realClaudeRowByID(before, id); found {
+		t.Fatalf("dispatched session id %s collided with a pre-existing row (sessionId=%s) -- refusing to touch a session this test did not create", id, sessionID)
 	}
-
-	const wantName = "検証 Rename テスト"
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	cleanup, sendErr := sendClaudeRename(ctx, claudePath, id, wantName)
-	if sendErr != nil {
-		t.Fatalf("sendClaudeRename: %v", sendErr)
-	}
-	// Mirrors Provider.Rename: catalog confirmation is what decides success,
-	// and cleanup runs concurrently rather than gating it.
-	cleanupDone := make(chan error, 1)
-	go func() { cleanupDone <- cleanup(ctx, 8*time.Second) }()
-	if !pollUntilNativeName(claudePath, id, wantName, 15*time.Second) {
-		t.Fatalf("native catalog never reflected %q within 15s", wantName)
-	}
-	userVisibleLatency := time.Since(start)
-	if err := <-cleanupDone; err != nil {
-		t.Logf("cleanup returned an error (does not affect rename correctness): %v", err)
-	}
-
-	if userVisibleLatency > 2500*time.Millisecond {
-		t.Fatalf("user-visible rename latency was %v -- expected well under the ~2.7s a previous fixed-settle design always paid", userVisibleLatency)
-	}
-	t.Logf("user-visible rename latency (Send -> catalog confirmed, cleanup excluded): %v", userVisibleLatency)
-
-	after, err := realClaudeAgentsJSON(claudePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gotSessionID, gotName, found := realClaudeRowByID(after, id)
-	if !found {
-		t.Fatalf("session %s missing from `claude agents --json --all` after rename", id)
-	}
-	if gotName != wantName {
-		t.Fatalf("native name = %q, want %q", gotName, wantName)
-	}
-
-	// No fork: exactly one row for this id, both before-dispatch absence
-	// and after-rename presence accounted for, and no second row anywhere
-	// in the catalog carrying the same (or a related) sessionId.
-	count := 0
-	for _, row := range after {
-		if id2, _ := row["id"].(string); id2 == id {
-			count++
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if rows, err := realClaudeAgentsJSON(claudePath); err == nil {
+			for _, row := range rows {
+				if row["id"] == id && row["state"] == "done" {
+					return id
+				}
+			}
 		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if count != 1 {
-		t.Fatalf("expected exactly one row for id %s after rename, found %d -- rename must not fork a session", id, count)
-	}
-	t.Logf("native rename confirmed in place: id=%s sessionId=%s name=%q", id, gotSessionID, gotName)
+	t.Fatalf("session %s did not finish its turn within 60s", id)
+	return ""
 }
 
 func realClaudeAgentsJSON(claudePath string) ([]map[string]any, error) {

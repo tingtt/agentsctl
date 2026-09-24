@@ -363,7 +363,9 @@ func TestListExposesRenameForWorkingAndStoppedSessions(t *testing.T) {
 }
 
 // fakeRenamer is a test NativeRenamer: it records the arguments Send was
-// called with and, on success, updates fakeRunner's canned `claude agents`
+// called with, consults ready exactly where the real transport does (after
+// starting its client, before sending), and, on success, updates
+// fakeRunner's canned `claude agents`
 // response so Provider.confirmRenamed's follow-up native-catalog check
 // observes the new name — mirroring what the real transport (a successful
 // `/rename` against the live daemon, which durably lands before its
@@ -376,6 +378,7 @@ type fakeRenamer struct {
 	sendErr              error
 	cleanupErr           error
 	calls                []renameCall
+	sent                 bool
 	cleanupCalls         int
 	runner               *fakeRunner
 	confirmWithNativeID  string // id key to update in runner's canned JSON on success
@@ -385,11 +388,19 @@ type renameCall struct {
 	path, id, name string
 }
 
-func (f *fakeRenamer) Send(_ context.Context, path, id, name string) (func(context.Context, time.Duration) error, error) {
+func (f *fakeRenamer) Send(ctx context.Context, path, id, name string, ready func(context.Context) error) (func(context.Context, time.Duration) error, error) {
 	f.calls = append(f.calls, renameCall{path, id, name})
 	if f.sendErr != nil {
 		return nil, f.sendErr
 	}
+	cleanup := func(context.Context, time.Duration) error {
+		f.cleanupCalls++
+		return f.cleanupErr
+	}
+	if err := ready(ctx); err != nil {
+		return cleanup, err
+	}
+	f.sent = true
 	if f.runner != nil {
 		field := f.confirmWithFieldName
 		if field == "" {
@@ -401,10 +412,7 @@ func (f *fakeRenamer) Send(_ context.Context, path, id, name string) (func(conte
 		}
 		f.runner.result.Stdout = []byte(fmt.Sprintf(`[{"id":%q,%q:%q,"status":"idle","state":"done"}]`, targetID, field, name))
 	}
-	return func(context.Context, time.Duration) error {
-		f.cleanupCalls++
-		return f.cleanupErr
-	}, nil
+	return cleanup, nil
 }
 
 // TestRenameInvokesNativeTransportForTheGivenSessionAndConfirmsViaCatalog
@@ -541,6 +549,53 @@ func TestConfirmRenamedPollsUntilDeadlineNotFixedAttemptCount(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Fatalf("confirmRenamed took %v to notice a name that appeared after ~30ms -- it should return promptly once confirmed, not wait out the full budget", elapsed)
+	}
+}
+
+// TestWaitSessionLiveWaitsForWorkerStatus fixes the Provider half of the
+// issue #75 fix: a stopped session's catalog row has no `status` (reproduced
+// with claude 2.1.281) until `claude attach` has respawned its worker and
+// that worker's REPL reports one, and only then may `/rename` be sent.
+// waitSessionLive must keep polling while the row lacks `status`, and
+// return promptly once it appears.
+func TestWaitSessionLiveWaitsForWorkerStatus(t *testing.T) {
+	r := &raceSafeRunner{}
+	r.set([]byte(`[{"id":"c1","name":"old","state":"done"}]`))
+	p := Provider{Path: "ignored", Runner: r, Store: newStore(t), ConfirmPollInterval: 2 * time.Millisecond, ConfirmMaxWait: time.Second}
+	go func() {
+		time.Sleep(30 * time.Millisecond) // several poll intervals in
+		r.set([]byte(`[{"id":"c1","name":"old","pid":4242,"status":"idle","state":"done"}]`))
+	}()
+	start := time.Now()
+	if err := p.waitSessionLive(context.Background(), "c1"); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 30*time.Millisecond {
+		t.Fatalf("waitSessionLive returned after %v, before the worker reported a status", elapsed)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("waitSessionLive took %v to notice a status that appeared after ~30ms", elapsed)
+	}
+}
+
+// TestRenameDoesNotSendWhenSessionNeverBecomesLive fixes that Rename
+// never lets the transport write `/rename` into a session whose worker
+// never reports a live status (it would only be buffered, unsubmitted, in
+// the composer), still cleans up the started client, and reports failure.
+func TestRenameDoesNotSendWhenSessionNeverBecomesLive(t *testing.T) {
+	r := &fakeRunner{result: base.Result{Stdout: []byte(`[{"id":"c1","name":"native-name","state":"done"}]`)}}
+	renamer := &fakeRenamer{runner: r}
+	p := Provider{Path: "ignored", Runner: r, Store: newStore(t), Renamer: renamer, ConfirmPollInterval: time.Millisecond, ConfirmMaxWait: 20 * time.Millisecond}
+	key := session.Key{Provider: session.ProviderClaude, ID: "c1"}
+	if err := p.Rename(context.Background(), key, "My New Name"); err == nil {
+		t.Fatal("rename reported success although the session never became live")
+	}
+	if renamer.sent {
+		t.Fatal("the rename command was sent before the session reported a live worker status")
+	}
+	if renamer.cleanupCalls != 1 {
+		t.Fatalf("cleanup was called %d times, want exactly 1 for the already-started client", renamer.cleanupCalls)
 	}
 }
 
