@@ -47,8 +47,13 @@ type data struct {
 	// here; provider/claude's List only consults an entry when Claude's
 	// own native catalog reports no name at all for that session.
 	ClaudeNames map[string]string `json:"claudeNames,omitempty"`
-	Pinned      map[string]bool   `json:"pinned,omitempty"`
-	Runs        map[string]run    `json:"runs,omitempty"`
+	// ClaudeCreatedAt maps a full native Claude sessionId (never the
+	// shortened `id`) to that session's authoritative creation time: only
+	// a value observed while the session had no running process is ever
+	// recorded (see provider/claude.Provider.knownCreatedAt).
+	ClaudeCreatedAt map[string]time.Time `json:"claudeCreatedAt,omitempty"`
+	Pinned          map[string]bool      `json:"pinned,omitempty"`
+	Runs            map[string]run       `json:"runs,omitempty"`
 	// ChatGPTCatalogs is provider/chatgpt's persisted last-known-good
 	// catalog cache, keyed by ChatGPT Project ID (see
 	// (*Store).ChatGPTCatalog/SaveChatGPTCatalog in chatgpt.go) so a
@@ -100,7 +105,7 @@ func fromRun(r Run) run {
 }
 
 func emptyData() data {
-	return data{ClaudeArchived: map[string]bool{}, ClaudeNames: map[string]string{}, Pinned: map[string]bool{}, Runs: map[string]run{}, ChatGPTCatalogs: map[string]chatGPTCatalog{}}
+	return data{ClaudeArchived: map[string]bool{}, ClaudeNames: map[string]string{}, ClaudeCreatedAt: map[string]time.Time{}, Pinned: map[string]bool{}, Runs: map[string]run{}, ChatGPTCatalogs: map[string]chatGPTCatalog{}}
 }
 
 // normalize ensures every map field is non-nil after decode/mutation, so
@@ -112,6 +117,9 @@ func (d *data) normalize() {
 	}
 	if d.ClaudeNames == nil {
 		d.ClaudeNames = map[string]string{}
+	}
+	if d.ClaudeCreatedAt == nil {
+		d.ClaudeCreatedAt = map[string]time.Time{}
 	}
 	if d.Pinned == nil {
 		d.Pinned = map[string]bool{}
