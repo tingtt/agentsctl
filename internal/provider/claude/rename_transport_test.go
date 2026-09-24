@@ -18,19 +18,23 @@ func readyNow(context.Context) error { return nil }
 
 // TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay fixes the
 // mechanical contract of sendClaudeRename against a fake `claude attach
-// <id>` client: once ready has passed (exactly once), the exact
-// "/rename <name>\r" bytes must reach the child, and Send must return as
-// soon as that write succeeds -- not after some fixed settle window. This
-// is the regression test for the latency fix: sendClaudeRename used to
-// wait a fixed 1.5s before writing and another fixed 1.2s after, neither
-// of which was ever load-bearing for correctness (see its doc comment for
-// the real-CLI measurements that proved this). Whether the real CLI
+// <id>` client: once ready has passed (exactly once), the command must
+// reach the child as a bracketed paste followed by a CR, and Send must
+// return as soon as that write succeeds -- not after some fixed settle
+// window (an earlier design waited a fixed 1.5s before writing and 1.2s
+// after, which was never load-bearing for correctness).
+//
+// The framing is the issue #75 regression: Claude 2.1.281 handles an
+// unbracketed burst of 64 or more characters as a paste, so a bare
+// "/rename <name>\r" with a name like the one below left the command
+// unsubmitted in the composer with the CR inserted as a newline. The name
+// is deliberately over that threshold and non-ASCII. Whether the real CLI
 // actually submits these bytes is covered by the opt-in live test.
 func TestSendClaudeRenameSendsExpectedInputWithoutFixedDelay(t *testing.T) {
 	dir := t.TempDir()
 	outPath := filepath.Join(dir, "got")
-	name := "Test Rename"
-	command := "/rename " + name + "\r"
+	name := "#75 fix(claude): submit /rename correctly for 既存 sessions"
+	command := "\x1b[200~/rename " + name + "\x1b[201~\r"
 	script := writeFakeClaudeAttachScript(t, fmt.Sprintf(
 		`stty raw -echo; dd bs=1 count=%d of="%s" 2>/dev/null; dd bs=1 count=1 of=/dev/null 2>/dev/null; exit 0`,
 		len(command), outPath))

@@ -457,10 +457,11 @@ func (p *Provider) confirmRenamed(ctx context.Context, id, name string) error {
 // a running session's REPL. Rename's transient `claude attach` wakes a
 // stopped session by respawning its worker, and until that worker's REPL
 // is mounted, its terminal input goes to Claude's early-input capture
-// instead of the composer: there a CR is buffered as a newline and never
-// submits, so `/rename <name>` would be left unsubmitted in the composer
-// (issue #75). A stopped row has no `status` at all; an already-live
-// session has one immediately, so this costs a single catalog read there.
+// instead of the composer: there escape sequences are dropped and a CR is
+// buffered as a newline, so `/rename <name>` would never be submitted
+// (reproduced with claude 2.1.281). A stopped row has no `status` at all;
+// an already-live session has one immediately, so this costs a single
+// catalog read there.
 func (p *Provider) waitSessionLive(ctx context.Context, id string) error {
 	err := p.pollNativeRow(ctx, id, func(row map[string]any) error {
 		if text(row, "status") == "" {

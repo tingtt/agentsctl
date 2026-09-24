@@ -29,9 +29,9 @@ import (
 // REPL is live (Provider.waitSessionLive): attaching to a stopped session
 // makes Claude respawn its worker, and input that reaches the worker
 // before its REPL mounts goes to Claude's early-input capture, which
-// buffers CR as a newline instead of submitting (issue #75, reproduced
-// with claude 2.1.281). Once ready has passed, writing immediately is
-// reliable: startClaudeAttachRaw puts the pty's slave into raw mode before
+// drops escape sequences and buffers CR as a newline instead of
+// submitting (reproduced with claude 2.1.281). Once ready has passed,
+// writing immediately is reliable: startClaudeAttachRaw puts the pty's slave into raw mode before
 // the child process even starts, so a write landing before the client has
 // gotten around to reading is safely queued by the kernel rather than
 // lost. Real-CLI measurement (disposable sessions, working mid-tool-call,
@@ -77,18 +77,27 @@ func sendClaudeRename(ctx context.Context, path, id, name string, ready func(con
 	if err := ready(ctx); err != nil {
 		return cleanup, err
 	}
-	// The full remaining line (including internal spaces) is the argument:
-	// verified against the installed CLI with names containing spaces and
-	// Japanese text, neither of which needed quoting. '\r' is the key the
-	// live composer treats as Enter when no keyboard protocol has been
-	// negotiated (this headless client answers none of Claude's terminal
-	// queries), and it submits only because ready has already passed --
-	// before that, the same byte is buffered as a newline (see above). '\n'
-	// does not submit even in a live composer: it stays in the input.
-	// validateRenameName above has already rejected any '\r'/'\n'/other
-	// control byte inside name itself, so this is the only place in the
-	// constructed input that a command separator can appear.
-	if _, err := child.Write([]byte("/rename " + name + "\r")); err != nil {
+	// The command text goes in as a bracketed paste, followed by a CR that
+	// submits it, all in one write. The full remaining line (including
+	// internal spaces) is the argument: verified against the installed CLI
+	// with names containing spaces and Japanese text, neither of which
+	// needed quoting.
+	//
+	// A plain "/rename <name>\r" is not enough (issue #75, claude 2.1.281):
+	// the composer handles an unbracketed input burst of 64 or more
+	// characters (counted as characters, not bytes) as a paste, so the
+	// trailing CR is inserted as a newline and the command stays unsubmitted
+	// in the composer. A CR on its own, or after a closed bracketed paste,
+	// is a plain Enter keypress and submits. Writing the text and the CR
+	// separately does not help: back-to-back writes reach Claude as one
+	// burst. This is also how Claude itself injects a reply into a
+	// background session's pty (bracketed paste, then CR).
+	//
+	// validateRenameName above has already rejected every control byte in
+	// name -- including '\r'/'\n' and ESC -- so name can neither submit early
+	// nor end the paste early; the markers and the final CR are the only
+	// control sequences in the constructed input.
+	if _, err := child.Write([]byte(bracketedPasteStart + "/rename " + name + bracketedPasteEnd + "\r")); err != nil {
 		_ = child.Close()
 		return nil, fmt.Errorf("send /rename to claude attach client: %w", err)
 	}
@@ -104,6 +113,13 @@ func sendClaudeRename(ctx context.Context, path, id, name string, ready func(con
 	// check is authoritative for rename success/failure anyway.
 	return cleanup, nil
 }
+
+// bracketedPasteStart and bracketedPasteEnd delimit a bracketed paste
+// (xterm DECSET 2004), which Claude's composer enables.
+const (
+	bracketedPasteStart = "\x1b[200~"
+	bracketedPasteEnd   = "\x1b[201~"
+)
 
 // drainUntilClosed reads and discards f's output until a Read fails (which
 // happens once f is closed), for callers with no real terminal to forward
@@ -127,8 +143,9 @@ func drainUntilClosed(f *os.File) {
 // a brand-new prompt the live agent will actually execute -- reproduced
 // against the installed CLI: a name containing "evil\rhi there" renamed the
 // session to "evil" and then had the agent answer "hi there" as a real
-// chat turn), ESC (could start an escape sequence a well-behaved client
-// might interpret as a key), and every other C0/C1 control byte, while
+// chat turn), ESC (could end sendClaudeRename's bracketed paste early or
+// start an escape sequence a client interprets as a key), and every other
+// C0/C1 control byte, while
 // leaving ordinary Unicode -- including Japanese text and plain spaces,
 // both verified against the installed CLI -- untouched.
 func validateRenameName(name string) error {

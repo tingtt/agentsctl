@@ -22,7 +22,12 @@ import (
 // name changed on the very same session (same id and sessionId) with no
 // extra session created alongside it.
 //
-// It covers two session states:
+// Both names are long enough that "/rename <name>\r" is 64 or more
+// characters: the issue #75 regression, where Claude handled such an
+// unbracketed burst as a paste and left the command unsubmitted in the
+// composer. One is plain ASCII and one mixes Japanese and spaces, since
+// the threshold counts characters, not bytes. It covers two session
+// states:
 //
 //   - live: the session's worker is running (its turn has finished). The
 //     user-visible rename latency (Send -> catalog confirms the new name,
@@ -30,10 +35,9 @@ import (
 //     it concurrently) is asserted to stay well under the ~2.7s of fixed
 //     settle delay a previous design always paid, without hard-coding a
 //     specific millisecond figure that would make this test flaky.
-//   - stopped: `claude attach` must respawn the worker first. This is the
-//     issue #75 regression: `/rename <name>\r` written before the worker's
-//     REPL was mounted was left unsubmitted in the composer, so the native
-//     name never changed and Rename timed out.
+//   - stopped: `claude attach` must respawn the worker first, and input
+//     written before its REPL is mounted is never submitted; this covers
+//     the readiness wait (waitSessionLive).
 //
 // sendClaudeRename's doc comment records what was separately, manually
 // verified for a working (mid-tool-call) session: same id/sessionId/pid,
@@ -49,9 +53,10 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 	for _, tc := range []struct {
 		state string
 		stop  bool
+		name  string
 	}{
-		{state: "live", stop: false},
-		{state: "stopped", stop: true},
+		{state: "live", stop: false, name: "#75 live: submit /rename correctly for existing Claude sessions"},
+		{state: "stopped", stop: true, name: "#75 stopped: 既存の Claude セッションで /rename を正しく submit できることを確認する長い名前です"},
 	} {
 		t.Run(tc.state, func(t *testing.T) {
 			id := dispatchRealClaudeSession(t, claudePath)
@@ -70,7 +75,10 @@ func TestRealClaudeRenameMutatesSessionInPlace(t *testing.T) {
 			}
 
 			p := Provider{Path: claudePath, Runner: base.ExecRunner{}}
-			wantName := "検証 Rename テスト " + tc.state
+			wantName := tc.name
+			if n := len([]rune("/rename " + wantName + "\r")); n < 64 {
+				t.Fatalf("test name gives a %d-character command; it must be at least 64 to cover issue #75", n)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 
