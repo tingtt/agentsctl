@@ -210,7 +210,7 @@ refreshing / pending といった refresh state machine の状態
 
 CWD を persist しないのは、リポジトリの移動や同一 Project を参照する別 checkout がある場合に、古い CWD がそのまま残ってしまうのを避けるため -- remote catalog (何がある conversation か) と local logical CWD (それが今どのディレクトリに属するか) は別の関心事として扱う。Local pin は既存の pin store がそのまま source of truth であり、ChatGPT catalog の persist/hydrate はそれに一切関与しない。
 
-Provider は raw JSON schema や `localstate` の内部型に直接依存しない。`internal/provider/chatgpt` は自身の consumer-side interface `CatalogStore` (`ChatGPTCatalog`/`SaveChatGPTCatalog`) を所有し、`*localstate.Store` がそれを満たす -- `provider/codex` が `localstate.Run` を介して `supervisor.Dispatcher` を consumer-side interface で受け取るのと同じ構図であり、テストは fake store で差し替えられる。
+Provider は raw JSON schema や `localstate` の内部型に直接依存しない。`internal/provider/chatgpt` は自身の consumer-side interface `CatalogStore` (`ChatGPTCatalog`/`SaveChatGPTCatalog`) を所有し、`*localstate.Store` がそれを満たす。provider が必要とする storage / runtime dependency は同様に consumer-side interface 越しに受け取り、テストでは fake implementation に差し替えられる。
 
 replace は COMPLETE な enumeration の後にのみ行われ、memory cache の更新と persist は同じ成功パス内で行われる:
 
@@ -551,7 +551,7 @@ Stop は、session に紐づく実行中の process を終了する。
 - turn ID は daemon restart 後に変化しうるため cache しない。
 - approval / user-input 待ちも active turn として interrupt でき、pending request は破棄される。
 - interrupt 後も thread 自体は残り、次の turn を開始できる。
-- daemon 外の writer しか確認できない thread は process を推測して停止せず fail closed とする.
+- daemon 外の writer しか確認できない thread は process を推測して停止せず fail closed とする。
 
 Stop は以下とは独立する。
 
@@ -735,7 +735,7 @@ running version の source of truth は `internal/version.Version` (既定値 `d
 - `/update`: `go install` に通知した version と同じ値を `-ldflags -X` で渡す。
 - 埋め込みのない build (`dev`) は update check を行わず、`/update` も利用できない。
 
-Go の build info は fallback として使わない。この version は release version であり、supervisor の互換性を表す `supervisor.BuildVersion` とは別物で、統合しない。
+Go の build info は fallback として使わない。この version は agentsctl release version の source of truth とし、provider runtime の protocol/version 判定とは分離する。
 
 ##### Update check
 
@@ -945,7 +945,7 @@ daemon 上で `notLoaded` の thread に限り、daemon 外の embedded runtime 
 - `notLoaded` + writer lock あり: daemon 外 runtime。Activity は Unknown、Runtime は External。
 - daemon loaded thread では writer lock を判定材料にしない。shared daemon 自身が writer lock を保持するためである。
 
-writer lock の瞬間的な acquire/release race による一時的表示差は許容するが、それを Activity 推定や destructive action の ownership proof へ拡張しない.
+writer lock の瞬間的な acquire/release race による一時的表示差は許容するが、それを Activity 推定や destructive action の ownership proof へ拡張しない。
 
 #### Process ownership and identity
 
@@ -953,7 +953,7 @@ OS process identity を扱う必要がある箇所では PID 単独を identity 
 
 Codex では、この process identity は `notLoaded` thread の writer lock が daemon 外 runtime に属することを確認するためだけに使う。process identity から thread identity や Activity を推測せず、その process を agentsctl-owned とみなして signal を送ることもしない。
 
-確認不能、process 消失、identity 不一致の場合は fail closed とする.
+確認不能、process 消失、identity 不一致の場合は fail closed とする。
 
 #### Codex canonical session identity
 
@@ -967,13 +967,13 @@ Codex session の canonical key は常に app-server が返す thread ID を使�
 - writer ownership による run-to-thread binding
 - Starting row から canonical row への Codex-specific `PreviousKeys` transition
 
-Agent View は Dispatch が返した canonical key が catalog / Observer snapshot に現れた時点で通常どおり選択する。Codex 固有の identity reconstruction を UI に持ち込まない.
+Agent View は Dispatch が返した canonical key が catalog / Observer snapshot に現れた時点で通常どおり選択する。Codex 固有の identity reconstruction を UI に持ち込まない。
 
 #### Foreground Codex TUI lifecycle
 
 Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Codex 自身の foreground TUI が terminal mode、redraw、paste mode を所有し、agentsctl は managed background PTY の output replay、resize trick、Codex-specific ANSI filteringを行わない。
 
-Open client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない.
+Open client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。
 
 #### Concurrency and backpressure
 
@@ -1032,7 +1032,7 @@ provider が `ActivityStarting` を返し、その provider 自身に catalog ch
 - full reload と競合させず、同じ provider の targeted List は同時に1つだけとする。
 - settle しない provider を無期限に poll しないよう reload cycle ごとの回数上限を持つ。
 - provider が Observer で current snapshot を publish できる場合、その provider の live Activity 追従をこの polling に依存させない。Codex の shared app-server runtime は `thread/status/changed` + Observer を利用するため、Codex Activity の通常更新は targeted polling を必要としない。
-- targeted List の結果は通常 reload と同じ provider snapshot pipeline を通し、selection / pin / scope / last-known-good semantics を変えない.
+- targeted List の結果は通常 reload と同じ provider snapshot pipeline を通し、selection / pin / scope / last-known-good semantics を変えない。
 
 ##### Provider catalog observer と provider snapshot store
 
@@ -1107,17 +1107,7 @@ observerSnapshotSeen
 
 この区別がないと、ChatGPT のような Observer provider で次のような regression が起きる: Observer が持続的な durability warning (例: persist 失敗) を publish した直後に Ctrl+L を押すと、ChatGPT の `List` はただ cache を読むだけで容易に成功し、その「成功」を Agent View が (誤って) warning の解消と解釈して warning を消してしまう -- 実際には持続的な問題は何も解決していないにもかかわらず。
 
-##### PTY output
-
-supervisor は PTY output を attach subscriber へ配信する。
-
-subscriber が遅い場合でも、PTY 自体の read loop を停止させない。
-
-session process の進行を UI client の描画速度に依存させない。
-
-subscriber ごとの output buffer は bytes 単位で bound する。PTY read() の chunk 数を容量単位として扱わない。
-
-buffer 上限を超えて追いつけない subscriber は、切断理由を Failure frame で明示したうえで attach を終了する。この切断は attach channel のみに関与し、managed process の lifetime には関与しない。
+#### OS boundaries
 
 #### OS boundaries
 
@@ -1143,7 +1133,7 @@ MVP の対象 OS は以下。
 
 background work の実行主体を interactive Codex TUI process / PTY にすると、session identity、Stop、Activity observation が local process ownership に結び付く。shared app-server は canonical thread ID、native status event、turn interruptionを提供し、TUI client が存在しなくても turn を継続できる。
 
-そのため Codex runtime は shared app-server daemon に置き、TUI は Open 時だけ接続する foreground client とする.
+そのため Codex runtime は shared app-server daemon に置き、TUI は Open 時だけ接続する foreground client とする。
 
 ### PID のみで process を識別する
 
@@ -1163,7 +1153,7 @@ PID reuse により、無関係な process を操作する可能性がある。
 
 新規 Dispatch は `thread/start` response から canonical thread ID を直接取得する。CWD、時刻、writer lock、row position 等から session identity を推測しない。
 
-既存 `notLoaded` thread について writer lock を見る場合も、用途は daemon 外 runtime の存在検出に限定し、thread identity の binding には使わない.
+既存 `notLoaded` thread について writer lock を見る場合も、用途は daemon 外 runtime の存在検出に限定し、thread identity の binding には使わない。
 
 ### Codex provisional run identity を session として公開する
 
@@ -1171,7 +1161,7 @@ PID reuse により、無関係な process を操作する可能性がある。
 
 `thread/start` が canonical thread ID を同期的に返すため、Codex の新規 session を一時的な run ID で公開する必要はない。
 
-Dispatch 直後から canonical `codex:<thread ID>` を使い、Agent View が CWD、timestamps、row position などから identity transition を推測する経路を作らない.
+Dispatch 直後から canonical `codex:<thread ID>` を使い、Agent View が CWD、timestamps、row position などから identity transition を推測する経路を作らない。
 
 ### 単発の redraw signal を送る
 
