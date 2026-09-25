@@ -1049,50 +1049,11 @@ provider が `ActivityStarting` を返し、その provider 自身に catalog ch
 
 Agent View 側は provider ごとの最新 session と最新 warning を `providerSnapshots` (provider ID をキーにした store) として保持し、1本の append-only な session slice には戻さない。`State.Rows` は毎回この `providerSnapshots` 全体 (provider 登録順) から再構築するため、まだ今回の reload に返答していない provider や、直近の refresh が失敗した provider の rows が空になったり消えたりすることはない -- 見えるのは常に「各 provider の直近の成功結果」の合成である。`CatalogLoading` は「rows が空である」ことではなく「今回要求した reload cycle がまだ全 provider から返答を得ていない」ことを表し、cache 済みの rows はその間も選択・Open 可能なままである。
 
-##### List と Observer、どちらが warning/rows の authority か
+##### List / Observer warning source と rows authority
 
-`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、providerSnapshots への適用ルールこそ大枠を共有するが、**warning と rows の authority は別々に移る**。これらは実装上のバグとして発見された区別であり、意図的に分離されている。
+`LoadStream` の到着 (`applyLoadSnapshot`) と `Observer` の publish (`applyObserverUpdate`) は、warning を source ごとに独立して保持する。List の失敗は List warning を set し、List の成功は List warning だけを clear する。Observer の失敗は Observer warning を set し、clean success は Observer warning だけを clear する。成功と `Warning` を同時に持つ Observer update は、その `Warning` を Observer warning として set する。一方の成功が他方の未解決 failure を消すことはない。
 
-```text
-ListOwnsStatus
-  → Observer が status を report する前に限り、List の成功が
-    warning/status の回復を証明できるか
-
-observerStatusSeen
-  → Observer が成功・失敗いずれかの status result を一度でも report し、
-    warning/status の authority を得たか
-
-observerSnapshotSeen
-  → rows の authority が Observer へ移ったか
-```
-
-3つは独立した軸であり、`ListOwnsStatus` が true でも rows の authority は与えない。
-
-warning の authority:
-
-```text
-List 失敗 (Err != nil)
-  → 常に warning = Err として表示する
-  → provider の実装が Observer を持つかどうかに関わらない
-    (List 自体の failure -- 設定不備・browser 未起動など -- を隠すことはない)
-
-List 成功 (Err == nil)
-  → observerSnapshotSeen == true
-    → warning にも rows にも触れない (Observer が authority)
-  → observerSnapshotSeen == false
-    → rows を更新してよい (List が rows authority を保持)
-  → observerStatusSeen == false かつ ListOwnsStatus == true
-    → List の成功時に warning を clear する (= List 自身が status の authority)
-  → observerStatusSeen == true、または ListOwnsStatus == false
-    → warning には一切触れない
-
-Observer 側は常に warning の authority を持つ:
-  成功 (Err == nil)  → warning を届いた Warning (nil ならクリア) にする
-  失敗 (Err != nil)  → warning を Err にする
-  いずれの場合も observerStatusSeen = true
-```
-
-`ListOwnsStatus` は `sessionctl.Controller` が provider の capability から導出する。Observer を実装しない provider は `true`、Observer を実装する provider は既定で `false` とする (ChatGPT のように List が last-known-good cache を読むだけの場合、List の成功は回復を証明しない)。ただし Observer provider の List 自体が native catalog を毎回直接取得し freshness を保証できる場合 (Codex: short-lived app-server の `thread/list`)、provider は optional capability `sessionctl.ListStatusAuthority` で `true` を明示できる。これにより Observer がまだ何も report していない間は、List の一時的な失敗 warning が後続の List 成功で解消される。Observer が error-only update を report した後は、List が rows authority を維持していても warning/status authority は Observer にあり、Codex の short-lived List 成功は shared daemon の回復を証明しない。Agent View 側はこの capability を自ら判定しない -- provider 固有の分岐は sessionctl の境界内に閉じ込める。
+両方の warning が未解決なら、provider ごとの monotonic sequence によって後から発生した問題を表示する。表示中の source が回復した場合は、もう一方の未解決 warning に戻る。これが Agent View における “latest unresolved provider problem wins” の意味である。
 
 rows (session) の authority は、warning とは別のもう1つの区別として存在する。`providerState.observerSnapshotSeen` が「この provider について Observer からの成功 update を一度でも適用したか」を追跡する:
 
@@ -1100,7 +1061,7 @@ rows (session) の authority は、warning とは別のもう1つの区別とし
 provider が Observer を実装しない
   → List が常に rows の authority (今までどおり)
 
-provider が Observer を実装する (ListOwnsStatus の値に関わらない)
+provider が Observer を実装する
   → observerSnapshotSeen == false (Observer からまだ一度も成功 update が
     来ていない -- 典型的には起動直後、persisted cache からの hydrate 直後)
     → List 成功はここでは rows を bootstrap してよい

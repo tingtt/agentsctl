@@ -91,7 +91,7 @@ func (r *Runtime) drainN(t *testing.T, n int) {
 			}
 			r.currentScope = upd.scope
 			if upd.ps.Provider != "" {
-				r.applyLoadSnapshot(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, upd.ps.ListOwnsStatus)
+				r.applyLoadSnapshot(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err)
 			}
 			r.recomputeRows()
 		case <-deadline:
@@ -336,10 +336,9 @@ func TestOpenCachedSessionDoesNotWaitForInFlightReload(t *testing.T) {
 	}
 }
 
-// This section fixes a real regression: a successful cached List
-// (ProviderSnapshot.ListOwnsStatus == false for an Observer-capable
-// provider) must never clear a warning only Observer is entitled to
-// replace or clear -- see applyLoadSnapshot's doc comment. Without this,
+// This section fixes a real regression: a successful cached List must
+// never clear a warning reported by Observer -- see applyLoadSnapshot's
+// doc comment. Without this,
 // a routine Ctrl+L against ChatGPT (whose List is now a cheap cached
 // read, not a real refresh) would silently erase an unresolved
 // persistence or refresh-failure warning the instant the cached read
@@ -785,50 +784,140 @@ func TestScopeChangeReFiltersObserverOwnedRowsWithoutListReplacement(t *testing.
 	}
 }
 
-// listStatusObserverProvider is a Codex-like Observer provider whose List
-// is a native, fresh read: it states ListOwnsStatus through
-// sessionctl.ListStatusAuthority, and its List can be made to fail.
-type listStatusObserverProvider struct {
+// failableObserverProvider makes an Observer provider's List fail on demand.
+type failableObserverProvider struct {
 	*observerFakeProvider
 	err error
 }
 
-func (p *listStatusObserverProvider) ListOwnsStatus() bool { return true }
-
-func (p *listStatusObserverProvider) List(ctx context.Context, archived bool) ([]session.Session, error) {
+func (p *failableObserverProvider) List(ctx context.Context, archived bool) ([]session.Session, error) {
 	if p.err != nil {
 		return nil, p.err
 	}
 	return p.observerFakeProvider.List(ctx, archived)
 }
 
-// TestListOwningStatusRecoversWarningBeforeObserverAuthority fixes that,
-// while the Observer has not published successfully yet, a successful List
-// from a provider stating ListOwnsStatus both refreshes the rows and clears
-// the warning an earlier List failure left -- the warning must not stick
-// until the Observer first connects.
-func TestListOwningStatusRecoversWarningBeforeObserverAuthority(t *testing.T) {
+func TestObserverWarningSurvivesListFailureRecovery(t *testing.T) {
 	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
 	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
-	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp), err: errors.New("temporary error")}
+	codex := &failableObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
 	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
 	ctx := context.Background()
 	rt.observerCh = rt.Controller.Observe(ctx)
 
 	rt.requestReload(ctx)
 	rt.drainCatalog(ctx)
-	if rt.State.Warnings[session.ProviderCodex] == nil {
-		t.Fatal("expected the List failure to surface as a warning")
+	codex.updates <- sessionctl.ProviderUpdate{Err: errors.New("daemon unavailable")}
+	rt.drainObserver(t)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "daemon unavailable" {
+		t.Fatalf("warning=%v, want daemon unavailable", got)
+	}
+
+	codex.err = errors.New("list failed")
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "list failed" {
+		t.Fatalf("warning=%v, want list failed", got)
 	}
 
 	codex.err = nil
 	rt.requestReload(ctx)
 	rt.drainCatalog(ctx)
-	if w := rt.State.Warnings[session.ProviderCodex]; w != nil {
-		t.Fatalf("a successful List owning status must clear the warning before Observer authority: %v", w)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "daemon unavailable" {
+		t.Fatalf("warning=%v, want unresolved daemon warning after List recovery", got)
 	}
 	if !contains(rowNames(rt.State.Rows), "A") {
 		t.Fatalf("rows=%v", rowNames(rt.State.Rows))
+	}
+	st := rt.providerSnapshots[session.ProviderCodex]
+	if st.observerSnapshotSeen || st.listWarning.err != nil || st.observerWarning.err == nil {
+		t.Fatalf("provider state=%+v", st)
+	}
+}
+
+func TestListWarningSurvivesObserverRecovery(t *testing.T) {
+	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
+	codex := &failableObserverProvider{observerFakeProvider: newObserverFakeProvider(fp), err: errors.New("list failed")}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "list failed" {
+		t.Fatalf("warning=%v, want list failed", got)
+	}
+
+	codex.updates <- sessionctl.ProviderUpdate{Err: errors.New("daemon unavailable")}
+	rt.drainObserver(t)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "daemon unavailable" {
+		t.Fatalf("warning=%v, want daemon unavailable", got)
+	}
+
+	codex.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}}
+	rt.drainObserver(t)
+	if got := rt.State.Warnings[session.ProviderCodex]; got == nil || got.Error() != "list failed" {
+		t.Fatalf("warning=%v, want unresolved List warning after Observer recovery", got)
+	}
+	if names := rowNames(rt.State.Rows); !contains(names, "B") || contains(names, "A") {
+		t.Fatalf("Observer success must take row authority: %v", names)
+	}
+
+	codex.err = nil
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if got := rt.State.Warnings[session.ProviderCodex]; got != nil {
+		t.Fatalf("warning=%v, want all sources recovered", got)
+	}
+	if names := rowNames(rt.State.Rows); !contains(names, "B") || contains(names, "A") {
+		t.Fatalf("List recovery must not replace Observer-owned rows: %v", names)
+	}
+}
+
+func TestObserverDurabilityWarningSurvivesListFailureRecovery(t *testing.T) {
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderChatGPT, ID: "b"}, Name: "B", CWD: "/work"}
+	fp := &fakeProvider{id: session.ProviderChatGPT, rows: []session.Session{bRow}}
+	chatgpt := &failableObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
+	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{chatgpt}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
+	ctx := context.Background()
+	rt.observerCh = rt.Controller.Observe(ctx)
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+
+	chatgpt.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}, Warning: errors.New("disk full")}
+	rt.drainObserver(t)
+	chatgpt.err = errors.New("list unavailable")
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if got := rt.State.Warnings[session.ProviderChatGPT]; got == nil || got.Error() != "list unavailable" {
+		t.Fatalf("warning=%v, want list unavailable", got)
+	}
+
+	chatgpt.err = nil
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if got := rt.State.Warnings[session.ProviderChatGPT]; got == nil || got.Error() != "disk full" {
+		t.Fatalf("warning=%v, want unresolved durability warning", got)
+	}
+}
+
+func TestProviderWarningUsesLatestUnresolvedSource(t *testing.T) {
+	var st providerState
+	st.setObserverWarning(errors.New("observer warning 1"))
+	st.setListWarning(errors.New("list warning 2"))
+	st.setObserverWarning(errors.New("observer warning 3"))
+	if got := st.currentWarning(); got == nil || got.Error() != "observer warning 3" {
+		t.Fatalf("warning=%v, want observer warning 3", got)
+	}
+	st.setObserverWarning(nil)
+	if got := st.currentWarning(); got == nil || got.Error() != "list warning 2" {
+		t.Fatalf("warning=%v, want fallback list warning 2", got)
+	}
+	st.setListWarning(nil)
+	if got := st.currentWarning(); got != nil {
+		t.Fatalf("warning=%v, want nil", got)
 	}
 }
 
@@ -840,7 +929,7 @@ func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) 
 	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
 	bRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "B", CWD: "/work"}
 	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
-	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
+	codex := &failableObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
 	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
 	ctx := context.Background()
 	rt.observerCh = rt.Controller.Observe(ctx)
@@ -858,9 +947,6 @@ func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) 
 	if rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
 		t.Fatal("an error-only update must not transfer row authority")
 	}
-	if !rt.providerSnapshots[session.ProviderCodex].observerStatusSeen {
-		t.Fatal("an error-only update must transfer warning/status authority")
-	}
 
 	// A fresh short-lived app-server List still owns and refreshes rows, but
 	// cannot prove that the shared daemon recovered after Observer reported it
@@ -876,9 +962,6 @@ func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) 
 	if rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
 		t.Fatal("List must not transfer row authority to Observer")
 	}
-	if !rt.providerSnapshots[session.ProviderCodex].observerStatusSeen {
-		t.Fatal("List must not reset Observer warning/status authority")
-	}
 
 	codex.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}}
 	rt.drainObserver(t)
@@ -890,20 +973,19 @@ func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) 
 		t.Fatalf("Observer recovery must clear the warning: %v", warning)
 	}
 	st := rt.providerSnapshots[session.ProviderCodex]
-	if !st.observerSnapshotSeen || !st.observerStatusSeen {
-		t.Fatalf("Observer recovery authorities=%+v", st)
+	if !st.observerSnapshotSeen || st.observerWarning.err != nil {
+		t.Fatalf("Observer recovery state=%+v", st)
 	}
 }
 
-// TestListOwningStatusNeverTakesRowsBackFromObserver fixes that
-// ListOwnsStatus is only about warnings: after an Observer success, a
-// successful List -- even one owning status -- neither rolls rows back
-// nor clears the Observer's warning, on repeated reloads.
-func TestListOwningStatusNeverTakesRowsBackFromObserver(t *testing.T) {
+// TestListNeverTakesRowsBackFromObserver fixes that List warning recovery
+// and row authority are independent: a successful List clears its own
+// warning but never rolls back Observer-owned rows.
+func TestListNeverTakesRowsBackFromObserver(t *testing.T) {
 	bRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "B", CWD: "/work"}
 	cRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "c"}, Name: "C", CWD: "/work"}
 	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{bRow}}
-	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
+	codex := &failableObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
 	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
 	ctx := context.Background()
 	rt.observerCh = rt.Controller.Observe(ctx)
@@ -919,7 +1001,7 @@ func TestListOwningStatusNeverTakesRowsBackFromObserver(t *testing.T) {
 		rt.drainCatalog(ctx)
 		names := rowNames(rt.State.Rows)
 		if !contains(names, "C") || contains(names, "B") {
-			t.Fatalf("a List owning status must not roll back Observer-owned rows: %v", names)
+			t.Fatalf("List must not roll back Observer-owned rows: %v", names)
 		}
 		if rt.State.Warnings[session.ProviderCodex] == nil {
 			t.Fatal("a List success must not clear the warning once Observer owns the provider")

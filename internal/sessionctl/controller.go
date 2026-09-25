@@ -43,30 +43,10 @@ type Snapshot struct {
 // the catalog side. Sessions is already actionsFor-narrowed, matching
 // what Load's own per-provider fetch does; Err is set instead when that
 // provider's List call failed (never both).
-//
-// ListOwnsStatus reports whether a successful List (Err == nil) proves
-// that this provider's refresh/availability status recovered -- true for
-// an ordinary Source-only provider (a successful List means it recovered
-// from any previous failure, exactly like before this field existed),
-// false by default for a provider that also implements Observer. For the
-// latter, List may simply be serving a last-known-good cache (see e.g.
-// provider/chatgpt): a successful cached read says nothing about
-// whether background refresh/durability actually recovered, so it must
-// not silently clear a warning only Observer is entitled to replace or
-// clear (see the DesignDoc's "Catalog validity vs. local durability" /
-// this field's rationale). An Observer provider whose List is a native,
-// fresh read opts back in through ListStatusAuthority. ListOwnsStatus
-// never grants row authority: once an Observer snapshot succeeded, List
-// does not replace rows whatever this says (see agentview's
-// observerSnapshotSeen). A List failure (Err != nil) is always
-// surfaced as this provider's warning regardless of ListOwnsStatus -- a
-// real Source.List error (misconfiguration, browser unavailable, ...) is
-// never hidden just because the provider also has an Observer.
 type ProviderSnapshot struct {
-	Provider       session.ProviderID
-	Sessions       []session.Session
-	Err            error
-	ListOwnsStatus bool
+	Provider session.ProviderID
+	Sessions []session.Session
+	Err      error
 }
 
 // LoadStream is Load's incremental counterpart: the same concurrent,
@@ -105,7 +85,7 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 
 // LoadProvider is LoadStream's single-provider counterpart: it Lists only
 // the provider id and returns the same ProviderSnapshot a LoadStream arrival
-// for it would carry (actionsFor-narrowed, ListOwnsStatus set), leaving
+// for it would carry (actionsFor-narrowed), leaving
 // every other provider untouched. A caller (Agent View) uses it to refresh
 // one provider's catalog without a full reload -- in particular without the
 // Refresher/Observer background refresh a full reload requests. An id that
@@ -113,19 +93,18 @@ func (c Controller) LoadStream(ctx context.Context) <-chan ProviderSnapshot {
 func (c Controller) LoadProvider(ctx context.Context, id session.ProviderID) ProviderSnapshot {
 	p, err := c.provider(id)
 	if err != nil {
-		return ProviderSnapshot{Provider: id, Err: err, ListOwnsStatus: true}
+		return ProviderSnapshot{Provider: id, Err: err}
 	}
 	return c.loadProvider(ctx, p)
 }
 
 // loadProvider is the one place a provider's List becomes a ProviderSnapshot,
 // shared by LoadStream and LoadProvider so the two can never disagree on
-// narrowing or status ownership.
+// narrowing.
 func (c Controller) loadProvider(ctx context.Context, p Source) ProviderSnapshot {
-	listOwnsStatus := listOwnsStatus(p)
 	rows, err := p.List(ctx, false)
 	if err != nil {
-		return ProviderSnapshot{Provider: p.ID(), Err: err, ListOwnsStatus: listOwnsStatus}
+		return ProviderSnapshot{Provider: p.ID(), Err: err}
 	}
 	// A fresh slice, never rows itself: a provider whose List returns a
 	// live reference into its own mutable state (a test double, typically)
@@ -135,20 +114,7 @@ func (c Controller) loadProvider(ctx context.Context, p Source) ProviderSnapshot
 		enriched[i] = rows[i]
 		enriched[i].Actions = actionsFor(p, rows[i])
 	}
-	return ProviderSnapshot{Provider: p.ID(), Sessions: enriched, ListOwnsStatus: listOwnsStatus}
-}
-
-// listOwnsStatus derives ProviderSnapshot.ListOwnsStatus from p's
-// capabilities: true for a Source-only provider, false for an Observer
-// unless it states otherwise through ListStatusAuthority.
-func listOwnsStatus(p Source) bool {
-	if _, observes := p.(Observer); !observes {
-		return true
-	}
-	if a, ok := p.(ListStatusAuthority); ok {
-		return a.ListOwnsStatus()
-	}
-	return false
+	return ProviderSnapshot{Provider: p.ID(), Sessions: enriched}
 }
 
 // ObserverUpdate is one Observer-sourced provider update, mirroring
