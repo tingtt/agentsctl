@@ -17,12 +17,11 @@ type daemonRunner struct {
 	mu     sync.Mutex
 	result base.Result
 	err    error
+	run    func(context.Context) (base.Result, error)
 	path   string
 	args   []string
 	cwd    string
 	calls  int
-	gate   <-chan struct{}
-	called chan<- struct{}
 }
 
 func (r *daemonRunner) Run(ctx context.Context, path string, args []string, cwd string) (base.Result, error) {
@@ -30,18 +29,8 @@ func (r *daemonRunner) Run(ctx context.Context, path string, args []string, cwd 
 	r.path, r.args, r.cwd = path, append([]string(nil), args...), cwd
 	r.calls++
 	r.mu.Unlock()
-	if r.called != nil {
-		select {
-		case r.called <- struct{}{}:
-		default:
-		}
-	}
-	if r.gate != nil {
-		select {
-		case <-r.gate:
-		case <-ctx.Done():
-			return base.Result{}, ctx.Err()
-		}
+	if r.run != nil {
+		return r.run(ctx)
 	}
 	return r.result, r.err
 }
@@ -132,44 +121,69 @@ func TestListDoesNotEnsureDaemon(t *testing.T) {
 	}
 }
 
-func TestCommandDaemonCoalescesOnlyConcurrentEnsureCalls(t *testing.T) {
-	gate := make(chan struct{})
-	called := make(chan struct{}, 1)
+func TestCommandDaemonConcurrentCallsKeepIndependentContextsAndAreNotCached(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	result := base.Result{Stdout: []byte(`{"status":"started","socketPath":"/tmp/codex.sock"}`)}
 	runner := &daemonRunner{
-		result: base.Result{Stdout: []byte(`{"status":"started","socketPath":"/tmp/codex.sock"}`)},
-		gate:   gate,
-		called: called,
+		run: func(ctx context.Context) (base.Result, error) {
+			started <- struct{}{}
+			select {
+			case <-ctx.Done():
+				return base.Result{}, ctx.Err()
+			case <-release:
+				return result, nil
+			}
+		},
 	}
 	daemon := &CommandDaemon{Runner: runner}
 
-	const callers = 3
-	results := make(chan error, callers)
-	for range callers {
-		go func() {
-			_, err := daemon.Ensure(context.Background())
-			results <- err
-		}()
-	}
-	select {
-	case <-called:
-	case <-time.After(time.Second):
-		t.Fatal("daemon command did not start")
-	}
-	time.Sleep(20 * time.Millisecond)
-	if got := runner.callCount(); got != 1 {
-		t.Fatalf("concurrent command calls=%d, want 1", got)
-	}
-	close(gate)
-	for range callers {
-		if err := <-results; err != nil {
-			t.Fatal(err)
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	resultA := make(chan error, 1)
+	resultB := make(chan error, 1)
+	go func() {
+		_, err := daemon.Ensure(ctxA)
+		resultA <- err
+	}()
+	go func() {
+		_, err := daemon.Ensure(context.Background())
+		resultB <- err
+	}()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("each concurrent Ensure must start its own command")
 		}
+	}
+
+	cancelA()
+	select {
+	case err := <-resultA:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled caller error=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller did not return")
+	}
+	close(release)
+	select {
+	case err := <-resultB:
+		if err != nil {
+			t.Fatalf("unrelated caller inherited cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("unrelated caller did not complete")
+	}
+	if got := runner.callCount(); got != 2 {
+		t.Fatalf("concurrent command calls=%d, want 2", got)
 	}
 
 	if _, err := daemon.Ensure(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := runner.callCount(); got != 2 {
-		t.Fatalf("later Ensure command calls=%d, want 2", got)
+	if got := runner.callCount(); got != 3 {
+		t.Fatalf("later Ensure command calls=%d, want 3", got)
 	}
 }

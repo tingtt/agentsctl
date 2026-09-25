@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 
 	base "github.com/tingtt/agentsctl/internal/provider"
 )
@@ -30,44 +29,17 @@ type DaemonLifecycle interface {
 }
 
 // CommandDaemon ensures the shared daemon through the Codex CLI's idempotent
-// app-server daemon start command. Concurrent calls share one in-flight
-// command; a later call starts a new command and does not use a cached result.
+// app-server daemon start command. Each call runs independently under its own
+// context; Codex serializes lifecycle operations and reports an existing
+// daemon as alreadyRunning.
 type CommandDaemon struct {
 	Path   string
 	Runner base.Runner
-
-	mu       sync.Mutex
-	inFlight *daemonCall
-}
-
-type daemonCall struct {
-	done chan struct{}
-	info DaemonInfo
-	err  error
 }
 
 // Ensure waits until Codex reports a ready shared daemon.
 func (d *CommandDaemon) Ensure(ctx context.Context) (DaemonInfo, error) {
-	d.mu.Lock()
-	if call := d.inFlight; call != nil {
-		d.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return DaemonInfo{}, ctx.Err()
-		case <-call.done:
-			return call.info, call.err
-		}
-	}
-	call := &daemonCall{done: make(chan struct{})}
-	d.inFlight = call
-	d.mu.Unlock()
-
-	call.info, call.err = d.ensure(ctx)
-	d.mu.Lock()
-	d.inFlight = nil
-	close(call.done)
-	d.mu.Unlock()
-	return call.info, call.err
+	return d.ensure(ctx)
 }
 
 func (d *CommandDaemon) ensure(ctx context.Context) (DaemonInfo, error) {
