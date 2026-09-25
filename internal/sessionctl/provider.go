@@ -92,8 +92,9 @@ type Archiver interface {
 //     it locally failed (see internal/provider/chatgpt's
 //     durabilityWarning). A consumer surfaces Warning (e.g. as a footer
 //     notice) without ever treating it as a reason to discard or hide
-//     Sessions, and clears any previously-shown Warning for this provider
-//     once an update arrives with Warning == nil.
+//     Sessions. When a later Observer update arrives with Warning == nil,
+//     the consumer clears the warning retained from Observer; any unresolved
+//     warning from an independent List call is tracked separately.
 //
 // Err and Warning must never both be set on the same update -- they
 // answer different questions ("did this refresh fail" vs. "did this
