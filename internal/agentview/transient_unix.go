@@ -181,7 +181,7 @@ func (t *transientRefresh) apply(r *Runtime, res transientResult) bool {
 	if t.inFlight[res.ps.Provider] == res.gen {
 		delete(t.inFlight, res.ps.Provider)
 	}
-	r.applyLoadSnapshot(res.ps.Provider, res.ps.Sessions, res.ps.Err, res.ps.ListOwnsStatus)
+	r.applyLoadSnapshot(res.ps.Provider, res.ps.Sessions, res.ps.Err)
 	r.recomputeRows()
 	t.schedule(r)
 	return true

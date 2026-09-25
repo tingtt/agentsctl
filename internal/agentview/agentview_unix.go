@@ -129,13 +129,15 @@ type Runtime struct {
 }
 
 // providerState is one provider's retained catalog entry in
-// Runtime.providerSnapshots: the latest known sessions and the latest
-// refresh warning, tracked independently so a failed refresh (an
-// Observer's error update, or a LoadStream provider error) never
-// discards previously-known sessions -- see applyProviderUpdate.
+// Runtime.providerSnapshots. List and Observer warnings are retained
+// independently so recovery reported by one source cannot erase an
+// unresolved problem reported by the other.
 type providerState struct {
 	sessions []session.Session
-	warning  error
+
+	listWarning     providerWarning
+	observerWarning providerWarning
+	nextWarningSeq  uint64
 
 	// observerSnapshotSeen reports whether a successful Observer catalog
 	// (ProviderUpdate.Err == nil) has ever been applied for this provider
@@ -148,6 +150,40 @@ type providerState struct {
 	// comment). Meaningless (and never consulted) for a provider that
 	// doesn't implement sessionctl.Observer at all.
 	observerSnapshotSeen bool
+}
+
+type providerWarning struct {
+	err error
+	// seq orders reports from both sources; the newest unresolved report is
+	// the one surfaced to State.Warnings.
+	seq uint64
+}
+
+func (s *providerState) setWarning(dst *providerWarning, err error) {
+	if err == nil {
+		dst.err = nil
+		return
+	}
+	s.nextWarningSeq++
+	*dst = providerWarning{err: err, seq: s.nextWarningSeq}
+}
+
+func (s *providerState) setListWarning(err error) {
+	s.setWarning(&s.listWarning, err)
+}
+
+func (s *providerState) setObserverWarning(err error) {
+	s.setWarning(&s.observerWarning, err)
+}
+
+func (s providerState) currentWarning() error {
+	if s.listWarning.err == nil {
+		return s.observerWarning.err
+	}
+	if s.observerWarning.err == nil || s.listWarning.seq > s.observerWarning.seq {
+		return s.listWarning.err
+	}
+	return s.observerWarning.err
 }
 
 // usageEvent is one sessionctl.UsageUpdate carried over Runtime.usageCh,
@@ -352,7 +388,7 @@ func (r *Runtime) eventLoop(ctx context.Context, reader *bufio.Reader, readInput
 			// ps.Provider is only empty for the zero-provider-configured
 			// case, which has nothing to apply.
 			if update.ps.Provider != "" {
-				r.applyLoadSnapshot(update.ps.Provider, update.ps.Sessions, update.ps.Err, update.ps.ListOwnsStatus)
+				r.applyLoadSnapshot(update.ps.Provider, update.ps.Sessions, update.ps.Err)
 			}
 			r.recomputeRows()
 			if update.done {
@@ -562,63 +598,37 @@ func (r *Runtime) requestReload(ctx context.Context) {
 // provider's warning, leaving its previously-known sessions untouched
 // (never discarding rows -- see the DesignDoc's last-known-good provider
 // snapshot store): a real Source.List error (misconfiguration, browser
-// unavailable, ...) is never hidden, regardless of listOwnsStatus.
+// unavailable, ...) is never hidden.
 //
-// A successful List (err == nil) is judged on two independent axes:
-//
-//   - rows: observerSnapshotSeen. Once a successful Observer publication
-//     has been applied for this provider, Observer owns its rows for good
-//     and a successful List is IGNORED entirely -- whatever
-//     listOwnsStatus says. Observer publications are independent of any
-//     Agent View reload generation (see the DesignDoc's "Observer
-//     generations"), so within one Ctrl+L cycle a slower LoadStream
-//     List(B) arrival can be delivered AFTER a faster background refresh
-//     has already published a newer Observer catalog C -- catalogGen
-//     alone does not protect against this, since both B and C are
-//     individually valid, current-generation-or-independent-of-
-//     generation events. Once Observer owns a provider's rows, no List
-//     result -- however "current" -- may roll them back to an older
-//     snapshot. Before that (a Source-only provider, or an Observer
-//     provider with no successful publication yet -- e.g. right after
-//     startup, serving a persisted-cache hydration, or Codex before its
-//     app-server connection is up), List seeds the rows.
-//   - warning: listOwnsStatus (see sessionctl.ProviderSnapshot's doc
-//     comment), consulted only while List still owns the rows. When true,
-//     a successful List proves recovery and clears the warning. When
-//     false (an Observer provider whose List may just read a cache, e.g.
-//     ChatGPT), it never touches the warning -- only a subsequent Observer
-//     update (see applyObserverUpdate) may replace or clear it. Without
-//     that, a routine Ctrl+L (a now-fast cached read) would silently erase
-//     an unresolved ChatGPT persistence or refresh-failure warning the
-//     moment the cache read itself merely succeeded.
+// A successful List always clears only the warning produced by List. It
+// never changes an unresolved Observer warning. Row replacement is decided
+// independently by observerSnapshotSeen. Once a successful Observer
+// publication has been applied for this provider, Observer owns its rows for
+// good and a successful List cannot replace them. Observer publications are
+// independent of any Agent View reload generation (see the DesignDoc's
+// "Observer generations"), so a slower List arrival can follow a newer
+// Observer catalog within one reload. Before Observer succeeds, List still
+// seeds rows for Source-only providers and startup cache hydration.
 //
 // Only ever called from the eventLoop goroutine. Does not itself update
 // State -- see recomputeRows.
-func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Session, err error, listOwnsStatus bool) {
+func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Session, err error) {
 	st := r.providerSnapshots[id]
 	if err != nil {
-		st.warning = err
+		st.setListWarning(err)
 		r.providerSnapshots[id] = st
 		return
 	}
-	if st.observerSnapshotSeen {
-		// Observer owns this provider's rows (and, from then on, its
-		// warning): this List result is ignored.
-		return
-	}
-	st.sessions = sessions
-	if listOwnsStatus {
-		st.warning = nil
+	st.setListWarning(nil)
+	if !st.observerSnapshotSeen {
+		st.sessions = sessions
 	}
 	r.providerSnapshots[id] = st
 }
 
 // applyObserverUpdate installs one Observer publication (ObserverUpdate)
-// into providerSnapshots. Observer is always authoritative for a
-// provider's refresh/durability status -- regardless of what that
-// provider's own List last reported (see applyLoadSnapshot) -- since it
-// is the one capability specifically designed to report background
-// refresh outcomes independent of any particular List call:
+// into providerSnapshots. It changes only Observer's warning; any unresolved
+// List warning remains independently retained.
 //
 //   - err != nil: a failed refresh. Sessions are left untouched and
 //     warning is set to err. Deliberately does NOT set
@@ -642,10 +652,10 @@ func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Se
 func (r *Runtime) applyObserverUpdate(id session.ProviderID, sessions []session.Session, err, warning error) {
 	st := r.providerSnapshots[id]
 	if err != nil {
-		st.warning = err
+		st.setObserverWarning(err)
 	} else {
 		st.sessions = sessions
-		st.warning = warning
+		st.setObserverWarning(warning)
 		st.observerSnapshotSeen = true
 	}
 	r.providerSnapshots[id] = st
@@ -668,8 +678,8 @@ func (r *Runtime) recomputeRows() {
 			continue
 		}
 		sessions = append(sessions, st.sessions...)
-		if st.warning != nil {
-			warnings[p.ID()] = st.warning
+		if warning := st.currentWarning(); warning != nil {
+			warnings[p.ID()] = warning
 		}
 	}
 	r.State.SetRows(r.Controller.MergeSessions(sessions, r.currentScope))

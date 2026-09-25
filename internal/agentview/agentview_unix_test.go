@@ -141,7 +141,7 @@ func (r *Runtime) drainCatalog(ctx context.Context) {
 			}
 			r.currentScope = upd.scope
 			if upd.ps.Provider != "" {
-				r.applyLoadSnapshot(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err, upd.ps.ListOwnsStatus)
+				r.applyLoadSnapshot(upd.ps.Provider, upd.ps.Sessions, upd.ps.Err)
 			}
 			r.recomputeRows()
 			if upd.done {

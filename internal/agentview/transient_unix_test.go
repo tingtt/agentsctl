@@ -258,7 +258,7 @@ func TestTransientRefreshDropsResultStartedBeforeALaterReload(t *testing.T) {
 	}}
 	rt := transientRuntime(p)
 	newManualClock(rt)
-	stale := transientResult{gen: rt.catalogGen - 1, ps: sessionctl.ProviderSnapshot{Provider: session.ProviderCodex, Sessions: []session.Session{codexRow("thread-1", "foo", session.ActivityIdle)}, ListOwnsStatus: true}}
+	stale := transientResult{gen: rt.catalogGen - 1, ps: sessionctl.ProviderSnapshot{Provider: session.ProviderCodex, Sessions: []session.Session{codexRow("thread-1", "foo", session.ActivityIdle)}}}
 	if rt.transient.apply(rt, stale) {
 		t.Fatal("a result from before the latest reload must not be applied")
 	}
@@ -460,7 +460,7 @@ func TestSupersededResultNeverTouchesCurrentLifecycle(t *testing.T) {
 	rt.transient.refresh(ctx, rt) // targeted B, held open
 	waitFor(t, 2*time.Second, func() bool { return p.calls.Load() == 3 })
 
-	stale := transientResult{gen: oldGen, ps: sessionctl.ProviderSnapshot{Provider: session.ProviderCodex, Sessions: []session.Session{codexRow("thread-x", "stale", session.ActivityIdle)}, ListOwnsStatus: true}}
+	stale := transientResult{gen: oldGen, ps: sessionctl.ProviderSnapshot{Provider: session.ProviderCodex, Sessions: []session.Session{codexRow("thread-x", "stale", session.ActivityIdle)}}}
 	if rt.transient.apply(rt, stale) {
 		t.Fatal("a superseded result must not change State")
 	}

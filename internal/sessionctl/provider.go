@@ -92,8 +92,9 @@ type Archiver interface {
 //     it locally failed (see internal/provider/chatgpt's
 //     durabilityWarning). A consumer surfaces Warning (e.g. as a footer
 //     notice) without ever treating it as a reason to discard or hide
-//     Sessions, and clears any previously-shown Warning for this provider
-//     once an update arrives with Warning == nil.
+//     Sessions. When a later Observer update arrives with Warning == nil,
+//     the consumer clears the warning retained from Observer; any unresolved
+//     warning from an independent List call is tracked separately.
 //
 // Err and Warning must never both be set on the same update -- they
 // answer different questions ("did this refresh fail" vs. "did this
@@ -124,22 +125,6 @@ type ProviderUpdate struct {
 // shuts down (see e.g. chatgpt.Provider.Close).
 type Observer interface {
 	Observe(ctx context.Context) <-chan ProviderUpdate
-}
-
-// ListStatusAuthority is an optional capability of an Observer provider
-// whose List is itself a native, fresh read (not a last-known-good cache):
-// a successful List then proves that the provider's refresh status has
-// recovered, even though the provider also implements Observer. It only
-// decides ProviderSnapshot.ListOwnsStatus -- which rows are shown is
-// decided separately, and once an Observer snapshot has succeeded List
-// never gets row authority back (see the DesignDoc's "List と Observer、
-// どちらが warning/rows の authority か").
-//
-// An Observer provider that does not implement it keeps the default:
-// ListOwnsStatus is false (e.g. ChatGPT, whose List may just read its
-// cache).
-type ListStatusAuthority interface {
-	ListOwnsStatus() bool
 }
 
 // Refresher is an optional capability: requests a background catalog

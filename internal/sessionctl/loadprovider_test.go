@@ -38,9 +38,6 @@ func TestLoadProviderListsOnlyThatProviderAndNarrowsActions(t *testing.T) {
 	if got.Sessions[0].Actions.Available(session.ActionOpen) {
 		t.Fatalf("actionsFor must narrow like LoadStream does (fakeSource is not an Opener): %+v", got.Sessions[0].Actions)
 	}
-	if !got.ListOwnsStatus {
-		t.Fatalf("a Source-only provider's List owns its status: %+v", got)
-	}
 }
 
 func TestLoadProviderMatchesLoadStreamSnapshot(t *testing.T) {
@@ -51,11 +48,8 @@ func TestLoadProviderMatchesLoadStreamSnapshot(t *testing.T) {
 		streamed = ps
 	}
 	got := c.LoadProvider(context.Background(), session.ProviderChatGPT)
-	if got.ListOwnsStatus != streamed.ListOwnsStatus || len(got.Sessions) != len(streamed.Sessions) || got.Err != nil {
+	if len(got.Sessions) != len(streamed.Sessions) || got.Err != nil {
 		t.Fatalf("LoadProvider = %+v, LoadStream = %+v, want the same snapshot", got, streamed)
-	}
-	if got.ListOwnsStatus {
-		t.Fatal("an Observer-capable provider must not report ListOwnsStatus")
 	}
 }
 

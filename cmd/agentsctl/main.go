@@ -93,6 +93,7 @@ func run() (*agentview.Restart, error) {
 	store := localstate.New(statePath)
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
+	daemon := &codex.CommandDaemon{Path: "codex", Runner: runner}
 	dispatch := supervisor.Dispatcher{Client: client}
 	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
 	cwd, err := os.Getwd()
@@ -101,7 +102,7 @@ func run() (*agentview.Restart, error) {
 	}
 	providers := []sessionctl.Source{
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon},
 	}
 	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {
