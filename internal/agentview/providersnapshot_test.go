@@ -838,6 +838,7 @@ func TestListOwningStatusRecoversWarningBeforeObserverAuthority(t *testing.T) {
 // row authority or replacing those rows.
 func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) {
 	aRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "a"}, Name: "A", CWD: "/work"}
+	bRow := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "b"}, Name: "B", CWD: "/work"}
 	fp := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{aRow}}
 	codex := &listStatusObserverProvider{observerFakeProvider: newObserverFakeProvider(fp)}
 	rt := &Runtime{Controller: sessionctl.Controller{Providers: []sessionctl.Source{codex}, Pins: &fakePins{}}, State: NewState(), CWD: "/work"}
@@ -856,6 +857,41 @@ func TestCodexInitialObserverFailurePreservesListRowsAndAuthority(t *testing.T) 
 	}
 	if rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
 		t.Fatal("an error-only update must not transfer row authority")
+	}
+	if !rt.providerSnapshots[session.ProviderCodex].observerStatusSeen {
+		t.Fatal("an error-only update must transfer warning/status authority")
+	}
+
+	// A fresh short-lived app-server List still owns and refreshes rows, but
+	// cannot prove that the shared daemon recovered after Observer reported it
+	// unavailable.
+	rt.requestReload(ctx)
+	rt.drainCatalog(ctx)
+	if !contains(rowNames(rt.State.Rows), "A") {
+		t.Fatalf("List rows must remain usable after the Ensure failure: %v", rowNames(rt.State.Rows))
+	}
+	if rt.State.Warnings[session.ProviderCodex] == nil {
+		t.Fatal("successful List must not clear an Observer-owned daemon warning")
+	}
+	if rt.providerSnapshots[session.ProviderCodex].observerSnapshotSeen {
+		t.Fatal("List must not transfer row authority to Observer")
+	}
+	if !rt.providerSnapshots[session.ProviderCodex].observerStatusSeen {
+		t.Fatal("List must not reset Observer warning/status authority")
+	}
+
+	codex.updates <- sessionctl.ProviderUpdate{Sessions: []session.Session{bRow}}
+	rt.drainObserver(t)
+	names := rowNames(rt.State.Rows)
+	if !contains(names, "B") || contains(names, "A") {
+		t.Fatalf("Observer recovery must replace List rows: %v", names)
+	}
+	if warning := rt.State.Warnings[session.ProviderCodex]; warning != nil {
+		t.Fatalf("Observer recovery must clear the warning: %v", warning)
+	}
+	st := rt.providerSnapshots[session.ProviderCodex]
+	if !st.observerSnapshotSeen || !st.observerStatusSeen {
+		t.Fatalf("Observer recovery authorities=%+v", st)
 	}
 }
 

@@ -137,6 +137,13 @@ type providerState struct {
 	sessions []session.Session
 	warning  error
 
+	// observerStatusSeen reports whether Observer has ever reported this
+	// provider's refresh/status outcome, successfully or otherwise. Once it
+	// has, Observer owns warning/status recovery: a successful List may still
+	// bootstrap rows before observerSnapshotSeen, but cannot clear Observer's
+	// warning. It only ever transitions false -> true.
+	observerStatusSeen bool
+
 	// observerSnapshotSeen reports whether a successful Observer catalog
 	// (ProviderUpdate.Err == nil) has ever been applied for this provider
 	// -- i.e. whether Observer, rather than List, now owns this
@@ -582,15 +589,13 @@ func (r *Runtime) requestReload(ctx context.Context) {
 //     provider with no successful publication yet -- e.g. right after
 //     startup, serving a persisted-cache hydration, or Codex before its
 //     app-server connection is up), List seeds the rows.
-//   - warning: listOwnsStatus (see sessionctl.ProviderSnapshot's doc
-//     comment), consulted only while List still owns the rows. When true,
-//     a successful List proves recovery and clears the warning. When
-//     false (an Observer provider whose List may just read a cache, e.g.
-//     ChatGPT), it never touches the warning -- only a subsequent Observer
-//     update (see applyObserverUpdate) may replace or clear it. Without
-//     that, a routine Ctrl+L (a now-fast cached read) would silently erase
-//     an unresolved ChatGPT persistence or refresh-failure warning the
-//     moment the cache read itself merely succeeded.
+//   - warning: observerStatusSeen records whether Observer has reported any
+//     status yet. Before that, listOwnsStatus (see
+//     sessionctl.ProviderSnapshot's doc comment) decides whether a successful
+//     List proves recovery and clears the warning. Afterwards, List success
+//     never clears Observer's warning, even while List still owns rows. This
+//     keeps a Codex daemon failure visible across successful catalog reloads
+//     and also preserves ChatGPT's cached-List semantics.
 //
 // Only ever called from the eventLoop goroutine. Does not itself update
 // State -- see recomputeRows.
@@ -607,7 +612,7 @@ func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Se
 		return
 	}
 	st.sessions = sessions
-	if listOwnsStatus {
+	if listOwnsStatus && !st.observerStatusSeen {
 		st.warning = nil
 	}
 	r.providerSnapshots[id] = st
@@ -619,6 +624,9 @@ func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Se
 // provider's own List last reported (see applyLoadSnapshot) -- since it
 // is the one capability specifically designed to report background
 // refresh outcomes independent of any particular List call:
+//
+// Every update sets observerStatusSeen, permanently transferring warning/status
+// authority from List to Observer.
 //
 //   - err != nil: a failed refresh. Sessions are left untouched and
 //     warning is set to err. Deliberately does NOT set
@@ -641,6 +649,7 @@ func (r *Runtime) applyLoadSnapshot(id session.ProviderID, sessions []session.Se
 // State -- see recomputeRows.
 func (r *Runtime) applyObserverUpdate(id session.ProviderID, sessions []session.Session, err, warning error) {
 	st := r.providerSnapshots[id]
+	st.observerStatusSeen = true
 	if err != nil {
 		st.warning = err
 	} else {
