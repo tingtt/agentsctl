@@ -42,9 +42,9 @@ type Provider struct {
 	// command output.
 	Foreground  base.Commander
 	WriterOwner func(string, processinfo.Identity) (bool, error)
-	// ControlSocket overrides the shared app-server control socket the
-	// Observer connects to; empty means the default under the resolved
-	// Codex home (see resolveCodexHome).
+	// ControlSocket overrides the shared app-server control socket used by
+	// the Observer and Open preflight; empty means the daemon lifecycle
+	// resolves the endpoint (see readySocket).
 	ControlSocket string
 
 	// writerFree replaces the writer-lock probe (see writerAbsent); tests

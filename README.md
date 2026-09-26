@@ -52,7 +52,7 @@ An opened Codex TUI inherits agentsctl's environment, so Codex's native external
 | `{` / `}` | Move to the previous/next session group when the prompt is empty |
 | `Ctrl+S` | Swap the prompt with the in-memory stash |
 | `Ctrl+G` | Edit the prompt in Vim |
-| `Ctrl+O` | Attach the selected session |
+| `Ctrl+O` | Open the selected session |
 | `Ctrl+T` | Pin or unpin the selected session |
 | `Ctrl+/` | Cycle directory scope: current directory → current directory + descendants + worktrees → all directories |
 | `Ctrl+R` | Rename the selected session |
