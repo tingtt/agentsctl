@@ -994,6 +994,13 @@ thread/status/changed
   -> 接続後の live Activity update
 ```
 
+新規 thread は rollout が persist されるまで `thread/list` に現れず、それは最初の turn の終了まで遅れうる。このため Observer は `thread/started` の native `Thread` を、`thread/list` がまだ返さない thread の live catalog source とし、表示する catalog を `thread/list` (durable) と live-started thread の和とする。
+
+- live-started thread にも `thread/status/changed` と `thread/name/updated` を反映する。`thread/closed` / `thread/archived` / `thread/deleted` でその thread は消える。
+- `thread/list` がまだ返さないことを理由に live-started thread を消さない。同じ ID を返した時点で durable 側の `Thread` に置き換える (1 row のまま)。
+- snapshot では、loaded だが `thread/list` にない thread を live-started thread として再構築する。
+- agentsctl 独自の provisional row は作らない。identity は常に daemon の thread ID である。
+
 reconnect 時は event replay を要求せず、snapshot を取り直した後の future event だけで current state へ収束する。
 
 snapshot 中に同じ thread の status event を受けた場合は snapshot response だけを古い/新しいと推測せず、その thread を `thread/read` し直して確定する。前回 cache に存在した thread が新しい loaded snapshot に存在しない場合は `notLoaded` として扱う。
