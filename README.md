@@ -31,7 +31,7 @@ agentsctl combines Claude and Codex sessions into one list.
 
 Type a prompt and press `Enter` to start a background session. Use `Shift+Tab` to switch between Claude and Codex.
 
-With an empty prompt, select an existing session and press `Enter` to open it. `Ctrl+]` returns to Agent View without stopping the session. A Codex session opens in the Codex TUI connected to Codex's shared app-server; `Ctrl+]` or quitting the TUI returns to Agent View and leaves the session and any running turn in place.
+With an empty prompt, select an existing session and press `Enter` to open it. `Ctrl+]` returns to Agent View without stopping the session. A Codex session opens in the Codex TUI connected to Codex's shared app-server; `Ctrl+]` detaches the foreground client and returns to Agent View without stopping the thread or any running turn. Quitting from inside the Codex TUI follows Codex's own exit behavior.
 
 The session list can be scoped to the current directory, its descendants and Git worktrees, or all directories with `Ctrl+/`.
 

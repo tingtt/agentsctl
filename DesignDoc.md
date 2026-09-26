@@ -548,7 +548,7 @@ shared daemon / thread / turn は bridge の外にあり、影響を受けない
 - bridge は client の実行中、outer terminal の raw mode、transport 所有の alternate screen、bracketed paste を所有する。child 出力の alternate-screen leave (DECRST 1049) は physical terminal への境界でだけ除去し、child (と child が起動する external editor) の画面遷移を transport 所有の alternate screen 内に閉じ込める。解除は child の reap と出力転送の停止の後に、child が設定しうる mode の neutralize、bracketed paste、alternate screen、raw mode の順で行う。正常終了・detach・起動後の失敗・出力失敗・context cancel のいずれでも同じである。signal で client を終了する detach では child 自身の restore (Codex の `restore_after_exit`) が走る保証がないため、bridge は child の終了理由に依存せず、keyboard reporting (keyboard enhancement stack と modifyOtherKeys)、focus reporting、mouse reporting、alternate scroll、cursor の形状と表示を、transport 所有の alternate screen を離れる前に neutralize してから Agent View へ terminal ownership を返す。各 reset は一部が失敗しても残りを試み、失敗は detach の成功に隠さず Open の error とする。
 - detach では server へ RPC を送らず、foreground client の process group へ `SIGHUP`、`SIGTERM`、`SIGKILL` の順に、各段で短い timeout (1秒) だけ応答を待って送り、client を必ず reap する。reap 後に process group に残った process は `SIGKILL` で終了する。既に終了していること (`ESRCH`) は失敗ではない。Codex TUI の `Ctrl+C` から出る "Run in background" などの UI 操作は、UI state と実装詳細に依存するため用いない。
 - 結果は終了の原因で区別する。`Ctrl+]` による detach は、signal による client の非 0 終了を伴っても Open の成功である。detach によらない client の非 0 終了 (remote 接続失敗を含む) は Open の error、context cancel は client を reap した後に context の error とする。
-- foreground client の終了 / detach は thread / turn を停止しない。client の終了で閉じる connection について、shared daemon は connection の subscription を除くだけで、turn の interrupt や thread の shutdown は行わない。pending の approval / user input は thread 単位で保持され、次に attach した connection へ再提示される。Open の後始末で Stop、`turn/interrupt`、`thread/unsubscribe`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。
+- agentsctl の `Ctrl+]` detach / Open transport cleanup は thread / turn を停止しない。foreground client の終了で閉じる connection について、shared daemon は connection の subscription を除くだけで、turn の interrupt や thread の shutdown は行わない。pending の approval / user input は thread 単位で保持され、次に attach した connection へ再提示される。agentsctl の detach cleanup では Stop、`turn/interrupt`、`thread/unsubscribe`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。Codex TUI 内から利用者が明示的に行う quit / exit 操作は Codex 自身の semantics に従い、agentsctl の detach 保証とは区別する。
 - daemon が loaded として報告する thread は shared daemon 自身が writer lock を保持するため、writer lock を確認せず Open できる。
 - daemon が `notLoaded` で writer lock がない休止 thread は、shared daemon 上へ resume して Open できる。
 - `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。その writer が agentsctl の legacy managed run であっても同じである。
@@ -1002,7 +1002,7 @@ Agent View は Dispatch が返した canonical key が catalog / Observer snapsh
 
 Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Codex 自身の foreground TUI が terminal mode、redraw、paste mode を所有し、agentsctl は managed background PTY の output replay、resize trick、Codex-specific ANSI filteringを行わない。
 
-Open client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。
+agentsctl の `Ctrl+]` detach または Open transport cleanup によって foreground client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。Codex TUI 内からの明示的な quit / exit は Codex 自身の semantics に従う。
 
 #### Concurrency and backpressure
 
