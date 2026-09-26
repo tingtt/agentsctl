@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,6 +52,10 @@ func TestMain(m *testing.M) {
 //   - stubborn: ignores SIGHUP and SIGTERM.
 //   - size: prints its terminal size now and on every SIGWINCH.
 //   - exit: prints "bye" and exits 3.
+//   - terminal-modes: sets every mode in codexModeSetup, then blocks with
+//     the default SIGHUP action; terminal-modes-stubborn also ignores
+//     SIGHUP and SIGTERM; terminal-modes-exit exits 3 right after setting
+//     them, without any cleanup of its own.
 //   - editor: prints a Codex-to-external-editor round trip and exits 0.
 func runForegroundHelper(mode, dir string) {
 	writePID := func(name string) {
@@ -117,6 +122,19 @@ func runForegroundHelper(mode, dir string) {
 	case "exit":
 		fmt.Print("bye")
 		os.Exit(3)
+	case "terminal-modes", "terminal-modes-stubborn", "terminal-modes-exit":
+		if mode == "terminal-modes-stubborn" {
+			signal.Ignore(syscall.SIGHUP, syscall.SIGTERM)
+		}
+		fmt.Print(codexModeSetup)
+		if mode == "terminal-modes-exit" {
+			os.Exit(3)
+		}
+		// Keep "ready" out of the setup's output chunk, so a test can fail
+		// just that write.
+		time.Sleep(50 * time.Millisecond)
+		ready()
+		select {}
 	case "editor":
 		for _, out := range []string{"Codex output", BracketedPasteDisable, AlternateScreenEnable, "editor output", AlternateScreenDisable, BracketedPasteEnable, "Codex redraw/output"} {
 			fmt.Print(out)
@@ -124,6 +142,31 @@ func runForegroundHelper(mode, dir string) {
 		}
 	}
 }
+
+// codexModeSetup is the physical-terminal mode setup a Codex TUI
+// (rust-v0.156.1, through its crossterm fork) can have in effect when it is
+// killed, byte for byte as it writes it:
+//
+//   - tui::set_modes: EnableBracketedPaste, then enable_keyboard_enhancement
+//     (DisableModifyOtherKeys, PushKeyboardEnhancementFlags with
+//     DISAMBIGUATE_ESCAPE_CODES|REPORT_EVENT_TYPES|REPORT_ALTERNATE_KEYS,
+//     and EnableModifyOtherKeys under a csi-u tmux), then EnableFocusChange;
+//   - AlternateScreen::enter: EnterAlternateScreen, another keyboard push,
+//     and configure_input's EnableAlternateScroll;
+//   - configure_input with pointer capture: EnablePointerCapture. Codex
+//     disables alternate scroll first; it is left on here so that each mode
+//     is checked on its own;
+//   - an external editor's own keyboard push (Neovim pushes one), which
+//     nobody pops when the whole process group is killed;
+//   - the composer's SetCursorStyle::SteadyBar, and ratatui hiding the
+//     cursor.
+const codexModeSetup = "\x1b[?2004h" +
+	"\x1b[>4;0m\x1b[>7u\x1b[>4;2m" +
+	"\x1b[?1004h" +
+	"\x1b[?1049h\x1b[>7u\x1b[?1007h" +
+	"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1003h" +
+	"\x1b[>1u" +
+	"\x1b[6 q\x1b[?25l"
 
 // foregroundRun is one ForegroundPTY.Run in progress against a fake user
 // terminal.
@@ -206,13 +249,14 @@ func gone(pid int) bool {
 	return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
 }
 
-// assertReleased checks the user's terminal is as it was before Run.
+// assertReleased checks the user's terminal is as it was before Run: every
+// mode neutral and nothing but shell on the main screen.
 func assertReleased(t *testing.T, screen *screenModel, shell string) {
 	t.Helper()
-	main, _, alternate := screen.state()
-	if alternate || screen.pasteOn() {
-		t.Fatalf("terminal left with alternate screen=%v bracketed paste=%v", alternate, screen.pasteOn())
+	if modes := screen.modes(); !reflect.DeepEqual(modes, terminalModes{}) {
+		t.Fatalf("terminal left with modes %+v, want all neutral", modes)
 	}
+	main, _, _ := screen.state()
 	if main != shell {
 		t.Fatalf("main screen = %q, want only %q", main, shell)
 	}
@@ -352,7 +396,7 @@ func TestForegroundPTYStartFailureLeavesTerminalUntouched(t *testing.T) {
 func TestForegroundPTYContextCancelReapsAndReportsCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	screen := &screenModel{}
-	r := startForeground(t, ctx, "stubborn", screen)
+	r := startForeground(t, ctx, "terminal-modes-stubborn", screen)
 	r.waitScreen("ready")
 	cancel()
 	if err := r.result(); !errors.Is(err, context.Canceled) {
@@ -364,21 +408,26 @@ func TestForegroundPTYContextCancelReapsAndReportsCancel(t *testing.T) {
 	assertReleased(t, screen, "")
 }
 
+// Only the child's "ready" write fails; its mode setup was already
+// forwarded, and the cleanup writes still get through.
 func TestForegroundPTYOutputFailureStillReleasesTerminal(t *testing.T) {
 	screen := &screenModel{failContaining: "ready"}
-	r := startForeground(t, context.Background(), "stubborn", screen)
+	r := startForeground(t, context.Background(), "terminal-modes-stubborn", screen)
 	if err := r.result(); err == nil || !strings.Contains(err.Error(), "terminal write failed") {
 		t.Fatalf("Run = %v, want the output failure", err)
 	}
 	if !gone(r.pid("pid")) {
 		t.Fatal("child not reaped after output failure")
 	}
+	if !strings.Contains(screen.written(), "\x1b[>7u") {
+		t.Fatal("the child's mode setup never reached the terminal")
+	}
 	assertReleased(t, screen, "")
 }
 
-// Paste and screen are released only after the child is reaped, which is
-// also after the last child output was forwarded, and the terminal mode is
-// restored only after both.
+// The child's modes are reset, and paste and screen released, only after
+// the child is reaped, which is also after the last child output was
+// forwarded; the terminal mode is restored only after all of them.
 func TestForegroundPTYReleasesModesOnlyAfterChildIsGone(t *testing.T) {
 	var pid atomic.Int64
 	var early atomic.Bool
@@ -389,7 +438,7 @@ func TestForegroundPTYReleasesModesOnlyAfterChildIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	screen := &screenModel{beforeWrite: func(b []byte) {
-		if s := string(b); s == BracketedPasteDisable || s == AlternateScreenDisable {
+		if s := string(b); s == BracketedPasteDisable || s == AlternateScreenDisable || slices.Contains(childModeResets, s) {
 			if p := pid.Load(); p == 0 || !gone(int(p)) {
 				early.Store(true)
 			}
@@ -400,7 +449,7 @@ func TestForegroundPTYReleasesModesOnlyAfterChildIsGone(t *testing.T) {
 		}
 	}}
 	dir := t.TempDir()
-	t.Setenv(helperModeEnv, "record")
+	t.Setenv(helperModeEnv, "terminal-modes")
 	t.Setenv(helperDirEnv, dir)
 	done := make(chan error, 1)
 	go func() {
@@ -417,7 +466,7 @@ func TestForegroundPTYReleasesModesOnlyAfterChildIsGone(t *testing.T) {
 		t.Fatal("terminal modes released while the child was still running")
 	}
 	if modeRestoredEarly.Load() {
-		t.Fatal("terminal mode restored before the screen was released")
+		t.Fatal("terminal mode restored before the modes were released")
 	}
 	restored, err := term.GetState(int(slave.Fd()))
 	if err != nil {
@@ -451,10 +500,85 @@ func TestForegroundPTYKeepsScreenOwnershipAcrossExternalEditorLifecycle(t *testi
 	if err := r.result(); err != nil {
 		t.Fatal(err)
 	}
-	want := "shell" + AlternateScreenEnable + BracketedPasteEnable + "Codex output" + BracketedPasteDisable + AlternateScreenEnable + "editor output" + BracketedPasteEnable + "Codex redraw/output" + BracketedPasteDisable + AlternateScreenDisable
+	want := "shell" + AlternateScreenEnable + BracketedPasteEnable + "Codex output" + BracketedPasteDisable + AlternateScreenEnable + "editor output" + BracketedPasteEnable + "Codex redraw/output" + strings.Join(childModeResets, "") + BracketedPasteDisable + AlternateScreenDisable
 	if got := screen.written(); got != want {
 		t.Fatalf("terminal output = %q, want %q", got, want)
 	}
+	assertReleased(t, screen, "shell")
+}
+
+// A forced detach kills the child before it can undo its terminal modes,
+// whichever step of the signal ladder it takes; the transport neutralizes
+// them all before returning.
+func TestForegroundPTYForcedDetachNeutralizesChildModes(t *testing.T) {
+	for _, mode := range []string{"terminal-modes", "terminal-modes-stubborn"} {
+		t.Run(mode, func(t *testing.T) {
+			screen := &screenModel{}
+			r := startReady(t, mode, screen)
+			if modes := screen.modes(); modes.keyboardStack != 3 || modes.modifyOtherKeys != 2 || !modes.focus || !modes.alternateScroll || len(modes.mouse) != 4 || !modes.cursorHidden || modes.cursorStyle != 6 {
+				t.Fatalf("child modes not in effect before detach: %+v", modes)
+			}
+			r.typeBytes([]byte{DetachKey})
+			if err := r.result(); err != nil {
+				t.Fatalf("Run = %v, want nil for a detach", err)
+			}
+			if !gone(r.pid("pid")) {
+				t.Fatal("child not reaped after detach")
+			}
+			assertReleased(t, screen, "")
+		})
+	}
+}
+
+// A child that fails without cleaning up (a remote connection failure, for
+// one) is still Open's error, and its modes are still neutralized.
+func TestForegroundPTYFailedChildModesAreNeutralized(t *testing.T) {
+	screen := &screenModel{}
+	r := startForeground(t, context.Background(), "terminal-modes-exit", screen)
+	var exit *exec.ExitError
+	if err := r.result(); !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("Run = %v, want exit status 3", err)
+	}
+	if !strings.Contains(screen.written(), "\x1b[>7u") {
+		t.Fatal("the child's mode setup never reached the terminal")
+	}
+	assertReleased(t, screen, "")
+}
+
+// One failed reset neither stops the resets after it nor disappears behind
+// a successful detach.
+func TestForegroundPTYAttemptsEveryResetAndReportsFailures(t *testing.T) {
+	screen := &screenModel{failWrite: keyboardEnhancementPop}
+	r := startReady(t, "terminal-modes", screen)
+	r.typeBytes([]byte{DetachKey})
+	if err := r.result(); err == nil || !strings.Contains(err.Error(), "terminal write failed") {
+		t.Fatalf("Run = %v, want the reset failure", err)
+	}
+	modes := screen.modes()
+	modes.keyboardStack = 0 // the failed pops are the only expected residue
+	if !reflect.DeepEqual(modes, terminalModes{}) {
+		t.Fatalf("resets after the failed one not applied: %+v", modes)
+	}
+}
+
+// The full handoff: Agent View suspends its overview, the Codex client is
+// force-detached, and Agent View resumes and later exits. Nothing the
+// child set survives into Agent View or the shell. The overview sequences
+// are Agent View's (overviewBeginModes / overviewEndModes).
+func TestForegroundPTYAgentViewHandoffLeavesNoChildModes(t *testing.T) {
+	const overviewBegin, overviewEnd = "\x1b[?1049h\x1b[?25l\x1b[?2004h", "\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l"
+	screen := &screenModel{}
+	_, _ = screen.Write([]byte("shell" + overviewBegin + "Agent View" + overviewEnd))
+	r := startReady(t, "terminal-modes", screen)
+	r.typeBytes([]byte{DetachKey})
+	if err := r.result(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = screen.Write([]byte(overviewBegin))
+	if modes := screen.modes(); !reflect.DeepEqual(modes, terminalModes{alternate: true, paste: true, cursorHidden: true}) {
+		t.Fatalf("resumed Agent View sees modes %+v, want only its own", modes)
+	}
+	_, _ = screen.Write([]byte("Agent View" + overviewEnd))
 	assertReleased(t, screen, "shell")
 }
 
@@ -489,68 +613,126 @@ func TestForegroundPTYFollowsTerminalSize(t *testing.T) {
 	}
 }
 
+// terminalModes is the mode state screenModel tracks. Its zero value is a
+// neutral terminal.
+type terminalModes struct {
+	alternate       bool
+	paste           bool
+	focus           bool
+	alternateScroll bool
+	mouse           []int // enabled mouse-reporting modes, sorted
+	keyboardStack   int   // pushed keyboard-enhancement frames
+	modifyOtherKeys int
+	cursorHidden    bool
+	cursorStyle     int
+}
+
 // screenModel is the user's terminal reduced to what these tests check:
-// bracketed paste and which of the main and alternate screens text lands
-// on. It recognizes only the mode sequences ForegroundPTY owns.
+// which of the main and alternate screens text lands on, and the modes in
+// terminalModes. It interprets only those CSI sequences, and treats the
+// keyboard-enhancement stack as one stack shared by both screens, the case
+// where a leftover frame is visible outside the alternate screen.
 type screenModel struct {
 	mu             sync.Mutex
 	output         bytes.Buffer
 	main           bytes.Buffer
 	alternate      bytes.Buffer
 	pending        []byte
-	alternateOn    bool
-	paste          bool
+	modeState      terminalModes
 	failContaining string
+	failWrite      string // when set, a Write of exactly this fails
 	beforeWrite    func([]byte)
 }
 
 func (m *screenModel) Write(b []byte) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.failContaining != "" && bytes.Contains(b, []byte(m.failContaining)) {
+	if (m.failContaining != "" && bytes.Contains(b, []byte(m.failContaining))) || (m.failWrite != "" && string(b) == m.failWrite) {
 		return 0, errors.New("terminal write failed")
 	}
 	if m.beforeWrite != nil {
 		m.beforeWrite(b)
 	}
 	m.output.Write(b)
-	on := bytes.LastIndex(b, []byte(BracketedPasteEnable))
-	off := bytes.LastIndex(b, []byte(BracketedPasteDisable))
-	if on >= 0 || off >= 0 {
-		m.paste = on > off
-	}
 	data := append(m.pending, b...)
 	m.pending = nil
 	for len(data) > 0 {
-		enter := bytes.Index(data, []byte(AlternateScreenEnable))
-		leave := bytes.Index(data, []byte(AlternateScreenDisable))
-		next, entering := enter, true
-		if leave >= 0 && (enter < 0 || leave < enter) {
-			next, entering = leave, false
+		esc := bytes.IndexByte(data, 0x1b)
+		if esc < 0 {
+			m.screenText(data)
+			return len(b), nil
 		}
-		if next < 0 {
-			keep := 0
-			for n := 1; n < len(AlternateScreenEnable) && n <= len(data); n++ {
-				if tail := string(data[len(data)-n:]); tail == AlternateScreenEnable[:n] || tail == AlternateScreenDisable[:n] {
-					keep = n
-				}
-			}
-			m.screenText(data[:len(data)-keep])
-			m.pending = append(m.pending, data[len(data)-keep:]...)
-			break
+		m.screenText(data[:esc])
+		data = data[esc:]
+		if len(data) < 2 {
+			m.pending = append(m.pending, data...)
+			return len(b), nil
 		}
-		m.screenText(data[:next])
-		if entering {
-			m.alternate.Reset()
+		if data[1] != '[' {
+			data = data[2:]
+			continue
 		}
-		m.alternateOn = entering
-		data = data[next+len(AlternateScreenEnable):]
+		end := bytes.IndexFunc(data[2:], func(r rune) bool { return r >= 0x40 && r <= 0x7e })
+		if end < 0 {
+			m.pending = append(m.pending, data...)
+			return len(b), nil
+		}
+		m.applyCSI(string(data[2:2+end]), data[2+end])
+		data = data[2+end+1:]
 	}
 	return len(b), nil
 }
 
+// applyCSI applies one CSI sequence: body is everything between "ESC [" and
+// the final byte.
+func (m *screenModel) applyCSI(body string, final byte) {
+	s := &m.modeState
+	switch {
+	case (final == 'h' || final == 'l') && strings.HasPrefix(body, "?"):
+		on := final == 'h'
+		for _, param := range strings.Split(body[1:], ";") {
+			switch n, _ := strconv.Atoi(param); n {
+			case 1049:
+				if on {
+					m.alternate.Reset()
+				}
+				s.alternate = on
+			case 2004:
+				s.paste = on
+			case 1004:
+				s.focus = on
+			case 1007:
+				s.alternateScroll = on
+			case 25:
+				s.cursorHidden = !on
+			case 1000, 1002, 1003, 1006, 1015:
+				s.mouse = slices.DeleteFunc(s.mouse, func(x int) bool { return x == n })
+				if on {
+					s.mouse = append(s.mouse, n)
+					slices.Sort(s.mouse)
+				}
+				if len(s.mouse) == 0 {
+					s.mouse = nil
+				}
+			}
+		}
+	case final == 'u' && strings.HasPrefix(body, ">"):
+		s.keyboardStack++
+	case final == 'u' && strings.HasPrefix(body, "<"):
+		n := 1
+		if body != "<" {
+			n, _ = strconv.Atoi(body[1:])
+		}
+		s.keyboardStack = max(0, s.keyboardStack-n)
+	case final == 'm' && strings.HasPrefix(body, ">4;"):
+		s.modifyOtherKeys, _ = strconv.Atoi(body[3:])
+	case final == 'q' && strings.HasSuffix(body, " "):
+		s.cursorStyle, _ = strconv.Atoi(strings.TrimSuffix(body, " "))
+	}
+}
+
 func (m *screenModel) screenText(b []byte) {
-	if m.alternateOn {
+	if m.modeState.alternate {
 		m.alternate.Write(b)
 		return
 	}
@@ -560,13 +742,21 @@ func (m *screenModel) screenText(b []byte) {
 func (m *screenModel) state() (main, alternate string, alternateOn bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.main.String(), m.alternate.String(), m.alternateOn
+	return m.main.String(), m.alternate.String(), m.modeState.alternate
+}
+
+func (m *screenModel) modes() terminalModes {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	modes := m.modeState
+	modes.mouse = slices.Clone(modes.mouse)
+	return modes
 }
 
 func (m *screenModel) pasteOn() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.paste
+	return m.modeState.paste
 }
 
 func (m *screenModel) written() string {

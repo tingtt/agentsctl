@@ -33,6 +33,11 @@ const foregroundDrainTimeout = 250 * time.Millisecond
 // DetachScanner and returns when the child exits, the user presses the
 // detach key, or ctx ends. It ends only the child's process group; whatever
 // the child was a client of is not touched.
+//
+// Ending the child by signal can bypass the child's own terminal cleanup,
+// so the transport never relies on it: before returning the terminal it
+// neutralizes every physical-terminal mode the child may have set (see
+// childModeResets), however the child ended.
 type ForegroundPTY struct {
 	// StopTimeout bounds each step of the SIGHUP, SIGTERM, SIGKILL ladder
 	// that ends the child; zero means defaultForegroundStopTimeout.
@@ -51,8 +56,11 @@ type ForegroundPTY struct {
 // The child starts in its own session with the PTY as its controlling
 // terminal, and the PTY is raw before the child starts. While the child
 // runs, in is raw, out is on an alternate screen with bracketed paste
-// enabled, and the PTY follows in's size; all of it is undone, in reverse
-// order, only after the child is reaped and forwarding has stopped.
+// enabled, and the PTY follows in's size. Only after the child is reaped
+// and forwarding has stopped, the modes the child may have left are reset,
+// then all of the above is undone in reverse order. Every cleanup step is
+// attempted even when an earlier one fails, and cleanup failures are
+// returned even after a detach.
 func (f ForegroundPTY) Run(ctx context.Context, path string, args []string, cwd string, in *os.File, out io.Writer) (retErr error) {
 	cmd := exec.Command(path, args...)
 	cmd.Dir = cwd
@@ -79,8 +87,9 @@ func (f ForegroundPTY) Run(ctx context.Context, path string, args []string, cwd 
 		return err
 	}
 	defer restore()
-	// LIFO: stop the child and forwarding (below), flush the filter,
-	// disable paste, leave the screen, then restore the mode.
+	// LIFO: stop the child and forwarding (below), flush the filter, reset
+	// the child's modes, disable paste, leave the screen, then restore the
+	// terminal mode.
 	defer func() { retErr = errors.Join(retErr, WriteFull(out, []byte(AlternateScreenDisable))) }()
 	if err := WriteFull(out, []byte(AlternateScreenEnable)); err != nil {
 		return err
@@ -89,6 +98,7 @@ func (f ForegroundPTY) Run(ctx context.Context, path string, args []string, cwd 
 	if err := WriteFull(out, []byte(BracketedPasteEnable)); err != nil {
 		return err
 	}
+	defer func() { retErr = errors.Join(retErr, resetChildModes(out)) }()
 	filtered := NewAlternateScreenLeaveFilter(out)
 	defer func() { retErr = errors.Join(retErr, filtered.Flush()) }()
 
