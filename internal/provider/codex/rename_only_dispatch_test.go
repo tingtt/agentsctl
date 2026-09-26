@@ -229,12 +229,12 @@ func TestCancelledListKeepsPendingRename(t *testing.T) {
 
 func ptr(s string) *string { return &s }
 
-// A rename-only bootstrap run must not be attachable until reconcile binds
-// it to its real thread: attaching the provisional run earlier split the run
-// and the thread into separate identities (a stale Starting row plus a real
-// thread no managed run owned). These tests pin that at all three places the
-// invariant lives -- the Dispatch row, List's provisional row, and
-// PrepareAttach itself.
+// A provisional Starting row is keyed by agentsctl's run ID, not a Codex
+// thread ID, so it cannot be opened until reconcile binds its run to a
+// thread; a rename-only bootstrap run says more specifically what it waits
+// for. These tests pin that at the Dispatch row and List's provisional row,
+// and follow a rename-only session until it becomes openable. Open's own
+// refusal is covered by TestOpenRefusesRowsWithoutCanonicalThread.
 
 func requireOpen(t *testing.T, s session.Session, want bool) {
 	t.Helper()
@@ -247,7 +247,12 @@ func requireOpen(t *testing.T, s session.Session, want bool) {
 	}
 }
 
-func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
+const (
+	unboundReason     = "Codex session is still starting and has no bound thread yet"
+	renameStartReason = "Codex rename-only session is still starting"
+)
+
+func TestDispatchStartingRowIsNotOpenable(t *testing.T) {
 	p, _, _, _ := newRenameTestProvider(t)
 	s, err := p.Dispatch(context.Background(), "/rename foo", "/work")
 	if err != nil {
@@ -257,6 +262,9 @@ func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
 		t.Fatalf("want a Starting row with a RunID, got %+v", s)
 	}
 	requireOpen(t, s, false)
+	if got := s.Actions[session.ActionOpen].Reason; got != renameStartReason {
+		t.Fatalf("Open reason = %q, want %q", got, renameStartReason)
+	}
 	if !s.Actions[session.ActionStop].Available {
 		t.Fatalf("Stop must stay available: %+v", s.Actions)
 	}
@@ -269,13 +277,16 @@ func TestDispatchStartingRowOpenAvailabilityDependsOnRenameOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireOpen(t, s, true)
+	requireOpen(t, s, false)
+	if got := s.Actions[session.ActionOpen].Reason; got != unboundReason {
+		t.Fatalf("Open reason = %q, want %q", got, unboundReason)
+	}
 	if s.Name != "Starting" || s.Activity != session.ActivityStarting {
 		t.Fatalf("an ordinary Starting row keeps its plain name and Activity: %+v", s)
 	}
 }
 
-func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
+func TestListStartingRowsAreNotOpenable(t *testing.T) {
 	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	for _, r := range []localstate.Run{
 		{ID: "run-rename", Provider: "codex", CWD: "/work", State: "running", PendingRename: "foo"},
@@ -299,7 +310,10 @@ func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
 		t.Fatalf("want two Starting rows: %+v", rows)
 	}
 	requireOpen(t, pending, false)
-	requireOpen(t, plain, true)
+	requireOpen(t, plain, false)
+	if pending.Actions[session.ActionOpen].Reason != renameStartReason || plain.Actions[session.ActionOpen].Reason != unboundReason {
+		t.Fatalf("Open reasons = %q / %q", pending.Actions[session.ActionOpen].Reason, plain.Actions[session.ActionOpen].Reason)
+	}
 	if pending.Name != "Starting (Waiting rename)" || plain.Name != "Starting" {
 		t.Fatalf("names = %q / %q, want the waiting-rename name only for the pending run", pending.Name, plain.Name)
 	}
@@ -310,50 +324,13 @@ func TestListStartingRowOpenAvailabilityDependsOnPendingRename(t *testing.T) {
 	}
 }
 
-func TestPrepareAttachRefusesUnboundRenameBootstrapEvenFromStaleRow(t *testing.T) {
-	p, rt, _, store := newRenameTestProvider(t)
-	if err := store.StartRun(localstate.Run{ID: "run-rename", Provider: "codex", CWD: "/work", State: "running", PendingRename: "foo"}); err != nil {
-		t.Fatal(err)
-	}
-	// A row built by hand -- as a stale UI row or another caller might --
-	// claiming Open is available.
-	stale := session.Session{Key: codexKey("run-rename"), RunID: "run-rename", CWD: "/work",
-		Actions: session.Actions{session.ActionOpen: {Available: true}}}
-	runID, err := p.PrepareAttach(context.Background(), stale)
-	if err == nil || runID != "" {
-		t.Fatalf("PrepareAttach = (%q, %v), want a refusal and no run to attach", runID, err)
-	}
-	if rt.resumes != 0 {
-		t.Fatalf("refused attach must not resume anything (%d calls)", rt.resumes)
-	}
-}
-
-func TestPrepareAttachStillAllowsOrdinaryAndBoundRuns(t *testing.T) {
-	p, rt, _, store := newRenameTestProvider(t)
-	for _, r := range []localstate.Run{
-		{ID: "run-plain", Provider: "codex", CWD: "/work", State: "running"},
-		{ID: "run-bound", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-1", PendingRename: "foo"},
-		{ID: "run-applied", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-2"},
-	} {
-		if err := store.StartRun(r); err != nil {
-			t.Fatal(err)
-		}
-		got, err := p.PrepareAttach(context.Background(), session.Session{Key: codexKey(r.ID), RunID: r.ID})
-		if err != nil || got != r.ID {
-			t.Fatalf("%s: PrepareAttach = (%q, %v), want the run to attach", r.ID, got, err)
-		}
-	}
-	if rt.resumes != 0 {
-		t.Fatalf("attaching an existing run must not resume: %d", rt.resumes)
-	}
-}
-
 // TestRenameOnlySessionBecomesOpenableOnceBound walks the whole lifecycle:
-// not attachable while unbound (also across Lists before the thread exists),
+// not openable while unbound (also across Lists before the thread exists),
 // then, once the thread appears, one List binds it, applies the name, drops
-// the provisional row and offers Open on the real thread.
+// the provisional row and offers Open on the real thread, which Open
+// resumes by its thread ID.
 func TestRenameOnlySessionBecomesOpenableOnceBound(t *testing.T) {
-	p, rt, api, _ := newRenameTestProvider(t)
+	p, _, api, _ := newRenameTestProvider(t)
 	api.rows = []Thread{{ID: "old", CWD: "/work"}}
 	starting, err := p.Dispatch(context.Background(), "/rename foo", "/work")
 	if err != nil {
@@ -379,8 +356,8 @@ func TestRenameOnlySessionBecomesOpenableOnceBound(t *testing.T) {
 		if got.Name != "Starting (Waiting rename)" {
 			t.Fatalf("Name = %q while waiting for the rename", got.Name)
 		}
-		if _, err := p.PrepareAttach(context.Background(), got); err == nil {
-			t.Fatal("attach must stay refused before binding")
+		if _, err := p.openThreadID(got); err == nil {
+			t.Fatal("Open must stay refused before binding")
 		}
 	}
 
@@ -408,11 +385,8 @@ func TestRenameOnlySessionBecomesOpenableOnceBound(t *testing.T) {
 		t.Fatalf("identity continuity lost: %+v", bound)
 	}
 	requireOpen(t, *bound, true)
-	got, err := p.PrepareAttach(context.Background(), *bound)
-	if err != nil || got != starting.RunID {
-		t.Fatalf("PrepareAttach(bound) = (%q, %v), want the managed run %q", got, err, starting.RunID)
-	}
-	if rt.resumes != 0 {
-		t.Fatalf("bound rename-only session must attach to its managed run, not resume: %d", rt.resumes)
+	got, err := p.openThreadID(*bound)
+	if err != nil || got != "thread-1" {
+		t.Fatalf("openThreadID(bound) = (%q, %v), want the bound thread", got, err)
 	}
 }

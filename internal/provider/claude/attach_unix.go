@@ -11,13 +11,12 @@ import (
 	"syscall"
 	"time"
 
-	creackpty "github.com/creack/pty"
-	"golang.org/x/term"
+	"github.com/tingtt/agentsctl/internal/terminal"
 )
 
 // startClaudeAttachRaw is creackpty.StartWithSize(cmd, nil), except the
 // pty's slave side is switched to raw mode BEFORE the child process
-// starts rather than after.
+// starts rather than after (see terminal.StartRawPTY, which it delegates to).
 //
 // This closes a real startup race: creackpty.Start leaves the slave in
 // the kernel's default cooked mode (ISIG etc. enabled) until the child
@@ -39,34 +38,7 @@ import (
 // the native rename transport (a transient, headless attach client) --
 // both start a `claude attach` child the same way.
 func startClaudeAttachRaw(cmd *exec.Cmd) (*os.File, error) {
-	master, slave, err := creackpty.Open()
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = slave.Close() }()
-	if _, err := term.MakeRaw(int(slave.Fd())); err != nil {
-		_ = master.Close()
-		return nil, err
-	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setsid = true
-	cmd.SysProcAttr.Setctty = true
-	if cmd.Stdin == nil {
-		cmd.Stdin = slave
-	}
-	if cmd.Stdout == nil {
-		cmd.Stdout = slave
-	}
-	if cmd.Stderr == nil {
-		cmd.Stderr = slave
-	}
-	if err := cmd.Start(); err != nil {
-		_ = master.Close()
-		return nil, err
-	}
-	return master, nil
+	return terminal.StartRawPTY(cmd, nil)
 }
 
 // detachClaudeClient ends only the `claude attach` client process; the

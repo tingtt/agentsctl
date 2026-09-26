@@ -3,7 +3,6 @@
 package supervisor
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,79 +22,23 @@ import (
 // process establishes these modes at startup, which can be long before any
 // attach subscriber exists; output produced then is not replayed (see the
 // DesignDoc's PTY attach and redraw section), so every attach establishes its
-// own screen and paste state.
+// own screen and paste state. The sequences and the child-leave filter are
+// shared with the foreground Open transport (see terminal.ForegroundPTY).
 const (
-	alternateScreenEnable  = "\x1b[?1049h"
-	alternateScreenDisable = "\x1b[?1049l"
-	bracketedPasteEnable   = "\x1b[?2004h"
-	bracketedPasteDisable  = "\x1b[?2004l"
+	alternateScreenEnable  = terminal.AlternateScreenEnable
+	alternateScreenDisable = terminal.AlternateScreenDisable
+	bracketedPasteEnable   = terminal.BracketedPasteEnable
+	bracketedPasteDisable  = terminal.BracketedPasteDisable
 )
 
-// alternateScreenLeaveFilter removes only a managed process's DECRST 1049
-// from the physical-terminal stream. Attach owns the outer alternate screen,
-// and terminal screen modes are not nested: forwarding a child leave would
-// release Attach's screen and expose the user's main buffer. The supervisor
-// still observes and broadcasts the original PTY bytes; this filter exists
-// only at the final client-to-terminal boundary.
-type alternateScreenLeaveFilter struct {
-	out     io.Writer
-	pending []byte
+// newAlternateScreenLeaveFilter removes only a managed process's DECRST 1049
+// from the physical-terminal stream; the supervisor still observes and
+// broadcasts the original PTY bytes.
+func newAlternateScreenLeaveFilter(out io.Writer) *terminal.AlternateScreenLeaveFilter {
+	return terminal.NewAlternateScreenLeaveFilter(out)
 }
 
-func newAlternateScreenLeaveFilter(out io.Writer) *alternateScreenLeaveFilter {
-	return &alternateScreenLeaveFilter{out: out}
-}
-
-func (f *alternateScreenLeaveFilter) Write(chunk []byte) error {
-	sequence := []byte(alternateScreenDisable)
-	data := append(f.pending, chunk...)
-	f.pending = f.pending[:0]
-	for len(data) > 0 {
-		if index := bytes.Index(data, sequence); index >= 0 {
-			if err := writeFull(f.out, data[:index]); err != nil {
-				return err
-			}
-			data = data[index+len(sequence):]
-			continue
-		}
-		keep := longestSuffixPrefix(data, sequence)
-		if err := writeFull(f.out, data[:len(data)-keep]); err != nil {
-			return err
-		}
-		f.pending = append(f.pending, data[len(data)-keep:]...)
-		return nil
-	}
-	return nil
-}
-
-func (f *alternateScreenLeaveFilter) Flush() error {
-	err := writeFull(f.out, f.pending)
-	f.pending = f.pending[:0]
-	return err
-}
-
-func longestSuffixPrefix(data, sequence []byte) int {
-	for length := min(len(data), len(sequence)-1); length > 0; length-- {
-		if bytes.Equal(data[len(data)-length:], sequence[:length]) {
-			return length
-		}
-	}
-	return 0
-}
-
-func writeFull(out io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := out.Write(data)
-		data = data[n:]
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
-}
+func writeFull(out io.Writer, data []byte) error { return terminal.WriteFull(out, data) }
 
 type lockedFrames struct {
 	mu sync.Mutex

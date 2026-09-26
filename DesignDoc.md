@@ -506,7 +506,7 @@ Agent View の raw mode と overview 固有 terminal mode は1つの lifecycle b
 
 overview が所有する terminal mode は raw mode、alternate screen、cursor の非表示、bracketed paste である。overview が active な間だけこれらを所有し、foreground の Open / 外部 editor は overview の suspend の後にはじめて terminal を受け取る。Open は provider を区別しない共通の foreground handoff であり、`suspend -> Open -> resume` の順に実行する。Open が失敗しても resume は必ず試み、suspend に失敗した場合は Open を実行しない。resume に失敗した場合は Open の error と合わせて (どちらも失わずに) terminal ownership の失敗として扱う。戻ったときの resume が overview 所有の mode (bracketed paste を含む) をすべて再確立する。
 
-attach client が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
+attach client や Codex Open の PTY bridge が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」、Codex の Open) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
 
 **Claude**
 
@@ -524,10 +524,34 @@ attach client が自身の attach 中に確立する bracketed paste (「PTY att
 codex --remote unix://... resume <thread ID>
 ```
 
-- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。
-- foreground TUI の終了 / detach は thread / turn を停止しない。再 Open では同じ canonical thread ID を使う。
+- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。explicit `--remote` は接続失敗時に embedded runtime へ fallback しない。agentsctl 側も、foreground client の失敗を plain `codex resume`、managed PTY、embedded runtime のいずれでも再試行せず、そのまま Open の error とする。
+- `--remote` の socket path は daemon lifecycle response の `socketPath` とし、`unix://` に続けて encode せずそのまま1つの引数として渡す。
+- `resume` へ渡すのは canonical thread ID だけである。canonical thread ID を持たない row (移行期間中の legacy provisional run 等) は Open 不可とし、Provider 境界でも current run state を読み直して拒否する。
+- 起動前に daemon を確保し、同じ daemon へ Open 専用の短命 connection で `thread/read` を行って current status を確認する。Observer の snapshot や row の Actions は advisory であり、安全性判断の source of truth にしない。status を確定できない場合 (接続・initialize・`thread/read` の失敗、不正な response) は起動しない。
+- title 生成用の internal thread (`ephemeral` かつ `threadSource == "thread_title"`) は Open しない。
+- foreground TUI は agentsctl の environment を継承し、`CWD` で、Open 中だけ存在する ephemeral な PTY bridge 上で実行する。
+
+```text
+Agent View (suspend)
+  -> Open-scoped PTY bridge (agentsctl process 内)
+       -> codex --remote unix://... resume <thread ID>
+  <- Ctrl+] を agentsctl が intercept
+  <- foreground client の process group だけを終了・reap
+Agent View (resume)
+
+shared daemon / thread / turn は bridge の外にあり、影響を受けない
+```
+
+- PTY bridge は transport であり session runtime ではない。run ID・localstate・thread identity を持たず、turn の実行を所有せず、detach / client 終了後に保持しない。再 Open は新しい foreground client と新しい PTY を作る。legacy の supervisor-managed background PTY が managed Codex process の lifetime と run identity を所有していたのとは異なり、bridge が所有するのは1回の Open の間の foreground client process だけである。
+- child PTY は child の起動前に raw mode にし、outer terminal と同じ size にする。起動直後の control byte が kernel の line discipline に signal として解釈される race を避けるためである。child は PTY を controlling terminal とする新しい session / process group で起動する。その後は outer terminal の resize (`SIGWINCH`) ごとに PTY の size を直接更新する。
+- 入力は Claude と同じ `terminal.DetachScanner` を通して relay する。`Ctrl+]` (literal byte、modifyOtherKeys、CSI-u) を検出すると、それ自体と同じ read のそれ以降の bytes は child へ渡さない。bracketed paste 内の byte は detach とみなさない。
+- bridge は client の実行中、outer terminal の raw mode、transport 所有の alternate screen、bracketed paste を所有する。child 出力の alternate-screen leave (DECRST 1049) は physical terminal への境界でだけ除去し、child (と child が起動する external editor) の画面遷移を transport 所有の alternate screen 内に閉じ込める。解除は child の reap と出力転送の停止の後に、child が設定しうる mode の neutralize、bracketed paste、alternate screen、raw mode の順で行う。正常終了・detach・起動後の失敗・出力失敗・context cancel のいずれでも同じである。signal で client を終了する detach では child 自身の restore (Codex の `restore_after_exit`) が走る保証がないため、bridge は child の終了理由に依存せず、keyboard reporting (keyboard enhancement stack と modifyOtherKeys)、focus reporting、mouse reporting、alternate scroll、cursor の形状と表示を、transport 所有の alternate screen を離れる前に neutralize してから Agent View へ terminal ownership を返す。各 reset は一部が失敗しても残りを試み、失敗は detach の成功に隠さず Open の error とする。
+- detach では server へ RPC を送らず、foreground client の process group へ `SIGHUP`、`SIGTERM`、`SIGKILL` の順に、各段で短い timeout (1秒) だけ応答を待って送り、client を必ず reap する。reap 後に process group に残った process は `SIGKILL` で終了する。既に終了していること (`ESRCH`) は失敗ではない。Codex TUI の `Ctrl+C` から出る "Run in background" などの UI 操作は、UI state と実装詳細に依存するため用いない。
+- 結果は終了の原因で区別する。`Ctrl+]` による detach は、signal による client の非 0 終了を伴っても Open の成功である。detach によらない client の非 0 終了 (remote 接続失敗を含む) は Open の error、context cancel は client を reap した後に context の error とする。
+- agentsctl の `Ctrl+]` detach / Open transport cleanup は thread / turn を停止しない。foreground client の終了で閉じる connection について、shared daemon は connection の subscription を除くだけで、turn の interrupt や thread の shutdown は行わない。pending の approval / user input は thread 単位で保持され、次に attach した connection へ再提示される。agentsctl の detach cleanup では Stop、`turn/interrupt`、`thread/unsubscribe`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。Codex TUI 内から利用者が明示的に行う quit / exit 操作は Codex 自身の semantics に従い、agentsctl の detach 保証とは区別する。
+- daemon が loaded として報告する thread は shared daemon 自身が writer lock を保持するため、writer lock を確認せず Open できる。
 - daemon が `notLoaded` で writer lock がない休止 thread は、shared daemon 上へ resume して Open できる。
-- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。
+- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。その writer が agentsctl の legacy managed run であっても同じである。
 
 #### Session actions
 
@@ -898,6 +922,7 @@ Codex の thread / turn runtime は shared app-server daemon が保持する。a
 
 - agentsctl は shared runtime が必要なとき `codex app-server daemon start` を冪等に実行して daemon を確保する。
 - Observer は初回接続だけでなく reconnect attempt の前にも daemon を確保し、lifecycle response の `socketPath` を接続先とする。
+- Open も起動のたびに daemon を確保し、同じ `socketPath` を preflight と `--remote` の接続先とする。Observer の接続状態には依存しない。
 - Observer が row authority を得る前の daemon 確保失敗は error-only update として warning を表示し、List が供給した rows を維持する。
 - implicit daemon auto-start や plain `codex resume` の fallback behavior を correctness の前提にしない。
 - daemon の Stop / Restart / Update を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。
@@ -975,9 +1000,9 @@ Agent View は Dispatch が返した canonical key が catalog / Observer snapsh
 
 #### Foreground Codex TUI lifecycle
 
-Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Codex 自身の foreground TUI が terminal mode、redraw、paste mode を所有し、agentsctl は managed background PTY の output replay、resize trick、Codex-specific ANSI filteringを行わない。
+Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Agent View の suspend 後、Open-scoped な `ForegroundPTY` が outer physical terminal の raw mode、alternate screen、bracketed paste、resize relay を所有し、その内側の child PTY で Codex foreground TUI を実行する。agentsctl は child の UI state や Codex 固有の画面内容を解釈せず、transport boundary として child の alternate-screen leave を抑止し、forced detach で child 自身の cleanup が走らない場合に keyboard reporting、focus / mouse reporting、alternate scroll、cursor 等を neutralize してから terminal ownership を Agent View へ返す。legacy managed background PTY の output replay や supervisor resize protocol は使用しない。
 
-Open client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。
+agentsctl の `Ctrl+]` detach または Open transport cleanup によって foreground client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。Codex TUI 内からの明示的な quit / exit は Codex 自身の semantics に従う。
 
 #### Concurrency and backpressure
 
