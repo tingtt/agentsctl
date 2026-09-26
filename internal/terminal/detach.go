@@ -7,7 +7,7 @@ import "strings"
 // DetachKey is the classic literal detach byte (Ctrl+], 0x1d). Recognizing
 // it (and the escape-sequence encodings some terminals substitute for it --
 // see DetachScanner) in the outer terminal's raw byte stream is how a
-// provider's Open transport (provider/claude, internal/supervisor) knows
+// provider's Open transport (provider/claude, ForegroundPTY, internal/supervisor) knows
 // to end the interactive view and return to Agent View, without stopping
 // the underlying provider session/process (see the DesignDoc's Attach/
 // Detach lifecycle separation).

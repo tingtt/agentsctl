@@ -18,6 +18,7 @@ import (
 	"github.com/tingtt/agentsctl/internal/selfupdate"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 	"github.com/tingtt/agentsctl/internal/supervisor"
+	"github.com/tingtt/agentsctl/internal/terminal"
 	"github.com/tingtt/agentsctl/internal/version"
 	"github.com/tingtt/agentsctl/internal/workspace"
 )
@@ -102,7 +103,7 @@ func run() (*agentview.Restart, error) {
 	}
 	providers := []sessionctl.Source{
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon, Foreground: runner},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon, Foreground: terminal.ForegroundPTY{}},
 	}
 	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {

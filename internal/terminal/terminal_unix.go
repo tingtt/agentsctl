@@ -1,12 +1,14 @@
 //go:build darwin || linux
 
 // Package terminal holds provider-agnostic raw-terminal mechanics shared by
-// every provider's Open transport: raw mode, resize-signal watching, and
-// detach-key (Ctrl+]) decoding from the outer terminal's byte stream.
+// every provider's Open transport: raw mode, resize-signal watching,
+// detach-key (Ctrl+]) decoding from the outer terminal's byte stream, raw
+// PTY startup, outer-screen ownership, and ForegroundPTY, the Open-scoped
+// PTY bridge Codex Open runs its remote TUI client through.
 // Provider-specific attach semantics -- Claude's `claude attach` subprocess
-// conventions, Codex's supervisor PTY protocol -- do not live here; see
-// provider/claude and internal/supervisor, which both depend on this
-// package rather than duplicating raw terminal handling.
+// conventions, the legacy supervisor PTY protocol for managed Codex runs --
+// do not live here; see provider/claude and internal/supervisor, which both
+// depend on this package rather than duplicating raw terminal handling.
 package terminal
 
 import (
@@ -47,12 +49,14 @@ func PollInput(f *os.File, timeout time.Duration) (bool, error) {
 // WatchResize invokes onResize once immediately and again on every
 // SIGWINCH delivered while f is a terminal, until the returned stop func is
 // called. If f is not a terminal, it is a no-op returning a no-op stop.
-// The two provider Open transports use this identically but do different
-// things in onResize: Claude inherits its child PTY's size directly from
-// f; Codex sends a resize frame over the supervisor socket instead (see
-// the DesignDoc's PTY attach and redraw section for why the frame path
-// additionally needs a same-size reattach bounce, which onResize is
-// responsible for, not this function).
+// The Open transports use this identically but do different things in
+// onResize: Claude's attach client and ForegroundPTY (Codex Open) own their
+// child PTY in this process and inherit its size directly from f; the
+// legacy supervisor Attach for managed Codex runs sends a resize frame over
+// the supervisor socket instead (see the DesignDoc's PTY attach and redraw
+// section for why the frame path additionally needs a same-size reattach
+// bounce, which onResize is responsible for, not this function). stop does
+// not wait for an onResize already running.
 func WatchResize(f *os.File, onResize func()) (stop func()) {
 	if !term.IsTerminal(int(f.Fd())) {
 		return func() {}

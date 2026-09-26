@@ -506,7 +506,7 @@ Agent View の raw mode と overview 固有 terminal mode は1つの lifecycle b
 
 overview が所有する terminal mode は raw mode、alternate screen、cursor の非表示、bracketed paste である。overview が active な間だけこれらを所有し、foreground の Open / 外部 editor は overview の suspend の後にはじめて terminal を受け取る。Open は provider を区別しない共通の foreground handoff であり、`suspend -> Open -> resume` の順に実行する。Open が失敗しても resume は必ず試み、suspend に失敗した場合は Open を実行しない。resume に失敗した場合は Open の error と合わせて (どちらも失わずに) terminal ownership の失敗として扱う。戻ったときの resume が overview 所有の mode (bracketed paste を含む) をすべて再確立する。
 
-attach client が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
+attach client や Codex Open の PTY bridge が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」、Codex の Open) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
 
 **Claude**
 
@@ -529,8 +529,26 @@ codex --remote unix://... resume <thread ID>
 - `resume` へ渡すのは canonical thread ID だけである。canonical thread ID を持たない row (移行期間中の legacy provisional run 等) は Open 不可とし、Provider 境界でも current run state を読み直して拒否する。
 - 起動前に daemon を確保し、同じ daemon へ Open 専用の短命 connection で `thread/read` を行って current status を確認する。Observer の snapshot や row の Actions は advisory であり、安全性判断の source of truth にしない。status を確定できない場合 (接続・initialize・`thread/read` の失敗、不正な response) は起動しない。
 - title 生成用の internal thread (`ephemeral` かつ `threadSource == "thread_title"`) は Open しない。
-- foreground TUI は agentsctl の terminal と environment をそのまま継承する通常の child process として `CWD` で実行する。supervisor PTY、出力 replay、`Ctrl+]` interception は挟まず、TUI の終了で Agent View へ戻る。
-- foreground TUI の終了 / detach は thread / turn を停止しない。Open の後始末で Stop、`turn/interrupt`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。
+- foreground TUI は agentsctl の environment を継承し、`CWD` で、Open 中だけ存在する ephemeral な PTY bridge 上で実行する。
+
+```text
+Agent View (suspend)
+  -> Open-scoped PTY bridge (agentsctl process 内)
+       -> codex --remote unix://... resume <thread ID>
+  <- Ctrl+] を agentsctl が intercept
+  <- foreground client の process group だけを終了・reap
+Agent View (resume)
+
+shared daemon / thread / turn は bridge の外にあり、影響を受けない
+```
+
+- PTY bridge は transport であり session runtime ではない。run ID・localstate・thread identity を持たず、turn の実行を所有せず、detach / client 終了後に保持しない。再 Open は新しい foreground client と新しい PTY を作る。legacy の supervisor-managed background PTY が managed Codex process の lifetime と run identity を所有していたのとは異なり、bridge が所有するのは1回の Open の間の foreground client process だけである。
+- child PTY は child の起動前に raw mode にし、outer terminal と同じ size にする。起動直後の control byte が kernel の line discipline に signal として解釈される race を避けるためである。child は PTY を controlling terminal とする新しい session / process group で起動する。その後は outer terminal の resize (`SIGWINCH`) ごとに PTY の size を直接更新する。
+- 入力は Claude と同じ `terminal.DetachScanner` を通して relay する。`Ctrl+]` (literal byte、modifyOtherKeys、CSI-u) を検出すると、それ自体と同じ read のそれ以降の bytes は child へ渡さない。bracketed paste 内の byte は detach とみなさない。
+- bridge は client の実行中、outer terminal の raw mode、transport 所有の alternate screen、bracketed paste を所有する。child 出力の alternate-screen leave (DECRST 1049) は physical terminal への境界でだけ除去し、child (と child が起動する external editor) の画面遷移を transport 所有の alternate screen 内に閉じ込める。解除は child の reap と出力転送の停止の後に、bracketed paste、alternate screen、raw mode の順で行う。正常終了・detach・起動後の失敗・出力失敗・context cancel のいずれでも同じである。
+- detach では server へ RPC を送らず、foreground client の process group へ `SIGHUP`、`SIGTERM`、`SIGKILL` の順に、各段で短い timeout (1秒) だけ応答を待って送り、client を必ず reap する。reap 後に process group に残った process は `SIGKILL` で終了する。既に終了していること (`ESRCH`) は失敗ではない。Codex TUI の `Ctrl+C` から出る "Run in background" などの UI 操作は、UI state と実装詳細に依存するため用いない。
+- 結果は終了の原因で区別する。`Ctrl+]` による detach は、signal による client の非 0 終了を伴っても Open の成功である。detach によらない client の非 0 終了 (remote 接続失敗を含む) は Open の error、context cancel は client を reap した後に context の error とする。
+- foreground client の終了 / detach は thread / turn を停止しない。client の終了で閉じる connection について、shared daemon は connection の subscription を除くだけで、turn の interrupt や thread の shutdown は行わない。pending の approval / user input は thread 単位で保持され、次に attach した connection へ再提示される。Open の後始末で Stop、`turn/interrupt`、`thread/unsubscribe`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。
 - daemon が loaded として報告する thread は shared daemon 自身が writer lock を保持するため、writer lock を確認せず Open できる。
 - daemon が `notLoaded` で writer lock がない休止 thread は、shared daemon 上へ resume して Open できる。
 - `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。その writer が agentsctl の legacy managed run であっても同じである。

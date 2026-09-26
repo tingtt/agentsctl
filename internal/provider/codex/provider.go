@@ -30,6 +30,15 @@ type Dispatcher interface {
 	Stop(context.Context, string) error
 }
 
+// ForegroundClient runs an interactive client process on the caller's
+// terminal for the duration of one Open. It returns nil when the process
+// exits successfully or the user detaches from it (Ctrl+]), after which
+// the process has been ended and reaped; any other end is an error.
+// terminal.ForegroundPTY is the production implementation.
+type ForegroundClient interface {
+	Run(ctx context.Context, path string, args []string, cwd string, in *os.File, out io.Writer) error
+}
+
 type Provider struct {
 	Path    string
 	API     AppServer
@@ -40,7 +49,7 @@ type Provider struct {
 	// Foreground runs the interactive Codex TUI client on the caller's
 	// terminal (see Open). It is separate from Runner, which only captures
 	// command output.
-	Foreground  base.Commander
+	Foreground  ForegroundClient
 	WriterOwner func(string, processinfo.Identity) (bool, error)
 	// ControlSocket overrides the shared app-server control socket used by
 	// the Observer and Open preflight; empty means the daemon lifecycle
@@ -533,10 +542,12 @@ const openPreflightTimeout = 10 * time.Second
 //
 //	codex --remote unix://<socket> resume <thread ID>
 //
-// on the caller's terminal, in s.CWD, with agentsctl's own environment. It
-// returns when that client exits. The client's lifetime is not the
-// thread's: its turns keep running in the daemon, and nothing here stops
-// or interrupts them.
+// in s.CWD, with agentsctl's own environment, through Foreground: an
+// Open-scoped PTY bridged to the caller's terminal. It returns when that
+// client exits or the user detaches with Ctrl+], which ends only the client
+// process. The client's lifetime is not the thread's: its connection
+// closing leaves the thread and any running turn in the daemon, and nothing
+// here stops or interrupts them.
 //
 // Before launching, Open proves s is a canonical Codex thread (see
 // openThreadID), ensures the daemon, and checks the thread's current
@@ -558,7 +569,7 @@ func (p *Provider) Open(ctx context.Context, s session.Session, in *os.File, out
 	if err := p.preflightOpen(ctx, socket, threadID); err != nil {
 		return err
 	}
-	if err := p.Foreground.Start(ctx, p.path(), remoteResumeArgs(socket, threadID), s.CWD, in, out, out); err != nil {
+	if err := p.Foreground.Run(ctx, p.path(), remoteResumeArgs(socket, threadID), s.CWD, in, out); err != nil {
 		return fmt.Errorf("codex remote resume %s: %w", threadID, err)
 	}
 	return nil

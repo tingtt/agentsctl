@@ -14,22 +14,23 @@ import (
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
-// fakeCommander records foreground launches instead of running them.
-type fakeCommander struct {
+// fakeForeground records foreground client runs instead of running them.
+// A nil err stands for both a clean client exit and a Ctrl+] detach, which
+// ForegroundClient reports alike.
+type fakeForeground struct {
 	calls   int
 	path    string
 	args    []string
 	cwd     string
-	in      io.Reader
+	in      *os.File
 	out     io.Writer
-	errOut  io.Writer
 	err     error
 	onStart func()
 }
 
-func (f *fakeCommander) Start(_ context.Context, path string, args []string, cwd string, in io.Reader, out, errOut io.Writer) error {
+func (f *fakeForeground) Run(_ context.Context, path string, args []string, cwd string, in *os.File, out io.Writer) error {
 	f.calls++
-	f.path, f.args, f.cwd, f.in, f.out, f.errOut = path, slices.Clone(args), cwd, in, out, errOut
+	f.path, f.args, f.cwd, f.in, f.out = path, slices.Clone(args), cwd, in, out
 	if f.onStart != nil {
 		f.onStart()
 	}
@@ -38,11 +39,11 @@ func (f *fakeCommander) Start(_ context.Context, path string, args []string, cwd
 
 // newOpenProvider returns a Provider whose daemon lifecycle reports d's
 // socket, with a scripted writer probe and a recording foreground launcher.
-func newOpenProvider(t *testing.T, d *fakeDaemon) (*Provider, *scriptedLifecycle, *writerProbe, *fakeCommander) {
+func newOpenProvider(t *testing.T, d *fakeDaemon) (*Provider, *scriptedLifecycle, *writerProbe, *fakeForeground) {
 	t.Helper()
 	lifecycle := &scriptedLifecycle{results: []lifecycleResult{readyDaemon(d.socket)}}
 	probe := &writerProbe{writers: map[string]bool{}, calls: map[string]int{}}
-	fg := &fakeCommander{}
+	fg := &fakeForeground{}
 	p := &Provider{
 		API:        &fakeAPI{},
 		Store:      localstate.New(filepath.Join(t.TempDir(), "state.json")),
@@ -98,8 +99,8 @@ func TestOpenLaunchesRemoteResumeAfterEnsureAndPreflight(t *testing.T) {
 	if fg.calls != 1 || fg.path != "codex" || !slices.Equal(fg.args, want) || fg.cwd != "/work/thread-1" {
 		t.Fatalf("launch = %d x %s %q in %q, want codex %q in /work/thread-1", fg.calls, fg.path, fg.args, fg.cwd, want)
 	}
-	if fg.in != io.Reader(in) || fg.out != io.Writer(out) || fg.errOut != io.Writer(out) {
-		t.Fatalf("stdio = %v/%v/%v, want the caller's terminal", fg.in, fg.out, fg.errOut)
+	if fg.in != in || fg.out != io.Writer(out) {
+		t.Fatalf("terminal = %v/%v, want the caller's", fg.in, fg.out)
 	}
 
 	fg.onStart = nil
@@ -143,7 +144,8 @@ func TestOpenControlSocketOverrideBypassesDaemonEnsure(t *testing.T) {
 }
 
 // A failed remote client is Open's failure: no second launch, no legacy
-// runtime call, nothing stopped. A successful exit stops nothing either.
+// runtime call, nothing stopped. A successful exit or a detach stops
+// nothing either.
 func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("thread-1", 1))
