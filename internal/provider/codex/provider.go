@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,20 +22,25 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Dispatcher starts and stops legacy supervisor-managed Codex runs. Open
+// never goes through it: it connects a foreground client to the shared
+// app-server daemon instead (see Provider.Open).
 type Dispatcher interface {
 	Dispatch(context.Context, string, string, []string, map[string]string) (localstate.Run, error)
 	Stop(context.Context, string) error
-	ResumeExisting(context.Context, string, string, map[string]string) (localstate.Run, error)
-	Attach(ctx context.Context, runID string, in *os.File, out io.Writer) error
 }
 
 type Provider struct {
-	Path        string
-	API         AppServer
-	Runner      base.Runner
-	Store       *localstate.Store
-	Runtime     Dispatcher
-	Daemon      DaemonLifecycle
+	Path    string
+	API     AppServer
+	Runner  base.Runner
+	Store   *localstate.Store
+	Runtime Dispatcher
+	Daemon  DaemonLifecycle
+	// Foreground runs the interactive Codex TUI client on the caller's
+	// terminal (see Open). It is separate from Runner, which only captures
+	// command output.
+	Foreground  base.Commander
 	WriterOwner func(string, processinfo.Identity) (bool, error)
 	// ControlSocket overrides the shared app-server control socket the
 	// Observer connects to; empty means the default under the resolved
@@ -62,12 +68,17 @@ func (p *Provider) codexHome() string {
 }
 
 func (p *Provider) ID() session.ProviderID { return session.ProviderCodex }
-func (p *Provider) Available() error {
-	path := p.Path
-	if path == "" {
-		path = "codex"
+
+// path is the Codex CLI executable: Path, or "codex" from PATH.
+func (p *Provider) path() string {
+	if p.Path == "" {
+		return "codex"
 	}
-	_, err := exec.LookPath(path)
+	return p.Path
+}
+
+func (p *Provider) Available() error {
+	_, err := exec.LookPath(p.path())
 	return err
 }
 
@@ -101,9 +112,10 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 // sessionRows normalizes a thread catalog plus the local managed-run state
 // into session rows. It is shared by List and the Observer snapshot so both
 // build rows the same way; only Activity/Runtime come from observe, the
-// caller's source of runtime observation. Which actions a row offers never
-// depends on observe: it stays with the managed-run and writer-lock rules
-// below.
+// caller's source of runtime observation. The only action observe decides
+// is advisory Open availability: a thread observed running outside the
+// shared app-server cannot be opened through it. Open re-checks everything
+// against the daemon itself (see Open).
 func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run, archived bool, observe func(Thread, func() bool) observation) []session.Session {
 	managed := map[string]localstate.Run{}
 	renameFailed := map[string]string{}
@@ -139,35 +151,33 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 			// requested name was lost.
 			summary = msg
 		}
-		var free *bool
-		writerFree := func() bool {
-			if free == nil {
-				v := p.writerAbsent(t.ID)
-				free = &v
-			}
-			return *free
-		}
-		observed := observe(t, writerFree)
+		observed := observe(t, func() bool { return p.writerAbsent(t.ID) })
 		runtime := observed.Runtime
 		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: {Available: true}}
+		// Open follows the observation, not whether agentsctl manages a run:
+		// a legacy managed run holding the writer lock outside the shared
+		// app-server is as unopenable as any other external writer. An
+		// Unknown observation stays openable; Open establishes the status
+		// itself.
+		if observed.Runtime == session.RuntimeExternal {
+			actions[session.ActionOpen] = session.Availability{Reason: errExternalWriter.Error()}
+		} else {
+			actions[session.ActionOpen] = session.Availability{Available: true}
+		}
 		switch {
 		case ok:
 			// An agentsctl-managed run keeps its existing Runtime whatever
 			// was observed: it is not the shared app-server's runtime.
 			runtime = session.RuntimeDetached
-			actions[session.ActionOpen] = session.Availability{Available: true}
 			if run.State == "running" || run.State == "starting" {
 				actions[session.ActionStop] = session.Availability{Available: true}
 			} else {
 				actions[session.ActionStop] = session.Availability{Reason: "managed run is not currently running"}
 			}
-		case writerFree():
-			actions[session.ActionOpen] = session.Availability{Available: true}
-			actions[session.ActionStop] = session.Availability{Reason: "no agentsctl-managed run is tracking this session"}
+		case observed.Runtime == session.RuntimeExternal:
+			actions[session.ActionStop] = session.Availability{Reason: "external or unknown Codex writer cannot be stopped safely"}
 		default:
-			reason := "external or unknown Codex writer cannot be attached or stopped safely"
-			actions[session.ActionOpen] = session.Availability{Reason: reason}
-			actions[session.ActionStop] = session.Availability{Reason: reason}
+			actions[session.ActionStop] = session.Availability{Reason: "no agentsctl-managed run is tracking this session"}
 		}
 		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: observed.Activity, Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
@@ -243,15 +253,10 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 }
 
 // awaitingBootstrapBind reports whether r is a rename-only bootstrap run
-// that reconcile has not yet bound to its real thread.
-//
-// Invariant: a rename-only bootstrap run must not be attached while it is
-// still unbound. Its first model turn is what creates the listed/resumable
-// thread that reconciliation must bind before the session can safely be
-// treated as a normal Codex session; attaching the provisional run earlier
-// can split the run and the thread into separate identities. Stop stays
-// available. Ordinary Starting runs carry no PendingRename and are
-// unaffected.
+// that reconcile has not yet bound to its real thread. Like every unbound
+// run it cannot be opened (see openWhileStarting); it only gets a more
+// specific reason, since its first model turn is what creates the thread
+// reconciliation must bind.
 func awaitingBootstrapBind(r localstate.Run) bool {
 	return r.PendingRename != "" && r.SessionID == ""
 }
@@ -266,14 +271,14 @@ func startingName(awaitingRename bool) string {
 	return "Starting"
 }
 
-// openWhileStarting is the Open availability of a provisional Starting row:
-// available, except while the run is a rename-only bootstrap awaiting its
-// thread (see awaitingBootstrapBind).
+// openWhileStarting is the Open availability of a provisional Starting row.
+// Its Key is agentsctl's run ID, not a Codex thread ID, so there is nothing
+// to resume until reconcile binds the run to its thread.
 func openWhileStarting(awaitingBind bool) session.Availability {
 	if awaitingBind {
 		return session.Availability{Reason: "Codex rename-only session is still starting"}
 	}
-	return session.Availability{Available: true}
+	return session.Availability{Reason: "Codex session is still starting and has no bound thread yet"}
 }
 
 // recordPendingRename attaches name to the just-started run runID. It runs
@@ -504,30 +509,6 @@ func (p *Provider) clearRenameError(threadID string) {
 	}
 }
 
-func (p *Provider) PrepareAttach(ctx context.Context, s session.Session) (string, error) {
-	if s.RunID != "" {
-		// The row's Actions are advisory: a stale or hand-built session
-		// still reaches here, so the invariant is enforced on the current
-		// run record rather than on what the caller believes.
-		runs, err := p.Store.Runs()
-		if err != nil {
-			return "", fmt.Errorf("check managed run before attach: %w", err)
-		}
-		if awaitingBootstrapBind(runs[s.RunID]) {
-			return "", errors.New("codex rename-only session is still starting and cannot be attached until its thread is bound")
-		}
-		return s.RunID, nil
-	}
-	if !p.writerAbsent(s.Key.ID) {
-		return "", errors.New("external or unknown writer cannot be attached safely")
-	}
-	r, err := p.Runtime.ResumeExisting(ctx, s.Key.ID, s.CWD, managedEnvironment())
-	if err != nil {
-		return "", err
-	}
-	return r.ID, nil
-}
-
 func managedEnvironment() map[string]string {
 	// Read the invoking agentsctl process here: the persistent supervisor's
 	// inherited CODEX_EDITOR may belong to an earlier invocation.
@@ -538,21 +519,126 @@ func managedEnvironment() map[string]string {
 	return map[string]string{"EDITOR": editor}
 }
 
-// Open implements sessionctl.Opener: it resolves s to a managed run --
-// binding a still-external, writer-absent thread into one first if needed
-// (see PrepareAttach) -- then forwards the real terminal to the
-// supervisor's PTY for that run until detach (see
-// internal/supervisor.Client.Attach). TUI lifetime and the managed
-// process's lifetime are independent: Open returning does not stop the
-// Codex CLI process, and the supervisor keeps it (and its PTY) alive
-// across agentsctl restarts (see the DesignDoc's Codex supervisor
-// Lifetime section).
+var (
+	errUnboundRun     = errors.New("codex session is still starting and has no bound thread yet")
+	errExternalWriter = errors.New("external or unknown Codex writer prevents remote Open")
+)
+
+// openPreflightTimeout bounds the daemon status check before Open hands the
+// terminal to Codex.
+const openPreflightTimeout = 10 * time.Second
+
+// Open implements sessionctl.Opener by running the Codex TUI in the
+// foreground as a client of the shared app-server daemon:
+//
+//	codex --remote unix://<socket> resume <thread ID>
+//
+// on the caller's terminal, in s.CWD, with agentsctl's own environment. It
+// returns when that client exits. The client's lifetime is not the
+// thread's: its turns keep running in the daemon, and nothing here stops
+// or interrupts them.
+//
+// Before launching, Open proves s is a canonical Codex thread (see
+// openThreadID), ensures the daemon, and checks the thread's current
+// status on it (see preflightOpen); the row's Actions are only advisory.
+// An explicit --remote never falls back to an embedded app-server, and
+// neither does Open: a client failure is returned as is.
 func (p *Provider) Open(ctx context.Context, s session.Session, in *os.File, out io.Writer) error {
-	runID, err := p.PrepareAttach(ctx, s)
+	threadID, err := p.openThreadID(s)
 	if err != nil {
 		return err
 	}
-	return p.Runtime.Attach(ctx, runID, in, out)
+	if p.Foreground == nil {
+		return errors.New("codex foreground launcher is not configured")
+	}
+	socket, err := p.readySocket(ctx)
+	if err != nil {
+		return err
+	}
+	if err := p.preflightOpen(ctx, socket, threadID); err != nil {
+		return err
+	}
+	if err := p.Foreground.Start(ctx, p.path(), remoteResumeArgs(socket, threadID), s.CWD, in, out, out); err != nil {
+		return fmt.Errorf("codex remote resume %s: %w", threadID, err)
+	}
+	return nil
+}
+
+// remoteResumeArgs is the Codex CLI invocation that resumes threadID as a
+// client of the app-server on the Unix socket at socket. Codex takes
+// everything after "unix://" as the path, so it is passed verbatim.
+func remoteResumeArgs(socket, threadID string) []string {
+	return []string{"--remote", "unix://" + socket, "resume", threadID}
+}
+
+// openThreadID returns the Codex thread ID s names. A row still keyed by a
+// provisional run ID has none, and a row whose run is bound to a different
+// thread is refused rather than guessed. It reads the current run state,
+// not the caller's possibly stale row.
+func (p *Provider) openThreadID(s session.Session) (string, error) {
+	if s.Key.ID == "" {
+		return "", errors.New("codex session has no thread ID")
+	}
+	if p.Store == nil {
+		if s.RunID != "" {
+			return "", errors.New("codex run state is not configured")
+		}
+		return s.Key.ID, nil
+	}
+	runs, err := p.Store.Runs()
+	if err != nil {
+		return "", fmt.Errorf("check managed run before open: %w", err)
+	}
+	runID := s.RunID
+	if runID == "" {
+		// A row that lost its RunID but is still keyed by a run ID.
+		if _, isRun := runs[s.Key.ID]; !isRun {
+			return s.Key.ID, nil
+		}
+		runID = s.Key.ID
+	}
+	run, ok := runs[runID]
+	switch {
+	case !ok:
+		return "", fmt.Errorf("codex managed run %s is not tracked", runID)
+	case awaitingBootstrapBind(run):
+		return "", errors.New("codex rename-only session is still starting and cannot be opened until its thread is bound")
+	case run.SessionID == "":
+		return "", errUnboundRun
+	case run.SessionID != s.Key.ID:
+		return "", fmt.Errorf("codex managed run %s is bound to thread %s, not %s", runID, run.SessionID, s.Key.ID)
+	}
+	return run.SessionID, nil
+}
+
+// preflightOpen reads threadID's current status from the shared daemon on
+// a connection of its own, closed before Open launches anything. A thread
+// the daemon has loaded is its own and needs no writer check (the daemon
+// holds the lock); a notLoaded thread may be opened only while no other
+// process holds its writer lock. Anything it cannot establish fails closed.
+func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) error {
+	ctx, cancel := context.WithTimeout(ctx, openPreflightTimeout)
+	defer cancel()
+	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
+	if err != nil {
+		return fmt.Errorf("connect codex app-server daemon: %w", err)
+	}
+	defer conn.Close()
+	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
+		return fmt.Errorf("initialize codex app-server daemon: %w", err)
+	}
+	t, err := readThread(ctx, conn, threadID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("thread/read %s: %w", threadID, err)
+	case t.ID != threadID || t.Status.Type == "":
+		return fmt.Errorf("thread/read %s: malformed response", threadID)
+	case hiddenThread(t):
+		return fmt.Errorf("codex thread %s is an internal thread and cannot be opened", threadID)
+	case t.Status.Type == statusNotLoaded && !p.writerAbsent(threadID):
+		return errExternalWriter
+	}
+	return nil
 }
 
 // reconcile binds each locally-tracked, not-yet-bound managed run to at

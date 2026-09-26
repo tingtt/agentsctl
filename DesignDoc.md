@@ -524,10 +524,16 @@ attach client が自身の attach 中に確立する bracketed paste (「PTY att
 codex --remote unix://... resume <thread ID>
 ```
 
-- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。
-- foreground TUI の終了 / detach は thread / turn を停止しない。再 Open では同じ canonical thread ID を使う。
+- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。explicit `--remote` は接続失敗時に embedded runtime へ fallback しない。agentsctl 側も、foreground client の失敗を plain `codex resume`、managed PTY、embedded runtime のいずれでも再試行せず、そのまま Open の error とする。
+- `--remote` の socket path は daemon lifecycle response の `socketPath` とし、`unix://` に続けて encode せずそのまま1つの引数として渡す。
+- `resume` へ渡すのは canonical thread ID だけである。canonical thread ID を持たない row (移行期間中の legacy provisional run 等) は Open 不可とし、Provider 境界でも current run state を読み直して拒否する。
+- 起動前に daemon を確保し、同じ daemon へ Open 専用の短命 connection で `thread/read` を行って current status を確認する。Observer の snapshot や row の Actions は advisory であり、安全性判断の source of truth にしない。status を確定できない場合 (接続・initialize・`thread/read` の失敗、不正な response) は起動しない。
+- title 生成用の internal thread (`ephemeral` かつ `threadSource == "thread_title"`) は Open しない。
+- foreground TUI は agentsctl の terminal と environment をそのまま継承する通常の child process として `CWD` で実行する。supervisor PTY、出力 replay、`Ctrl+]` interception は挟まず、TUI の終了で Agent View へ戻る。
+- foreground TUI の終了 / detach は thread / turn を停止しない。Open の後始末で Stop、`turn/interrupt`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。
+- daemon が loaded として報告する thread は shared daemon 自身が writer lock を保持するため、writer lock を確認せず Open できる。
 - daemon が `notLoaded` で writer lock がない休止 thread は、shared daemon 上へ resume して Open できる。
-- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。
+- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。その writer が agentsctl の legacy managed run であっても同じである。
 
 #### Session actions
 
@@ -898,6 +904,7 @@ Codex の thread / turn runtime は shared app-server daemon が保持する。a
 
 - agentsctl は shared runtime が必要なとき `codex app-server daemon start` を冪等に実行して daemon を確保する。
 - Observer は初回接続だけでなく reconnect attempt の前にも daemon を確保し、lifecycle response の `socketPath` を接続先とする。
+- Open も起動のたびに daemon を確保し、同じ `socketPath` を preflight と `--remote` の接続先とする。Observer の接続状態には依存しない。
 - Observer が row authority を得る前の daemon 確保失敗は error-only update として warning を表示し、List が供給した rows を維持する。
 - implicit daemon auto-start や plain `codex resume` の fallback behavior を correctness の前提にしない。
 - daemon の Stop / Restart / Update を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。

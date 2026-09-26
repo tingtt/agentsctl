@@ -31,24 +31,20 @@ agentsctl combines Claude and Codex sessions into one list.
 
 Type a prompt and press `Enter` to start a background session. Use `Shift+Tab` to switch between Claude and Codex.
 
-With an empty prompt, select an existing session and press `Enter` to open it. `Ctrl+]` returns to Agent View without stopping the session.
+With an empty prompt, select an existing session and press `Enter` to open it. For Claude, `Ctrl+]` returns to Agent View without stopping the session. A Codex session opens in the Codex TUI connected to Codex's shared app-server; quitting the TUI returns to Agent View and leaves the session and any running turn in place.
 
 The session list can be scoped to the current directory, its descendants and Git worktrees, or all directories with `Ctrl+/`.
 
 Directory groups initially show 10 sessions at a time with selectable `Show more` rows. Pinned sessions stay together and can be folded or restored as one group.
 
-To use Codex's native external editor shortcut, set `CODEX_EDITOR` when starting agentsctl:
-
-```sh
-CODEX_EDITOR=nvim agentsctl
-```
+An opened Codex TUI inherits agentsctl's environment, so Codex's native external editor shortcut uses your `VISUAL` or `EDITOR`.
 
 ## Key bindings
 
 | Key | Action |
 | --- | --- |
 | `Enter` | Dispatch a prompt, or open/expand the selected row when the prompt is empty |
-| `Ctrl+]` | Detach and return to Agent View |
+| `Ctrl+]` | Detach from an opened Claude session or ChatGPT view and return to Agent View |
 | `Shift+Tab` | Switch the prompt provider between Claude and Codex |
 | `Option+Enter` / `Shift+Enter` | Insert a newline |
 | `↑` / `↓` | Move between session/control rows, or move the multiline prompt cursor |

@@ -102,7 +102,7 @@ func run() (*agentview.Restart, error) {
 	}
 	providers := []sessionctl.Source{
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon, Foreground: runner},
 	}
 	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {

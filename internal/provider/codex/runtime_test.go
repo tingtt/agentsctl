@@ -232,15 +232,19 @@ func TestObserverResolvesNotLoadedThroughWriterLockOnly(t *testing.T) {
 			t.Fatalf("%s=%s/%s, want %+v", id, s.Activity, s.Runtime, w)
 		}
 	}
-	// Action ownership is unchanged by observation: the loaded thread's
-	// writer is held, so Open/Stop stay unavailable as before.
-	if s, _ := rowOf(u, "loaded"); s.Actions.Available(session.ActionOpen) {
-		t.Fatalf("loaded thread actions=%+v", s.Actions)
+	// Open goes through the shared daemon: a thread it has loaded or a
+	// dormant one can be opened, one running outside it cannot. Stop stays
+	// with agentsctl-managed runs.
+	for id, open := range map[string]bool{"dormant": true, "external": false, "loaded": true} {
+		s, _ := rowOf(u, id)
+		if s.Actions.Available(session.ActionOpen) != open || s.Actions.Available(session.ActionStop) {
+			t.Fatalf("%s actions=%+v, want Open=%v and no Stop", id, s.Actions, open)
+		}
 	}
 }
 
-// A loaded thread's Activity never depends on the writer lock. (Actions
-// still probe it; that is the existing ownership rule.)
+// A loaded thread's Activity and actions never depend on the writer lock:
+// it is not even probed.
 func TestObserverLoadedActivityIgnoresWriterLock(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("loaded", 1))
@@ -250,8 +254,11 @@ func TestObserverLoadedActivityIgnoresWriterLock(t *testing.T) {
 	ch := observe(t, p)
 	d.waitReady(t)
 	u := waitFor(t, ch, "snapshot", activityIs("loaded", session.ActivityIdle))
-	if s, _ := rowOf(u, "loaded"); s.Runtime != session.RuntimeDetached {
+	if s, _ := rowOf(u, "loaded"); s.Runtime != session.RuntimeDetached || !s.Actions.Available(session.ActionOpen) {
 		t.Fatalf("loaded=%+v", s)
+	}
+	if n := probe.callsFor("loaded"); n != 0 {
+		t.Fatalf("writer lock probed %d times for a loaded thread", n)
 	}
 }
 

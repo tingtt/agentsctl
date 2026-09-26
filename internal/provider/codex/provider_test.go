@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"maps"
 	"os"
 	"os/exec"
@@ -36,14 +35,12 @@ type fakeAPI struct {
 
 type fakeDispatcher struct {
 	dispatchEnvironment map[string]string
-	resumeEnvironment   map[string]string
 
 	// dispatches counts Dispatch calls; prompt is the last one's prompt, i.e.
 	// what the Codex CLI would receive as its initial prompt. When store is
 	// set the run is recorded there like the supervisor does; dispatchErr
 	// fails the start instead. stopped lists the runs Stop was asked for.
 	dispatches  int
-	resumes     int
 	prompt      string
 	store       *localstate.Store
 	dispatchErr error
@@ -67,18 +64,10 @@ func (f *fakeDispatcher) Dispatch(_ context.Context, prompt, cwd string, baselin
 	return r, nil
 }
 
-func (f *fakeDispatcher) ResumeExisting(_ context.Context, _, _ string, environment map[string]string) (localstate.Run, error) {
-	f.resumes++
-	f.resumeEnvironment = cloneEnvironment(environment)
-	return localstate.Run{ID: "resume-run"}, nil
-}
-
 func (f *fakeDispatcher) Stop(_ context.Context, id string) error {
 	f.stopped = append(f.stopped, id)
 	return nil
 }
-
-func (f *fakeDispatcher) Attach(context.Context, string, *os.File, io.Writer) error { return nil }
 
 func cloneEnvironment(environment map[string]string) map[string]string {
 	if environment == nil {
@@ -91,7 +80,7 @@ func cloneEnvironment(environment map[string]string) map[string]string {
 	return result
 }
 
-func TestManagedCodexEnvironmentAppliesToDispatchAndResume(t *testing.T) {
+func TestManagedCodexEnvironmentAppliesToDispatch(t *testing.T) {
 	t.Setenv("CODEX_EDITOR", "nvim")
 	t.Setenv("EDITOR", "vim")
 	runtime := &fakeDispatcher{}
@@ -103,19 +92,10 @@ func TestManagedCodexEnvironmentAppliesToDispatchAndResume(t *testing.T) {
 	if _, err := provider.Dispatch(context.Background(), "prompt", "/work"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := provider.PrepareAttach(context.Background(), session.Session{
-		Key: session.Key{Provider: session.ProviderCodex, ID: "thread"},
-		CWD: "/work",
-	}); err != nil {
-		t.Fatal(err)
-	}
 
 	want := map[string]string{"EDITOR": "nvim"}
 	if !maps.Equal(runtime.dispatchEnvironment, want) {
 		t.Fatalf("dispatch environment=%v, want %v", runtime.dispatchEnvironment, want)
-	}
-	if !maps.Equal(runtime.resumeEnvironment, want) {
-		t.Fatalf("resume environment=%v, want %v", runtime.resumeEnvironment, want)
 	}
 	if got := os.Getenv("EDITOR"); got != "vim" {
 		t.Fatalf("agentsctl EDITOR=%q, want unchanged value vim", got)

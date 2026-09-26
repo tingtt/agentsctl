@@ -39,8 +39,9 @@ type Dispatcher interface {
 // Opener performs the common Agent View "Open selected session" intent
 // (see the DesignDoc's "Open as common Agent View intent"): taking over
 // the terminal for s using whatever transport the provider's runtime model
-// requires (Claude: `claude attach`; Codex: supervisor PTY attach; a
-// future browser-backed provider: launching a browser view). in/out are
+// requires (Claude: `claude attach`; Codex: a foreground `codex --remote`
+// client of the shared app-server daemon; a future browser-backed
+// provider: launching a browser view). in/out are
 // the real terminal file/writer Agent View owns. Open returns once control
 // has come back to Agent View -- i.e. the interactive view ended -- not
 // when the underlying session itself stops; the DesignDoc's Attach/Detach
