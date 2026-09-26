@@ -72,6 +72,11 @@ type codexRuntime struct {
 	// flight when an unlisted started thread closed. Only a later fetch may
 	// prove that the thread never became durable and prune its overlay.
 	closedStarted map[string]uint64
+	// activeTurnHints holds exact turn IDs returned by this process's
+	// turn/start calls. They only bridge Stop across the first turn's
+	// pre-materialization gap; thread/turns/list remains authoritative once
+	// available. The hints are never persisted or exposed in catalog rows.
+	activeTurnHints map[string]string
 	// status holds the native status of each daemon-loaded thread; a
 	// thread absent from it is notLoaded.
 	status map[string]ThreadStatus
@@ -93,15 +98,16 @@ type codexRuntime struct {
 
 func newCodexRuntime(readySocket func(context.Context) (string, error)) *codexRuntime {
 	return &codexRuntime{
-		readySocket:   readySocket,
-		minBackoff:    defaultMinBackoff,
-		maxBackoff:    defaultMaxBackoff,
-		catalogGap:    defaultCatalogGap,
-		changed:       make(chan struct{}, 1),
-		wake:          make(chan struct{}, 1),
-		hidden:        map[string]bool{},
-		started:       map[string]Thread{},
-		closedStarted: map[string]uint64{},
+		readySocket:     readySocket,
+		minBackoff:      defaultMinBackoff,
+		maxBackoff:      defaultMaxBackoff,
+		catalogGap:      defaultCatalogGap,
+		changed:         make(chan struct{}, 1),
+		wake:            make(chan struct{}, 1),
+		hidden:          map[string]bool{},
+		started:         map[string]Thread{},
+		closedStarted:   map[string]uint64{},
+		activeTurnHints: map[string]string{},
 	}
 }
 
@@ -250,6 +256,7 @@ func (r *codexRuntime) startLifecycle() {
 	r.live, r.everLive, r.lastErr, r.lastReadyErr, r.status = false, false, nil, false, nil
 	r.started = map[string]Thread{}
 	r.closedStarted = map[string]uint64{}
+	r.activeTurnHints = map[string]string{}
 }
 
 // run connects, and reconnects with bounded backoff, until ctx ends.
@@ -285,6 +292,7 @@ func (r *codexRuntime) disconnected(err error, readyErr bool) {
 	r.mu.Lock()
 	changed := r.live || r.lastErr == nil || r.lastErr.Error() != err.Error() || r.lastReadyErr != readyErr
 	r.live, r.snapshotting, r.dirty, r.status = false, false, nil, nil
+	r.activeTurnHints = map[string]string{}
 	r.lastErr, r.lastReadyErr = err, readyErr
 	r.mu.Unlock()
 	if changed {
@@ -557,6 +565,7 @@ func (r *codexRuntime) handleNotification(method string, params json.RawMessage)
 		}
 		if json.Unmarshal(params, &p) == nil && p.ThreadID != "" {
 			r.forgetStarted(p.ThreadID)
+			r.forgetActiveTurn(p.ThreadID, "")
 		}
 		r.requestCatalog()
 	case notifyUnarchived:
@@ -629,6 +638,35 @@ func (r *codexRuntime) markStartedClosed(id string) {
 	r.mu.Unlock()
 }
 
+// rememberActiveTurn records only an exact turn/start response. The hint
+// is consulted only when Codex explicitly reports that turns/list is not
+// available before the first user message materializes.
+func (r *codexRuntime) rememberActiveTurn(threadID, turnID string) {
+	if threadID == "" || turnID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.activeTurnHints[threadID] = turnID
+	r.mu.Unlock()
+}
+
+func (r *codexRuntime) activeTurnHint(threadID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.activeTurnHints[threadID]
+}
+
+// forgetActiveTurn removes a hint when expectedTurnID is empty or still
+// matches it. The match guard prevents delayed cleanup from deleting a
+// newer exact hint.
+func (r *codexRuntime) forgetActiveTurn(threadID, expectedTurnID string) {
+	r.mu.Lock()
+	if expectedTurnID == "" || r.activeTurnHints[threadID] == expectedTurnID {
+		delete(r.activeTurnHints, threadID)
+	}
+	r.mu.Unlock()
+}
+
 // setStatus records one thread's new native status. During a snapshot it
 // only marks the thread dirty (see snapshot). A status for a thread the
 // catalog does not list yet (and that is not known to be hidden) also asks
@@ -636,6 +674,9 @@ func (r *codexRuntime) markStartedClosed(id string) {
 // stay out of the catalog.
 func (r *codexRuntime) setStatus(id string, status ThreadStatus) {
 	r.mu.Lock()
+	if status.Type == statusIdle || status.Type == statusSystemError || status.Type == statusNotLoaded {
+		delete(r.activeTurnHints, id)
+	}
 	if r.snapshotting {
 		r.dirty[id] = true
 		r.mu.Unlock()

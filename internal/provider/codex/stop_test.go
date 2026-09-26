@@ -37,6 +37,94 @@ func TestStopInterruptsAuthoritativelyResolvedActiveTurn(t *testing.T) {
 	}
 }
 
+func TestStopImmediatelyAfterDispatchUsesExactUnmaterializedTurnHint(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.turnStarted = "never"
+	created, err := f.p.Dispatch(context.Background(), "long work", "/work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.p.Stop(context.Background(), created.Key); err != nil {
+		t.Fatal(err)
+	}
+	params := decodeParams(t, f.d.requestsOf("turn/interrupt")[0])
+	if want := map[string]any{"threadId": "thread-new-1", "turnId": "turn-1"}; !reflect.DeepEqual(params, want) {
+		t.Fatalf("turn/interrupt params = %v, want %v", params, want)
+	}
+	if f.d.callCount("thread/turns/list") != 1 {
+		t.Fatalf("thread/turns/list calls = %d, want one attempt without polling", f.d.callCount("thread/turns/list"))
+	}
+	if active := f.d.activeTurn("thread-new-1"); active != "" {
+		t.Fatalf("turn remains active: %s", active)
+	}
+	if hint := f.p.runtime().activeTurnHint("thread-new-1"); hint != "" {
+		t.Fatalf("active turn hint after Stop = %q, want cleared", hint)
+	}
+	if len(f.legacy.stopped) != 0 {
+		t.Fatalf("Stop used the legacy process path: %v", f.legacy.stopped)
+	}
+}
+
+func TestStopUnmaterializedExternalThreadWithoutHintFailsClosed(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.startUnmaterializedTurn("thread-external", "turn-external", active())
+	err := f.p.Stop(context.Background(), codexKey("thread-external"))
+	if err == nil || !strings.Contains(err.Error(), "exact turn ID is unavailable") {
+		t.Fatalf("Stop = %v, want missing exact-turn hint error", err)
+	}
+	if f.d.callCount("turn/interrupt") != 0 {
+		t.Fatal("Stop guessed and interrupted an unmaterialized external turn")
+	}
+}
+
+func TestStopOtherTurnsListErrorNeverUsesHint(t *testing.T) {
+	f := prepareActiveStop(t, active())
+	f.p.runtime().rememberActiveTurn("thread-1", "turn-1")
+	f.d.failNext("thread/turns/list", 1)
+	err := f.p.Stop(context.Background(), codexKey("thread-1"))
+	if err == nil || !strings.Contains(err.Error(), "resolve active Codex turn") {
+		t.Fatalf("Stop = %v, want authoritative lookup error", err)
+	}
+	if f.d.callCount("turn/interrupt") != 0 {
+		t.Fatal("Stop used a hint for a non-materialization lookup error")
+	}
+}
+
+func TestStopAuthoritativeTurnOverridesStaleHint(t *testing.T) {
+	f := prepareActiveStop(t, active())
+	f.d.startActiveTurn("thread-1", "turn-2", active())
+	f.p.runtime().rememberActiveTurn("thread-1", "turn-1")
+	if err := f.p.Stop(context.Background(), codexKey("thread-1")); err != nil {
+		t.Fatal(err)
+	}
+	params := decodeParams(t, f.d.requestsOf("turn/interrupt")[0])
+	if got := params["turnId"]; got != "turn-2" {
+		t.Fatalf("turn/interrupt turnId = %v, want authoritative turn-2", got)
+	}
+}
+
+func TestStopHintFallbackNeverInterruptsReplacement(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.startUnmaterializedTurn("thread-1", "turn-1", active())
+	f.p.runtime().rememberActiveTurn("thread-1", "turn-1")
+	f.d.before["turn/interrupt"] = func(c *fakeConn) {
+		f.d.completeTurn(c, "thread-1", "turn-1", turnStatusCompleted)
+		f.d.materialize("thread-1")
+		f.d.startActiveTurn("thread-1", "turn-2", active())
+		f.d.broadcast(notifyStatusChanged, map[string]any{"threadId": "thread-1", "status": active()})
+	}
+	err := f.p.Stop(context.Background(), codexKey("thread-1"))
+	if err == nil || !strings.Contains(err.Error(), "different active turn turn-2") {
+		t.Fatalf("Stop = %v, want fail-closed replacement-turn error", err)
+	}
+	if active := f.d.activeTurn("thread-1"); active != "turn-2" {
+		t.Fatalf("replacement turn = %q, want turn-2 untouched", active)
+	}
+	if f.d.callCount("turn/interrupt") != 1 {
+		t.Fatalf("turn/interrupt calls = %d, want no retry", f.d.callCount("turn/interrupt"))
+	}
+}
+
 func TestStopInterruptsUserWaitsAndResolvesPendingRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

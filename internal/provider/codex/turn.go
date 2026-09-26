@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -14,6 +15,10 @@ const (
 	turnStatusFailed      = "failed"
 	turnStatusInProgress  = "inProgress"
 )
+
+var errTurnsListUnmaterialized = errors.New("codex thread turns are not materialized")
+
+const turnsListUnmaterializedMessage = "thread/turns/list is unavailable before first user message"
 
 type turnKey struct {
 	threadID string
@@ -169,6 +174,9 @@ func readCurrentTurnState(ctx context.Context, conn *rpcConn, threadID string) (
 	}
 	params := map[string]any{"threadId": threadID, "limit": 100, "sortDirection": "desc", "itemsView": "notLoaded"}
 	if err := conn.call(ctx, "thread/turns/list", params, &res); err != nil {
+		if isTurnsListUnmaterialized(err) {
+			return state, fmt.Errorf("%w: thread/turns/list %s: %v", errTurnsListUnmaterialized, threadID, err)
+		}
 		return currentTurnState{}, fmt.Errorf("thread/turns/list %s: %w", threadID, err)
 	}
 	for _, turn := range res.Data {
@@ -201,6 +209,13 @@ func readCurrentTurnState(ctx context.Context, conn *rpcConn, threadID string) (
 		}
 	}
 	return state, nil
+}
+
+// isTurnsListUnmaterialized classifies the Codex 0.157.1 InvalidRequest
+// message. The protocol exposes no dedicated error code or structured
+// reason for this pre-materialization condition.
+func isTurnsListUnmaterialized(err error) bool {
+	return err != nil && strings.Contains(err.Error(), turnsListUnmaterializedMessage)
 }
 
 func cleanupBootstrapTurn(ctx context.Context, conn *rpcConn, events *turnLifecycleEvents, threadID, turnID string) error {

@@ -347,23 +347,40 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	}
 	return connectDaemon(ctx, socket, events.observe, func(conn *rpcConn) error {
 		state, err := readCurrentTurnState(ctx, conn, k.ID)
-		if err != nil {
+		var turnID string
+		switch {
+		case err == nil:
+			if state.status.Type == statusNotLoaded && !p.writerAbsent(k.ID) {
+				return errors.New("external or unknown Codex writer cannot be stopped safely")
+			}
+			turnID = state.activeTurnID
+		case errors.Is(err, errTurnsListUnmaterialized):
+			turnID = p.runtime().activeTurnHint(k.ID)
+			if turnID == "" {
+				return fmt.Errorf("cannot safely stop active Codex thread %s: current turn is not materialized yet and its exact turn ID is unavailable", k.ID)
+			}
+		default:
 			return fmt.Errorf("resolve active Codex turn: %w", err)
 		}
-		if state.status.Type == statusNotLoaded && !p.writerAbsent(k.ID) {
-			return errors.New("external or unknown Codex writer cannot be stopped safely")
-		}
-		turnID := state.activeTurnID
 		if turnID == "" {
+			p.runtime().forgetActiveTurn(k.ID, "")
 			return nil
 		}
 		if err := interruptTurn(ctx, conn, k.ID, turnID); err != nil {
-			return p.reconcileStopRace(ctx, conn, k.ID, turnID, err)
+			if err := p.reconcileStopRace(ctx, conn, k.ID, turnID, err); err != nil {
+				return err
+			}
+			p.runtime().forgetActiveTurn(k.ID, "")
+			return nil
 		}
 		if err := events.waitInactive(ctx, conn, k.ID); err != nil {
 			return fmt.Errorf("wait for Codex turn %s to stop: %w", turnID, err)
 		}
-		return p.confirmStoppedTurn(ctx, conn, k.ID, turnID)
+		if err := p.confirmStoppedTurn(ctx, conn, k.ID, turnID); err != nil {
+			return err
+		}
+		p.runtime().forgetActiveTurn(k.ID, "")
+		return nil
 	})
 }
 

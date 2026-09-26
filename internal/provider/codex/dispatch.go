@@ -75,6 +75,7 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		if err != nil {
 			return fmt.Errorf("codex turn/start on thread %s: %w", threadID, err)
 		}
+		p.runtime().rememberActiveTurn(threadID, turnID)
 
 		// Committed: the turn has started. What follows must neither undo
 		// it nor report it as failed, and the caller giving up no longer
@@ -98,6 +99,9 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 			cleanupErr = cleanupStep(ctx, func(ctx context.Context) error {
 				return cleanupBootstrapTurn(ctx, conn, lifecycle, threadID, turnID)
 			})
+			if cleanupErr == nil {
+				p.runtime().forgetActiveTurn(threadID, turnID)
+			}
 		}
 		_ = cleanupStep(ctx, func(ctx context.Context) error { return unsubscribeThread(ctx, conn, threadID) })
 		if renameErr != nil {

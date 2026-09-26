@@ -606,7 +606,7 @@ Stop は、session に紐づく実行中の処理を provider-native な方法�
 
 - Stop は Codex process の kill ではなく、shared app-server 上の active turn を native RPC で interrupt する。
 - Stop の時点で shared daemon の `thread/read` と live turn を含む `thread/turns/list` から current `inProgress` turn を取得し、その exact turn ID に `turn/interrupt` を送る。Observer cache から turn ID を推測しない。
-- turn ID は daemon restart 後に変化しうるため cache しない。
+- first turn の materialization 前だけは `thread/turns/list` が明示的に unavailable を返すため、この process の `turn/start` response が返した同じ thread の exact turn ID を in-memory hint として使用できる。hint は永続化せず、notification または daemon lifecycle の終了で破棄し、別 turn を代わりに interrupt しない。
 - approval / user-input 待ちも active turn として interrupt でき、pending request は破棄される。
 - lookup 後に対象 turn が終了した race は authoritative state を再確認する。別 turn が active ならそれを代わりに止めず fail closed とする。
 - interrupt 後も thread 自体は残り、次の turn を開始できる。

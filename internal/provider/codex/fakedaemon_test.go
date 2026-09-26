@@ -449,6 +449,9 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 		_ = json.Unmarshal(params, &p)
 		d.mu.Lock()
 		defer d.mu.Unlock()
+		if _, ok := d.pending[p.ThreadID]; ok {
+			return nil, fmt.Errorf("thread %s is not materialized yet; %s", p.ThreadID, turnsListUnmaterializedMessage)
+		}
 		var turns []any
 		if turnID := d.activeTurns[p.ThreadID]; turnID != "" {
 			turns = append(turns, map[string]any{"id": turnID, "status": turnStatusInProgress, "items": []any{}})
@@ -601,6 +604,14 @@ func (d *fakeDaemon) completeTurn(c *fakeConn, threadID, turnID, status string) 
 
 func (d *fakeDaemon) startActiveTurn(threadID, turnID string, status ThreadStatus) {
 	d.mu.Lock()
+	d.activeTurns[threadID] = turnID
+	d.loaded[threadID] = status
+	d.mu.Unlock()
+}
+
+func (d *fakeDaemon) startUnmaterializedTurn(threadID, turnID string, status ThreadStatus) {
+	d.mu.Lock()
+	d.pending[threadID] = Thread{ID: threadID, CWD: "/work", CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
 	d.activeTurns[threadID] = turnID
 	d.loaded[threadID] = status
 	d.mu.Unlock()

@@ -37,6 +37,42 @@ func notifyRuntime(t *testing.T, rt *codexRuntime, method string, params any) {
 	rt.handleNotification(method, raw)
 }
 
+func TestActiveTurnHintClearsOnNonActiveStatusAndRuntimeRemoval(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		method string
+		params any
+	}{
+		{name: "idle status", method: notifyStatusChanged, params: map[string]any{"threadId": "new", "status": idle}},
+		{name: "closed", method: notifyClosed, params: map[string]any{"threadId": "new"}},
+		{name: "archived", method: notifyArchived, params: map[string]any{"threadId": "new"}},
+		{name: "deleted", method: notifyDeleted, params: map[string]any{"threadId": "new"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newLiveRuntime(t)
+			rt.rememberActiveTurn("new", "turn-1")
+			notifyRuntime(t, rt, tc.method, tc.params)
+			if got := rt.activeTurnHint("new"); got != "" {
+				t.Fatalf("active turn hint = %q, want cleared", got)
+			}
+		})
+	}
+}
+
+func TestActiveTurnHintsClearAcrossRuntimeLifecycle(t *testing.T) {
+	rt := newLiveRuntime(t)
+	rt.rememberActiveTurn("new", "turn-1")
+	rt.disconnected(nil, false)
+	if got := rt.activeTurnHint("new"); got != "" {
+		t.Fatalf("active turn hint after disconnect = %q, want cleared", got)
+	}
+	rt.rememberActiveTurn("new", "turn-2")
+	rt.startLifecycle()
+	if got := rt.activeTurnHint("new"); got != "" {
+		t.Fatalf("active turn hint after lifecycle reset = %q, want cleared", got)
+	}
+}
+
 func visibleIDs(rt *codexRuntime) []string {
 	var ids []string
 	for _, t := range rt.view().catalog {
