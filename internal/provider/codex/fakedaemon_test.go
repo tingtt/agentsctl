@@ -32,8 +32,13 @@ type fakeDaemon struct {
 	ln     net.Listener
 	srv    *http.Server
 
-	mu       sync.Mutex
-	threads  []Thread                // thread/list
+	mu      sync.Mutex
+	threads []Thread // thread/list: the durable catalog
+	// pending holds threads thread/start created whose rollout is not
+	// persisted yet: loaded and readable, but not in thread/list, and
+	// thread/name/set on them fails, like the real daemon. A thread moves
+	// to threads when its first turn/started goes out (see materialize).
+	pending  map[string]Thread
 	archived []Thread                // moved here by thread/archive
 	loaded   map[string]ThreadStatus // thread/loaded/list + thread/read
 	pageSize int                     // thread/list page size; 0 = one page
@@ -73,9 +78,8 @@ type fakeDaemon struct {
 	unsubscribeStatus any
 	before            map[string]func(c *fakeConn)
 
-	// Turn lifecycle. turn/start leaves a thread thread/start created
-	// unmaterialized (no rollout: thread/name/set on it fails, like the real
-	// daemon) until its turn/started goes out; turnStarted says when:
+	// Turn lifecycle. A thread thread/start created stays pending until
+	// its turn/started goes out; turnStarted says when:
 	//   ""               after the response, but only once the client's next
 	//                    request was handled (or turnStartedGrace passed),
 	//                    so a client that does not wait for it races it
@@ -88,7 +92,6 @@ type fakeDaemon struct {
 	turnStarted          string
 	unrelatedTurnStarted bool
 	traceLifecycle       bool
-	unmaterialized       map[string]bool
 
 	// ready receives each connection once the client sent initialized.
 	ready chan *fakeConn
@@ -143,7 +146,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, params: map[string][]json.RawMessage{}, unmaterialized: map[string]bool{}, before: map[string]func(*fakeConn){}, dropOn: map[string]bool{}, hangOn: map[string]bool{}, ready: make(chan *fakeConn, 16)}
+	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, params: map[string][]json.RawMessage{}, pending: map[string]Thread{}, before: map[string]func(*fakeConn){}, dropOn: map[string]bool{}, hangOn: map[string]bool{}, ready: make(chan *fakeConn, 16)}
 	d.start()
 	t.Cleanup(d.stop)
 	return d
@@ -377,6 +380,10 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 				return map[string]any{"thread": t}, nil
 			}
 		}
+		if t, ok := d.pending[p.ThreadID]; ok {
+			t.Status = status
+			return map[string]any{"thread": t}, nil
+		}
 		if loaded {
 			return map[string]any{"thread": Thread{ID: p.ThreadID, Status: status}}, nil
 		}
@@ -393,9 +400,8 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 		}
 		d.threadSeq++
 		t := Thread{ID: "thread-new-" + strconv.Itoa(d.threadSeq), CWD: p.CWD, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
-		d.threads = append(d.threads, t)
+		d.pending[t.ID] = t
 		d.loaded[t.ID] = idle
-		d.unmaterialized[t.ID] = true
 		d.mu.Unlock()
 		t.Status = idle
 		d.broadcast(notifyStarted, map[string]any{"thread": t})
@@ -468,7 +474,7 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 		}
 		_ = json.Unmarshal(params, &p)
 		d.mu.Lock()
-		if d.unmaterialized[p.ThreadID] {
+		if _, ok := d.pending[p.ThreadID]; ok {
 			d.mu.Unlock()
 			return nil, errors.New("failed to set thread name: Fatal error: failed to update thread metadata " + p.ThreadID)
 		}
@@ -491,13 +497,27 @@ func (c *fakeConn) turnStarted(threadID, turnID string, materializes bool) {
 	d := c.d
 	d.mu.Lock()
 	if materializes {
-		delete(d.unmaterialized, threadID)
+		d.materializeLocked(threadID)
 	}
 	if d.traceLifecycle {
 		d.events = append(d.events, "turn/started "+threadID+"/"+turnID)
 	}
 	d.mu.Unlock()
 	c.notify("turn/started", map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": "inProgress", "items": []any{}}})
+}
+
+// materialize persists a pending thread: from now on thread/list lists it.
+func (d *fakeDaemon) materialize(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.materializeLocked(id)
+}
+
+func (d *fakeDaemon) materializeLocked(id string) {
+	if t, ok := d.pending[id]; ok {
+		delete(d.pending, id)
+		d.threads = append(d.threads, t)
+	}
 }
 
 // broadcast sends a notification on every open connection.

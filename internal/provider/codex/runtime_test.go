@@ -605,7 +605,9 @@ func TestCatalogResyncFailureReconnectsAndConverges(t *testing.T) {
 
 	d.setThreads(catalogThread("a", 1), catalogThread("b", 2))
 	d.failNext("thread/list", 1)
-	c.notify(notifyStarted, map[string]any{"thread": catalogThread("b", 2)})
+	// b only becomes visible through the catalog re-read (unlike a
+	// thread/started, which shows its thread at once).
+	c.notify(notifyUnarchived, map[string]any{"threadId": "b"})
 
 	var sawUnavailable bool
 	waitFor(t, ch, "b listed", func(u sessionctl.ProviderUpdate) bool {
