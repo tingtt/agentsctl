@@ -21,8 +21,10 @@ import (
 
 // fakeDaemon is a minimal scripted Codex app-server listening on a Unix
 // socket with the WebSocket transport: initialize, thread/list,
-// thread/loaded/list, thread/read, server-sent notifications and forced
-// disconnects. It implements only what the runtime uses.
+// thread/loaded/list, thread/read, the Dispatch requests (thread/start,
+// turn/start, thread/unsubscribe, thread/name/set), server-sent
+// notifications and requests, and forced disconnects. It implements only
+// what the provider uses.
 type fakeDaemon struct {
 	t      *testing.T
 	socket string
@@ -44,6 +46,31 @@ type fakeDaemon struct {
 	failures map[string]int
 	conns    []*fakeConn
 
+	// events logs, in arrival order, the method of every client request
+	// (not notifications) and "close" whenever a connection ends. params
+	// holds each request's params by method, in arrival order.
+	events []string
+	params map[string][]json.RawMessage
+	// clientResponses holds every JSON-RPC response a client sent, i.e.
+	// every answer to a server-initiated request.
+	clientResponses []json.RawMessage
+	// dropOn[method] closes the connection instead of answering a request
+	// of method; hangOn[method] never answers it.
+	dropOn map[string]bool
+	hangOn map[string]bool
+
+	// Dispatch scripting. threadSeq numbers the threads thread/start
+	// creates (thread-new-<n>). threadStartResult / turnStartResult, when
+	// set, replace the respective response. unsubscribeStatus is the
+	// thread/unsubscribe status (default unsubscribed). before[method]
+	// runs on the connection's handler goroutine before a request of
+	// method is answered, so whatever it sends precedes the response.
+	threadSeq         int
+	threadStartResult any
+	turnStartResult   any
+	unsubscribeStatus any
+	before            map[string]func(c *fakeConn)
+
 	// ready receives each connection once the client sent initialized.
 	ready chan *fakeConn
 }
@@ -63,7 +90,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, ready: make(chan *fakeConn, 16)}
+	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, params: map[string][]json.RawMessage{}, before: map[string]func(*fakeConn){}, dropOn: map[string]bool{}, hangOn: map[string]bool{}, ready: make(chan *fakeConn, 16)}
 	d.start()
 	t.Cleanup(d.stop)
 	return d
@@ -143,6 +170,11 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	c := &fakeConn{d: d, ws: ws, closed: make(chan struct{})}
 	defer close(c.closed)
+	defer func() {
+		d.mu.Lock()
+		d.events = append(d.events, "close")
+		d.mu.Unlock()
+	}()
 	d.mu.Lock()
 	d.conns = append(d.conns, c)
 	d.mu.Unlock()
@@ -159,22 +191,49 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(data, &msg) != nil {
 			continue
 		}
+		if msg.Method == "" {
+			d.mu.Lock()
+			d.clientResponses = append(d.clientResponses, append(json.RawMessage(nil), data...))
+			d.mu.Unlock()
+			continue
+		}
 		d.mu.Lock()
 		d.calls[msg.Method]++
+		if len(msg.ID) > 0 {
+			d.events = append(d.events, msg.Method)
+			d.params[msg.Method] = append(d.params[msg.Method], msg.Params)
+		}
+		drop, hang := d.dropOn[msg.Method], d.hangOn[msg.Method]
 		fail := len(msg.ID) > 0 && d.failures[msg.Method] > 0
 		if fail {
 			d.failures[msg.Method]--
 		}
 		d.mu.Unlock()
+		if len(msg.ID) > 0 && drop {
+			_ = ws.CloseNow()
+			return
+		}
+		if len(msg.ID) > 0 && hang {
+			continue
+		}
 		if fail {
 			c.send(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "error": map[string]any{"code": -32603, "message": "injected failure"}})
 			continue
 		}
 		if len(msg.ID) == 0 {
 			if msg.Method == "initialized" {
-				d.ready <- c
+				select {
+				case d.ready <- c:
+				default: // nobody waits for this connection (e.g. Dispatch's own)
+				}
 			}
 			continue
+		}
+		d.mu.Lock()
+		hook := d.before[msg.Method]
+		d.mu.Unlock()
+		if hook != nil {
+			hook(c)
 		}
 		result, rpcErr := d.handle(c, msg.Method, msg.Params)
 		reply := map[string]any{"jsonrpc": "2.0", "id": msg.ID}
@@ -262,8 +321,113 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 			return map[string]any{"thread": Thread{ID: p.ThreadID, Status: status}}, nil
 		}
 		return nil, errors.New("thread not found")
+	case "thread/start":
+		var p struct {
+			CWD string `json:"cwd"`
+		}
+		_ = json.Unmarshal(params, &p)
+		d.mu.Lock()
+		if d.threadStartResult != nil {
+			defer d.mu.Unlock()
+			return d.threadStartResult, nil
+		}
+		d.threadSeq++
+		t := Thread{ID: "thread-new-" + strconv.Itoa(d.threadSeq), CWD: p.CWD, CreatedAt: time.Now().Unix(), UpdatedAt: time.Now().Unix()}
+		d.threads = append(d.threads, t)
+		d.loaded[t.ID] = idle
+		d.mu.Unlock()
+		t.Status = idle
+		d.broadcast(notifyStarted, map[string]any{"thread": t})
+		return map[string]any{"thread": t, "model": "fake-model", "modelProvider": "fake", "cwd": p.CWD}, nil
+	case "turn/start":
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		d.mu.Lock()
+		override := d.turnStartResult
+		d.mu.Unlock()
+		if override != nil {
+			return override, nil
+		}
+		d.setLoaded(p.ThreadID, active())
+		d.broadcast(notifyStatusChanged, map[string]any{"threadId": p.ThreadID, "status": active()})
+		return map[string]any{"turn": map[string]any{"id": "turn-1", "status": "inProgress", "items": []any{}}}, nil
+	case "thread/unsubscribe":
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		status := d.unsubscribeStatus
+		if status == nil {
+			status = "unsubscribed"
+		}
+		return map[string]any{"status": status}, nil
+	case "thread/name/set":
+		var p struct {
+			ThreadID string `json:"threadId"`
+			Name     string `json:"name"`
+		}
+		_ = json.Unmarshal(params, &p)
+		d.mu.Lock()
+		for i := range d.threads {
+			if d.threads[i].ID == p.ThreadID {
+				d.threads[i].Name = ptr(p.Name)
+			}
+		}
+		d.mu.Unlock()
+		d.broadcast(notifyNameUpdated, map[string]any{"threadId": p.ThreadID, "threadName": p.Name})
+		return map[string]any{}, nil
 	}
 	return nil, errors.New("method not found")
+}
+
+// broadcast sends a notification on every open connection.
+func (d *fakeDaemon) broadcast(method string, params any) {
+	d.mu.Lock()
+	conns := append([]*fakeConn(nil), d.conns...)
+	d.mu.Unlock()
+	for _, c := range conns {
+		c.notify(method, params)
+	}
+}
+
+// requestsOf returns the params of every request of method so far.
+func (d *fakeDaemon) requestsOf(method string) []json.RawMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]json.RawMessage(nil), d.params[method]...)
+}
+
+func (d *fakeDaemon) eventLog() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.events...)
+}
+
+func (d *fakeDaemon) responses() []json.RawMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]json.RawMessage(nil), d.clientResponses...)
+}
+
+// waitClosed waits until n connections have ended.
+func (d *fakeDaemon) waitClosed(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		closed := 0
+		for _, e := range d.eventLog() {
+			if e == "close" {
+				closed++
+			}
+		}
+		if closed >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d connections closed, want %d", closed, n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (c *fakeConn) send(msg any) {

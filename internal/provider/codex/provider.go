@@ -22,11 +22,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Dispatcher starts and stops legacy supervisor-managed Codex runs. Open
-// never goes through it: it connects a foreground client to the shared
-// app-server daemon instead (see Provider.Open).
-type Dispatcher interface {
-	Dispatch(context.Context, string, string, []string, map[string]string) (localstate.Run, error)
+// ManagedRuntime stops legacy supervisor-managed Codex runs that were
+// started before Dispatch moved to the shared app-server daemon. Nothing
+// new is ever started through it: Dispatch talks to the daemon over RPC
+// (see Provider.Dispatch), and Open connects a foreground client to the
+// daemon (see Provider.Open).
+type ManagedRuntime interface {
 	Stop(context.Context, string) error
 }
 
@@ -44,7 +45,7 @@ type Provider struct {
 	API     AppServer
 	Runner  base.Runner
 	Store   *localstate.Store
-	Runtime Dispatcher
+	Runtime ManagedRuntime
 	Daemon  DaemonLifecycle
 	// Foreground runs the interactive Codex TUI client on the caller's
 	// terminal (see Open). It is separate from Runner, which only captures
@@ -227,42 +228,9 @@ func sortedKeys(keys []session.Key) []session.Key {
 	return keys
 }
 
-func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
-	// A composer input that is only `/rename <name>` is never forwarded to
-	// Codex: as an initial prompt it would reach the model as plain text.
-	// The requested name stays with agentsctl (see recordPendingRename) and
-	// the model only ever sees a fixed bootstrap prompt.
-	var pendingRename string
-	if name, isRename := parseRenameOnly(prompt); isRename {
-		if name == "" {
-			return session.Session{}, errors.New("name must not be empty")
-		}
-		prompt, pendingRename = renameBootstrapPrompt, name
-	}
-	before, err := p.API.List(ctx, false)
-	if err != nil {
-		return session.Session{}, err
-	}
-	baseline := make([]string, 0, len(before))
-	for _, t := range before {
-		baseline = append(baseline, t.ID)
-	}
-	r, err := p.Runtime.Dispatch(ctx, prompt, cwd, baseline, managedEnvironment())
-	if err != nil {
-		return session.Session{}, err
-	}
-	if pendingRename != "" {
-		if err := p.recordPendingRename(ctx, r.ID, pendingRename); err != nil {
-			return session.Session{}, err
-		}
-	}
-	createdAt := time.Now()
-	actions := session.Actions{session.ActionOpen: openWhileStarting(pendingRename != ""), session.ActionStop: {Available: true}}
-	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: startingName(pendingRename != ""), CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
-}
-
-// awaitingBootstrapBind reports whether r is a rename-only bootstrap run
-// that reconcile has not yet bound to its real thread. Like every unbound
+// awaitingBootstrapBind reports whether r is a legacy rename-only bootstrap
+// run that reconcile has not yet bound to its real thread. Only runs
+// persisted before Dispatch moved to the shared daemon have this shape. Like every unbound
 // run it cannot be opened (see openWhileStarting); it only gets a more
 // specific reason, since its first model turn is what creates the thread
 // reconciliation must bind.
@@ -290,33 +258,11 @@ func openWhileStarting(awaitingBind bool) session.Availability {
 	return session.Availability{Reason: "Codex session is still starting and has no bound thread yet"}
 }
 
-// recordPendingRename attaches name to the just-started run runID. It runs
-// after the supervisor has recorded the run, so the name lives in the same
-// local run state reconciliation already reads; a concurrent bind of the
-// run only ever adds SessionID, which this update leaves alone. If the name
-// cannot be recorded the run is stopped rather than left running a
-// bootstrap turn nothing will ever rename.
-func (p *Provider) recordPendingRename(ctx context.Context, runID, name string) error {
-	applied, err := p.Store.UpdateRunIf(runID,
-		func(localstate.Run) bool { return true },
-		func(r localstate.Run) localstate.Run { r.PendingRename = name; return r },
-	)
-	if err == nil && !applied {
-		err = errors.New("started run is not tracked")
-	}
-	if err == nil {
-		return nil
-	}
-	err = fmt.Errorf("record pending rename: %w", err)
-	if stopErr := p.Runtime.Stop(ctx, runID); stopErr != nil {
-		err = errors.Join(err, fmt.Errorf("stop run: %w", stopErr))
-	}
-	return err
-}
-
 // applyPendingRenames renames, through the same native rename an existing
-// session uses, each thread that reconcile has just bound to a run still
-// carrying a PendingRename, and clears the pending state. There is one
+// session uses, each thread that reconcile has just bound to a legacy run
+// still carrying a PendingRename, and clears the pending state. Dispatch no
+// longer records one; this only settles runs persisted before it moved to
+// the shared daemon. There is one
 // attempt: the thread exists whatever happens, so a failure is recorded on
 // the run (RenameError, surfaced by List) and an ordinary rename of the
 // thread is the retry -- no retry loop of its own. A List cancelled
@@ -518,16 +464,6 @@ func (p *Provider) clearRenameError(threadID string) {
 	}
 }
 
-func managedEnvironment() map[string]string {
-	// Read the invoking agentsctl process here: the persistent supervisor's
-	// inherited CODEX_EDITOR may belong to an earlier invocation.
-	editor := os.Getenv("CODEX_EDITOR")
-	if editor == "" {
-		return nil
-	}
-	return map[string]string{"EDITOR": editor}
-}
-
 var (
 	errUnboundRun     = errors.New("codex session is still starting and has no bound thread yet")
 	errExternalWriter = errors.New("external or unknown Codex writer prevents remote Open")
@@ -652,11 +588,14 @@ func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) e
 	return nil
 }
 
-// reconcile binds each locally-tracked, not-yet-bound managed run to at
-// most one Codex app-server thread, per the DesignDoc's run-to-thread
-// binding rule: a candidate thread must be new since the run's own
-// pre-dispatch baseline, share its CWD, and be owned (writer lock) by the
-// run's own process identity. Zero or multiple candidates never bind.
+// reconcile binds each locally-tracked, not-yet-bound legacy managed run
+// (one persisted before Dispatch moved to the shared daemon) to at most one
+// Codex app-server thread: a candidate thread must be new since the run's
+// own pre-dispatch baseline, share its CWD, and be owned (writer lock) by
+// the run's own process identity. Zero or multiple candidates never bind.
+// The ownership proof is what keeps a thread Dispatch started on the shared
+// daemon -- whose writer lock the daemon holds -- from being claimed by a
+// legacy run in the same CWD.
 //
 // The writer-lock ownership probe (owner below) is filesystem/process I/O,
 // so it runs entirely against an unlocked Runs() snapshot, never inside

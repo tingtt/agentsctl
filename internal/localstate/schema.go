@@ -21,10 +21,12 @@ type Run struct {
 	Error     string
 	Baseline  []string
 	StartedAt time.Time
-	// PendingRename is a session name a rename-only dispatch is still
-	// waiting to apply: it belongs to the run until the run is bound to a
-	// thread that can be renamed, and is cleared after the one attempt to
-	// apply it (see provider/codex.Provider.applyPendingRenames).
+	// PendingRename is a session name a legacy rename-only dispatch is
+	// still waiting to apply: it belongs to the run until the run is bound
+	// to a thread that can be renamed, and is cleared after the one attempt
+	// to apply it (see provider/codex.Provider.applyPendingRenames). Codex
+	// Dispatch no longer records one; only runs persisted before it moved
+	// to the shared app-server daemon carry it.
 	PendingRename string
 	// RenameError records why that attempt failed, so the failure is
 	// surfaced instead of lost; it is not retried automatically -- the

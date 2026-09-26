@@ -95,7 +95,9 @@ func run() (*agentview.Restart, error) {
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	daemon := &codex.CommandDaemon{Path: "codex", Runner: runner}
-	dispatch := supervisor.Dispatcher{Client: client}
+	// Codex Dispatch runs on the shared app-server daemon; the supervisor
+	// only still stops legacy managed runs started before it did.
+	legacyCodex := supervisor.Dispatcher{Client: client}
 	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -103,7 +105,7 @@ func run() (*agentview.Restart, error) {
 	}
 	providers := []sessionctl.Source{
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: dispatch, Daemon: daemon, Foreground: terminal.ForegroundPTY{}},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: legacyCodex, Daemon: daemon, Foreground: terminal.ForegroundPTY{}},
 	}
 	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {
