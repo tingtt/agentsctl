@@ -180,8 +180,10 @@ func (d *fakeDaemon) start() {
 		d.t.Fatal(err)
 	}
 	d.ln = ln
-	d.srv = &http.Server{Handler: http.HandlerFunc(d.serve)}
-	go func() { _ = d.srv.Serve(ln) }()
+	srv := &http.Server{Handler: http.HandlerFunc(d.serve)}
+	d.srv = srv
+	// srv, not d.srv: stop may already have cleared d.srv when this runs.
+	go func() { _ = srv.Serve(ln) }()
 }
 
 // stop closes the listener and every connection; the socket file is gone
