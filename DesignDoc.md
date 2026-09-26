@@ -316,15 +316,15 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 /rename <name>
   -> thread/start                    (canonical thread ID を取得)
   -> turn/start(bootstrap prompt)    (accepted = commit point)
-  -> thread/unsubscribe              (best effort)
-  -> thread/name/set                 (同じ shared-daemon connection)
+  -> thread/name/set                 (同じ shared-daemon connection、subscribe 中)
+  -> thread/unsubscribe              (best effort、rename の成否に関わらず試みる)
   -> close
 ```
 
 - bootstrap prompt は固定文とし name や `/rename` を含めない。name は user-controlled な文字列であり model instruction に埋め込まない。
 - session identity は最初から `codex:<thread ID>` であり、bootstrap のための provisional run key、identity transition、local PendingRename は作らない。
 - native rename は bootstrap turn が accepted された後にだけ送る。bootstrap turn が失敗した thread に名前だけが残る状態を作らないためである。
-- unsubscribe の失敗は rename-only の失敗理由にしない。connection が使える限り rename を試みる。
+- rename は unsubscribe より前に送る。rename が失敗しても unsubscribe は cleanup として試み、close を fallback とする。unsubscribe の失敗は rename-only の失敗理由にしない。
 - commit 後の rename 失敗 (RPC error、connection 喪失を含む) は、canonical thread ID を含む rename-only Dispatch failure として返す。thread / turn はすでに committed であるため、Stop、`turn/interrupt`、delete / archive、自動 retry は行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
 - bootstrap 中の Activity は通常の native thread status を使う。
 - bootstrap turn は model turn を1回消費する。rate limit 等で失敗する場合も特別な回避はしない。
@@ -621,8 +621,13 @@ Archive は、既存 session を通常の Agent View から除外する。
 
 **Codex**
 
-- app-server の native archive を利用する。
-- daemon 外の active writer が存在する thread は、ownership を推測して archive しない。
+- shared daemon の native archive (`thread/archive`) を利用する。daemon は loaded thread を runtime ごと shutdown して archive するため、送信前に provider が同じ connection で authoritative preflight を行う。
+  - `thread/read` で現在の status を読み、Observer と同じ解釈 (active は Working / NeedsInput、`notLoaded` は writer lock で休止か daemon 外 runtime かを判定) で評価する。
+  - idle / systemError、または `notLoaded` かつ writer lock なしの場合だけ `thread/archive` を送る。
+  - active (Working / NeedsInput) は拒否する。`thread/archive` を送らないため、Archive が暗黙に turn を止めることはない。
+  - `notLoaded` かつ writer lock あり (daemon 外の writer) は、ownership を推測せず拒否する。
+  - 未知の status や `thread/read` の失敗も拒否する。
+- row の Archive availability は同じ observation に基づく UX 上の guard であり、Working / NeedsInput と daemon 外 writer では unavailable とする。Unknown 等で offered であっても、実際の Archive は上記 preflight を必ず通る。preflight と `thread/archive` の間に始まった turn までは防げない。
 
 実行中の session は Archive できない。
 
@@ -646,7 +651,7 @@ Rename は、既存 session の表示名を変更する。
 
 **Codex**
 
-- app-server の native rename を利用する。
+- shared daemon の native rename (`thread/name/set`) を利用する。daemon は metadata だけを更新するため、実行中の session も中断せずに rename できる。
 - 新規 session の `/rename <name>` は、thread が存在しないため直接は適用できない。「Rename-only new session (Codex)」を参照。
 
 #### Directory scope
@@ -948,6 +953,7 @@ Codex の thread / turn runtime は shared app-server daemon が保持する。a
 - agentsctl は shared runtime が必要なとき `codex app-server daemon start` を冪等に実行して daemon を確保する。
 - Observer は初回接続だけでなく reconnect attempt の前にも daemon を確保し、lifecycle response の `socketPath` を接続先とする。
 - Open も起動のたびに daemon を確保し、同じ `socketPath` を preflight と `--remote` の接続先とする。Observer の接続状態には依存しない。
+- 既存 thread の mutation (Rename / Archive / Unarchive) も操作のたびに daemon を確保し、その daemon への専用 connection で行う。thread の writer lock を持つ daemon 以外の app-server process (short-lived stdio app-server 等) からは mutation しない。short-lived app-server は List / Usage などの read にだけ使う。
 - Observer が row authority を得る前の daemon 確保失敗は error-only update として warning を表示し、List が供給した rows を維持する。
 - implicit daemon auto-start や plain `codex resume` の fallback behavior を correctness の前提にしない。
 - daemon の Stop / Restart / Update を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。
