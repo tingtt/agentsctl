@@ -316,6 +316,7 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 /rename <name>
   -> thread/start                    (canonical thread ID を取得)
   -> turn/start(bootstrap prompt)    (accepted = commit point)
+  -> 対応する turn/started を待つ     (rollout persistence の readiness)
   -> thread/name/set                 (同じ shared-daemon connection、subscribe 中)
   -> thread/unsubscribe              (best effort、rename の成否に関わらず試みる)
   -> close
@@ -324,8 +325,12 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 - bootstrap prompt は固定文とし name や `/rename` を含めない。name は user-controlled な文字列であり model instruction に埋め込まない。
 - session identity は最初から `codex:<thread ID>` であり、bootstrap のための provisional run key、identity transition、local PendingRename は作らない。
 - native rename は bootstrap turn が accepted された後にだけ送る。bootstrap turn が失敗した thread に名前だけが残る状態を作らないためである。
+- `turn/start` の response は turn の受理 (Dispatch の commit point) を示すだけで、thread の rollout の persistence を保証しない。rename (metadata update) は rollout を必要とするため、response 直後に送ると失敗しうる。daemon は turn の開始を rollout に persist した後に `turn/started` を送るため、thread ID と turn ID が `thread/start` / `turn/start` の response と一致する `turn/started` を rename の readiness とする。
+  - notification は response より先に届きうるため、Dispatch connection の確立時点から `turn/started` を記録する。別 thread / 別 turn の `turn/started` は readiness としない。
+  - `turn/completed` は待たない。`thread/read` の成功も rollout の存在を示さないため readiness に使わない。sleep や rename の blind retry もしない。
+  - `turn/started` が bound 内に届かない、または connection が閉じた場合は rename failure とし、rename は送らない。通常 Dispatch はこの待機をしない。
 - rename は unsubscribe より前に送る。rename が失敗しても unsubscribe は cleanup として試み、close を fallback とする。unsubscribe の失敗は rename-only の失敗理由にしない。
-- commit 後の rename 失敗 (RPC error、connection 喪失を含む) は、canonical thread ID を含む rename-only Dispatch failure として返す。thread / turn はすでに committed であるため、Stop、`turn/interrupt`、delete / archive、自動 retry は行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
+- commit 後の rename 失敗 (readiness 待ちの失敗、RPC error、connection 喪失を含む) は、canonical thread ID を含む rename-only Dispatch failure として返す。thread / turn はすでに committed であるため、Stop、`turn/interrupt`、delete / archive、自動 retry は行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
 - bootstrap 中の Activity は通常の native thread status を使う。
 - bootstrap turn は model turn を1回消費する。rate limit 等で失敗する場合も特別な回避はしない。
 
