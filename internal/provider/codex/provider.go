@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,11 +21,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Dispatcher starts and stops legacy supervisor-managed Codex runs. Open
-// never goes through it: it connects a foreground client to the shared
-// app-server daemon instead (see Provider.Open).
-type Dispatcher interface {
-	Dispatch(context.Context, string, string, []string, map[string]string) (localstate.Run, error)
+// ManagedRuntime stops legacy supervisor-managed Codex runs that were
+// started before Dispatch moved to the shared app-server daemon. Nothing
+// new is ever started through it: Dispatch talks to the daemon over RPC
+// (see Provider.Dispatch), and Open connects a foreground client to the
+// daemon (see Provider.Open).
+type ManagedRuntime interface {
 	Stop(context.Context, string) error
 }
 
@@ -44,7 +44,7 @@ type Provider struct {
 	API     AppServer
 	Runner  base.Runner
 	Store   *localstate.Store
-	Runtime Dispatcher
+	Runtime ManagedRuntime
 	Daemon  DaemonLifecycle
 	// Foreground runs the interactive Codex TUI client on the caller's
 	// terminal (see Open). It is separate from Runner, which only captures
@@ -121,10 +121,9 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 // sessionRows normalizes a thread catalog plus the local managed-run state
 // into session rows. It is shared by List and the Observer snapshot so both
 // build rows the same way; only Activity/Runtime come from observe, the
-// caller's source of runtime observation. The only action observe decides
-// is advisory Open availability: a thread observed running outside the
-// shared app-server cannot be opened through it. Open re-checks everything
-// against the daemon itself (see Open).
+// caller's source of runtime observation. It supplies advisory Open, Stop,
+// and Archive availability; each operation re-checks its own safety
+// conditions against the daemon.
 func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run, archived bool, observe func(Thread, func() bool) observation) []session.Session {
 	managed := map[string]localstate.Run{}
 	renameFailed := map[string]string{}
@@ -162,7 +161,7 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 		}
 		observed := observe(t, func() bool { return p.writerAbsent(t.ID) })
 		runtime := observed.Runtime
-		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: {Available: true}}
+		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: archiveAvailability(observed)}
 		// Open follows the observation, not whether agentsctl manages a run:
 		// a legacy managed run holding the writer lock outside the shared
 		// app-server is as unopenable as any other external writer. An
@@ -185,8 +184,12 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 			}
 		case observed.Runtime == session.RuntimeExternal:
 			actions[session.ActionStop] = session.Availability{Reason: "external or unknown Codex writer cannot be stopped safely"}
+		case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+			actions[session.ActionStop] = session.Availability{Available: true}
+		case observed.Activity == session.ActivityIdle || observed.Activity == session.ActivityFailed:
+			actions[session.ActionStop] = session.Availability{Reason: "session is not running"}
 		default:
-			actions[session.ActionStop] = session.Availability{Reason: "no agentsctl-managed run is tracking this session"}
+			actions[session.ActionStop] = session.Availability{Reason: "Codex activity is unknown"}
 		}
 		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: observed.Activity, Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
@@ -220,6 +223,22 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 	return rows
 }
 
+// archiveAvailability is the advisory Archive availability of a thread
+// observed as observed: a running session (Working or waiting on the user)
+// is refused, and a thread another process writes is never archived.
+// An observation that establishes neither (e.g. Unknown while the Observer
+// is down) leaves Archive offered; Archive itself re-checks with the
+// daemon before acting (see archivable).
+func archiveAvailability(observed observation) session.Availability {
+	switch {
+	case observed.Runtime == session.RuntimeExternal:
+		return session.Availability{Reason: errArchiveExternalWriter.Error()}
+	case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+		return session.Availability{Reason: errArchiveRunning.Error()}
+	}
+	return session.Availability{Available: true}
+}
+
 // sortedKeys returns keys ordered by ID so PreviousKeys does not depend on
 // Go's randomized map iteration order over the run records.
 func sortedKeys(keys []session.Key) []session.Key {
@@ -227,42 +246,9 @@ func sortedKeys(keys []session.Key) []session.Key {
 	return keys
 }
 
-func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
-	// A composer input that is only `/rename <name>` is never forwarded to
-	// Codex: as an initial prompt it would reach the model as plain text.
-	// The requested name stays with agentsctl (see recordPendingRename) and
-	// the model only ever sees a fixed bootstrap prompt.
-	var pendingRename string
-	if name, isRename := parseRenameOnly(prompt); isRename {
-		if name == "" {
-			return session.Session{}, errors.New("name must not be empty")
-		}
-		prompt, pendingRename = renameBootstrapPrompt, name
-	}
-	before, err := p.API.List(ctx, false)
-	if err != nil {
-		return session.Session{}, err
-	}
-	baseline := make([]string, 0, len(before))
-	for _, t := range before {
-		baseline = append(baseline, t.ID)
-	}
-	r, err := p.Runtime.Dispatch(ctx, prompt, cwd, baseline, managedEnvironment())
-	if err != nil {
-		return session.Session{}, err
-	}
-	if pendingRename != "" {
-		if err := p.recordPendingRename(ctx, r.ID, pendingRename); err != nil {
-			return session.Session{}, err
-		}
-	}
-	createdAt := time.Now()
-	actions := session.Actions{session.ActionOpen: openWhileStarting(pendingRename != ""), session.ActionStop: {Available: true}}
-	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: r.ID}, Name: startingName(pendingRename != ""), CWD: cwd, CreatedAt: createdAt, UpdatedAt: createdAt, Activity: session.ActivityStarting, Runtime: session.RuntimeDetached, RunID: r.ID, Actions: actions}, nil
-}
-
-// awaitingBootstrapBind reports whether r is a rename-only bootstrap run
-// that reconcile has not yet bound to its real thread. Like every unbound
+// awaitingBootstrapBind reports whether r is a legacy rename-only bootstrap
+// run that reconcile has not yet bound to its real thread. Only runs
+// persisted before Dispatch moved to the shared daemon have this shape. Like every unbound
 // run it cannot be opened (see openWhileStarting); it only gets a more
 // specific reason, since its first model turn is what creates the thread
 // reconciliation must bind.
@@ -290,33 +276,11 @@ func openWhileStarting(awaitingBind bool) session.Availability {
 	return session.Availability{Reason: "Codex session is still starting and has no bound thread yet"}
 }
 
-// recordPendingRename attaches name to the just-started run runID. It runs
-// after the supervisor has recorded the run, so the name lives in the same
-// local run state reconciliation already reads; a concurrent bind of the
-// run only ever adds SessionID, which this update leaves alone. If the name
-// cannot be recorded the run is stopped rather than left running a
-// bootstrap turn nothing will ever rename.
-func (p *Provider) recordPendingRename(ctx context.Context, runID, name string) error {
-	applied, err := p.Store.UpdateRunIf(runID,
-		func(localstate.Run) bool { return true },
-		func(r localstate.Run) localstate.Run { r.PendingRename = name; return r },
-	)
-	if err == nil && !applied {
-		err = errors.New("started run is not tracked")
-	}
-	if err == nil {
-		return nil
-	}
-	err = fmt.Errorf("record pending rename: %w", err)
-	if stopErr := p.Runtime.Stop(ctx, runID); stopErr != nil {
-		err = errors.Join(err, fmt.Errorf("stop run: %w", stopErr))
-	}
-	return err
-}
-
 // applyPendingRenames renames, through the same native rename an existing
-// session uses, each thread that reconcile has just bound to a run still
-// carrying a PendingRename, and clears the pending state. There is one
+// session uses, each thread that reconcile has just bound to a legacy run
+// still carrying a PendingRename, and clears the pending state. Dispatch no
+// longer records one; this only settles runs persisted before it moved to
+// the shared daemon. There is one
 // attempt: the thread exists whatever happens, so a failure is recorded on
 // the run (RenameError, surfaced by List) and an ordinary rename of the
 // thread is the retry -- no retry loop of its own. A List cancelled
@@ -363,6 +327,9 @@ func (p *Provider) applyPendingRenames(ctx context.Context, threads []Thread) {
 	}
 }
 
+// Stop interrupts the exact shared-daemon turn that is active when the
+// operation resolves it. Legacy locally managed runs keep their existing
+// process-based Stop path.
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	runs, err := p.Store.Runs()
 	if err != nil {
@@ -373,13 +340,76 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 			return p.Runtime.Stop(ctx, r.ID)
 		}
 	}
-	return errors.New("refusing to stop a Codex writer not owned by agentsctl")
+	events := newTurnLifecycleEvents()
+	socket, err := p.readySocket(ctx)
+	if err != nil {
+		return err
+	}
+	return connectDaemon(ctx, socket, events.observe, func(conn *rpcConn) error {
+		state, err := readCurrentTurnState(ctx, conn, k.ID)
+		var turnID string
+		switch {
+		case err == nil:
+			if state.status.Type == statusNotLoaded && !p.writerAbsent(k.ID) {
+				return errors.New("external or unknown Codex writer cannot be stopped safely")
+			}
+			turnID = state.activeTurnID
+		case errors.Is(err, errTurnsListUnmaterialized):
+			turnID = p.runtime().activeTurnHint(k.ID)
+			if turnID == "" {
+				return fmt.Errorf("cannot safely stop active Codex thread %s: current turn is not materialized yet and its exact turn ID is unavailable", k.ID)
+			}
+		default:
+			return fmt.Errorf("resolve active Codex turn: %w", err)
+		}
+		if turnID == "" {
+			p.runtime().forgetActiveTurn(k.ID, "")
+			return nil
+		}
+		if err := interruptTurn(ctx, conn, k.ID, turnID); err != nil {
+			if err := p.reconcileStopRace(ctx, conn, k.ID, turnID, err); err != nil {
+				return err
+			}
+			p.runtime().forgetActiveTurn(k.ID, "")
+			return nil
+		}
+		if err := events.waitInactive(ctx, conn, k.ID); err != nil {
+			return fmt.Errorf("wait for Codex turn %s to stop: %w", turnID, err)
+		}
+		if err := p.confirmStoppedTurn(ctx, conn, k.ID, turnID); err != nil {
+			return err
+		}
+		p.runtime().forgetActiveTurn(k.ID, "")
+		return nil
+	})
+}
+
+func (p *Provider) reconcileStopRace(ctx context.Context, conn *rpcConn, threadID, turnID string, interruptErr error) error {
+	if err := p.confirmStoppedTurn(ctx, conn, threadID, turnID); err != nil {
+		return errors.Join(fmt.Errorf("interrupt Codex turn %s: %w", turnID, interruptErr), err)
+	}
+	return nil
+}
+
+func (p *Provider) confirmStoppedTurn(ctx context.Context, conn *rpcConn, threadID, turnID string) error {
+	state, err := readCurrentTurnState(ctx, conn, threadID)
+	if err != nil {
+		return fmt.Errorf("confirm Codex turn %s stopped: %w", turnID, err)
+	}
+	if state.activeTurnID == "" {
+		return nil
+	}
+	if state.activeTurnID != turnID {
+		return fmt.Errorf("Codex turn %s ended, but thread %s now has different active turn %s; refusing to interrupt it", turnID, threadID, state.activeTurnID)
+	}
+	return fmt.Errorf("Codex turn %s remains active on thread %s", turnID, threadID)
 }
 
 // Archive removes k's session. For an actual Codex thread (no local run
 // record shares k.ID, or that record is already bound to a thread) this
-// calls the app-server's native thread/archive. For an agentsctl-owned
-// unbound run — a local run that started but never got proven to any
+// calls native thread/archive on the shared daemon, and only once the
+// daemon itself confirmed the thread is at rest (see archivable). For an
+// agentsctl-owned unbound run — a local run that started but never got proven to any
 // app-server thread (localstate.Run.SessionID == "") — k.ID is agentsctl's
 // own run ID, never a Codex thread ID, so it must never reach the
 // app-server under any state, not just the terminal one List() actually
@@ -401,17 +431,48 @@ func (p *Provider) Archive(ctx context.Context, k session.Key) error {
 		}
 		return p.Store.DeleteTerminalUnboundRun(k.ID, isTerminalRunState)
 	}
-	if err := p.API.Archive(ctx, k.ID); err != nil {
-		return err
-	}
-	p.catalogChanged()
-	return nil
+	return p.withDaemon(ctx, func(conn *rpcConn) error {
+		if err := p.archivable(ctx, conn, k.ID); err != nil {
+			return err
+		}
+		return conn.call(ctx, "thread/archive", map[string]any{"threadId": k.ID}, nil)
+	})
 }
 
-// catalogChanged asks the Observer's connection to re-read the catalog
-// after a change made through the short-lived app-server, which the shared
-// daemon does not broadcast.
-func (p *Provider) catalogChanged() { p.runtime().requestCatalog() }
+var (
+	errArchiveRunning        = errors.New("codex session is running; stop it before archiving")
+	errArchiveExternalWriter = errors.New("external or unknown Codex writer prevents archive")
+)
+
+// archivable re-reads threadID's status on conn, right before Archive
+// sends thread/archive on it, and refuses unless the thread is at rest.
+// The daemon archives a thread it has loaded by shutting its runtime down,
+// so a running turn -- Working or waiting on the user -- must never reach
+// thread/archive: Archive would become an implicit Stop. The status is
+// read the same way the Observer reads it (see observeThread): a loaded
+// thread's native status decides on its own; a notLoaded one is at rest
+// only while no other process holds its writer lock. Anything else,
+// including a status this version does not know, is refused. The row's
+// cached Actions play no part here.
+func (p *Provider) archivable(ctx context.Context, conn *rpcConn, threadID string) error {
+	t, err := readThread(ctx, conn, threadID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("thread/read %s: %w", threadID, err)
+	case t.ID != threadID || t.Status.Type == "":
+		return fmt.Errorf("thread/read %s: malformed response", threadID)
+	}
+	observed := observeThread(t.Status, func() bool { return p.writerAbsent(threadID) })
+	switch {
+	case observed.Runtime == session.RuntimeExternal:
+		return errArchiveExternalWriter
+	case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+		return errArchiveRunning
+	case observed.Activity == session.ActivityIdle || observed.Activity == session.ActivityFailed:
+		return nil
+	}
+	return fmt.Errorf("codex thread %s has status %q; refusing to archive it", threadID, t.Status.Type)
+}
 
 // isTerminalRunState reports whether a localstate.Run.State value is
 // terminal — the run reached an end state without (or, for a previously-
@@ -422,12 +483,13 @@ func (p *Provider) catalogChanged() { p.runtime().requestCatalog() }
 func isTerminalRunState(state string) bool {
 	return state == "failed" || state == "stale" || state == "stopped"
 }
+
+// Unarchive restores k's thread through the shared daemon. Unlike Archive
+// it touches no runtime, so it needs no preflight.
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
-	if err := p.API.Unarchive(ctx, k.ID); err != nil {
-		return err
-	}
-	p.catalogChanged()
-	return nil
+	return p.withDaemon(ctx, func(conn *rpcConn) error {
+		return conn.call(ctx, "thread/unarchive", map[string]any{"threadId": k.ID}, nil)
+	})
 }
 
 // fiveHourWindowDurationMins and weeklyWindowDurationMins are the
@@ -484,14 +546,17 @@ func rateLimitWindow(w *RateLimitWindow) session.UsageWindow {
 	}
 	return session.UsageWindow{State: session.UsageAvailable, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
 }
+
+// Rename sets k's thread name through the shared daemon. The daemon
+// patches thread metadata whether or not a turn is running, so a running
+// session can be renamed without interrupting it.
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")
 	}
-	if err := p.API.Rename(ctx, k.ID, name); err != nil {
+	if err := p.withDaemon(ctx, func(conn *rpcConn) error { return setThreadName(ctx, conn, k.ID, name) }); err != nil {
 		return err
 	}
-	p.catalogChanged()
 	p.clearRenameError(k.ID)
 	return nil
 }
@@ -516,16 +581,6 @@ func (p *Provider) clearRenameError(threadID string) {
 			func(current localstate.Run) localstate.Run { current.RenameError = ""; return current },
 		)
 	}
-}
-
-func managedEnvironment() map[string]string {
-	// Read the invoking agentsctl process here: the persistent supervisor's
-	// inherited CODEX_EDITOR may belong to an earlier invocation.
-	editor := os.Getenv("CODEX_EDITOR")
-	if editor == "" {
-		return nil
-	}
-	return map[string]string{"EDITOR": editor}
 }
 
 var (
@@ -630,14 +685,10 @@ func (p *Provider) openThreadID(s session.Session) (string, error) {
 func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, openPreflightTimeout)
 	defer cancel()
-	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
-	if err != nil {
-		return fmt.Errorf("connect codex app-server daemon: %w", err)
-	}
-	defer conn.Close()
-	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
-		return fmt.Errorf("initialize codex app-server daemon: %w", err)
-	}
+	return connectDaemon(ctx, socket, nil, func(conn *rpcConn) error { return p.checkOpenable(ctx, conn, threadID) })
+}
+
+func (p *Provider) checkOpenable(ctx context.Context, conn *rpcConn, threadID string) error {
 	t, err := readThread(ctx, conn, threadID)
 	switch {
 	case err != nil:
@@ -652,11 +703,14 @@ func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) e
 	return nil
 }
 
-// reconcile binds each locally-tracked, not-yet-bound managed run to at
-// most one Codex app-server thread, per the DesignDoc's run-to-thread
-// binding rule: a candidate thread must be new since the run's own
-// pre-dispatch baseline, share its CWD, and be owned (writer lock) by the
-// run's own process identity. Zero or multiple candidates never bind.
+// reconcile binds each locally-tracked, not-yet-bound legacy managed run
+// (one persisted before Dispatch moved to the shared daemon) to at most one
+// Codex app-server thread: a candidate thread must be new since the run's
+// own pre-dispatch baseline, share its CWD, and be owned (writer lock) by
+// the run's own process identity. Zero or multiple candidates never bind.
+// The ownership proof is what keeps a thread Dispatch started on the shared
+// daemon -- whose writer lock the daemon holds -- from being claimed by a
+// legacy run in the same CWD.
 //
 // The writer-lock ownership probe (owner below) is filesystem/process I/O,
 // so it runs entirely against an unlocked Runs() snapshot, never inside

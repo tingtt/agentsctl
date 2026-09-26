@@ -42,8 +42,8 @@ func nativeActivity(status ThreadStatus) session.Activity {
 }
 
 // observation is the display-side Activity/Runtime of one catalog thread.
-// Of a row's actions it only informs advisory Open availability (see
-// Provider.sessionRows); Open itself re-checks against the daemon.
+// It informs advisory action availability (see Provider.sessionRows); each
+// control operation re-checks its authority against the daemon.
 type observation struct {
 	Activity session.Activity
 	Runtime  session.Runtime

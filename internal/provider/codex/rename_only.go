@@ -11,8 +11,8 @@ import (
 // parseRenameOnly, Provider.Dispatch).
 //
 // Codex does not expose a listed/resumable thread until the first model
-// turn. Use a minimal bootstrap turn so reconciliation can bind the run
-// before renaming it (see Provider.applyPendingRenames).
+// turn, so a rename-only session still runs one minimal bootstrap turn
+// before the native rename (see Provider.Dispatch).
 const renameBootstrapPrompt = "Wait for the next user prompt. Do not perform any task."
 
 // parseRenameOnly recognizes a new-session composer input that consists of

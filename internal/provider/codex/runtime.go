@@ -1,10 +1,12 @@
 package codex
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -27,7 +29,10 @@ const (
 // codexRuntime observes the shared Codex app-server daemon over one
 // persistent connection (see rpcConn) and keeps what it learned: the
 // thread catalog and the native status of every thread the daemon has
-// loaded. Before every connection attempt it requests a ready endpoint from
+// loaded. The catalog it shows is the durable one (thread/list) plus the
+// live threads the daemon announced (thread/started) that thread/list does
+// not return yet: a new thread reaches thread/list only once its rollout
+// is persisted, which can be as late as its first turn's end. Before every connection attempt it requests a ready endpoint from
 // its lifecycle-independent dependency; an unavailable endpoint or daemon is
 // an ordinary state it retries with bounded backoff.
 //
@@ -54,6 +59,24 @@ type codexRuntime struct {
 	catalog    []Thread
 	catalogSeq uint64
 	listed     map[string]bool
+	// started holds live threads the daemon announced (thread/started, or
+	// loaded at snapshot time) that the installed catalog does not list:
+	// the daemon's own Thread, kept until thread/list lists it (see
+	// installCatalogLocked), explicit archive/delete removes it, or a
+	// post-close catalog confirms it never became durable. startedNow names
+	// the ones announced during the running snapshot, which that snapshot
+	// keeps (see installSnapshot).
+	started    map[string]Thread
+	startedNow map[string]bool
+	// closedStarted records the newest catalog fetch that was already in
+	// flight when an unlisted started thread closed. Only a later fetch may
+	// prove that the thread never became durable and prune its overlay.
+	closedStarted map[string]uint64
+	// activeTurnHints holds exact turn IDs returned by this process's
+	// turn/start calls. They only bridge Stop across the first turn's
+	// pre-materialization gap; thread/turns/list remains authoritative once
+	// available. The hints are never persisted or exposed in catalog rows.
+	activeTurnHints map[string]string
 	// status holds the native status of each daemon-loaded thread; a
 	// thread absent from it is notLoaded.
 	status map[string]ThreadStatus
@@ -75,13 +98,16 @@ type codexRuntime struct {
 
 func newCodexRuntime(readySocket func(context.Context) (string, error)) *codexRuntime {
 	return &codexRuntime{
-		readySocket: readySocket,
-		minBackoff:  defaultMinBackoff,
-		maxBackoff:  defaultMaxBackoff,
-		catalogGap:  defaultCatalogGap,
-		changed:     make(chan struct{}, 1),
-		wake:        make(chan struct{}, 1),
-		hidden:      map[string]bool{},
+		readySocket:     readySocket,
+		minBackoff:      defaultMinBackoff,
+		maxBackoff:      defaultMaxBackoff,
+		catalogGap:      defaultCatalogGap,
+		changed:         make(chan struct{}, 1),
+		wake:            make(chan struct{}, 1),
+		hidden:          map[string]bool{},
+		started:         map[string]Thread{},
+		closedStarted:   map[string]uint64{},
+		activeTurnHints: map[string]string{},
 	}
 }
 
@@ -117,7 +143,27 @@ func (r *codexRuntime) view() runtimeView {
 	for id, s := range r.status {
 		status[id] = s
 	}
-	return runtimeView{catalog: r.catalog, status: status, live: r.live, everLive: r.everLive, lastErr: r.lastErr, lastReadyErr: r.lastReadyErr}
+	return runtimeView{catalog: r.visibleCatalogLocked(), status: status, live: r.live, everLive: r.everLive, lastErr: r.lastErr, lastReadyErr: r.lastReadyErr}
+}
+
+// visibleCatalogLocked is the catalog consumers see: the live-started
+// threads, newest first, then the durable catalog. A thread is in at most
+// one of the two.
+func (r *codexRuntime) visibleCatalogLocked() []Thread {
+	if len(r.started) == 0 {
+		return r.catalog
+	}
+	visible := make([]Thread, 0, len(r.started)+len(r.catalog))
+	for _, t := range r.started {
+		visible = append(visible, t)
+	}
+	slices.SortFunc(visible, func(a, b Thread) int {
+		if c := cmp.Compare(b.CreatedAt, a.CreatedAt); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return append(visible, r.catalog...)
 }
 
 // kick signals changed without blocking.
@@ -175,6 +221,18 @@ func (r *codexRuntime) installCatalogLocked(seq uint64, threads []Thread) bool {
 			delete(r.status, id)
 		}
 	}
+	// A live-started thread thread/list now lists is durable: the listed
+	// Thread replaces it. One it does not list yet stays, status included.
+	for id := range listed {
+		delete(r.started, id)
+		delete(r.closedStarted, id)
+	}
+	for id, closedAt := range r.closedStarted {
+		if seq > closedAt && !listed[id] {
+			delete(r.started, id)
+			delete(r.closedStarted, id)
+		}
+	}
 	r.catalog, r.catalogSeq, r.listed = catalog, seq, listed
 	return true
 }
@@ -196,6 +254,9 @@ func (r *codexRuntime) startLifecycle() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.live, r.everLive, r.lastErr, r.lastReadyErr, r.status = false, false, nil, false, nil
+	r.started = map[string]Thread{}
+	r.closedStarted = map[string]uint64{}
+	r.activeTurnHints = map[string]string{}
 }
 
 // run connects, and reconnects with bounded backoff, until ctx ends.
@@ -231,6 +292,7 @@ func (r *codexRuntime) disconnected(err error, readyErr bool) {
 	r.mu.Lock()
 	changed := r.live || r.lastErr == nil || r.lastErr.Error() != err.Error() || r.lastReadyErr != readyErr
 	r.live, r.snapshotting, r.dirty, r.status = false, false, nil, nil
+	r.activeTurnHints = map[string]string{}
 	r.lastErr, r.lastReadyErr = err, readyErr
 	r.mu.Unlock()
 	if changed {
@@ -274,7 +336,7 @@ func (r *codexRuntime) connect(ctx context.Context) (wasLive, endpointReady bool
 // now is simply absent, i.e. notLoaded.
 func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 	r.mu.Lock()
-	r.snapshotting, r.dirty, r.needCatalog = true, map[string]bool{}, false
+	r.snapshotting, r.dirty, r.needCatalog, r.startedNow = true, map[string]bool{}, false, map[string]bool{}
 	r.fetchSeq++
 	seq := r.fetchSeq
 	r.mu.Unlock()
@@ -288,6 +350,7 @@ func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 		return err
 	}
 	status := map[string]ThreadStatus{}
+	loaded := map[string]Thread{}
 	var hidden []string
 	read := func(id string) error {
 		t, err := readThread(ctx, conn, id)
@@ -302,10 +365,13 @@ func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 		case hiddenThread(t):
 			hidden = append(hidden, id)
 			delete(status, id)
+			delete(loaded, id)
 		case t.Status.Type == statusNotLoaded:
 			delete(status, id)
+			delete(loaded, id)
 		default:
 			status[id] = t.Status
+			loaded[id] = t
 		}
 		return nil
 	}
@@ -315,7 +381,7 @@ func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 		}
 	}
 	for round := 0; ; round++ {
-		dirty := r.installSnapshot(seq, threads, status, hidden)
+		dirty := r.installSnapshot(seq, threads, status, loaded, hidden)
 		if len(dirty) == 0 {
 			return nil
 		}
@@ -332,8 +398,12 @@ func (r *codexRuntime) snapshot(ctx context.Context, conn *rpcConn) error {
 
 // installSnapshot installs a finished snapshot and goes live, unless a
 // status notification arrived since the reads: then it returns the dirty
-// threads for the caller to read again and installs nothing.
-func (r *codexRuntime) installSnapshot(seq uint64, threads []Thread, status map[string]ThreadStatus, hidden []string) map[string]bool {
+// threads for the caller to read again and installs nothing. The
+// live-started threads become the loaded threads thread/list did not
+// return, plus those announced during this snapshot; any earlier one is
+// gone with the connection that announced it, unless the daemon still has
+// it loaded.
+func (r *codexRuntime) installSnapshot(seq uint64, threads []Thread, status map[string]ThreadStatus, loaded map[string]Thread, hidden []string) map[string]bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.dirty) > 0 {
@@ -344,6 +414,19 @@ func (r *codexRuntime) installSnapshot(seq uint64, threads []Thread, status map[
 	for _, id := range hidden {
 		r.hidden[id] = true
 	}
+	started := map[string]Thread{}
+	for id := range r.startedNow {
+		if t, ok := r.started[id]; ok {
+			started[id] = t
+		}
+	}
+	for id, t := range loaded {
+		if !r.hidden[id] {
+			started[id] = t
+		}
+	}
+	r.started, r.startedNow = started, nil
+	r.closedStarted = map[string]uint64{}
 	r.installCatalogLocked(seq, threads)
 	installed := make(map[string]ThreadStatus, len(status))
 	for id, s := range status {
@@ -423,9 +506,11 @@ const (
 
 // handleNotification applies one broadcast notification. Status changes
 // (including a thread closing, which unloads it) update the status cache
-// directly; anything that changes the catalog's shape or metadata asks for
-// a native catalog re-read instead of being merged by hand. Runs on the
-// connection's reader goroutine, so it never performs I/O.
+// directly. A started thread joins the live-started threads at once (see
+// codexRuntime), a rename is applied to the visible catalog, and an
+// archive or deletion drops a live-started thread; beyond that, anything that changes the catalog's shape or metadata asks
+// for a native catalog re-read instead of being merged by hand. Runs on
+// the connection's reader goroutine, so it never performs I/O.
 func (r *codexRuntime) handleNotification(method string, params json.RawMessage) {
 	switch method {
 	case notifyStatusChanged:
@@ -444,7 +529,11 @@ func (r *codexRuntime) handleNotification(method string, params json.RawMessage)
 		if json.Unmarshal(params, &p) != nil || p.ThreadID == "" {
 			return
 		}
+		// Closing unloads runtime only. A post-close catalog fetch decides
+		// whether an unlisted overlay ever became durable.
 		r.setStatus(p.ThreadID, ThreadStatus{Type: statusNotLoaded})
+		r.markStartedClosed(p.ThreadID)
+		r.requestCatalog()
 	case notifyStarted:
 		var p struct {
 			Thread Thread `json:"thread"`
@@ -458,10 +547,124 @@ func (r *codexRuntime) handleNotification(method string, params json.RawMessage)
 			r.mu.Unlock()
 			return
 		}
+		r.addStarted(p.Thread)
 		r.requestCatalog()
-	case notifyNameUpdated, notifyArchived, notifyUnarchived, notifyDeleted:
+	case notifyNameUpdated:
+		var p struct {
+			ThreadID   string  `json:"threadId"`
+			ThreadName *string `json:"threadName"`
+		}
+		if json.Unmarshal(params, &p) != nil || p.ThreadID == "" {
+			return
+		}
+		r.applyName(p.ThreadID, p.ThreadName)
+		r.requestCatalog()
+	case notifyArchived, notifyDeleted:
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		if json.Unmarshal(params, &p) == nil && p.ThreadID != "" {
+			r.forgetStarted(p.ThreadID)
+			r.forgetActiveTurn(p.ThreadID, "")
+		}
+		r.requestCatalog()
+	case notifyUnarchived:
 		r.requestCatalog()
 	}
+}
+
+// addStarted records a started thread the catalog does not list yet as a
+// live-started thread, with the status it was announced with.
+func (r *codexRuntime) addStarted(t Thread) {
+	r.mu.Lock()
+	if !r.live && !r.snapshotting || r.listed[t.ID] {
+		r.mu.Unlock()
+		return
+	}
+	r.started[t.ID] = t
+	delete(r.closedStarted, t.ID)
+	if r.snapshotting {
+		r.startedNow[t.ID] = true
+	}
+	r.mu.Unlock()
+	if t.Status.Type != "" {
+		r.setStatus(t.ID, t.Status)
+	}
+	r.kick()
+}
+
+// applyName sets a renamed thread's name wherever the visible catalog
+// holds it, so the name shows before the catalog re-read confirms it. The
+// durable catalog is copied, never changed in place: views share it.
+func (r *codexRuntime) applyName(id string, name *string) {
+	r.mu.Lock()
+	changed := false
+	if t, ok := r.started[id]; ok {
+		t.Name = name
+		r.started[id] = t
+		changed = true
+	}
+	if i := slices.IndexFunc(r.catalog, func(t Thread) bool { return t.ID == id }); i >= 0 {
+		r.catalog = slices.Clone(r.catalog)
+		r.catalog[i].Name = name
+		changed = true
+	}
+	r.mu.Unlock()
+	if changed {
+		r.kick()
+	}
+}
+
+// forgetStarted drops a live-started thread that went away.
+func (r *codexRuntime) forgetStarted(id string) {
+	r.mu.Lock()
+	_, ok := r.started[id]
+	delete(r.started, id)
+	delete(r.closedStarted, id)
+	r.mu.Unlock()
+	if ok {
+		r.kick()
+	}
+}
+
+// markStartedClosed keeps an unlisted thread visible until a catalog fetch
+// started after thread/closed confirms it is still absent. A result already
+// in flight when the notification arrived cannot make that decision.
+func (r *codexRuntime) markStartedClosed(id string) {
+	r.mu.Lock()
+	if _, ok := r.started[id]; ok {
+		r.closedStarted[id] = r.fetchSeq
+	}
+	r.mu.Unlock()
+}
+
+// rememberActiveTurn records only an exact turn/start response. The hint
+// is consulted only when Codex explicitly reports that turns/list is not
+// available before the first user message materializes.
+func (r *codexRuntime) rememberActiveTurn(threadID, turnID string) {
+	if threadID == "" || turnID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.activeTurnHints[threadID] = turnID
+	r.mu.Unlock()
+}
+
+func (r *codexRuntime) activeTurnHint(threadID string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.activeTurnHints[threadID]
+}
+
+// forgetActiveTurn removes a hint when expectedTurnID is empty or still
+// matches it. The match guard prevents delayed cleanup from deleting a
+// newer exact hint.
+func (r *codexRuntime) forgetActiveTurn(threadID, expectedTurnID string) {
+	r.mu.Lock()
+	if expectedTurnID == "" || r.activeTurnHints[threadID] == expectedTurnID {
+		delete(r.activeTurnHints, threadID)
+	}
+	r.mu.Unlock()
 }
 
 // setStatus records one thread's new native status. During a snapshot it
@@ -471,6 +674,9 @@ func (r *codexRuntime) handleNotification(method string, params json.RawMessage)
 // stay out of the catalog.
 func (r *codexRuntime) setStatus(id string, status ThreadStatus) {
 	r.mu.Lock()
+	if status.Type == statusIdle || status.Type == statusSystemError || status.Type == statusNotLoaded {
+		delete(r.activeTurnHints, id)
+	}
 	if r.snapshotting {
 		r.dirty[id] = true
 		r.mu.Unlock()

@@ -271,44 +271,78 @@ provider ごとの起動方法は異なるが、Agent View 上では同じ Dispa
 
 **Codex**
 
-- shared app-server daemon を利用する。
+- shared app-server daemon を利用する。supervisor-managed Codex process や short-lived stdio app-server は使わない。
+- Dispatch ごとに daemon を確保し (`readySocket`)、Observer の persistent connection とは別の dedicated connection を張る。`thread/start` はその connection を thread へ自動 subscribe するため、Dispatch の subscription lifecycle を Observer と混ぜない。
 - Dispatch は次の RPC sequence とする。
 
 ```text
+initialize
 thread/start
   -> canonical thread ID
-
 turn/start
-  -> response を待つ
-
+  -> accepted response = commit point
 thread/unsubscribe
-  -> subscriber-only の turn event / approval / user-input request の delivery を解除
+  -> best-effort cleanup
+close
+  -> fallback cleanup (常に実行)
 ```
 
-- `thread/start` の response で canonical thread ID を同期的に得るため、provisional run ID、baseline、CWD / writer lock による run-to-thread binding は持たない。
-- `turn/start` の response を待ってから Dispatch 成功とする。失敗した場合は Dispatch error とし、turn のない thread を session catalog row として捏造しない。
-- `thread/unsubscribe` の前に approval / user-input request が届く race があっても agentsctl は応答しない。request は thread 側に保持され、後から foreground TUI が Open されたときに再提示される。
+- `thread/start` の params は `cwd` (Composer の Dispatch CWD)、`ephemeral: false`、`threadSource: "user"` だけとする。
+  - `ephemeral: false`: user-visible / durable / resumable な thread を作る操作であり、durability を daemon の config に依存させない。
+  - `threadSource: "user"`: title generation 等の internal thread と区別する。
+  - model、approval policy、sandbox、permissions、config overrides 等は送らない。`cwd` に対する Codex config の解決は shared daemon の責務であり、agentsctl は Codex config を複製しない。
+- `thread/start` の response の `thread.id` が空なら malformed として Dispatch error とし、canonical identity として受理しない。
+- `turn/start` は `threadId`、`turnTrigger: "user"`、1つの text `UserInput` (prompt を verbatim) だけを送る。cwd / model / permissions 等を turn scope で上書きせず、thread/start で確立した設定を使う。
+- `turn/start` の成功 response (空でない `turn.id`) が Dispatch の commit point である。この時点で server-side の turn は開始済みとみなす。
+  - commit point より前の失敗 (`thread/start` failure、`turn/start` の RPC error、malformed response) は Dispatch error とする。`thread/start` 成功後に `turn/start` が失敗しても thread を削除・隠蔽せず、Starting row、local run、provisional identity も作らない。native catalog にその thread が現れるかは app-server の責務であり、現れた場合は catalog を権威として扱う。
+  - commit point より後の失敗は Dispatch を error へ戻さない。再送が別 thread / turn を二重に作るためである。
+- `thread/unsubscribe` は commit 後の best-effort cleanup とする。
+  - `unsubscribed` / `notSubscribed` / `notLoaded` はいずれも「この connection に残す subscription がない」という結果として扱う。
+  - RPC error、transport error、未知または malformed な status、timeout は cleanup failure であり、Dispatch の成功を失敗に反転させない。
+  - connection close が fallback である。close で connection の subscription は除去され、turn の interrupt や thread の shutdown は起きない。
+  - commit 後の各 cleanup step は caller の cancellation から切り離した短い timeout で bound し、応答しない daemon が committed Dispatch の return を妨げないようにする。
+- `thread/unsubscribe` の前に approval / user-input request が届く race があっても agentsctl は応答しない (approve / deny / cancel / error response のいずれも送らない)。request は thread 側に保持され、後から foreground TUI が Open されたときに再提示される。
+- Dispatch が返すのは canonical `codex:<thread ID>` と要求した CWD だけである。Activity、Runtime、RunID、PreviousKeys、Actions を推測して返さず、Dispatch の response から catalog row を作らない。row は `thread/list` と Observer (broadcast `thread/started` / `thread/status/changed`) から現れる。
+- 新規 Dispatch は local run、baseline、provisional run ID、PendingRename を作らず、run-to-thread reconcile に依存しない。
 - Activity は Dispatch connection の thread subscription ではなく、persistent observer が受け取る broadcast `thread/status/changed` から更新する。
 
 ###### Rename-only new session (Codex)
 
-新規 session の Composer 入力が単独の `/rename <name>` である場合、その文字列を Codex の initial prompt として渡さない。Codex には通常 prompt として渡るためである。認識するのは入力全体がこの1コマンドである場合に限り、name が空なら Dispatch 前に validation error とする。
+新規 session の Composer 入力が単独の `/rename <name>` である場合、その文字列を Codex の initial prompt として渡さない。Codex には通常 prompt として渡るためである。認識するのは入力全体がこの1コマンドである場合に限り、name が空なら daemon の確保や RPC connection の作成より前に validation error とする。
 
 Codex は user/model turn を一度も持たない thread を durable な resumable/listable session として扱わない。このため rename-only でも固定の bootstrap turn を1回実行する。
 
 ```text
 /rename <name>
-  -> thread/start                 (canonical thread ID を取得)
-  -> turn/start(bootstrap prompt)
-  -> thread/unsubscribe
-  -> thread が durable になった後に native thread rename
+  -> thread/start                    (canonical thread ID を取得)
+  -> turn/start(bootstrap prompt)    (accepted = commit point)
+  -> 対応する turn/started を待つ     (rollout persistence の readiness)
+  -> thread/name/set                 (同じ shared-daemon connection、subscribe 中)
+  -> turn/interrupt                  (bootstrap の exact thread / turn)
+  -> 対応する turn/completed を待つ   (status = interrupted)
+  -> thread/unsubscribe              (best effort、rename の成否に関わらず試みる)
+  -> close
 ```
 
-- bootstrap prompt は固定文とし name を含めない。name は user-controlled な文字列であり model instruction に埋め込まない。
-- session identity は最初から `codex:<thread ID>` であり、bootstrap のための provisional run key や identity transition は作らない。
+- bootstrap prompt は固定文とし name や `/rename` を含めない。name は user-controlled な文字列であり model instruction に埋め込まない。
+- session identity は最初から `codex:<thread ID>` であり、bootstrap のための provisional run key、identity transition、local PendingRename は作らない。
+- native rename は bootstrap turn が accepted された後にだけ送る。bootstrap turn が失敗した thread に名前だけが残る状態を作らないためである。
+- `turn/start` の response は turn の受理 (Dispatch の commit point) を示すだけで、thread の rollout の persistence を保証しない。rename (metadata update) は rollout を必要とするため、response 直後に送ると失敗しうる。daemon は turn の開始を rollout に persist した後に `turn/started` を送るため、thread ID と turn ID が `thread/start` / `turn/start` の response と一致する `turn/started` を rename の readiness とする。
+  - notification は response より先に届きうるため、Dispatch connection の確立時点から `turn/started` を記録する。別 thread / 別 turn の `turn/started` は readiness としない。
+  - `thread/read` の成功は rollout の存在を示さないため readiness に使わない。sleep や rename の blind retry もしない。
+  - `turn/started` が bound 内に届かない、または connection が閉じた場合は rename failure とし、rename は送らない。通常 Dispatch はこの待機をしない。
+- rename 後は `turn/start` response の exact turn ID に `turn/interrupt` を送り、同じ thread / turn の `turn/completed(status = interrupted)` を待つ。`turn/completed` が interrupt response より先に届く race を失わないよう、connection 作成時から lifecycle notification を記録する。
+- bootstrap が interrupt 前に自然終了して RPC が失敗した場合は、同じ daemon の `thread/read` と `thread/turns/list` で current active turn を再確認する。thread が `idle` / `systemError` / `notLoaded` なら cleanup 済みとして扱い、同じ turn が active のまま、または別 turn が active なら失敗する。別 turn を代わりに interrupt しない。
+- rename が失敗しても bootstrap interrupt と unsubscribe を試み、close を fallback とする。rename 成功後に bootstrap turn が active のままなら canonical thread ID を含む post-commit cleanup error とする。unsubscribe の失敗だけでは rename-only Dispatch を失敗にしない。
+- commit 後は rename / cleanup が失敗しても thread の delete、archive、rollback、daemon restart、自動 retry を行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
 - bootstrap 中の Activity は通常の native thread status を使う。
 - bootstrap turn は model turn を1回消費する。rate limit 等で失敗する場合も特別な回避はしない。
-- native rename の失敗は rename failure として扱い、別 thread の推測や自動 retry は行わない。
+
+###### Legacy managed run (移行期間)
+
+RPC Dispatch 導入前に supervisor-managed Dispatch が localstate に残した run は、移行 code の撤去までは従来どおり reconcile、provisional row、`PreviousKeys`、PendingRename の適用、managed-run Stop の対象とする。新規 Dispatch はこの状態を作らない。
+
+legacy reconcile は candidate thread の writer lock owner が legacy run 自身の process identity であることを binding の条件とする。RPC Dispatch の thread の writer lock は shared daemon が保持するため、同じ CWD・新しい timestamp であっても legacy run に bind されない。
 
 ##### Composer directory context
 
@@ -561,7 +595,7 @@ shared daemon / thread / turn は bridge の外にあり、影響を受けない
 
 ##### Stop
 
-Stop は、session に紐づく実行中の process を終了する。
+Stop は、session に紐づく実行中の処理を provider-native な方法で停止する。
 
 **Claude**
 
@@ -571,9 +605,10 @@ Stop は、session に紐づく実行中の process を終了する。
 **Codex**
 
 - Stop は Codex process の kill ではなく、shared app-server 上の active turn を native RPC で interrupt する。
-- Stop の時点で `thread/turns/list` から `inProgress` turn を取得し、その turn ID に `turn/interrupt` を送る。
-- turn ID は daemon restart 後に変化しうるため cache しない。
+- Stop の時点で shared daemon の `thread/read` と live turn を含む `thread/turns/list` から current `inProgress` turn を取得し、その exact turn ID に `turn/interrupt` を送る。Observer cache から turn ID を推測しない。
+- first turn の materialization 前だけは `thread/turns/list` が明示的に unavailable を返すため、この process の `turn/start` response が返した同じ thread の exact turn ID を in-memory hint として使用できる。hint は永続化せず、notification または daemon lifecycle の終了で破棄し、別 turn を代わりに interrupt しない。
 - approval / user-input 待ちも active turn として interrupt でき、pending request は破棄される。
+- lookup 後に対象 turn が終了した race は authoritative state を再確認する。別 turn が active ならそれを代わりに止めず fail closed とする。
 - interrupt 後も thread 自体は残り、次の turn を開始できる。
 - daemon 外の writer しか確認できない thread は process を推測して停止せず fail closed とする。
 
@@ -596,8 +631,13 @@ Archive は、既存 session を通常の Agent View から除外する。
 
 **Codex**
 
-- app-server の native archive を利用する。
-- daemon 外の active writer が存在する thread は、ownership を推測して archive しない。
+- shared daemon の native archive (`thread/archive`) を利用する。daemon は loaded thread を runtime ごと shutdown して archive するため、送信前に provider が同じ connection で authoritative preflight を行う。
+  - `thread/read` で現在の status を読み、Observer と同じ解釈 (active は Working / NeedsInput、`notLoaded` は writer lock で休止か daemon 外 runtime かを判定) で評価する。
+  - idle / systemError、または `notLoaded` かつ writer lock なしの場合だけ `thread/archive` を送る。
+  - active (Working / NeedsInput) は拒否する。`thread/archive` を送らないため、Archive が暗黙に turn を止めることはない。
+  - `notLoaded` かつ writer lock あり (daemon 外の writer) は、ownership を推測せず拒否する。
+  - 未知の status や `thread/read` の失敗も拒否する。
+- row の Archive availability は同じ observation に基づく UX 上の guard であり、Working / NeedsInput と daemon 外 writer では unavailable とする。Unknown 等で offered であっても、実際の Archive は上記 preflight を必ず通る。preflight と `thread/archive` の間に始まった turn までは防げない。
 
 実行中の session は Archive できない。
 
@@ -621,7 +661,7 @@ Rename は、既存 session の表示名を変更する。
 
 **Codex**
 
-- app-server の native rename を利用する。
+- shared daemon の native rename (`thread/name/set`) を利用する。daemon は metadata だけを更新するため、実行中の session も中断せずに rename できる。
 - 新規 session の `/rename <name>` は、thread が存在しないため直接は適用できない。「Rename-only new session (Codex)」を参照。
 
 #### Directory scope
@@ -923,6 +963,7 @@ Codex の thread / turn runtime は shared app-server daemon が保持する。a
 - agentsctl は shared runtime が必要なとき `codex app-server daemon start` を冪等に実行して daemon を確保する。
 - Observer は初回接続だけでなく reconnect attempt の前にも daemon を確保し、lifecycle response の `socketPath` を接続先とする。
 - Open も起動のたびに daemon を確保し、同じ `socketPath` を preflight と `--remote` の接続先とする。Observer の接続状態には依存しない。
+- 既存 thread の mutation (Rename / Archive / Unarchive) も操作のたびに daemon を確保し、その daemon への専用 connection で行う。thread の writer lock を持つ daemon 以外の app-server process (short-lived stdio app-server 等) からは mutation しない。short-lived app-server は List / Usage などの read にだけ使う。
 - Observer が row authority を得る前の daemon 確保失敗は error-only update として warning を表示し、List が供給した rows を維持する。
 - implicit daemon auto-start や plain `codex resume` の fallback behavior を correctness の前提にしない。
 - daemon の Stop / Restart / Update を通常操作として agentsctl が所有しない。Codex updater 等による restart は起こりうるため、RPC connection は切断と再接続を通常の lifecycle として扱う。
@@ -957,6 +998,14 @@ thread/loaded/list + thread/read
 thread/status/changed
   -> 接続後の live Activity update
 ```
+
+新規 thread は rollout が persist されるまで `thread/list` に現れず、それは最初の turn の終了まで遅れうる。このため Observer は `thread/started` の native `Thread` を、`thread/list` がまだ返さない thread の live catalog source とし、表示する catalog を `thread/list` (durable) と live-started thread の和とする。
+
+- live-started thread にも `thread/status/changed` と `thread/name/updated` を反映する。`thread/closed` は daemon runtime の unload として status を `notLoaded` にし、catalog row は維持して catalog resync を要求する。`thread/archived` / `thread/deleted` は catalog existence の明示的な removal として row を除く。
+- `thread/list` がまだ返さないことを理由に live-started thread を消さない。同じ ID を返した時点で durable 側の `Thread` に置き換える (1 row のまま)。
+- 未永続の live-started thread が closed した場合だけ、close 後に開始した authoritative `thread/list` にも absent なら overlay を除く。close 前から in-flight だった catalog result では除かない。
+- snapshot では、loaded だが `thread/list` にない thread を live-started thread として再構築する。
+- agentsctl 独自の provisional row は作らない。identity は常に daemon の thread ID である。
 
 reconnect 時は event replay を要求せず、snapshot を取り直した後の future event だけで current state へ収束する。
 
@@ -1172,6 +1221,12 @@ PID reuse により、無関係な process を操作する可能性がある。
 `thread/start` が canonical thread ID を同期的に返すため、Codex の新規 session を一時的な run ID で公開する必要はない。
 
 Dispatch 直後から canonical `codex:<thread ID>` を使い、Agent View が CWD、timestamps、row position などから identity transition を推測する経路を作らない。
+
+### Dispatch のために `thread/list` の source filter を広げる
+
+**不採用。**
+
+managed daemon は `--session-source` なしで app-server を起動し、その default session source は interactive な `vscode` である。これは `thread/list` の default interactive sources に含まれるため、RPC Dispatch の thread は source filter を変えずに catalog に現れる。`appServer` source kind の追加や originator による filtering は行わない。
 
 ### 単発の redraw signal を送る
 

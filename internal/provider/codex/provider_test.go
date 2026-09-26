@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,136 +19,27 @@ import (
 
 var errBoom = errors.New("boom")
 
+// fakeAPI is the short-lived app-server's read side. It has no mutation
+// methods: Rename, Archive and Unarchive go to the shared daemon.
 type fakeAPI struct {
-	rows       []Thread
-	home       string
-	archived   string
-	unarchived string
-	renamed    string
-	renameErr  error
-	renames    int
+	rows  []Thread
+	home  string
+	lists int
 
 	rateLimits    AccountRateLimits
 	rateLimitsErr error
 }
 
-type fakeDispatcher struct {
-	dispatchEnvironment map[string]string
-
-	// dispatches counts Dispatch calls; prompt is the last one's prompt, i.e.
-	// what the Codex CLI would receive as its initial prompt. When store is
-	// set the run is recorded there like the supervisor does; dispatchErr
-	// fails the start instead. stopped lists the runs Stop was asked for.
-	dispatches  int
-	prompt      string
-	store       *localstate.Store
-	dispatchErr error
-	stopped     []string
+// fakeManagedRuntime records which legacy managed runs Stop was asked for.
+// It has no Dispatch: nothing new is ever started through the legacy
+// runtime.
+type fakeManagedRuntime struct {
+	stopped []string
 }
 
-func (f *fakeDispatcher) Dispatch(_ context.Context, prompt, cwd string, baseline []string, environment map[string]string) (localstate.Run, error) {
-	f.dispatches++
-	f.prompt = prompt
-	if f.dispatchErr != nil {
-		return localstate.Run{}, f.dispatchErr
-	}
-	f.dispatchEnvironment = cloneEnvironment(environment)
-	r := localstate.Run{ID: "dispatch-run"}
-	if f.store != nil {
-		r = localstate.Run{ID: "run-1", Provider: "codex", CWD: cwd, State: "running", Baseline: baseline}
-		if err := f.store.StartRun(r); err != nil {
-			return localstate.Run{}, err
-		}
-	}
-	return r, nil
-}
-
-func (f *fakeDispatcher) Stop(_ context.Context, id string) error {
+func (f *fakeManagedRuntime) Stop(_ context.Context, id string) error {
 	f.stopped = append(f.stopped, id)
 	return nil
-}
-
-func cloneEnvironment(environment map[string]string) map[string]string {
-	if environment == nil {
-		return nil
-	}
-	result := make(map[string]string, len(environment))
-	for key, value := range environment {
-		result[key] = value
-	}
-	return result
-}
-
-func TestManagedCodexEnvironmentAppliesToDispatch(t *testing.T) {
-	t.Setenv("CODEX_EDITOR", "nvim")
-	t.Setenv("EDITOR", "vim")
-	runtime := &fakeDispatcher{}
-	provider := &Provider{
-		API:     &fakeAPI{home: t.TempDir()},
-		Runtime: runtime,
-	}
-
-	if _, err := provider.Dispatch(context.Background(), "prompt", "/work"); err != nil {
-		t.Fatal(err)
-	}
-
-	want := map[string]string{"EDITOR": "nvim"}
-	if !maps.Equal(runtime.dispatchEnvironment, want) {
-		t.Fatalf("dispatch environment=%v, want %v", runtime.dispatchEnvironment, want)
-	}
-	if got := os.Getenv("EDITOR"); got != "vim" {
-		t.Fatalf("agentsctl EDITOR=%q, want unchanged value vim", got)
-	}
-}
-
-func TestManagedCodexEnvironmentOmitsEmptyAndUnsetEditor(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		unset bool
-	}{
-		{name: "empty"},
-		{name: "unset", unset: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("CODEX_EDITOR", "")
-			if tc.unset {
-				if err := os.Unsetenv("CODEX_EDITOR"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			t.Setenv("EDITOR", "vim")
-			runtime := &fakeDispatcher{}
-			provider := &Provider{API: &fakeAPI{}, Runtime: runtime}
-			if _, err := provider.Dispatch(context.Background(), "prompt", "/work"); err != nil {
-				t.Fatal(err)
-			}
-			if runtime.dispatchEnvironment != nil {
-				t.Fatalf("dispatch environment=%v, want no override", runtime.dispatchEnvironment)
-			}
-			if got := os.Getenv("EDITOR"); got != "vim" {
-				t.Fatalf("agentsctl EDITOR=%q, want unchanged value vim", got)
-			}
-		})
-	}
-}
-
-func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
-	api := &fakeAPI{}
-	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
-	p := Provider{API: api, Store: store}
-	key := session.Key{Provider: session.ProviderCodex, ID: "thread"}
-	if err := p.Archive(context.Background(), key); err != nil {
-		t.Fatal(err)
-	}
-	if api.archived != "thread" {
-		t.Fatal("native archive not called")
-	}
-	if err := p.Unarchive(context.Background(), key); err != nil {
-		t.Fatal(err)
-	}
-	if api.unarchived != "thread" {
-		t.Fatal("native unarchive not called")
-	}
 }
 
 func durationMins(m int) *int { return &m }
@@ -315,19 +205,10 @@ func TestUsagePropagatesAPIError(t *testing.T) {
 }
 
 func (f *fakeAPI) List(context.Context, bool) ([]Thread, error) {
+	f.lists++
 	return append([]Thread(nil), f.rows...), nil
 }
-func (f *fakeAPI) Rename(_ context.Context, id, name string) error {
-	f.renames++
-	if f.renameErr != nil {
-		return f.renameErr
-	}
-	f.renamed = id + ":" + name
-	return nil
-}
-func (f *fakeAPI) Archive(_ context.Context, id string) error   { f.archived = id; return nil }
-func (f *fakeAPI) Unarchive(_ context.Context, id string) error { f.unarchived = id; return nil }
-func (f *fakeAPI) CodexHome() string                            { return f.home }
+func (f *fakeAPI) CodexHome() string { return f.home }
 func (f *fakeAPI) RateLimits(context.Context) (AccountRateLimits, error) {
 	return f.rateLimits, f.rateLimitsErr
 }
@@ -499,13 +380,13 @@ func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
 	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec: operation not permitted"}); err != nil {
 		t.Fatal(err)
 	}
-	api := &fakeAPI{}
-	p := Provider{Store: store, API: api}
+	d := newFakeDaemon(t)
+	p := Provider{Store: store, API: &fakeAPI{}, ControlSocket: d.socket}
 	if err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"}); err != nil {
 		t.Fatal(err)
 	}
-	if api.archived != "" {
-		t.Fatalf("unbound run archive called app-server thread/archive with id=%q", api.archived)
+	if n := d.callCount("initialize"); n != 0 {
+		t.Fatalf("unbound run archive contacted the daemon (%d connections)", n)
 	}
 	runs, _ := store.Runs()
 	if _, ok := runs["r"]; ok {
@@ -534,8 +415,8 @@ func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 			if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: runState}); err != nil {
 				t.Fatal(err)
 			}
-			api := &fakeAPI{}
-			p := Provider{Store: store, API: api}
+			d := newFakeDaemon(t)
+			p := Provider{Store: store, API: &fakeAPI{}, ControlSocket: d.socket}
 			err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
 			if err == nil {
 				t.Fatal("expected an error archiving an active unbound run, got nil")
@@ -544,8 +425,8 @@ func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 			if _, ok := runs["r"]; !ok {
 				t.Fatal("running/starting unbound run was locally deleted by Archive")
 			}
-			if api.archived != "" {
-				t.Fatalf("running/starting unbound run's local ID reached the app-server thread/archive: id=%q", api.archived)
+			if n := d.callCount("initialize"); n != 0 {
+				t.Fatalf("running/starting unbound run's local ID reached the daemon (%d connections)", n)
 			}
 		})
 	}

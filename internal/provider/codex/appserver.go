@@ -81,16 +81,18 @@ type AccountRateLimits struct {
 	RateLimits RateLimitSnapshot `json:"rateLimits"`
 }
 
+// AppServer is the read side served by a short-lived `codex app-server
+// --stdio` process. Thread mutations never go through it: a separate
+// app-server process cannot write a thread the shared daemon holds, so
+// Rename, Archive and Unarchive run on the shared daemon (see
+// Provider.withDaemon).
 type AppServer interface {
 	List(context.Context, bool) ([]Thread, error)
-	Rename(context.Context, string, string) error
-	Archive(context.Context, string) error
-	Unarchive(context.Context, string) error
 	// RateLimits reads the account's current 5h/weekly rate-limit
 	// utilization via the app-server's account/rateLimits/read method --
-	// the same native, machine-readable transport List/Rename/Archive
-	// already use (`codex app-server --stdio`), confirmed against the
-	// installed CLI's own generated JSON Schema
+	// the same native, machine-readable transport List already uses
+	// (`codex app-server --stdio`), confirmed against the installed CLI's
+	// own generated JSON Schema
 	// (`codex app-server generate-json-schema`) and a live request/
 	// response exchange, never by parsing TUI display output.
 	RateLimits(context.Context) (AccountRateLimits, error)
@@ -207,21 +209,6 @@ func mergeThread(byID map[string]Thread, order *[]string, t Thread) {
 	if t.UpdatedAt > existing.UpdatedAt {
 		byID[t.ID] = t
 	}
-}
-func (c *CommandAppServer) Rename(ctx context.Context, id, name string) error {
-	return c.withClient(ctx, func(cl *rpcClient) error {
-		return cl.call(ctx, "thread/name/set", map[string]string{"threadId": id, "name": name}, nil)
-	})
-}
-func (c *CommandAppServer) Archive(ctx context.Context, id string) error {
-	return c.withClient(ctx, func(cl *rpcClient) error {
-		return cl.call(ctx, "thread/archive", map[string]string{"threadId": id}, nil)
-	})
-}
-func (c *CommandAppServer) Unarchive(ctx context.Context, id string) error {
-	return c.withClient(ctx, func(cl *rpcClient) error {
-		return cl.call(ctx, "thread/unarchive", map[string]string{"threadId": id}, nil)
-	})
 }
 func (c *CommandAppServer) RateLimits(ctx context.Context) (AccountRateLimits, error) {
 	var res AccountRateLimits

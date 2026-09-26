@@ -47,7 +47,7 @@ func newOpenProvider(t *testing.T, d *fakeDaemon) (*Provider, *scriptedLifecycle
 	p := &Provider{
 		API:        &fakeAPI{},
 		Store:      localstate.New(filepath.Join(t.TempDir(), "state.json")),
-		Runtime:    &fakeDispatcher{},
+		Runtime:    &fakeManagedRuntime{},
 		Daemon:     lifecycle,
 		Foreground: fg,
 		writerFree: probe.free,
@@ -151,7 +151,7 @@ func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	d.setThreads(catalogThread("thread-1", 1))
 	d.setLoaded("thread-1", active())
 	p, _, _, fg := newOpenProvider(t, d)
-	dispatcher := p.Runtime.(*fakeDispatcher)
+	legacy := p.Runtime.(*fakeManagedRuntime)
 	fg.err = errBoom
 
 	err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
@@ -162,8 +162,8 @@ func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	if err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if fg.calls != 2 || dispatcher.dispatches != 0 || len(dispatcher.stopped) != 0 {
-		t.Fatalf("launches=%d dispatches=%d stopped=%v, want one launch per Open and nothing else", fg.calls, dispatcher.dispatches, dispatcher.stopped)
+	if fg.calls != 2 || len(legacy.stopped) != 0 || d.callCount("thread/start") != 0 {
+		t.Fatalf("launches=%d stopped=%v thread/start=%d, want one launch per Open and nothing else", fg.calls, legacy.stopped, d.callCount("thread/start"))
 	}
 	for _, method := range []string{"turn/interrupt", "thread/unsubscribe"} {
 		if n := d.callCount(method); n != 0 {
