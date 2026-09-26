@@ -334,8 +334,8 @@ func TestDispatchedThreadIsPublishedByObserver(t *testing.T) {
 	if !row.Actions[session.ActionOpen].Available {
 		t.Fatalf("dispatched thread must be openable: %+v", row.Actions)
 	}
-	if row.Actions[session.ActionStop].Available {
-		t.Fatalf("Stop has no managed run to act on until #83: %+v", row.Actions)
+	if !row.Actions[session.ActionStop].Available {
+		t.Fatalf("active shared-daemon thread must offer native Stop: %+v", row.Actions)
 	}
 }
 

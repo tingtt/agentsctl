@@ -233,12 +233,16 @@ func TestObserverResolvesNotLoadedThroughWriterLockOnly(t *testing.T) {
 		}
 	}
 	// Open goes through the shared daemon: a thread it has loaded or a
-	// dormant one can be opened, one running outside it cannot. Stop stays
-	// with agentsctl-managed runs.
-	for id, open := range map[string]bool{"dormant": true, "external": false, "loaded": true} {
+	// dormant one can be opened, one running outside it cannot. Native Stop
+	// is offered only for the daemon-loaded active thread.
+	for id, want := range map[string]struct{ open, stop bool }{
+		"dormant":  {open: true},
+		"external": {},
+		"loaded":   {open: true, stop: true},
+	} {
 		s, _ := rowOf(u, id)
-		if s.Actions.Available(session.ActionOpen) != open || s.Actions.Available(session.ActionStop) {
-			t.Fatalf("%s actions=%+v, want Open=%v and no Stop", id, s.Actions, open)
+		if s.Actions.Available(session.ActionOpen) != want.open || s.Actions.Available(session.ActionStop) != want.stop {
+			t.Fatalf("%s actions=%+v, want Open=%v Stop=%v", id, s.Actions, want.open, want.stop)
 		}
 	}
 }

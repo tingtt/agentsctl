@@ -27,8 +27,8 @@ func runsOf(t *testing.T, store *localstate.Store) map[string]localstate.Run {
 // TestRenameOnlyDispatchBootstrapsThenRenamesNatively pins the rename-only
 // sequence: the model only sees the fixed bootstrap prompt, and the name is
 // set natively on the same connection once that turn has started (its
-// turn/started arrived), while the connection is still subscribed, and
-// only then unsubscribed.
+// turn/started arrived), then the artificial turn is interrupted and
+// completed before the connection unsubscribes.
 func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 	for _, tc := range []struct{ input, name string }{
 		{"/rename foo", "foo"},
@@ -39,12 +39,13 @@ func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 		t.Run(tc.input, func(t *testing.T) {
 			f := newDispatchFixture(t)
 			f.d.traceLifecycle = true
+			f.d.turnInterruptCompletion = "afterResponse"
 			got, err := f.p.Dispatch(context.Background(), tc.input, "/work")
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.d.waitClosed(t, 1)
-			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "turn/started thread-new-1/turn-1", "thread/name/set", "thread/unsubscribe", "close")
+			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "turn/started thread-new-1/turn-1", "thread/name/set", "turn/interrupt", "turn/interrupt response", "turn/completed thread-new-1/turn-1 interrupted", "thread/unsubscribe", "close")
 
 			turn := decodeParams(t, f.d.requestsOf("turn/start")[0])
 			if !reflect.DeepEqual(turn["input"], textInput(renameBootstrapPrompt)) {
@@ -59,6 +60,9 @@ func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 			}
 			if want := (session.Session{Key: codexKey("thread-new-1"), CWD: "/work"}); !reflect.DeepEqual(got, want) {
 				t.Fatalf("Dispatch = %+v, want only the canonical key and CWD", got)
+			}
+			if turnID := f.d.activeTurn("thread-new-1"); turnID != "" {
+				t.Fatalf("bootstrap turn still active: %s", turnID)
 			}
 			f.requireNoLegacySideEffects(t)
 		})
@@ -95,8 +99,8 @@ func TestOrdinaryDispatchNeverRenames(t *testing.T) {
 
 // A rename that fails after the bootstrap turn was accepted fails the
 // rename-only Dispatch, naming the thread that now exists, still releases
-// the subscription, and touches that thread no further: no interrupt,
-// delete, archive, legacy Stop, retry or local pending rename.
+// the subscription, and still interrupts the bootstrap turn. It never
+// deletes, archives, rolls back, retries, or creates a local pending rename.
 func TestRenameOnlyPostCommitRenameFailureKeepsThread(t *testing.T) {
 	restore := dispatchCleanupTimeout
 	dispatchCleanupTimeout = 100 * time.Millisecond
@@ -120,14 +124,14 @@ func TestRenameOnlyPostCommitRenameFailureKeepsThread(t *testing.T) {
 			}
 			f.d.waitClosed(t, 1)
 			if tc.unsubscribed {
-				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
+				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "turn/interrupt", "thread/unsubscribe", "close")
 			} else {
 				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "close")
 			}
 			if n := f.d.callCount("thread/name/set"); n > 1 {
 				t.Fatalf("rename retried (%d attempts)", n)
 			}
-			for _, method := range []string{"turn/interrupt", "thread/delete", "thread/archive"} {
+			for _, method := range []string{"thread/delete", "thread/archive"} {
 				if n := f.d.callCount(method); n != 0 {
 					t.Fatalf("%s called %d times after a rename failure", method, n)
 				}
@@ -169,15 +173,15 @@ func TestRenameOnlyWaitsForMatchingTurnStarted(t *testing.T) {
 				t.Fatalf("Dispatch = (%+v, %v), want the renamed session", got, err)
 			}
 			f.d.waitClosed(t, 1)
-			want := append(append([]string{"ensure", "initialize", "thread/start"}, tc.want...), "thread/unsubscribe", "close")
+			want := append(append([]string{"ensure", "initialize", "thread/start"}, tc.want...), "turn/interrupt", "turn/completed thread-new-1/turn-1 interrupted", "turn/interrupt response", "thread/unsubscribe", "close")
 			requireEvents(t, f.d, want...)
 		})
 	}
 }
 
 // Without its turn/started the rename is never attempted: the rename-only
-// Dispatch fails naming the committed thread, still unsubscribes, and
-// leaves the thread and its turn alone.
+// Dispatch fails naming the committed thread and still tries to stop the
+// artificial turn before unsubscribing.
 func TestRenameOnlyReadinessFailureKeepsThread(t *testing.T) {
 	restore := dispatchCleanupTimeout
 	dispatchCleanupTimeout = 100 * time.Millisecond
@@ -192,9 +196,9 @@ func TestRenameOnlyReadinessFailureKeepsThread(t *testing.T) {
 			}
 			f.d.waitClosed(t, 1)
 			if mode == "never" { // a dropped connection cannot receive it
-				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/unsubscribe", "close")
+				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "turn/interrupt", "thread/unsubscribe", "close")
 			}
-			for _, method := range []string{"thread/name/set", "turn/interrupt", "thread/delete", "thread/archive"} {
+			for _, method := range []string{"thread/name/set", "thread/delete", "thread/archive"} {
 				if n := f.d.callCount(method); n != 0 {
 					t.Fatalf("%s called %d times", method, n)
 				}
@@ -214,7 +218,52 @@ func TestRenameOnlyUnsubscribeFailureStillSucceeds(t *testing.T) {
 		t.Fatalf("Dispatch = (%+v, %v), want success", got, err)
 	}
 	f.d.waitClosed(t, 1)
-	requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
+	requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "turn/interrupt", "thread/unsubscribe", "close")
+}
+
+func TestRenameOnlyInterruptCompletionBeforeResponseIsBuffered(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.traceLifecycle = true
+	got, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
+	if err != nil || got.Key != codexKey("thread-new-1") {
+		t.Fatalf("Dispatch = (%+v, %v), want success", got, err)
+	}
+	f.d.waitClosed(t, 1)
+	requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "turn/started thread-new-1/turn-1", "thread/name/set", "turn/interrupt", "turn/completed thread-new-1/turn-1 interrupted", "turn/interrupt response", "thread/unsubscribe", "close")
+}
+
+func TestRenameOnlyNaturalCompletionBeforeInterruptSucceeds(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.before["turn/interrupt"] = func(c *fakeConn) {
+		f.d.completeTurn(c, "thread-new-1", "turn-1", turnStatusCompleted)
+	}
+	got, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
+	if err != nil || got.Key != codexKey("thread-new-1") {
+		t.Fatalf("Dispatch = (%+v, %v), want success after natural completion", got, err)
+	}
+	if status := f.d.loadedStatus("thread-new-1"); status.Type != statusIdle {
+		t.Fatalf("thread status = %+v, want idle", status)
+	}
+}
+
+func TestRenameOnlyInterruptFailureWhileActiveIsReported(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.failNext("turn/interrupt", 1)
+	_, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
+	if err == nil || !strings.Contains(err.Error(), "thread-new-1") || !strings.Contains(err.Error(), "bootstrap cleanup") {
+		t.Fatalf("Dispatch = %v, want post-commit cleanup failure naming thread-new-1", err)
+	}
+	if active := f.d.activeTurn("thread-new-1"); active != "turn-1" {
+		t.Fatalf("active turn = %q, want turn-1 after failed exact interrupt", active)
+	}
+	if f.d.callCount("thread/unsubscribe") != 1 {
+		t.Fatal("unsubscribe was not attempted")
+	}
+	for _, method := range []string{"thread/delete", "thread/archive"} {
+		if f.d.callCount(method) != 0 {
+			t.Fatalf("%s called after cleanup failure", method)
+		}
+	}
 }
 
 // Before the bootstrap turn is accepted there is nothing to rename.

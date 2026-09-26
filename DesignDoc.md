@@ -318,6 +318,8 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
   -> turn/start(bootstrap prompt)    (accepted = commit point)
   -> 対応する turn/started を待つ     (rollout persistence の readiness)
   -> thread/name/set                 (同じ shared-daemon connection、subscribe 中)
+  -> turn/interrupt                  (bootstrap の exact thread / turn)
+  -> 対応する turn/completed を待つ   (status = interrupted)
   -> thread/unsubscribe              (best effort、rename の成否に関わらず試みる)
   -> close
 ```
@@ -327,10 +329,12 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 - native rename は bootstrap turn が accepted された後にだけ送る。bootstrap turn が失敗した thread に名前だけが残る状態を作らないためである。
 - `turn/start` の response は turn の受理 (Dispatch の commit point) を示すだけで、thread の rollout の persistence を保証しない。rename (metadata update) は rollout を必要とするため、response 直後に送ると失敗しうる。daemon は turn の開始を rollout に persist した後に `turn/started` を送るため、thread ID と turn ID が `thread/start` / `turn/start` の response と一致する `turn/started` を rename の readiness とする。
   - notification は response より先に届きうるため、Dispatch connection の確立時点から `turn/started` を記録する。別 thread / 別 turn の `turn/started` は readiness としない。
-  - `turn/completed` は待たない。`thread/read` の成功も rollout の存在を示さないため readiness に使わない。sleep や rename の blind retry もしない。
+  - `thread/read` の成功は rollout の存在を示さないため readiness に使わない。sleep や rename の blind retry もしない。
   - `turn/started` が bound 内に届かない、または connection が閉じた場合は rename failure とし、rename は送らない。通常 Dispatch はこの待機をしない。
-- rename は unsubscribe より前に送る。rename が失敗しても unsubscribe は cleanup として試み、close を fallback とする。unsubscribe の失敗は rename-only の失敗理由にしない。
-- commit 後の rename 失敗 (readiness 待ちの失敗、RPC error、connection 喪失を含む) は、canonical thread ID を含む rename-only Dispatch failure として返す。thread / turn はすでに committed であるため、Stop、`turn/interrupt`、delete / archive、自動 retry は行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
+- rename 後は `turn/start` response の exact turn ID に `turn/interrupt` を送り、同じ thread / turn の `turn/completed(status = interrupted)` を待つ。`turn/completed` が interrupt response より先に届く race を失わないよう、connection 作成時から lifecycle notification を記録する。
+- bootstrap が interrupt 前に自然終了して RPC が失敗した場合は、同じ daemon の `thread/read` と `thread/turns/list` で current active turn を再確認する。thread が `idle` / `systemError` / `notLoaded` なら cleanup 済みとして扱い、同じ turn が active のまま、または別 turn が active なら失敗する。別 turn を代わりに interrupt しない。
+- rename が失敗しても bootstrap interrupt と unsubscribe を試み、close を fallback とする。rename 成功後に bootstrap turn が active のままなら canonical thread ID を含む post-commit cleanup error とする。unsubscribe の失敗だけでは rename-only Dispatch を失敗にしない。
+- commit 後は rename / cleanup が失敗しても thread の delete、archive、rollback、daemon restart、自動 retry を行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
 - bootstrap 中の Activity は通常の native thread status を使う。
 - bootstrap turn は model turn を1回消費する。rate limit 等で失敗する場合も特別な回避はしない。
 
@@ -591,7 +595,7 @@ shared daemon / thread / turn は bridge の外にあり、影響を受けない
 
 ##### Stop
 
-Stop は、session に紐づく実行中の process を終了する。
+Stop は、session に紐づく実行中の処理を provider-native な方法で停止する。
 
 **Claude**
 
@@ -601,9 +605,10 @@ Stop は、session に紐づく実行中の process を終了する。
 **Codex**
 
 - Stop は Codex process の kill ではなく、shared app-server 上の active turn を native RPC で interrupt する。
-- Stop の時点で `thread/turns/list` から `inProgress` turn を取得し、その turn ID に `turn/interrupt` を送る。
+- Stop の時点で shared daemon の `thread/read` と live turn を含む `thread/turns/list` から current `inProgress` turn を取得し、その exact turn ID に `turn/interrupt` を送る。Observer cache から turn ID を推測しない。
 - turn ID は daemon restart 後に変化しうるため cache しない。
 - approval / user-input 待ちも active turn として interrupt でき、pending request は破棄される。
+- lookup 後に対象 turn が終了した race は authoritative state を再確認する。別 turn が active ならそれを代わりに止めず fail closed とする。
 - interrupt 後も thread 自体は残り、次の turn を開始できる。
 - daemon 外の writer しか確認できない thread は process を推測して停止せず fail closed とする。
 
@@ -996,8 +1001,9 @@ thread/status/changed
 
 新規 thread は rollout が persist されるまで `thread/list` に現れず、それは最初の turn の終了まで遅れうる。このため Observer は `thread/started` の native `Thread` を、`thread/list` がまだ返さない thread の live catalog source とし、表示する catalog を `thread/list` (durable) と live-started thread の和とする。
 
-- live-started thread にも `thread/status/changed` と `thread/name/updated` を反映する。`thread/closed` / `thread/archived` / `thread/deleted` でその thread は消える。
+- live-started thread にも `thread/status/changed` と `thread/name/updated` を反映する。`thread/closed` は daemon runtime の unload として status を `notLoaded` にし、catalog row は維持して catalog resync を要求する。`thread/archived` / `thread/deleted` は catalog existence の明示的な removal として row を除く。
 - `thread/list` がまだ返さないことを理由に live-started thread を消さない。同じ ID を返した時点で durable 側の `Thread` に置き換える (1 row のまま)。
+- 未永続の live-started thread が closed した場合だけ、close 後に開始した authoritative `thread/list` にも absent なら overlay を除く。close 前から in-flight だった catalog result では除かない。
 - snapshot では、loaded だが `thread/list` にない thread を live-started thread として再構築する。
 - agentsctl 独自の provisional row は作らない。identity は常に daemon の thread ID である。
 

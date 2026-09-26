@@ -121,10 +121,9 @@ func (p *Provider) List(ctx context.Context, archived bool) ([]session.Session, 
 // sessionRows normalizes a thread catalog plus the local managed-run state
 // into session rows. It is shared by List and the Observer snapshot so both
 // build rows the same way; only Activity/Runtime come from observe, the
-// caller's source of runtime observation. The only action observe decides
-// is advisory Open availability: a thread observed running outside the
-// shared app-server cannot be opened through it. Open re-checks everything
-// against the daemon itself (see Open).
+// caller's source of runtime observation. It supplies advisory Open, Stop,
+// and Archive availability; each operation re-checks its own safety
+// conditions against the daemon.
 func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run, archived bool, observe func(Thread, func() bool) observation) []session.Session {
 	managed := map[string]localstate.Run{}
 	renameFailed := map[string]string{}
@@ -185,8 +184,12 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 			}
 		case observed.Runtime == session.RuntimeExternal:
 			actions[session.ActionStop] = session.Availability{Reason: "external or unknown Codex writer cannot be stopped safely"}
+		case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+			actions[session.ActionStop] = session.Availability{Available: true}
+		case observed.Activity == session.ActivityIdle || observed.Activity == session.ActivityFailed:
+			actions[session.ActionStop] = session.Availability{Reason: "session is not running"}
 		default:
-			actions[session.ActionStop] = session.Availability{Reason: "no agentsctl-managed run is tracking this session"}
+			actions[session.ActionStop] = session.Availability{Reason: "Codex activity is unknown"}
 		}
 		rows = append(rows, session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: t.ID}, Name: value(t.Name), Summary: summary, CWD: t.CWD, CreatedAt: time.Unix(t.CreatedAt, 0), UpdatedAt: time.Unix(t.UpdatedAt, 0), Activity: observed.Activity, Runtime: runtime, Archived: archived, RunID: run.ID, PreviousKeys: sortedKeys(provisional[t.ID]), Actions: actions})
 	}
@@ -222,7 +225,7 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 
 // archiveAvailability is the advisory Archive availability of a thread
 // observed as observed: a running session (Working or waiting on the user)
-// is stopped first, and a thread another process writes is never archived.
+// is refused, and a thread another process writes is never archived.
 // An observation that establishes neither (e.g. Unknown while the Observer
 // is down) leaves Archive offered; Archive itself re-checks with the
 // daemon before acting (see archivable).
@@ -324,6 +327,9 @@ func (p *Provider) applyPendingRenames(ctx context.Context, threads []Thread) {
 	}
 }
 
+// Stop interrupts the exact shared-daemon turn that is active when the
+// operation resolves it. Legacy locally managed runs keep their existing
+// process-based Stop path.
 func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 	runs, err := p.Store.Runs()
 	if err != nil {
@@ -334,7 +340,52 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 			return p.Runtime.Stop(ctx, r.ID)
 		}
 	}
-	return errors.New("refusing to stop a Codex writer not owned by agentsctl")
+	events := newTurnLifecycleEvents()
+	socket, err := p.readySocket(ctx)
+	if err != nil {
+		return err
+	}
+	return connectDaemon(ctx, socket, events.observe, func(conn *rpcConn) error {
+		state, err := readCurrentTurnState(ctx, conn, k.ID)
+		if err != nil {
+			return fmt.Errorf("resolve active Codex turn: %w", err)
+		}
+		if state.status.Type == statusNotLoaded && !p.writerAbsent(k.ID) {
+			return errors.New("external or unknown Codex writer cannot be stopped safely")
+		}
+		turnID := state.activeTurnID
+		if turnID == "" {
+			return nil
+		}
+		if err := interruptTurn(ctx, conn, k.ID, turnID); err != nil {
+			return p.reconcileStopRace(ctx, conn, k.ID, turnID, err)
+		}
+		if err := events.waitInactive(ctx, conn, k.ID); err != nil {
+			return fmt.Errorf("wait for Codex turn %s to stop: %w", turnID, err)
+		}
+		return p.confirmStoppedTurn(ctx, conn, k.ID, turnID)
+	})
+}
+
+func (p *Provider) reconcileStopRace(ctx context.Context, conn *rpcConn, threadID, turnID string, interruptErr error) error {
+	if err := p.confirmStoppedTurn(ctx, conn, threadID, turnID); err != nil {
+		return errors.Join(fmt.Errorf("interrupt Codex turn %s: %w", turnID, interruptErr), err)
+	}
+	return nil
+}
+
+func (p *Provider) confirmStoppedTurn(ctx context.Context, conn *rpcConn, threadID, turnID string) error {
+	state, err := readCurrentTurnState(ctx, conn, threadID)
+	if err != nil {
+		return fmt.Errorf("confirm Codex turn %s stopped: %w", turnID, err)
+	}
+	if state.activeTurnID == "" {
+		return nil
+	}
+	if state.activeTurnID != turnID {
+		return fmt.Errorf("Codex turn %s ended, but thread %s now has different active turn %s; refusing to interrupt it", turnID, threadID, state.activeTurnID)
+	}
+	return fmt.Errorf("Codex turn %s remains active on thread %s", turnID, threadID)
 }
 
 // Archive removes k's session. For an actual Codex thread (no local run

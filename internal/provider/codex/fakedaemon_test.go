@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -22,10 +23,10 @@ import (
 
 // fakeDaemon is a minimal scripted Codex app-server listening on a Unix
 // socket with the WebSocket transport: initialize, thread/list,
-// thread/loaded/list, thread/read, the Dispatch requests (thread/start,
-// turn/start, thread/unsubscribe, thread/name/set), server-sent
-// notifications and requests, and forced disconnects. It implements only
-// what the provider uses.
+// thread/loaded/list, thread/read, thread/turns/list, the Dispatch requests
+// (thread/start, turn/start, thread/unsubscribe, thread/name/set), exact
+// turn interruption, server-sent notifications and requests, and forced
+// disconnects. It implements only what the provider uses.
 type fakeDaemon struct {
 	t      *testing.T
 	socket string
@@ -38,10 +39,12 @@ type fakeDaemon struct {
 	// persisted yet: loaded and readable, but not in thread/list, and
 	// thread/name/set on them fails, like the real daemon. A thread moves
 	// to threads when its first turn/started goes out (see materialize).
-	pending  map[string]Thread
-	archived []Thread                // moved here by thread/archive
-	loaded   map[string]ThreadStatus // thread/loaded/list + thread/read
-	pageSize int                     // thread/list page size; 0 = one page
+	pending         map[string]Thread
+	archived        []Thread                // moved here by thread/archive
+	loaded          map[string]ThreadStatus // thread/loaded/list + thread/read
+	activeTurns     map[string]string       // current inProgress turn by thread
+	pendingRequests map[string]bool         // approval/user-input request by thread
+	pageSize        int                     // thread/list page size; 0 = one page
 	// beforeRead, when set, runs before a thread/read is answered (on the
 	// connection's handler goroutine, so a notification it sends precedes
 	// the response on the wire). A non-nil result replaces the status the
@@ -92,6 +95,10 @@ type fakeDaemon struct {
 	turnStarted          string
 	unrelatedTurnStarted bool
 	traceLifecycle       bool
+	// turnInterruptCompletion controls notification ordering. Empty sends
+	// turn/completed before the response; "afterResponse" defers it until
+	// the response has been written.
+	turnInterruptCompletion string
 
 	// ready receives each connection once the client sent initialized.
 	ready chan *fakeConn
@@ -106,8 +113,9 @@ type fakeConn struct {
 	// held is lifecycle work (see holdTurnStarted) waiting to run after the
 	// connection's next request has been handled, or after
 	// turnStartedGrace if none comes.
-	heldMu sync.Mutex
-	held   []func()
+	heldMu     sync.Mutex
+	held       []func()
+	afterReply []func()
 }
 
 // turnStartedGrace is how long a held turn/started waits for a request
@@ -138,6 +146,20 @@ func (c *fakeConn) release(held []func()) {
 	}
 }
 
+func (c *fakeConn) afterResponse(f func()) {
+	c.heldMu.Lock()
+	c.afterReply = append(c.afterReply, f)
+	c.heldMu.Unlock()
+}
+
+func (c *fakeConn) takeAfterResponse() []func() {
+	c.heldMu.Lock()
+	defer c.heldMu.Unlock()
+	after := c.afterReply
+	c.afterReply = nil
+	return after
+}
+
 func newFakeDaemon(t *testing.T) *fakeDaemon {
 	t.Helper()
 	// Unix socket paths are length-limited; keep it short.
@@ -146,7 +168,7 @@ func newFakeDaemon(t *testing.T) *fakeDaemon {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, calls: map[string]int{}, failures: map[string]int{}, params: map[string][]json.RawMessage{}, pending: map[string]Thread{}, before: map[string]func(*fakeConn){}, dropOn: map[string]bool{}, hangOn: map[string]bool{}, ready: make(chan *fakeConn, 16)}
+	d := &fakeDaemon{t: t, socket: filepath.Join(dir, "s.sock"), loaded: map[string]ThreadStatus{}, activeTurns: map[string]string{}, pendingRequests: map[string]bool{}, calls: map[string]int{}, failures: map[string]int{}, params: map[string][]json.RawMessage{}, pending: map[string]Thread{}, before: map[string]func(*fakeConn){}, dropOn: map[string]bool{}, hangOn: map[string]bool{}, ready: make(chan *fakeConn, 16)}
 	d.start()
 	t.Cleanup(d.stop)
 	return d
@@ -213,6 +235,30 @@ func (d *fakeDaemon) callCount(method string) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.calls[method]
+}
+
+func (d *fakeDaemon) activeTurn(id string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.activeTurns[id]
+}
+
+func (d *fakeDaemon) loadedStatus(id string) ThreadStatus {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.loaded[id]
+}
+
+func (d *fakeDaemon) setPendingRequest(id string, pending bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pendingRequests[id] = pending
+}
+
+func (d *fakeDaemon) hasPendingRequest(id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pendingRequests[id]
 }
 
 func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +351,14 @@ func (d *fakeDaemon) serve(w http.ResponseWriter, r *http.Request) {
 			reply["result"] = result
 		}
 		c.send(reply)
+		if msg.Method == "turn/interrupt" {
+			d.mu.Lock()
+			if d.traceLifecycle {
+				d.events = append(d.events, "turn/interrupt response")
+			}
+			d.mu.Unlock()
+		}
+		c.release(c.takeAfterResponse())
 		c.release(held)
 	}
 }
@@ -388,6 +442,18 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 			return map[string]any{"thread": Thread{ID: p.ThreadID, Status: status}}, nil
 		}
 		return nil, errors.New("thread not found")
+	case "thread/turns/list":
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		var turns []any
+		if turnID := d.activeTurns[p.ThreadID]; turnID != "" {
+			turns = append(turns, map[string]any{"id": turnID, "status": turnStatusInProgress, "items": []any{}})
+		}
+		return map[string]any{"data": turns, "nextCursor": nil}, nil
 	case "thread/start":
 		var p struct {
 			CWD string `json:"cwd"`
@@ -418,6 +484,9 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 			return override, nil
 		}
 		d.setLoaded(p.ThreadID, active())
+		d.mu.Lock()
+		d.activeTurns[p.ThreadID] = "turn-1"
+		d.mu.Unlock()
 		d.broadcast(notifyStatusChanged, map[string]any{"threadId": p.ThreadID, "status": active()})
 		if unrelated {
 			c.turnStarted("other-thread", "turn-1", false)
@@ -432,6 +501,29 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 			c.hold(func() { _ = c.ws.CloseNow() })
 		}
 		return map[string]any{"turn": map[string]any{"id": "turn-1", "status": "inProgress", "items": []any{}}}, nil
+	case "turn/interrupt":
+		var p struct {
+			ThreadID string `json:"threadId"`
+			TurnID   string `json:"turnId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		d.mu.Lock()
+		activeTurnID := d.activeTurns[p.ThreadID]
+		mode := d.turnInterruptCompletion
+		d.mu.Unlock()
+		if activeTurnID == "" {
+			return nil, errors.New("no active turn to interrupt")
+		}
+		if activeTurnID != p.TurnID {
+			return nil, fmt.Errorf("expected active turn id %s but found %s", p.TurnID, activeTurnID)
+		}
+		complete := func() { d.completeTurn(c, p.ThreadID, p.TurnID, turnStatusInterrupted) }
+		if mode == "afterResponse" {
+			c.afterResponse(complete)
+		} else {
+			complete()
+		}
+		return map[string]any{}, nil
 	case "thread/unsubscribe":
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -488,6 +580,30 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 		return map[string]any{}, nil
 	}
 	return nil, errors.New("method not found")
+}
+
+func (d *fakeDaemon) completeTurn(c *fakeConn, threadID, turnID, status string) {
+	d.mu.Lock()
+	if d.activeTurns[threadID] != turnID {
+		d.mu.Unlock()
+		return
+	}
+	delete(d.activeTurns, threadID)
+	delete(d.pendingRequests, threadID)
+	d.loaded[threadID] = idle
+	if d.traceLifecycle {
+		d.events = append(d.events, "turn/completed "+threadID+"/"+turnID+" "+status)
+	}
+	d.mu.Unlock()
+	c.notify("turn/completed", map[string]any{"threadId": threadID, "turn": map[string]any{"id": turnID, "status": status, "items": []any{}}})
+	d.broadcast(notifyStatusChanged, map[string]any{"threadId": threadID, "status": idle})
+}
+
+func (d *fakeDaemon) startActiveTurn(threadID, turnID string, status ThreadStatus) {
+	d.mu.Lock()
+	d.activeTurns[threadID] = turnID
+	d.loaded[threadID] = status
+	d.mu.Unlock()
 }
 
 // turnStarted sends turn/started for threadID's turnID on c. materializes

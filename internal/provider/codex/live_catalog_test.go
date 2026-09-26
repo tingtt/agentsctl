@@ -186,8 +186,8 @@ func TestListedStartedThreadIsPromoted(t *testing.T) {
 	}
 }
 
-func TestStartedThreadRemovedBeforeListed(t *testing.T) {
-	for _, method := range []string{notifyClosed, notifyArchived, notifyDeleted} {
+func TestStartedThreadExplicitlyRemovedBeforeListed(t *testing.T) {
+	for _, method := range []string{notifyArchived, notifyDeleted} {
 		t.Run(method, func(t *testing.T) {
 			rt := newLiveRuntime(t)
 			notifyRuntime(t, rt, notifyStarted, map[string]any{"thread": startedThread("new")})
@@ -198,6 +198,55 @@ func TestStartedThreadRemovedBeforeListed(t *testing.T) {
 			requireNoStarted(t, rt)
 		})
 	}
+}
+
+func TestThreadClosedKeepsDurableRowNotLoaded(t *testing.T) {
+	rt := newLiveRuntime(t)
+	notifyRuntime(t, rt, notifyStatusChanged, map[string]any{"threadId": "old", "status": active()})
+	notifyRuntime(t, rt, notifyClosed, map[string]any{"threadId": "old"})
+
+	if got := visibleIDs(rt); !slices.Equal(got, []string{"old"}) {
+		t.Fatalf("visible = %q, want the durable thread retained", got)
+	}
+	if got := activityOf(t, rt, "old"); got != session.ActivityIdle {
+		t.Fatalf("activity = %s, want the unloaded thread idle", got)
+	}
+	rt.mu.Lock()
+	need := rt.needCatalog
+	rt.mu.Unlock()
+	if !need {
+		t.Fatal("thread/closed must request an authoritative catalog resync")
+	}
+	rt.installCatalog(rt.beginCatalogFetch(), []Thread{catalogThread("old", 1)})
+	if got := visibleIDs(rt); !slices.Equal(got, []string{"old"}) {
+		t.Fatalf("post-close catalog dropped the durable thread: %q", got)
+	}
+	if got := activityOf(t, rt, "old"); got != session.ActivityIdle {
+		t.Fatalf("post-close activity = %s, want Idle", got)
+	}
+}
+
+func TestClosedUnlistedThreadPrunedOnlyByPostCloseCatalog(t *testing.T) {
+	rt := newLiveRuntime(t)
+	notifyRuntime(t, rt, notifyStarted, map[string]any{"thread": startedThread("new")})
+	stale := rt.beginCatalogFetch()
+	notifyRuntime(t, rt, notifyClosed, map[string]any{"threadId": "new"})
+
+	if got := visibleIDs(rt); !slices.Equal(got, []string{"new", "old"}) {
+		t.Fatalf("visible after close = %q, want the overlay retained", got)
+	}
+	if got := activityOf(t, rt, "new"); got != session.ActivityIdle {
+		t.Fatalf("activity after close = %s, want notLoaded/Idle", got)
+	}
+	rt.installCatalog(stale, []Thread{catalogThread("old", 1)})
+	if got := visibleIDs(rt); !slices.Equal(got, []string{"new", "old"}) {
+		t.Fatalf("stale catalog pruned the overlay: %q", got)
+	}
+	rt.installCatalog(rt.beginCatalogFetch(), []Thread{catalogThread("old", 1)})
+	if got := visibleIDs(rt); !slices.Equal(got, []string{"old"}) {
+		t.Fatalf("post-close catalog left a ghost overlay: %q", got)
+	}
+	requireNoStarted(t, rt)
 }
 
 // A snapshot rebuilds the live-started threads from what the daemon has
@@ -289,7 +338,7 @@ func TestRenameOnlyDispatchedThreadShowsName(t *testing.T) {
 	p, _ := newObservedProvider(t, d, nil)
 	p.Runtime = &fakeManagedRuntime{}
 	ch := observe(t, p)
-	d.waitReady(t)
+	c := d.waitReady(t)
 	waitFor(t, ch, "initial", func(u sessionctl.ProviderUpdate) bool { return u.Err == nil && u.Warning == nil })
 
 	if _, err := p.Dispatch(context.Background(), "/rename foo", "/work"); err != nil {
@@ -297,7 +346,13 @@ func TestRenameOnlyDispatchedThreadShowsName(t *testing.T) {
 	}
 	waitFor(t, ch, "renamed row", func(u sessionctl.ProviderUpdate) bool {
 		s, ok := rowOf(u, "thread-new-1")
-		return ok && s.Name == "foo"
+		return ok && s.Name == "foo" && s.Activity == session.ActivityIdle
+	})
+	d.setLoaded("thread-new-1", notLoadedSt)
+	c.notify(notifyClosed, map[string]any{"threadId": "thread-new-1"})
+	waitFor(t, ch, "closed renamed row remains", func(u sessionctl.ProviderUpdate) bool {
+		s, ok := rowOf(u, "thread-new-1")
+		return ok && s.Name == "foo" && s.Activity == session.ActivityIdle
 	})
 }
 
@@ -315,6 +370,7 @@ func TestSnapshotShowsLoadedUnlistedThread(t *testing.T) {
 	c := d.waitReady(t)
 	waitFor(t, ch, "new working", activityIs("new", session.ActivityWorking))
 
+	d.setLoaded("new", notLoadedSt)
 	c.notify(notifyClosed, map[string]any{"threadId": "new"})
 	waitFor(t, ch, "closed before persisted", func(u sessionctl.ProviderUpdate) bool {
 		_, ok := rowOf(u, "new")
