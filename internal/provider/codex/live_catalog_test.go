@@ -331,7 +331,6 @@ func TestDispatchedThreadVisibleBeforePersisted(t *testing.T) {
 	d.setThreads(catalogThread("old", 1))
 	d.turnStarted = "never"
 	p, _ := newObservedProvider(t, d, nil)
-	p.Runtime = &fakeManagedRuntime{}
 	ch := observe(t, p)
 	c := d.waitReady(t)
 	waitFor(t, ch, "initial", activityIs("old", session.ActivityIdle))
@@ -351,7 +350,7 @@ func TestDispatchedThreadVisibleBeforePersisted(t *testing.T) {
 		t.Fatal(err)
 	}
 	u := waitFor(t, ch, "dispatched thread working", activityIs("thread-new-1", session.ActivityWorking), once)
-	if row, _ := rowOf(u, "thread-new-1"); row.CWD != "/work" || row.RunID != "" || len(row.PreviousKeys) != 0 {
+	if row, _ := rowOf(u, "thread-new-1"); row.CWD != "/work" || len(row.PreviousKeys) != 0 {
 		t.Fatalf("row = %+v, want the daemon's canonical thread", row)
 	}
 	if n := d.callCount("thread/list"); n < 2 {
@@ -372,7 +371,6 @@ func TestDispatchedThreadVisibleBeforePersisted(t *testing.T) {
 func TestRenameOnlyDispatchedThreadShowsName(t *testing.T) {
 	d := newFakeDaemon(t)
 	p, _ := newObservedProvider(t, d, nil)
-	p.Runtime = &fakeManagedRuntime{}
 	ch := observe(t, p)
 	c := d.waitReady(t)
 	waitFor(t, ch, "initial", func(u sessionctl.ProviderUpdate) bool { return u.Err == nil && u.Warning == nil })

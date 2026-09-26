@@ -163,8 +163,8 @@ func (s *State) RequestSelection(key session.Key) {
 // replacement identity.
 //
 // Selection also follows a provider-stated identity transition: when a row
-// in rows lists the tracked key in its PreviousKeys (e.g. a Codex Starting
-// row whose managed run has been bound to its thread) and the continuity
+// in rows lists the tracked key in its PreviousKeys (a provisional row
+// replaced by its session's canonical row) and the continuity
 // passes session.IdentityTransitions' validation, the tracked key moves to
 // that row's current Key, taking precedence over the nearby-session
 // fallback above. The same continuity carries the rename target and
@@ -277,7 +277,7 @@ func nearbySurvivingItem(oldModel, newModel selectableList, target listItemID) (
 //   - Rename.Target and LastAttachedKey follow the session, since both
 //     mean "this session" regardless of which key names it.
 //   - A pending confirmation is dropped instead: it was armed against the
-//     pre-transition row's action availability (a Starting Codex run offers
+//     pre-transition row's action availability (a provisional row may offer
 //     no Archive at all), so a two-press destructive gate must not carry
 //     over to the differently-actionable canonical row.
 func (s *State) followIdentity(moved map[session.Key]session.Key) {

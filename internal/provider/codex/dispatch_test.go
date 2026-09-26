@@ -4,15 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tingtt/agentsctl/internal/localstate"
-	"github.com/tingtt/agentsctl/internal/process"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -40,9 +37,7 @@ type dispatchFixture struct {
 	p         *Provider
 	d         *fakeDaemon
 	lifecycle *loggingLifecycle
-	legacy    *fakeManagedRuntime
 	api       *fakeAPI
-	store     *localstate.Store
 }
 
 func newDispatchFixture(t *testing.T) dispatchFixture {
@@ -51,26 +46,18 @@ func newDispatchFixture(t *testing.T) dispatchFixture {
 	f := dispatchFixture{
 		d:         d,
 		lifecycle: &loggingLifecycle{d: d},
-		legacy:    &fakeManagedRuntime{},
 		api:       &fakeAPI{},
-		store:     localstate.New(filepath.Join(t.TempDir(), "state.json")),
 	}
-	f.p = &Provider{API: f.api, Store: f.store, Runtime: f.legacy, Daemon: f.lifecycle, writerFree: func(string) bool { return true }}
+	f.p = &Provider{API: f.api, Daemon: f.lifecycle, writerFree: func(string) bool { return true }}
 	return f
 }
 
-// requireNoLegacySideEffects checks that Dispatch left nothing behind
-// outside the daemon: no local run, no baseline List, no legacy Stop.
-func (f dispatchFixture) requireNoLegacySideEffects(t *testing.T) {
+// requireDaemonOnly checks that Dispatch worked only through the daemon
+// connection: it never read the catalog to learn which thread it started.
+func (f dispatchFixture) requireDaemonOnly(t *testing.T) {
 	t.Helper()
-	if runs := runsOf(t, f.store); len(runs) != 0 {
-		t.Fatalf("Dispatch recorded local runs: %+v", runs)
-	}
 	if f.api.lists != 0 {
-		t.Fatalf("Dispatch listed the catalog %d times (baseline capture)", f.api.lists)
-	}
-	if len(f.legacy.stopped) != 0 {
-		t.Fatalf("Dispatch stopped legacy runs %v", f.legacy.stopped)
+		t.Fatalf("Dispatch listed the catalog %d times", f.api.lists)
 	}
 }
 
@@ -135,7 +122,7 @@ func TestDispatchStartsThreadAndTurnOnOwnConnection(t *testing.T) {
 			if want := (session.Session{Key: codexKey("thread-new-1"), CWD: "/work/repo"}); !reflect.DeepEqual(got, want) {
 				t.Fatalf("Dispatch = %+v, want only the canonical key and CWD", got)
 			}
-			f.requireNoLegacySideEffects(t)
+			f.requireDaemonOnly(t)
 		})
 	}
 }
@@ -164,7 +151,7 @@ func TestDispatchEnsureFailureContactsNoDaemon(t *testing.T) {
 	if n := f.d.callCount("initialize"); n != 0 {
 		t.Fatalf("dialed the daemon after Ensure failed (%d initialize)", n)
 	}
-	f.requireNoLegacySideEffects(t)
+	f.requireDaemonOnly(t)
 }
 
 func TestDispatchControlSocketOverrideBypassesEnsure(t *testing.T) {
@@ -193,7 +180,7 @@ func TestDispatchThreadStartFailureStartsNothing(t *testing.T) {
 			}
 			f.d.waitClosed(t, 1)
 			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "close")
-			f.requireNoLegacySideEffects(t)
+			f.requireDaemonOnly(t)
 		})
 	}
 }
@@ -221,7 +208,7 @@ func TestDispatchTurnStartFailureIsDispatchFailure(t *testing.T) {
 			}
 			f.d.waitClosed(t, 1)
 			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "close")
-			f.requireNoLegacySideEffects(t)
+			f.requireDaemonOnly(t)
 		})
 	}
 }
@@ -261,7 +248,7 @@ func TestDispatchSucceedsWhateverUnsubscribeDoes(t *testing.T) {
 					t.Fatalf("%s called %d times after a cleanup failure", method, n)
 				}
 			}
-			f.requireNoLegacySideEffects(t)
+			f.requireDaemonOnly(t)
 		})
 	}
 }
@@ -312,7 +299,6 @@ func TestDispatchedThreadIsPublishedByObserver(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("old", 1))
 	p, _ := newObservedProvider(t, d, nil)
-	p.Runtime = &fakeManagedRuntime{}
 	ch := observe(t, p)
 	waitFor(t, ch, "initial snapshot", func(u sessionctl.ProviderUpdate) bool {
 		_, ok := rowOf(u, "old")
@@ -328,7 +314,7 @@ func TestDispatchedThreadIsPublishedByObserver(t *testing.T) {
 		t.Fatalf("want the old and the dispatched thread only: %+v", u.Sessions)
 	}
 	row, _ := rowOf(u, created.Key.ID)
-	if row.Key != codexKey("thread-new-1") || row.RunID != "" || len(row.PreviousKeys) != 0 || row.CWD != "/work" {
+	if row.Key != codexKey("thread-new-1") || len(row.PreviousKeys) != 0 || row.CWD != "/work" {
 		t.Fatalf("dispatched row = %+v, want the canonical native row", row)
 	}
 	if !row.Actions[session.ActionOpen].Available {
@@ -336,45 +322,5 @@ func TestDispatchedThreadIsPublishedByObserver(t *testing.T) {
 	}
 	if !row.Actions[session.ActionStop].Available {
 		t.Fatalf("active shared-daemon thread must offer native Stop: %+v", row.Actions)
-	}
-}
-
-// A legacy managed run still waiting for its thread must not claim a
-// thread Dispatch started on the shared daemon, even with the same CWD and
-// a newer timestamp: that thread's writer lock is the daemon's, not the
-// run's, and ownership is what reconcile requires.
-func TestLegacyReconcileDoesNotClaimSharedDaemonThread(t *testing.T) {
-	legacyRun := process.Identity{PID: 4242, StartTime: 1, UID: 501}
-	daemon := process.Identity{PID: 999, StartTime: 2, UID: 501}
-	for _, tc := range []struct {
-		name      string
-		writer    process.Identity
-		wantBound string
-	}{
-		{name: "daemon owns writer", writer: daemon, wantBound: ""},
-		// The same fixture binds once the run itself owns the writer, so
-		// the case above fails only for want of ownership.
-		{name: "legacy run owns writer", writer: legacyRun, wantBound: "thread-new"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
-			if err := store.StartRun(localstate.Run{ID: "legacy", Provider: "codex", CWD: "/work", State: "running", StartedAt: time.Unix(100, 0), PID: legacyRun.PID, StartTime: legacyRun.StartTime, UID: legacyRun.UID, Baseline: []string{"old"}}); err != nil {
-				t.Fatal(err)
-			}
-			api := &fakeAPI{home: "/home", rows: []Thread{
-				{ID: "old", CWD: "/work", CreatedAt: 50},
-				{ID: "thread-new", CWD: "/work", CreatedAt: 200},
-			}}
-			owners := map[string]process.Identity{writerLockPath("/home", "thread-new"): tc.writer}
-			p := &Provider{API: api, Store: store, writerFree: func(string) bool { return true }, WriterOwner: func(path string, id process.Identity) (bool, error) {
-				return owners[path] == id, nil
-			}}
-			if _, err := p.List(context.Background(), false); err != nil {
-				t.Fatal(err)
-			}
-			if r := runsOf(t, store)["legacy"]; r.SessionID != tc.wantBound || r.Error != "" {
-				t.Fatalf("legacy run = %+v, want SessionID %q", r, tc.wantBound)
-			}
-		})
 	}
 }

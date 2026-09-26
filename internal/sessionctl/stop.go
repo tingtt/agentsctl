@@ -10,7 +10,7 @@ import (
 // Stop terminates the process/session backing key. It fails closed if the
 // provider is not configured or does not implement Stopper. The actual
 // ownership/identity re-verification before any signal is sent is a
-// provider/supervisor-internal safety boundary (see the DesignDoc's
+// provider-internal safety boundary (see the DesignDoc's
 // process-ownership invariants), not something Controller re-implements.
 func (c Controller) Stop(ctx context.Context, key session.Key) (Result, error) {
 	p, err := c.provider(key.Provider)

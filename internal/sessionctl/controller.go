@@ -206,8 +206,8 @@ func (c Controller) MergeSessions(sessions []session.Session, scope session.Scop
 // migratePins follows the validated identity continuity of sessions (see
 // session.IdentityTransitions -- the same validation Agent View applies to
 // selection) in the pin store: a pin left on a provisional key -- pinned
-// while the session was still Starting, or pinned on a stale view after its
-// binding -- moves to the session's current Key, so no provisional pin
+// while the session was still provisional, or pinned on a stale view after
+// the transition -- moves to the session's current Key, so no provisional pin
 // metadata outlives the transition. A continuity that fails validation
 // (ambiguous, old key still present, cross-provider, ...) moves nothing.
 // It is applied on every merge rather than as a one-shot event, which

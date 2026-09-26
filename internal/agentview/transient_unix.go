@@ -11,10 +11,10 @@ import (
 )
 
 // Transient refresh: a provider can list a session that is still becoming
-// something else -- a Codex run listed as Starting until a later List binds
-// it to its real thread. Nothing in that provider changes the catalog by
-// itself, so a catalog loaded once would show the Starting row until the
-// user asked for another reload. While any provider lists an
+// something else -- e.g. the Starting row a Claude Dispatch returns, until
+// a later List reports the session's native state. Nothing in that provider
+// changes the catalog by itself, so a catalog loaded once would show the
+// Starting row until the user asked for another reload. While any provider lists an
 // ActivityStarting session, Agent View therefore re-Lists just that
 // provider on a timer, feeding the result through the same providerSnapshots
 // pipeline a reload uses.
@@ -22,14 +22,12 @@ import (
 // This is deliberately not a reload: it neither lists the other providers
 // nor requests any Refresher/Observer background refresh (a full reload
 // does both), and it stops by itself once no provider lists a transient
-// session. What makes the session settle -- reconciliation, a native rename
-// -- stays inside the provider's List; Agent View only knows that a Starting
+// session. What makes the session settle stays inside the provider's List; Agent View only knows that a Starting
 // session means "ask again shortly".
 const (
 	defaultTransientRefreshInterval = time.Second
 	// maxTransientRefreshes bounds how many timer rounds follow one reload,
-	// so a session that never settles (e.g. its run can never be bound)
-	// cannot keep re-Listing its provider forever; the next reload starts a
+	// so a session that never settles cannot keep re-Listing its provider forever; the next reload starts a
 	// new budget.
 	maxTransientRefreshes = 180
 )

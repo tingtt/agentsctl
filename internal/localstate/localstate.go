@@ -1,13 +1,13 @@
 // Package localstate is the Root Owner of agentsctl's local persisted
 // state: pin metadata, the Claude archive overlay, the legacy Claude
-// rename-name fallback, known Claude session creation times, and Codex
-// managed-run records (see the DesignDoc's
+// rename-name fallback, known Claude session creation times, and the
+// ChatGPT catalog cache (see the DesignDoc's
 // "Native state and local overlays" -- this is supplemental state only,
 // never a substitute for provider-native state).
 //
-// The raw JSON schema (data, run in schema.go) is private. Every other
+// The raw JSON schema (data in schema.go) is private. Every other
 // package reaches persisted state exclusively through Store's
-// domain-meaning operations (pins.go, claude.go, runs.go) -- never a raw
+// domain-meaning operations (pins.go, claude.go, chatgpt.go) -- never a raw
 // read-modify-write against the schema itself (see the DesignDoc's
 // "Encapsulate local persistence schema").
 package localstate
@@ -26,7 +26,7 @@ import (
 // Store is the single Root Owner of one state.json file. It is safe for
 // concurrent use both within one process (mu) and across processes (the
 // advisory file lock every Load/update takes): multiple agentsctl
-// processes (a TUI plus the Codex supervisor daemon) share one Store path.
+// processes (e.g. two Agent Views) may share one Store path.
 type Store struct {
 	path string
 	mu   sync.Mutex
@@ -38,7 +38,7 @@ func (s *Store) Path() string { return s.path }
 // update performs one exclusive-locked read-modify-write transaction: fn
 // observes and mutates a private snapshot, and the result is atomically
 // persisted only if fn returns nil. This is the single mutation primitive
-// every domain operation in pins.go/claude.go/runs.go is built on; it is
+// every domain operation in pins.go/claude.go/chatgpt.go is built on; it is
 // deliberately unexported so no package outside localstate can perform a
 // raw schema mutation (see the package doc comment).
 func (s *Store) update(fn func(*data) error) error {

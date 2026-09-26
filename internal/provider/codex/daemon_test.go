@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tingtt/agentsctl/internal/localstate"
 	base "github.com/tingtt/agentsctl/internal/provider"
 )
 
@@ -112,7 +111,7 @@ func TestCommandDaemonRejectsFailedOrInvalidResponses(t *testing.T) {
 
 func TestListDoesNotEnsureDaemon(t *testing.T) {
 	lifecycle := &scriptedLifecycle{results: []lifecycleResult{{err: errors.New("must not be called")}}}
-	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	p := &Provider{API: &fakeAPI{}, Daemon: lifecycle}
 	if _, err := p.List(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}

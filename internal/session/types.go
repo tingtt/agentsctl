@@ -70,8 +70,9 @@ const (
 	RuntimeExternal Runtime = "external"
 	// RuntimeStopped is confirmed not running.
 	RuntimeStopped Runtime = "stopped"
-	// RuntimeNone applies to a session with no runtime concept at all (a
-	// Codex thread with no managed run bound to it).
+	// RuntimeNone applies to a session no runtime currently holds (a
+	// dormant Codex thread neither the shared daemon nor any other process
+	// has loaded).
 	RuntimeNone    Runtime = "none"
 	RuntimeUnknown Runtime = "unknown"
 )
@@ -97,15 +98,11 @@ type Session struct {
 	// does not implement the corresponding capability interface, is
 	// fail-closed unavailable (see internal/sessionctl's Load).
 	Actions Actions `json:"actions"`
-	// RunID is set only for a Codex session with an agentsctl-managed run
-	// (see the DesignDoc's Codex run-to-thread binding); empty otherwise.
-	RunID string `json:"runId,omitempty"`
 	// PreviousKeys lists provisional Keys this session was previously
 	// presented under, when its Key changed once its canonical identity was
-	// established (a Codex managed run is listed under its run ID until it
-	// is bound to a thread -- see the DesignDoc's Codex provisional session
-	// identity). It is a provider's explicit statement that each listed Key
-	// and Key are the same session; consumers migrate selection and local
+	// established (see the DesignDoc's Common session model). It is a
+	// provider's explicit statement that each listed Key and Key are the
+	// same session; consumers migrate selection and local
 	// metadata along it and must never derive such continuity themselves
 	// (from CWD, timestamps, row position, ...). A provider lists a Key here
 	// only for a confirmed transition; nil means no transition to report.

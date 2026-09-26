@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -781,7 +780,7 @@ func newObservedProvider(t *testing.T, d *fakeDaemon, api *fakeAPI) (*Provider, 
 		api = &fakeAPI{}
 	}
 	probe := &writerProbe{writers: map[string]bool{}, calls: map[string]int{}}
-	p := &Provider{API: api, Store: localstate.New(filepath.Join(t.TempDir(), "state.json")), ControlSocket: d.socket, writerFree: probe.free}
+	p := &Provider{API: api, ControlSocket: d.socket, writerFree: probe.free}
 	rt := p.runtime()
 	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 10*time.Millisecond, 50*time.Millisecond, 0
 	p.obs.rt = rt
