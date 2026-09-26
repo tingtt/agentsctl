@@ -617,7 +617,7 @@ func (p *Provider) openThreadID(s session.Session) (string, error) {
 func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, openPreflightTimeout)
 	defer cancel()
-	return connectDaemon(ctx, socket, func(conn *rpcConn) error { return p.checkOpenable(ctx, conn, threadID) })
+	return connectDaemon(ctx, socket, nil, func(conn *rpcConn) error { return p.checkOpenable(ctx, conn, threadID) })
 }
 
 func (p *Provider) checkOpenable(ctx context.Context, conn *rpcConn, threadID string) error {

@@ -2,8 +2,10 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/tingtt/agentsctl/internal/session"
@@ -21,7 +23,7 @@ var dispatchCleanupTimeout = 10 * time.Second
 //	initialize -> thread/start -> turn/start -> thread/unsubscribe -> close
 //
 // A rename-only input also sets the name, between turn/start and
-// thread/unsubscribe.
+// thread/unsubscribe, once the turn's turn/started arrived.
 //
 // thread/start returns the canonical thread ID; a successful turn/start
 // response is the commit point, after which the turn may already be
@@ -41,8 +43,10 @@ var dispatchCleanupTimeout = 10 * time.Second
 // A composer input that is only `/rename <name>` is never forwarded to
 // Codex: as an initial prompt it would reach the model as plain text. The
 // model gets the fixed renameBootstrapPrompt instead, and the name is set
-// natively on the same connection once that bootstrap turn was accepted,
-// before the connection unsubscribes (see setThreadName). A rename failure
+// natively on the same connection once that bootstrap turn has started --
+// its turn/started, not the accepted response, says the thread's rollout
+// exists (see turnStarts) -- and before the connection unsubscribes (see
+// setThreadName). An ordinary Dispatch waits for no turn/started. A rename failure
 // after the commit point fails Dispatch with the thread's ID, and leaves
 // the thread and its turn alone.
 func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
@@ -53,13 +57,21 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		}
 		prompt, rename = renameBootstrapPrompt, name
 	}
+	socket, err := p.readySocket(ctx)
+	if err != nil {
+		return session.Session{}, err
+	}
+	// Recorded from the moment the connection exists: a turn/started
+	// notification may arrive before the turn/start response it matches.
+	started := newTurnStarts()
 	var threadID string
-	err := p.withDaemon(ctx, func(conn *rpcConn) error {
+	err = connectDaemon(ctx, socket, started.observe, func(conn *rpcConn) error {
 		var err error
 		if threadID, err = startThread(ctx, conn, cwd); err != nil {
 			return fmt.Errorf("codex thread/start: %w", err)
 		}
-		if err := startTurn(ctx, conn, threadID, prompt); err != nil {
+		turnID, err := startTurn(ctx, conn, threadID, prompt)
+		if err != nil {
 			return fmt.Errorf("codex turn/start on thread %s: %w", threadID, err)
 		}
 
@@ -69,7 +81,15 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		// subscribed; unsubscribing is attempted whatever it did.
 		var renameErr error
 		if rename != "" {
-			renameErr = cleanupStep(ctx, func(ctx context.Context) error { return setThreadName(ctx, conn, threadID, rename) })
+			renameErr = cleanupStep(ctx, func(ctx context.Context) error {
+				// The accepted response does not mean the thread's rollout
+				// is persisted yet, and the rename needs it. The daemon
+				// sends turn/started only after persisting the turn start.
+				if err := started.wait(ctx, conn, threadID, turnID); err != nil {
+					return fmt.Errorf("wait for turn/started: %w", err)
+				}
+				return setThreadName(ctx, conn, threadID, rename)
+			})
 		}
 		_ = cleanupStep(ctx, func(ctx context.Context) error { return unsubscribeThread(ctx, conn, threadID) })
 		if renameErr != nil {
@@ -111,9 +131,9 @@ func startThread(ctx context.Context, conn *rpcConn, cwd string) (string, error)
 }
 
 // startTurn submits prompt as one text input on threadID, with the
-// settings thread/start established. It returns once the daemon accepted
-// the turn.
-func startTurn(ctx context.Context, conn *rpcConn, threadID, prompt string) error {
+// settings thread/start established, and returns the turn's ID once the
+// daemon accepted it. Acceptance is not persistence: see turnStarts.
+func startTurn(ctx context.Context, conn *rpcConn, threadID, prompt string) (string, error) {
 	var res struct {
 		Turn struct {
 			ID string `json:"id"`
@@ -125,12 +145,69 @@ func startTurn(ctx context.Context, conn *rpcConn, threadID, prompt string) erro
 		"input":       []any{map[string]any{"type": "text", "text": prompt, "textElements": []any{}}},
 	}
 	if err := conn.call(ctx, "turn/start", params, &res); err != nil {
-		return err
+		return "", err
 	}
 	if res.Turn.ID == "" {
-		return errors.New("malformed response: empty turn id")
+		return "", errors.New("malformed response: empty turn id")
 	}
-	return nil
+	return res.Turn.ID, nil
+}
+
+// turnStarts records the turn/started notifications one connection
+// receives. The daemon persists a turn's start to the thread's rollout
+// before it sends turn/started, while the turn/start response only says the
+// turn was accepted; so a matching turn/started is the point from which the
+// thread's rollout exists for metadata updates such as a rename.
+type turnStarts struct {
+	mu   sync.Mutex
+	seen map[[2]string]bool // {thread ID, turn ID}
+	// changed is closed, and replaced, whenever a turn start is recorded.
+	changed chan struct{}
+}
+
+func newTurnStarts() *turnStarts {
+	return &turnStarts{seen: map[[2]string]bool{}, changed: make(chan struct{})}
+}
+
+// observe is the connection's notification callback. It never blocks.
+func (s *turnStarts) observe(method string, params json.RawMessage) {
+	if method != "turn/started" {
+		return
+	}
+	var p struct {
+		ThreadID string `json:"threadId"`
+		Turn     struct {
+			ID string `json:"id"`
+		} `json:"turn"`
+	}
+	if json.Unmarshal(params, &p) != nil || p.ThreadID == "" || p.Turn.ID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen[[2]string{p.ThreadID, p.Turn.ID}] = true
+	close(s.changed)
+	s.changed = make(chan struct{})
+}
+
+// wait returns once turnID's turn/started for threadID was recorded, whether
+// before or after wait was called. It fails when ctx ends or conn closes.
+func (s *turnStarts) wait(ctx context.Context, conn *rpcConn, threadID, turnID string) error {
+	for {
+		s.mu.Lock()
+		seen, changed := s.seen[[2]string{threadID, turnID}], s.changed
+		s.mu.Unlock()
+		if seen {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-conn.Done():
+			return conn.Err()
+		}
+	}
 }
 
 // unsubscribeThread releases this connection's subscription to threadID.

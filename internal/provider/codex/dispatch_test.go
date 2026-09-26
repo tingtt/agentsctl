@@ -140,6 +140,20 @@ func TestDispatchStartsThreadAndTurnOnOwnConnection(t *testing.T) {
 	}
 }
 
+// Only a rename waits for turn/started: an ordinary Dispatch returns once
+// the turn is accepted, even if turn/started never comes.
+func TestDispatchDoesNotWaitForTurnStarted(t *testing.T) {
+	f := newDispatchFixture(t)
+	f.d.turnStarted = "never"
+	begin := time.Now()
+	if _, err := f.p.Dispatch(context.Background(), "prompt", "/work"); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(begin); elapsed >= dispatchCleanupTimeout/2 {
+		t.Fatalf("Dispatch took %s, as if it waited for turn/started", elapsed)
+	}
+}
+
 func TestDispatchEnsureFailureContactsNoDaemon(t *testing.T) {
 	f := newDispatchFixture(t)
 	f.lifecycle.err = errBoom

@@ -59,7 +59,7 @@ func (p *Provider) withDaemon(ctx context.Context, fn func(*rpcConn) error) erro
 	if err != nil {
 		return err
 	}
-	return connectDaemon(ctx, socket, fn)
+	return connectDaemon(ctx, socket, nil, fn)
 }
 
 // Observe implements sessionctl.Observer from the shared Codex app-server

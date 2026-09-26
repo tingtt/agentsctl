@@ -220,9 +220,14 @@ func (c *rpcConn) fail(err error) {
 
 // connectDaemon opens a connection of its own to the app-server daemon on
 // socket, initializes it, runs fn on it and closes it, whatever fn does.
-// Server requests reaching it stay unanswered (see rpcConn).
-func connectDaemon(ctx context.Context, socket string, fn func(*rpcConn) error) error {
-	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
+// onNotify, when not nil, receives the connection's notifications from the
+// moment it is dialed, under dialRPC's rules (it must not block). Server
+// requests reaching it stay unanswered (see rpcConn).
+func connectDaemon(ctx context.Context, socket string, onNotify func(string, json.RawMessage), fn func(*rpcConn) error) error {
+	if onNotify == nil {
+		onNotify = func(string, json.RawMessage) {}
+	}
+	conn, err := dialRPC(ctx, socket, onNotify)
 	if err != nil {
 		return fmt.Errorf("connect codex app-server daemon: %w", err)
 	}

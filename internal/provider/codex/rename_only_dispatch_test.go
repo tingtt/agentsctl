@@ -26,8 +26,9 @@ func runsOf(t *testing.T, store *localstate.Store) map[string]localstate.Run {
 
 // TestRenameOnlyDispatchBootstrapsThenRenamesNatively pins the rename-only
 // sequence: the model only sees the fixed bootstrap prompt, and the name is
-// set natively on the same connection once that turn was accepted, while
-// the connection is still subscribed, and only then unsubscribed.
+// set natively on the same connection once that turn has started (its
+// turn/started arrived), while the connection is still subscribed, and
+// only then unsubscribed.
 func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 	for _, tc := range []struct{ input, name string }{
 		{"/rename foo", "foo"},
@@ -37,12 +38,13 @@ func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 	} {
 		t.Run(tc.input, func(t *testing.T) {
 			f := newDispatchFixture(t)
+			f.d.traceLifecycle = true
 			got, err := f.p.Dispatch(context.Background(), tc.input, "/work")
 			if err != nil {
 				t.Fatal(err)
 			}
 			f.d.waitClosed(t, 1)
-			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
+			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "turn/started thread-new-1/turn-1", "thread/name/set", "thread/unsubscribe", "close")
 
 			turn := decodeParams(t, f.d.requestsOf("turn/start")[0])
 			if !reflect.DeepEqual(turn["input"], textInput(renameBootstrapPrompt)) {
@@ -128,6 +130,73 @@ func TestRenameOnlyPostCommitRenameFailureKeepsThread(t *testing.T) {
 			for _, method := range []string{"turn/interrupt", "thread/delete", "thread/archive"} {
 				if n := f.d.callCount(method); n != 0 {
 					t.Fatalf("%s called %d times after a rename failure", method, n)
+				}
+			}
+			f.requireNoLegacySideEffects(t)
+		})
+	}
+}
+
+// The accepted turn/start response does not mean the new thread's rollout
+// exists yet, and renaming it before then fails in the daemon. The rename
+// waits for the turn/started of exactly the turn it started -- which the
+// daemon sends only after persisting it -- however that notification is
+// ordered against the response and whatever other turn/started precede it.
+func TestRenameOnlyWaitsForMatchingTurnStarted(t *testing.T) {
+	for name, tc := range map[string]struct {
+		setup func(*fakeDaemon)
+		want  []string
+	}{
+		"after response": {
+			setup: func(*fakeDaemon) {},
+			want:  []string{"turn/start", "turn/started thread-new-1/turn-1", "thread/name/set"},
+		},
+		"before response": {
+			setup: func(d *fakeDaemon) { d.turnStarted = "beforeResponse" },
+			want:  []string{"turn/start", "turn/started thread-new-1/turn-1", "thread/name/set"},
+		},
+		"unrelated first": {
+			setup: func(d *fakeDaemon) { d.unrelatedTurnStarted = true },
+			want:  []string{"turn/start", "turn/started other-thread/turn-1", "turn/started thread-new-1/turn-other", "turn/started thread-new-1/turn-1", "thread/name/set"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newDispatchFixture(t)
+			f.d.traceLifecycle = true
+			tc.setup(f.d)
+			got, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
+			if err != nil || got.Key != codexKey("thread-new-1") {
+				t.Fatalf("Dispatch = (%+v, %v), want the renamed session", got, err)
+			}
+			f.d.waitClosed(t, 1)
+			want := append(append([]string{"ensure", "initialize", "thread/start"}, tc.want...), "thread/unsubscribe", "close")
+			requireEvents(t, f.d, want...)
+		})
+	}
+}
+
+// Without its turn/started the rename is never attempted: the rename-only
+// Dispatch fails naming the committed thread, still unsubscribes, and
+// leaves the thread and its turn alone.
+func TestRenameOnlyReadinessFailureKeepsThread(t *testing.T) {
+	restore := dispatchCleanupTimeout
+	dispatchCleanupTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { dispatchCleanupTimeout = restore })
+	for _, mode := range []string{"never", "drop"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newDispatchFixture(t)
+			f.d.turnStarted = mode
+			_, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
+			if err == nil || !strings.Contains(err.Error(), "thread-new-1") || !strings.Contains(err.Error(), "turn/started") {
+				t.Fatalf("Dispatch = %v, want a rename failure naming thread-new-1 and the missing turn/started", err)
+			}
+			f.d.waitClosed(t, 1)
+			if mode == "never" { // a dropped connection cannot receive it
+				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/unsubscribe", "close")
+			}
+			for _, method := range []string{"thread/name/set", "turn/interrupt", "thread/delete", "thread/archive"} {
+				if n := f.d.callCount(method); n != 0 {
+					t.Fatalf("%s called %d times", method, n)
 				}
 			}
 			f.requireNoLegacySideEffects(t)
