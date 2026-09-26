@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -33,6 +34,7 @@ type fakeDaemon struct {
 
 	mu       sync.Mutex
 	threads  []Thread                // thread/list
+	archived []Thread                // moved here by thread/archive
 	loaded   map[string]ThreadStatus // thread/loaded/list + thread/read
 	pageSize int                     // thread/list page size; 0 = one page
 	// beforeRead, when set, runs before a thread/read is answered (on the
@@ -361,6 +363,33 @@ func (d *fakeDaemon) handle(c *fakeConn, method string, params json.RawMessage) 
 			status = "unsubscribed"
 		}
 		return map[string]any{"status": status}, nil
+	case "thread/archive", "thread/unarchive":
+		var p struct {
+			ThreadID string `json:"threadId"`
+		}
+		_ = json.Unmarshal(params, &p)
+		from, to, note := &d.threads, &d.archived, notifyArchived
+		if method == "thread/unarchive" {
+			from, to, note = &d.archived, &d.threads, notifyUnarchived
+		}
+		d.mu.Lock()
+		i := slices.IndexFunc(*from, func(t Thread) bool { return t.ID == p.ThreadID })
+		if i < 0 {
+			d.mu.Unlock()
+			return nil, errors.New("thread not found")
+		}
+		t := (*from)[i]
+		*from = slices.Delete(*from, i, i+1)
+		*to = append(*to, t)
+		// Archiving tears a loaded thread down; unarchiving loads nothing.
+		delete(d.loaded, p.ThreadID)
+		d.mu.Unlock()
+		d.broadcast(note, map[string]any{"threadId": p.ThreadID})
+		if method == "thread/unarchive" {
+			t.Status = notLoadedSt
+			return map[string]any{"thread": t}, nil
+		}
+		return map[string]any{}, nil
 	case "thread/name/set":
 		var p struct {
 			ThreadID string `json:"threadId"`

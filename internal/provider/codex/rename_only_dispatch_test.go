@@ -2,10 +2,13 @@ package codex
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/process"
@@ -23,7 +26,8 @@ func runsOf(t *testing.T, store *localstate.Store) map[string]localstate.Run {
 
 // TestRenameOnlyDispatchBootstrapsThenRenamesNatively pins the rename-only
 // sequence: the model only sees the fixed bootstrap prompt, and the name is
-// set natively on the same connection once that turn was accepted.
+// set natively on the same connection once that turn was accepted, while
+// the connection is still subscribed, and only then unsubscribed.
 func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 	for _, tc := range []struct{ input, name string }{
 		{"/rename foo", "foo"},
@@ -38,7 +42,7 @@ func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.d.waitClosed(t, 1)
-			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/unsubscribe", "thread/name/set", "close")
+			requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
 
 			turn := decodeParams(t, f.d.requestsOf("turn/start")[0])
 			if !reflect.DeepEqual(turn["input"], textInput(renameBootstrapPrompt)) {
@@ -53,9 +57,6 @@ func TestRenameOnlyDispatchBootstrapsThenRenamesNatively(t *testing.T) {
 			}
 			if want := (session.Session{Key: codexKey("thread-new-1"), CWD: "/work"}); !reflect.DeepEqual(got, want) {
 				t.Fatalf("Dispatch = %+v, want only the canonical key and CWD", got)
-			}
-			if f.api.renames != 0 {
-				t.Fatalf("rename-only used the short-lived app-server rename (%d calls)", f.api.renames)
 			}
 			f.requireNoLegacySideEffects(t)
 		})
@@ -91,25 +92,35 @@ func TestOrdinaryDispatchNeverRenames(t *testing.T) {
 }
 
 // A rename that fails after the bootstrap turn was accepted fails the
-// rename-only Dispatch, naming the thread that now exists, and touches that
-// thread no further: no interrupt, delete, archive, legacy Stop, retry or
-// local pending rename.
+// rename-only Dispatch, naming the thread that now exists, still releases
+// the subscription, and touches that thread no further: no interrupt,
+// delete, archive, legacy Stop, retry or local pending rename.
 func TestRenameOnlyPostCommitRenameFailureKeepsThread(t *testing.T) {
-	for name, inject := range map[string]func(*fakeDaemon){
-		"rename rpc error": func(d *fakeDaemon) { d.failNext("thread/name/set", 1) },
-		// The connection is gone before the rename can be sent at all.
-		"connection lost at unsubscribe": func(d *fakeDaemon) { d.dropOn["thread/unsubscribe"] = true },
+	restore := dispatchCleanupTimeout
+	dispatchCleanupTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { dispatchCleanupTimeout = restore })
+	for name, tc := range map[string]struct {
+		inject func(*fakeDaemon)
+		// unsubscribed: whether the daemon can still receive the
+		// unsubscribe attempted after the failed rename.
+		unsubscribed bool
+	}{
+		"rename rpc error":   {func(d *fakeDaemon) { d.failNext("thread/name/set", 1) }, true},
+		"rename no response": {func(d *fakeDaemon) { d.hangOn["thread/name/set"] = true }, true},
+		"connection lost":    {func(d *fakeDaemon) { d.dropOn["thread/name/set"] = true }, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newDispatchFixture(t)
-			inject(f.d)
+			tc.inject(f.d)
 			_, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
 			if err == nil || !strings.Contains(err.Error(), "thread-new-1") || !strings.Contains(err.Error(), "foo") {
 				t.Fatalf("Dispatch = %v, want a rename failure naming thread-new-1 and foo", err)
 			}
 			f.d.waitClosed(t, 1)
-			if n := f.d.callCount("turn/start"); n != 1 {
-				t.Fatalf("turn/start called %d times", n)
+			if tc.unsubscribed {
+				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
+			} else {
+				requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "close")
 			}
 			if n := f.d.callCount("thread/name/set"); n > 1 {
 				t.Fatalf("rename retried (%d attempts)", n)
@@ -124,18 +135,17 @@ func TestRenameOnlyPostCommitRenameFailureKeepsThread(t *testing.T) {
 	}
 }
 
-// Unsubscribe is cleanup, so its failure is not a rename-only failure: the
-// rename still runs on the connection.
-func TestRenameOnlyUnsubscribeFailureStillRenames(t *testing.T) {
+// Unsubscribe is cleanup, so its failure after a successful rename is not a
+// rename-only failure.
+func TestRenameOnlyUnsubscribeFailureStillSucceeds(t *testing.T) {
 	f := newDispatchFixture(t)
 	f.d.failNext("thread/unsubscribe", 1)
 	got, err := f.p.Dispatch(context.Background(), "/rename foo", "/work")
 	if err != nil || got.Key != codexKey("thread-new-1") {
 		t.Fatalf("Dispatch = (%+v, %v), want success", got, err)
 	}
-	if n := f.d.callCount("thread/name/set"); n != 1 {
-		t.Fatalf("thread/name/set called %d times", n)
-	}
+	f.d.waitClosed(t, 1)
+	requireEvents(t, f.d, "ensure", "initialize", "thread/start", "turn/start", "thread/name/set", "thread/unsubscribe", "close")
 }
 
 // Before the bootstrap turn is accepted there is nothing to rename.
@@ -160,26 +170,40 @@ func TestRenameOnlyPreCommitFailureNeverRenames(t *testing.T) {
 
 // seedLegacyRenameRun returns a provider whose state holds a legacy
 // rename-only run still waiting to be bound (its thread does not exist
-// yet), like one the supervisor-managed Dispatch left behind.
-func seedLegacyRenameRun(t *testing.T) (*Provider, *fakeAPI, *localstate.Store) {
+// yet), like one the supervisor-managed Dispatch left behind. Its native
+// rename goes to d, the shared daemon.
+func seedLegacyRenameRun(t *testing.T) (*Provider, *fakeAPI, *localstate.Store, *fakeDaemon) {
 	t.Helper()
 	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
 	if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", Baseline: []string{"old"}, PendingRename: "foo"}); err != nil {
 		t.Fatal(err)
 	}
 	api := &fakeAPI{rows: []Thread{{ID: "old", CWD: "/work"}}}
-	p := &Provider{Store: store, API: api, Runtime: &fakeManagedRuntime{}, WriterOwner: func(string, process.Identity) (bool, error) { return true, nil }}
-	return p, api, store
+	d := newFakeDaemon(t)
+	d.setThreads(Thread{ID: "thread-1", CWD: "/work"})
+	p := &Provider{Store: store, API: api, Runtime: &fakeManagedRuntime{}, ControlSocket: d.socket, WriterOwner: func(string, process.Identity) (bool, error) { return true, nil }}
+	return p, api, store, d
+}
+
+// renames lists the thread/name/set requests d received, as id:name.
+func renames(t *testing.T, d *fakeDaemon) []string {
+	t.Helper()
+	var got []string
+	for _, raw := range d.requestsOf("thread/name/set") {
+		m := decodeParams(t, raw)
+		got = append(got, fmt.Sprintf("%v:%v", m["threadId"], m["name"]))
+	}
+	return got
 }
 
 func TestPendingRenameWaitsUntilRunIsBound(t *testing.T) {
-	p, api, store := seedLegacyRenameRun(t)
+	p, _, store, d := seedLegacyRenameRun(t)
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if api.renames != 0 {
-		t.Fatalf("renamed %q before any thread was bound", api.renamed)
+	if got := renames(t, d); len(got) != 0 {
+		t.Fatalf("renamed %q before any thread was bound", got)
 	}
 	if runsOf(t, store)["run-1"].PendingRename != "foo" {
 		t.Fatalf("pending rename lost while unbound: %+v", runsOf(t, store)["run-1"])
@@ -190,14 +214,14 @@ func TestPendingRenameWaitsUntilRunIsBound(t *testing.T) {
 }
 
 func TestBoundRunAppliesPendingRenameNativelyAndKeepsIdentity(t *testing.T) {
-	p, api, store := seedLegacyRenameRun(t)
+	p, api, store, d := seedLegacyRenameRun(t)
 	api.rows = append(api.rows, Thread{ID: "thread-1", CWD: "/work"})
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if api.renamed != "thread-1:foo" || api.renames != 1 {
-		t.Fatalf("native rename = %q (%d calls), want thread-1:foo once", api.renamed, api.renames)
+	if got := renames(t, d); !slices.Equal(got, []string{"thread-1:foo"}) {
+		t.Fatalf("native renames = %q, want thread-1:foo once", got)
 	}
 	r := runsOf(t, store)["run-1"]
 	if r.PendingRename != "" || r.RenameError != "" || r.SessionID != "thread-1" {
@@ -218,21 +242,21 @@ func TestBoundRunAppliesPendingRenameNativelyAndKeepsIdentity(t *testing.T) {
 		t.Fatalf("PreviousKeys = %v, want [codex:run-1]", bound.PreviousKeys)
 	}
 
-	if _, err := p.List(context.Background(), false); err != nil || api.renames != 1 {
-		t.Fatalf("a cleared pending rename must not be applied again (err=%v, renames=%d)", err, api.renames)
+	if _, err := p.List(context.Background(), false); err != nil || len(renames(t, d)) != 1 {
+		t.Fatalf("a cleared pending rename must not be applied again (err=%v, renames=%q)", err, renames(t, d))
 	}
 }
 
 func TestPendingRenameFailureIsSurfacedNotRetriedAndKeepsThread(t *testing.T) {
-	p, api, store := seedLegacyRenameRun(t)
+	p, api, store, d := seedLegacyRenameRun(t)
 	api.rows = append(api.rows, Thread{ID: "thread-1", CWD: "/work", Preview: ptr("Wait for the next user prompt.")})
-	api.renameErr = errBoom
+	d.failNext("thread/name/set", 1)
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
 		t.Fatalf("a rename failure must not fail the catalog: %v", err)
 	}
 	r := runsOf(t, store)["run-1"]
-	if r.SessionID != "thread-1" || r.PendingRename != "" || !strings.Contains(r.RenameError, "foo") || !strings.Contains(r.RenameError, "boom") {
+	if r.SessionID != "thread-1" || r.PendingRename != "" || !strings.Contains(r.RenameError, "foo") || !strings.Contains(r.RenameError, "injected failure") {
 		t.Fatalf("run = %+v, want bound, pending cleared, failure recorded", r)
 	}
 	var bound session.Session
@@ -244,12 +268,11 @@ func TestPendingRenameFailureIsSurfacedNotRetriedAndKeepsThread(t *testing.T) {
 	if bound.Name != "" || bound.Summary != r.RenameError || len(bound.PreviousKeys) != 1 {
 		t.Fatalf("the thread must stay listed, unnamed, showing the failure: %+v", bound)
 	}
-	if _, err := p.List(context.Background(), false); err != nil || api.renames != 1 {
-		t.Fatalf("a failed pending rename must not be retried automatically (err=%v, renames=%d)", err, api.renames)
+	if _, err := p.List(context.Background(), false); err != nil || len(renames(t, d)) != 1 {
+		t.Fatalf("a failed pending rename must not be retried automatically (err=%v, renames=%q)", err, renames(t, d))
 	}
 
 	// The retry is an ordinary rename of the thread, which resolves the failure.
-	api.renameErr = nil
 	if err := p.Rename(context.Background(), codexKey("thread-1"), "foo"); err != nil {
 		t.Fatal(err)
 	}
@@ -259,9 +282,8 @@ func TestPendingRenameFailureIsSurfacedNotRetriedAndKeepsThread(t *testing.T) {
 }
 
 func TestCancelledListKeepsPendingRename(t *testing.T) {
-	p, api, store := seedLegacyRenameRun(t)
+	p, api, store, _ := seedLegacyRenameRun(t)
 	api.rows = append(api.rows, Thread{ID: "thread-1", CWD: "/work"})
-	api.renameErr = context.Canceled
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := p.List(ctx, false); err != nil {
@@ -341,7 +363,7 @@ func TestListStartingRowsAreNotOpenable(t *testing.T) {
 // it, applies the name, drops the provisional row and offers Open on the
 // real thread, which Open resumes by its thread ID.
 func TestLegacyRenameOnlyRunBecomesOpenableOnceBound(t *testing.T) {
-	p, api, _ := seedLegacyRenameRun(t)
+	p, api, _, d := seedLegacyRenameRun(t)
 	starting := session.Session{Key: codexKey("run-1"), RunID: "run-1"}
 
 	for range 2 { // the thread has not appeared yet
@@ -384,8 +406,8 @@ func TestLegacyRenameOnlyRunBecomesOpenableOnceBound(t *testing.T) {
 	if bound == nil {
 		t.Fatalf("real thread row missing: %+v", rows)
 	}
-	if api.renamed != "thread-1:foo" || bound.Name != "foo" {
-		t.Fatalf("pending rename not applied: renamed=%q Name=%q", api.renamed, bound.Name)
+	if got := renames(t, d); !slices.Equal(got, []string{"thread-1:foo"}) || bound.Name != "foo" {
+		t.Fatalf("pending rename not applied: renamed=%q Name=%q", got, bound.Name)
 	}
 	if len(bound.PreviousKeys) != 1 || bound.PreviousKeys[0] != starting.Key || bound.RunID != starting.RunID {
 		t.Fatalf("identity continuity lost: %+v", bound)

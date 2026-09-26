@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -163,7 +162,7 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 		}
 		observed := observe(t, func() bool { return p.writerAbsent(t.ID) })
 		runtime := observed.Runtime
-		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: {Available: true}}
+		actions := session.Actions{session.ActionRename: {Available: true}, session.ActionArchive: archiveAvailability(observed)}
 		// Open follows the observation, not whether agentsctl manages a run:
 		// a legacy managed run holding the writer lock outside the shared
 		// app-server is as unopenable as any other external writer. An
@@ -219,6 +218,22 @@ func (p *Provider) sessionRows(threads []Thread, runs map[string]localstate.Run,
 		}
 	}
 	return rows
+}
+
+// archiveAvailability is the advisory Archive availability of a thread
+// observed as observed: a running session (Working or waiting on the user)
+// is stopped first, and a thread another process writes is never archived.
+// An observation that establishes neither (e.g. Unknown while the Observer
+// is down) leaves Archive offered; Archive itself re-checks with the
+// daemon before acting (see archivable).
+func archiveAvailability(observed observation) session.Availability {
+	switch {
+	case observed.Runtime == session.RuntimeExternal:
+		return session.Availability{Reason: errArchiveExternalWriter.Error()}
+	case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+		return session.Availability{Reason: errArchiveRunning.Error()}
+	}
+	return session.Availability{Available: true}
 }
 
 // sortedKeys returns keys ordered by ID so PreviousKeys does not depend on
@@ -324,8 +339,9 @@ func (p *Provider) Stop(ctx context.Context, k session.Key) error {
 
 // Archive removes k's session. For an actual Codex thread (no local run
 // record shares k.ID, or that record is already bound to a thread) this
-// calls the app-server's native thread/archive. For an agentsctl-owned
-// unbound run — a local run that started but never got proven to any
+// calls native thread/archive on the shared daemon, and only once the
+// daemon itself confirmed the thread is at rest (see archivable). For an
+// agentsctl-owned unbound run — a local run that started but never got proven to any
 // app-server thread (localstate.Run.SessionID == "") — k.ID is agentsctl's
 // own run ID, never a Codex thread ID, so it must never reach the
 // app-server under any state, not just the terminal one List() actually
@@ -347,17 +363,48 @@ func (p *Provider) Archive(ctx context.Context, k session.Key) error {
 		}
 		return p.Store.DeleteTerminalUnboundRun(k.ID, isTerminalRunState)
 	}
-	if err := p.API.Archive(ctx, k.ID); err != nil {
-		return err
-	}
-	p.catalogChanged()
-	return nil
+	return p.withDaemon(ctx, func(conn *rpcConn) error {
+		if err := p.archivable(ctx, conn, k.ID); err != nil {
+			return err
+		}
+		return conn.call(ctx, "thread/archive", map[string]any{"threadId": k.ID}, nil)
+	})
 }
 
-// catalogChanged asks the Observer's connection to re-read the catalog
-// after a change made through the short-lived app-server, which the shared
-// daemon does not broadcast.
-func (p *Provider) catalogChanged() { p.runtime().requestCatalog() }
+var (
+	errArchiveRunning        = errors.New("codex session is running; stop it before archiving")
+	errArchiveExternalWriter = errors.New("external or unknown Codex writer prevents archive")
+)
+
+// archivable re-reads threadID's status on conn, right before Archive
+// sends thread/archive on it, and refuses unless the thread is at rest.
+// The daemon archives a thread it has loaded by shutting its runtime down,
+// so a running turn -- Working or waiting on the user -- must never reach
+// thread/archive: Archive would become an implicit Stop. The status is
+// read the same way the Observer reads it (see observeThread): a loaded
+// thread's native status decides on its own; a notLoaded one is at rest
+// only while no other process holds its writer lock. Anything else,
+// including a status this version does not know, is refused. The row's
+// cached Actions play no part here.
+func (p *Provider) archivable(ctx context.Context, conn *rpcConn, threadID string) error {
+	t, err := readThread(ctx, conn, threadID)
+	switch {
+	case err != nil:
+		return fmt.Errorf("thread/read %s: %w", threadID, err)
+	case t.ID != threadID || t.Status.Type == "":
+		return fmt.Errorf("thread/read %s: malformed response", threadID)
+	}
+	observed := observeThread(t.Status, func() bool { return p.writerAbsent(threadID) })
+	switch {
+	case observed.Runtime == session.RuntimeExternal:
+		return errArchiveExternalWriter
+	case observed.Activity == session.ActivityWorking || observed.Activity == session.ActivityNeedsInput:
+		return errArchiveRunning
+	case observed.Activity == session.ActivityIdle || observed.Activity == session.ActivityFailed:
+		return nil
+	}
+	return fmt.Errorf("codex thread %s has status %q; refusing to archive it", threadID, t.Status.Type)
+}
 
 // isTerminalRunState reports whether a localstate.Run.State value is
 // terminal — the run reached an end state without (or, for a previously-
@@ -368,12 +415,13 @@ func (p *Provider) catalogChanged() { p.runtime().requestCatalog() }
 func isTerminalRunState(state string) bool {
 	return state == "failed" || state == "stale" || state == "stopped"
 }
+
+// Unarchive restores k's thread through the shared daemon. Unlike Archive
+// it touches no runtime, so it needs no preflight.
 func (p *Provider) Unarchive(ctx context.Context, k session.Key) error {
-	if err := p.API.Unarchive(ctx, k.ID); err != nil {
-		return err
-	}
-	p.catalogChanged()
-	return nil
+	return p.withDaemon(ctx, func(conn *rpcConn) error {
+		return conn.call(ctx, "thread/unarchive", map[string]any{"threadId": k.ID}, nil)
+	})
 }
 
 // fiveHourWindowDurationMins and weeklyWindowDurationMins are the
@@ -430,14 +478,17 @@ func rateLimitWindow(w *RateLimitWindow) session.UsageWindow {
 	}
 	return session.UsageWindow{State: session.UsageAvailable, Percent: w.UsedPercent, Reset: time.Unix(*w.ResetsAt, 0)}
 }
+
+// Rename sets k's thread name through the shared daemon. The daemon
+// patches thread metadata whether or not a turn is running, so a running
+// session can be renamed without interrupting it.
 func (p *Provider) Rename(ctx context.Context, k session.Key, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("name is required")
 	}
-	if err := p.API.Rename(ctx, k.ID, name); err != nil {
+	if err := p.withDaemon(ctx, func(conn *rpcConn) error { return setThreadName(ctx, conn, k.ID, name) }); err != nil {
 		return err
 	}
-	p.catalogChanged()
 	p.clearRenameError(k.ID)
 	return nil
 }
@@ -566,14 +617,10 @@ func (p *Provider) openThreadID(s session.Session) (string, error) {
 func (p *Provider) preflightOpen(ctx context.Context, socket, threadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, openPreflightTimeout)
 	defer cancel()
-	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
-	if err != nil {
-		return fmt.Errorf("connect codex app-server daemon: %w", err)
-	}
-	defer conn.Close()
-	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
-		return fmt.Errorf("initialize codex app-server daemon: %w", err)
-	}
+	return connectDaemon(ctx, socket, func(conn *rpcConn) error { return p.checkOpenable(ctx, conn, threadID) })
+}
+
+func (p *Provider) checkOpenable(ctx context.Context, conn *rpcConn, threadID string) error {
 	t, err := readThread(ctx, conn, threadID)
 	switch {
 	case err != nil:

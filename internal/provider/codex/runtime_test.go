@@ -667,17 +667,29 @@ func TestDisconnectKeepsProvisionalRunSemantics(t *testing.T) {
 // A thread that leaves the catalog loses its cached status: when it comes
 // back without being loaded again (and without any status or closed
 // notification) it is notLoaded, never its old live status. The catalog
-// changes are driven either by the daemon's own broadcasts or by this
-// Provider's short-lived app-server actions.
+// changes are driven by the daemon's broadcasts, whether another client
+// or this Provider's own Archive/Unarchive caused them.
 func TestCatalogRemovalDropsCachedStatus(t *testing.T) {
 	a := session.Key{Provider: session.ProviderCodex, ID: "a"}
 	paths := map[string]struct{ archive, unarchive func(*Provider, *fakeConn) }{
 		"daemon notifications": {
-			archive:   func(_ *Provider, c *fakeConn) { c.notify(notifyArchived, map[string]any{"threadId": "a"}) },
-			unarchive: func(_ *Provider, c *fakeConn) { c.notify(notifyUnarchived, map[string]any{"threadId": "a"}) },
+			// The daemon tore the runtime down without a thread/closed
+			// notification.
+			archive: func(_ *Provider, c *fakeConn) {
+				c.d.setThreads()
+				c.d.setLoaded("a", notLoadedSt)
+				c.notify(notifyArchived, map[string]any{"threadId": "a"})
+			},
+			unarchive: func(_ *Provider, c *fakeConn) {
+				c.d.setThreads(catalogThread("a", 1))
+				c.notify(notifyUnarchived, map[string]any{"threadId": "a"})
+			},
 		},
 		"provider actions": {
-			archive: func(p *Provider, _ *fakeConn) {
+			// Archive refuses a running thread, so it settles first; its
+			// loaded idle status must not outlive the archive either.
+			archive: func(p *Provider, c *fakeConn) {
+				c.statusChanged("a", idle)
 				if err := p.Archive(context.Background(), a); err != nil {
 					t.Fatal(err)
 				}
@@ -699,16 +711,9 @@ func TestCatalogRemovalDropsCachedStatus(t *testing.T) {
 			c := d.waitReady(t)
 			waitFor(t, ch, "a working", activityIs("a", session.ActivityWorking))
 
-			// Archived: the daemon tore the runtime down without a
-			// thread/closed notification.
-			d.setThreads()
-			d.mu.Lock()
-			delete(d.loaded, "a")
-			d.mu.Unlock()
 			path.archive(p, c)
 			waitFor(t, ch, "a gone", func(u sessionctl.ProviderUpdate) bool { _, ok := rowOf(u, "a"); return u.Err == nil && !ok })
 
-			d.setThreads(catalogThread("a", 1))
 			path.unarchive(p, c)
 			u := waitFor(t, ch, "a back", func(u sessionctl.ProviderUpdate) bool { _, ok := rowOf(u, "a"); return ok })
 			if s, _ := rowOf(u, "a"); s.Activity != session.ActivityIdle || s.Runtime != session.RuntimeNone {

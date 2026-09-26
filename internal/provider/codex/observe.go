@@ -50,6 +50,18 @@ func (p *Provider) readySocket(ctx context.Context) (string, error) {
 	return info.SocketPath, nil
 }
 
+// withDaemon runs fn on a connection of its own to the shared app-server
+// daemon (see readySocket, connectDaemon). Every Codex thread mutation goes
+// through it, so the daemon that holds a thread's writer lock is the one
+// that changes it.
+func (p *Provider) withDaemon(ctx context.Context, fn func(*rpcConn) error) error {
+	socket, err := p.readySocket(ctx)
+	if err != nil {
+		return err
+	}
+	return connectDaemon(ctx, socket, fn)
+}
+
 // Observe implements sessionctl.Observer from the shared Codex app-server
 // daemon: every publication is the full Codex catalog, rebuilt from the
 // latest catalog and native status the runtime holds, never just the thread

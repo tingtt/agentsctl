@@ -218,6 +218,21 @@ func (c *rpcConn) fail(err error) {
 	_ = c.ws.CloseNow()
 }
 
+// connectDaemon opens a connection of its own to the app-server daemon on
+// socket, initializes it, runs fn on it and closes it, whatever fn does.
+// Server requests reaching it stay unanswered (see rpcConn).
+func connectDaemon(ctx context.Context, socket string, fn func(*rpcConn) error) error {
+	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
+	if err != nil {
+		return fmt.Errorf("connect codex app-server daemon: %w", err)
+	}
+	defer conn.Close()
+	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
+		return fmt.Errorf("initialize codex app-server daemon: %w", err)
+	}
+	return fn(conn)
+}
+
 // initializeRPC performs the app-server handshake (initialize, then
 // initialized) shared by every connection.
 func initializeRPC(ctx context.Context, call func(context.Context, string, any, any) error, notify func(string, any) error, result any) error {

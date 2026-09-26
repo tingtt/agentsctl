@@ -2,7 +2,6 @@ package codex
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -20,6 +19,9 @@ var dispatchCleanupTimeout = 10 * time.Second
 // submits prompt as its first turn, over a connection of its own:
 //
 //	initialize -> thread/start -> turn/start -> thread/unsubscribe -> close
+//
+// A rename-only input also sets the name, between turn/start and
+// thread/unsubscribe.
 //
 // thread/start returns the canonical thread ID; a successful turn/start
 // response is the commit point, after which the turn may already be
@@ -39,8 +41,10 @@ var dispatchCleanupTimeout = 10 * time.Second
 // A composer input that is only `/rename <name>` is never forwarded to
 // Codex: as an initial prompt it would reach the model as plain text. The
 // model gets the fixed renameBootstrapPrompt instead, and the name is set
-// natively on the same connection once that bootstrap turn was accepted
-// (see setThreadName).
+// natively on the same connection once that bootstrap turn was accepted,
+// before the connection unsubscribes (see setThreadName). A rename failure
+// after the commit point fails Dispatch with the thread's ID, and leaves
+// the thread and its turn alone.
 func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Session, error) {
 	var rename string
 	if name, isRename := parseRenameOnly(prompt); isRename {
@@ -49,33 +53,32 @@ func (p *Provider) Dispatch(ctx context.Context, prompt, cwd string) (session.Se
 		}
 		prompt, rename = renameBootstrapPrompt, name
 	}
-	socket, err := p.readySocket(ctx)
+	var threadID string
+	err := p.withDaemon(ctx, func(conn *rpcConn) error {
+		var err error
+		if threadID, err = startThread(ctx, conn, cwd); err != nil {
+			return fmt.Errorf("codex thread/start: %w", err)
+		}
+		if err := startTurn(ctx, conn, threadID, prompt); err != nil {
+			return fmt.Errorf("codex turn/start on thread %s: %w", threadID, err)
+		}
+
+		// Committed: the turn has started. What follows must neither undo
+		// it nor report it as failed, and the caller giving up no longer
+		// matters. The rename runs while the connection is still
+		// subscribed; unsubscribing is attempted whatever it did.
+		var renameErr error
+		if rename != "" {
+			renameErr = cleanupStep(ctx, func(ctx context.Context) error { return setThreadName(ctx, conn, threadID, rename) })
+		}
+		_ = cleanupStep(ctx, func(ctx context.Context) error { return unsubscribeThread(ctx, conn, threadID) })
+		if renameErr != nil {
+			return fmt.Errorf("codex thread %s started, but rename to %q failed: %w", threadID, rename, renameErr)
+		}
+		return nil
+	})
 	if err != nil {
 		return session.Session{}, err
-	}
-	conn, err := dialRPC(ctx, socket, func(string, json.RawMessage) {})
-	if err != nil {
-		return session.Session{}, fmt.Errorf("connect codex app-server daemon: %w", err)
-	}
-	defer conn.Close()
-	if err := initializeRPC(ctx, conn.call, conn.notify, nil); err != nil {
-		return session.Session{}, fmt.Errorf("initialize codex app-server daemon: %w", err)
-	}
-	threadID, err := startThread(ctx, conn, cwd)
-	if err != nil {
-		return session.Session{}, fmt.Errorf("codex thread/start: %w", err)
-	}
-	if err := startTurn(ctx, conn, threadID, prompt); err != nil {
-		return session.Session{}, fmt.Errorf("codex turn/start on thread %s: %w", threadID, err)
-	}
-
-	// Committed: the turn has started. What follows must neither undo it
-	// nor report it as failed, and the caller giving up no longer matters.
-	_ = cleanupStep(ctx, func(ctx context.Context) error { return unsubscribeThread(ctx, conn, threadID) })
-	if rename != "" {
-		if err := cleanupStep(ctx, func(ctx context.Context) error { return setThreadName(ctx, conn, threadID, rename) }); err != nil {
-			return session.Session{}, fmt.Errorf("codex thread %s started, but rename to %q failed: %w", threadID, rename, err)
-		}
 	}
 	return session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: threadID}, CWD: cwd}, nil
 }

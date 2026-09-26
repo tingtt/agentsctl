@@ -19,15 +19,12 @@ import (
 
 var errBoom = errors.New("boom")
 
+// fakeAPI is the short-lived app-server's read side. It has no mutation
+// methods: Rename, Archive and Unarchive go to the shared daemon.
 type fakeAPI struct {
-	rows       []Thread
-	home       string
-	archived   string
-	unarchived string
-	renamed    string
-	renameErr  error
-	renames    int
-	lists      int
+	rows  []Thread
+	home  string
+	lists int
 
 	rateLimits    AccountRateLimits
 	rateLimitsErr error
@@ -43,25 +40,6 @@ type fakeManagedRuntime struct {
 func (f *fakeManagedRuntime) Stop(_ context.Context, id string) error {
 	f.stopped = append(f.stopped, id)
 	return nil
-}
-
-func TestArchiveAndUnarchiveUseAppServerWithoutRuntimeStop(t *testing.T) {
-	api := &fakeAPI{}
-	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
-	p := Provider{API: api, Store: store}
-	key := session.Key{Provider: session.ProviderCodex, ID: "thread"}
-	if err := p.Archive(context.Background(), key); err != nil {
-		t.Fatal(err)
-	}
-	if api.archived != "thread" {
-		t.Fatal("native archive not called")
-	}
-	if err := p.Unarchive(context.Background(), key); err != nil {
-		t.Fatal(err)
-	}
-	if api.unarchived != "thread" {
-		t.Fatal("native unarchive not called")
-	}
 }
 
 func durationMins(m int) *int { return &m }
@@ -230,17 +208,7 @@ func (f *fakeAPI) List(context.Context, bool) ([]Thread, error) {
 	f.lists++
 	return append([]Thread(nil), f.rows...), nil
 }
-func (f *fakeAPI) Rename(_ context.Context, id, name string) error {
-	f.renames++
-	if f.renameErr != nil {
-		return f.renameErr
-	}
-	f.renamed = id + ":" + name
-	return nil
-}
-func (f *fakeAPI) Archive(_ context.Context, id string) error   { f.archived = id; return nil }
-func (f *fakeAPI) Unarchive(_ context.Context, id string) error { f.unarchived = id; return nil }
-func (f *fakeAPI) CodexHome() string                            { return f.home }
+func (f *fakeAPI) CodexHome() string { return f.home }
 func (f *fakeAPI) RateLimits(context.Context) (AccountRateLimits, error) {
 	return f.rateLimits, f.rateLimitsErr
 }
@@ -412,13 +380,13 @@ func TestArchiveUnboundRunIsLocalCleanupNotThreadArchive(t *testing.T) {
 	if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: "failed", Error: "fork/exec: operation not permitted"}); err != nil {
 		t.Fatal(err)
 	}
-	api := &fakeAPI{}
-	p := Provider{Store: store, API: api}
+	d := newFakeDaemon(t)
+	p := Provider{Store: store, API: &fakeAPI{}, ControlSocket: d.socket}
 	if err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"}); err != nil {
 		t.Fatal(err)
 	}
-	if api.archived != "" {
-		t.Fatalf("unbound run archive called app-server thread/archive with id=%q", api.archived)
+	if n := d.callCount("initialize"); n != 0 {
+		t.Fatalf("unbound run archive contacted the daemon (%d connections)", n)
 	}
 	runs, _ := store.Runs()
 	if _, ok := runs["r"]; ok {
@@ -447,8 +415,8 @@ func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 			if err := store.StartRun(localstate.Run{ID: "r", Provider: "codex", CWD: "/work", State: runState}); err != nil {
 				t.Fatal(err)
 			}
-			api := &fakeAPI{}
-			p := Provider{Store: store, API: api}
+			d := newFakeDaemon(t)
+			p := Provider{Store: store, API: &fakeAPI{}, ControlSocket: d.socket}
 			err := p.Archive(context.Background(), session.Key{Provider: session.ProviderCodex, ID: "r"})
 			if err == nil {
 				t.Fatal("expected an error archiving an active unbound run, got nil")
@@ -457,8 +425,8 @@ func TestArchiveRejectsRunningOrStartingUnboundRun(t *testing.T) {
 			if _, ok := runs["r"]; !ok {
 				t.Fatal("running/starting unbound run was locally deleted by Archive")
 			}
-			if api.archived != "" {
-				t.Fatalf("running/starting unbound run's local ID reached the app-server thread/archive: id=%q", api.archived)
+			if n := d.callCount("initialize"); n != 0 {
+				t.Fatalf("running/starting unbound run's local ID reached the daemon (%d connections)", n)
 			}
 		})
 	}
