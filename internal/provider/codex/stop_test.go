@@ -60,9 +60,6 @@ func TestStopImmediatelyAfterDispatchUsesExactUnmaterializedTurnHint(t *testing.
 	if hint := f.p.runtime().activeTurnHint("thread-new-1"); hint != "" {
 		t.Fatalf("active turn hint after Stop = %q, want cleared", hint)
 	}
-	if len(f.legacy.stopped) != 0 {
-		t.Fatalf("Stop used the legacy process path: %v", f.legacy.stopped)
-	}
 }
 
 func TestStopUnmaterializedExternalThreadWithoutHintFailsClosed(t *testing.T) {

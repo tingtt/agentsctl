@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -54,7 +53,7 @@ func TestObserverEnsuresDaemonBeforeConnecting(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("a", 1))
 	lifecycle := &scriptedLifecycle{results: []lifecycleResult{readyDaemon(d.socket)}, called: make(chan int, 4)}
-	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	p := &Provider{API: &fakeAPI{}, Daemon: lifecycle}
 	rt := p.runtime()
 	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 10*time.Millisecond, 50*time.Millisecond, 0
 	ch := observe(t, p)
@@ -79,7 +78,7 @@ func TestObserverPublishesInitialEnsureFailureThenRecovers(t *testing.T) {
 		{err: errors.New("daemon package unavailable")},
 		{info: readyDaemon(d.socket).info, gate: second},
 	}, called: make(chan int, 4)}
-	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	p := &Provider{API: &fakeAPI{}, Daemon: lifecycle}
 	rt := p.runtime()
 	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 20*time.Millisecond, 40*time.Millisecond, 0
 	ch := observe(t, p)
@@ -125,7 +124,7 @@ func TestObserverReEnsuresDaemonAfterAuthorityLoss(t *testing.T) {
 		{err: errors.New("daemon absent")},
 		{info: readyDaemon(d.socket).info, gate: third},
 	}, called: make(chan int, 8)}
-	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json"), Daemon: lifecycle}
+	p := &Provider{API: &fakeAPI{}, Daemon: lifecycle}
 	rt := p.runtime()
 	rt.minBackoff, rt.maxBackoff, rt.catalogGap = 20*time.Millisecond, 40*time.Millisecond, 0
 	ch := observe(t, p)
@@ -342,7 +341,7 @@ func TestSnapshotRereadsThreadChangedDuringSnapshot(t *testing.T) {
 
 func TestObserverWithoutDaemonKeepsListAuthorityAndBacksOff(t *testing.T) {
 	var attempts atomic.Int32
-	p := &Provider{API: &fakeAPI{}, Store: localstate.New(t.TempDir() + "/state.json")}
+	p := &Provider{API: &fakeAPI{}}
 	rt := newCodexRuntime(func(context.Context) (string, error) {
 		attempts.Add(1)
 		return "/nonexistent/app-server-control.sock", nil
@@ -368,9 +367,8 @@ func TestObserverWithoutDaemonKeepsListAuthorityAndBacksOff(t *testing.T) {
 	}
 }
 
-// Rows that only the existing execution path produces -- a new thread
-// List found, a provisional run -- reach the Observer's snapshots once it
-// owns the rows.
+// A new thread List found reaches the Observer's snapshots once it owns the
+// rows, with its Activity from the runtime.
 func TestListFeedsObserverCatalogAfterAuthority(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("a", 1))
@@ -380,21 +378,14 @@ func TestListFeedsObserverCatalogAfterAuthority(t *testing.T) {
 	d.waitReady(t)
 	waitFor(t, ch, "initial", activityIs("a", session.ActivityIdle))
 
-	if err := p.Store.SaveRun(localstate.Run{ID: "run-1", Provider: "codex", State: "running", CWD: "/work", StartedAt: time.Unix(5, 0)}); err != nil {
-		t.Fatal(err)
-	}
 	api.rows = []Thread{catalogThread("a", 1), catalogThread("fresh", 3)}
 	if _, err := p.List(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	u := waitFor(t, ch, "listed rows", func(u sessionctl.ProviderUpdate) bool {
 		_, fresh := rowOf(u, "fresh")
-		_, run := rowOf(u, "run-1")
-		return fresh && run
+		return fresh
 	})
-	if s, _ := rowOf(u, "run-1"); s.Activity != session.ActivityStarting {
-		t.Fatalf("provisional run=%+v", s)
-	}
 	if s, _ := rowOf(u, "fresh"); s.Activity != session.ActivityIdle {
 		t.Fatalf("listed thread must take its Activity from the runtime: %+v", s)
 	}
@@ -629,45 +620,6 @@ func TestCatalogResyncFailureReconnectsAndConverges(t *testing.T) {
 		t.Fatal("a failed resync must make the connection unavailable before it converges")
 	}
 	d.waitReady(t) // the reconnect that converged
-}
-
-// Losing the daemon only affects what the daemon observed: provisional
-// runs keep the existing managed-run semantics.
-func TestDisconnectKeepsProvisionalRunSemantics(t *testing.T) {
-	d := newFakeDaemon(t)
-	d.setThreads(catalogThread("a", 2), catalogThread("m", 1))
-	d.setLoaded("a", active())
-	p, _ := newObservedProvider(t, d, nil)
-	for _, r := range []localstate.Run{
-		{ID: "run-1", Provider: "codex", State: "running", CWD: "/work", StartedAt: time.Unix(5, 0)},
-		{ID: "run-2", Provider: "codex", State: "failed", CWD: "/work", StartedAt: time.Unix(6, 0), Error: "exec failed"},
-		{ID: "run-3", Provider: "codex", State: "running", SessionID: "m", CWD: "/work", StartedAt: time.Unix(1, 0)},
-	} {
-		if err := p.Store.SaveRun(r); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ch := observe(t, p)
-	d.waitReady(t)
-	waitFor(t, ch, "a working", activityIs("a", session.ActivityWorking))
-
-	d.stop()
-	u := waitFor(t, ch, "unavailable", func(u sessionctl.ProviderUpdate) bool { return u.Err == nil && u.Warning != nil })
-	want := map[string]observation{
-		"a":     {session.ActivityUnknown, session.RuntimeUnknown},
-		"m":     {session.ActivityUnknown, session.RuntimeDetached}, // managed thread: existing Runtime override
-		"run-1": {session.ActivityStarting, session.RuntimeDetached},
-		"run-2": {session.ActivityFailed, session.RuntimeStopped},
-	}
-	if len(u.Sessions) != len(want) {
-		t.Fatalf("rows=%+v", u.Sessions)
-	}
-	for id, w := range want {
-		s, ok := rowOf(u, id)
-		if !ok || (observation{s.Activity, s.Runtime}) != w {
-			t.Fatalf("%s=%+v, want %+v", id, s, w)
-		}
-	}
 }
 
 // A thread that leaves the catalog loses its cached status: when it comes

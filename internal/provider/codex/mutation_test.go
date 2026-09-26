@@ -150,7 +150,7 @@ func TestArchiveAvailabilityFollowsObservation(t *testing.T) {
 		{ID: "unknown", Status: ThreadStatus{Type: "somethingNew"}},
 	}
 	p := &Provider{API: &fakeAPI{}, writerFree: func(id string) bool { return id != "external" }}
-	rows := p.sessionRows(threads, nil, false, func(t Thread, writerFree func() bool) observation {
+	rows := p.sessionRows(threads, false, func(t Thread, writerFree func() bool) observation {
 		return observeThread(t.Status, writerFree)
 	})
 	var offered []string

@@ -71,7 +71,7 @@ agentsctl はこの provider ごとの差異を吸収し、複数セッション
 
 agentsctl は、Claude、Codex、ChatGPT を共通の session model として Agent View へ提示する。ただし、実際の lifecycle operation は provider ごとの能力へ委譲する。
 
-agentsctl が補うのは、主に Codex に不足するバックグラウンド実行能力である。
+agentsctl 自身は session runtime を持たない。Codex のバックグラウンド実行も shared app-server daemon に委ね、agentsctl は daemon の確保と native RPC / event による操作・観測だけを行う。
 
 ### UX Design
 
@@ -271,7 +271,7 @@ provider ごとの起動方法は異なるが、Agent View 上では同じ Dispa
 
 **Codex**
 
-- shared app-server daemon を利用する。supervisor-managed Codex process や short-lived stdio app-server は使わない。
+- shared app-server daemon を利用する。background の Codex TUI process や short-lived stdio app-server は使わない。
 - Dispatch ごとに daemon を確保し (`readySocket`)、Observer の persistent connection とは別の dedicated connection を張る。`thread/start` はその connection を thread へ自動 subscribe するため、Dispatch の subscription lifecycle を Observer と混ぜない。
 - Dispatch は次の RPC sequence とする。
 
@@ -294,7 +294,7 @@ close
 - `thread/start` の response の `thread.id` が空なら malformed として Dispatch error とし、canonical identity として受理しない。
 - `turn/start` は `threadId`、`turnTrigger: "user"`、1つの text `UserInput` (prompt を verbatim) だけを送る。cwd / model / permissions 等を turn scope で上書きせず、thread/start で確立した設定を使う。
 - `turn/start` の成功 response (空でない `turn.id`) が Dispatch の commit point である。この時点で server-side の turn は開始済みとみなす。
-  - commit point より前の失敗 (`thread/start` failure、`turn/start` の RPC error、malformed response) は Dispatch error とする。`thread/start` 成功後に `turn/start` が失敗しても thread を削除・隠蔽せず、Starting row、local run、provisional identity も作らない。native catalog にその thread が現れるかは app-server の責務であり、現れた場合は catalog を権威として扱う。
+  - commit point より前の失敗 (`thread/start` failure、`turn/start` の RPC error、malformed response) は Dispatch error とする。`thread/start` 成功後に `turn/start` が失敗しても thread を削除・隠蔽せず、agentsctl 側で row や identity を作らない。native catalog にその thread が現れるかは app-server の責務であり、現れた場合は catalog を権威として扱う。
   - commit point より後の失敗は Dispatch を error へ戻さない。再送が別 thread / turn を二重に作るためである。
 - `thread/unsubscribe` は commit 後の best-effort cleanup とする。
   - `unsubscribed` / `notSubscribed` / `notLoaded` はいずれも「この connection に残す subscription がない」という結果として扱う。
@@ -302,8 +302,8 @@ close
   - connection close が fallback である。close で connection の subscription は除去され、turn の interrupt や thread の shutdown は起きない。
   - commit 後の各 cleanup step は caller の cancellation から切り離した短い timeout で bound し、応答しない daemon が committed Dispatch の return を妨げないようにする。
 - `thread/unsubscribe` の前に approval / user-input request が届く race があっても agentsctl は応答しない (approve / deny / cancel / error response のいずれも送らない)。request は thread 側に保持され、後から foreground TUI が Open されたときに再提示される。
-- Dispatch が返すのは canonical `codex:<thread ID>` と要求した CWD だけである。Activity、Runtime、RunID、PreviousKeys、Actions を推測して返さず、Dispatch の response から catalog row を作らない。row は `thread/list` と Observer (broadcast `thread/started` / `thread/status/changed`) から現れる。
-- 新規 Dispatch は local run、baseline、provisional run ID、PendingRename を作らず、run-to-thread reconcile に依存しない。
+- Dispatch が返すのは canonical `codex:<thread ID>` と要求した CWD だけである。Activity、Runtime、PreviousKeys、Actions を推測して返さず、Dispatch の response から catalog row を作らない。row は `thread/list` と Observer (broadcast `thread/started` / `thread/status/changed`) から現れる。
+- Dispatch は local state を作らず、Dispatch 前の catalog も読まない。どの thread を開始したかは `thread/start` の response だけが決める。
 - Activity は Dispatch connection の thread subscription ではなく、persistent observer が受け取る broadcast `thread/status/changed` から更新する。
 
 ###### Rename-only new session (Codex)
@@ -325,7 +325,7 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 ```
 
 - bootstrap prompt は固定文とし name や `/rename` を含めない。name は user-controlled な文字列であり model instruction に埋め込まない。
-- session identity は最初から `codex:<thread ID>` であり、bootstrap のための provisional run key、identity transition、local PendingRename は作らない。
+- session identity は最初から `codex:<thread ID>` であり、bootstrap のための一時的な key、identity transition、保留中の name を保持する local state は作らない。
 - native rename は bootstrap turn が accepted された後にだけ送る。bootstrap turn が失敗した thread に名前だけが残る状態を作らないためである。
 - `turn/start` の response は turn の受理 (Dispatch の commit point) を示すだけで、thread の rollout の persistence を保証しない。rename (metadata update) は rollout を必要とするため、response 直後に送ると失敗しうる。daemon は turn の開始を rollout に persist した後に `turn/started` を送るため、thread ID と turn ID が `thread/start` / `turn/start` の response と一致する `turn/started` を rename の readiness とする。
   - notification は response より先に届きうるため、Dispatch connection の確立時点から `turn/started` を記録する。別 thread / 別 turn の `turn/started` は readiness としない。
@@ -337,12 +337,6 @@ Codex は user/model turn を一度も持たない thread を durable な resuma
 - commit 後は rename / cleanup が失敗しても thread の delete、archive、rollback、daemon restart、自動 retry を行わない。native catalog に現れる thread が source of truth であり、user は通常の Rename で再試行できる。
 - bootstrap 中の Activity は通常の native thread status を使う。
 - bootstrap turn は model turn を1回消費する。rate limit 等で失敗する場合も特別な回避はしない。
-
-###### Legacy managed run (移行期間)
-
-RPC Dispatch 導入前に supervisor-managed Dispatch が localstate に残した run は、移行 code の撤去までは従来どおり reconcile、provisional row、`PreviousKeys`、PendingRename の適用、managed-run Stop の対象とする。新規 Dispatch はこの状態を作らない。
-
-legacy reconcile は candidate thread の writer lock owner が legacy run 自身の process identity であることを binding の条件とする。RPC Dispatch の thread の writer lock は shared daemon が保持するため、同じ CWD・新しい timestamp であっても legacy run に bind されない。
 
 ##### Composer directory context
 
@@ -540,7 +534,7 @@ Agent View の raw mode と overview 固有 terminal mode は1つの lifecycle b
 
 overview が所有する terminal mode は raw mode、alternate screen、cursor の非表示、bracketed paste である。overview が active な間だけこれらを所有し、foreground の Open / 外部 editor は overview の suspend の後にはじめて terminal を受け取る。Open は provider を区別しない共通の foreground handoff であり、`suspend -> Open -> resume` の順に実行する。Open が失敗しても resume は必ず試み、suspend に失敗した場合は Open を実行しない。resume に失敗した場合は Open の error と合わせて (どちらも失わずに) terminal ownership の失敗として扱う。戻ったときの resume が overview 所有の mode (bracketed paste を含む) をすべて再確立する。
 
-attach client や Codex Open の PTY bridge が自身の attach 中に確立する bracketed paste (「PTY attach and redraw」、Codex の Open) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
+attach client や Codex Open の PTY bridge が自身の attach 中に確立する bracketed paste (Claude の attach、Codex の Open) は overview の mode とは別の ownership scope であり、overview が代わりに所有することはしない。overview の suspend が bracketed paste を解除した後に attach が自ら確立し、attach の終了時に解除し、overview の resume が再び確立する。
 
 **Claude**
 
@@ -558,9 +552,9 @@ attach client や Codex Open の PTY bridge が自身の attach 中に確立す�
 codex --remote unix://... resume <thread ID>
 ```
 
-- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。explicit `--remote` は接続失敗時に embedded runtime へ fallback しない。agentsctl 側も、foreground client の失敗を plain `codex resume`、managed PTY、embedded runtime のいずれでも再試行せず、そのまま Open の error とする。
+- plain `codex resume` は daemon unavailable や特定 option で embedded runtime へ silent fallback しうるため、agentsctl の Open では使わない。explicit `--remote` は接続失敗時に embedded runtime へ fallback しない。agentsctl 側も、foreground client の失敗を plain `codex resume` や embedded runtime で再試行せず、そのまま Open の error とする。
 - `--remote` の socket path は daemon lifecycle response の `socketPath` とし、`unix://` に続けて encode せずそのまま1つの引数として渡す。
-- `resume` へ渡すのは canonical thread ID だけである。canonical thread ID を持たない row (移行期間中の legacy provisional run 等) は Open 不可とし、Provider 境界でも current run state を読み直して拒否する。
+- `resume` へ渡すのは row の key である canonical thread ID だけである。Codex の row は常に thread ID を key とし、thread ID を持たない row は Open しない。
 - 起動前に daemon を確保し、同じ daemon へ Open 専用の短命 connection で `thread/read` を行って current status を確認する。Observer の snapshot や row の Actions は advisory であり、安全性判断の source of truth にしない。status を確定できない場合 (接続・initialize・`thread/read` の失敗、不正な response) は起動しない。
 - title 生成用の internal thread (`ephemeral` かつ `threadSource == "thread_title"`) は Open しない。
 - foreground TUI は agentsctl の environment を継承し、`CWD` で、Open 中だけ存在する ephemeral な PTY bridge 上で実行する。
@@ -576,7 +570,7 @@ Agent View (resume)
 shared daemon / thread / turn は bridge の外にあり、影響を受けない
 ```
 
-- PTY bridge は transport であり session runtime ではない。run ID・localstate・thread identity を持たず、turn の実行を所有せず、detach / client 終了後に保持しない。再 Open は新しい foreground client と新しい PTY を作る。legacy の supervisor-managed background PTY が managed Codex process の lifetime と run identity を所有していたのとは異なり、bridge が所有するのは1回の Open の間の foreground client process だけである。
+- PTY bridge は transport であり session runtime ではない。localstate や thread identity を持たず、turn の実行を所有せず、detach / client 終了後に保持しない。再 Open は新しい foreground client と新しい PTY を作る。bridge が所有するのは1回の Open の間の foreground client process だけである。
 - child PTY は child の起動前に raw mode にし、outer terminal と同じ size にする。起動直後の control byte が kernel の line discipline に signal として解釈される race を避けるためである。child は PTY を controlling terminal とする新しい session / process group で起動する。その後は outer terminal の resize (`SIGWINCH`) ごとに PTY の size を直接更新する。
 - 入力は Claude と同じ `terminal.DetachScanner` を通して relay する。`Ctrl+]` (literal byte、modifyOtherKeys、CSI-u) を検出すると、それ自体と同じ read のそれ以降の bytes は child へ渡さない。bracketed paste 内の byte は detach とみなさない。
 - bridge は client の実行中、outer terminal の raw mode、transport 所有の alternate screen、bracketed paste を所有する。child 出力の alternate-screen leave (DECRST 1049) は physical terminal への境界でだけ除去し、child (と child が起動する external editor) の画面遷移を transport 所有の alternate screen 内に閉じ込める。解除は child の reap と出力転送の停止の後に、child が設定しうる mode の neutralize、bracketed paste、alternate screen、raw mode の順で行う。正常終了・detach・起動後の失敗・出力失敗・context cancel のいずれでも同じである。signal で client を終了する detach では child 自身の restore (Codex の `restore_after_exit`) が走る保証がないため、bridge は child の終了理由に依存せず、keyboard reporting (keyboard enhancement stack と modifyOtherKeys)、focus reporting、mouse reporting、alternate scroll、cursor の形状と表示を、transport 所有の alternate screen を離れる前に neutralize してから Agent View へ terminal ownership を返す。各 reset は一部が失敗しても残りを試み、失敗は detach の成功に隠さず Open の error とする。
@@ -585,7 +579,7 @@ shared daemon / thread / turn は bridge の外にあり、影響を受けない
 - agentsctl の `Ctrl+]` detach / Open transport cleanup は thread / turn を停止しない。foreground client の終了で閉じる connection について、shared daemon は connection の subscription を除くだけで、turn の interrupt や thread の shutdown は行わない。pending の approval / user input は thread 単位で保持され、次に attach した connection へ再提示される。agentsctl の detach cleanup では Stop、`turn/interrupt`、`thread/unsubscribe`、daemon の停止を行わない。再 Open では同じ canonical thread ID を使う。Codex TUI 内から利用者が明示的に行う quit / exit 操作は Codex 自身の semantics に従い、agentsctl の detach 保証とは区別する。
 - daemon が loaded として報告する thread は shared daemon 自身が writer lock を保持するため、writer lock を確認せず Open できる。
 - daemon が `notLoaded` で writer lock がない休止 thread は、shared daemon 上へ resume して Open できる。
-- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。その writer が agentsctl の legacy managed run であっても同じである。
+- `notLoaded` かつ writer lock がある thread は daemon 外の runtime が存在するため `RuntimeExternal` とし、その writer と競合する Open / destructive operation は fail closed とする。
 
 #### Session actions
 
@@ -1015,41 +1009,43 @@ Observer publication は provider 全体の current snapshot の full replacemen
 
 ##### Writer lock の責務
 
-writer lock は run-to-thread binding には使用しない。
-
-daemon 上で `notLoaded` の thread に限り、daemon 外の embedded runtime が存在するかを判定するために利用する。
+writer lock の責務は1つだけである。daemon 上で `notLoaded` の thread について、daemon 外の runtime (embedded runtime 等) が存在するかを判定する。
 
 - `notLoaded` + writer lock なし: 休止 thread。Activity は Idle、Runtime は None。
 - `notLoaded` + writer lock あり: daemon 外 runtime。Activity は Unknown、Runtime は External。
+- lock の有無を確定できない場合 (Codex home 不明、regular file でない lock、I/O error) は writer ありとして扱い、fail closed とする。
 - daemon loaded thread では writer lock を判定材料にしない。shared daemon 自身が writer lock を保持するためである。
+
+writer lock は次には使わない。
+
+- loaded thread の Activity 推定
+- thread identity の推測や identity transition
+- lock を保持する process の特定や、それが agentsctl のものかの判定
+- Stop target の選択
 
 writer lock の瞬間的な acquire/release race による一時的表示差は許容するが、それを Activity 推定や destructive action の ownership proof へ拡張しない。
 
 #### Process ownership and identity
 
-OS process identity を扱う必要がある箇所では PID 単独を identity として扱わず、PID / process start time / UID を組み合わせる。
+agentsctl が signal を送るのは、自身が起動して1回の操作の間だけ所有する child process group (Claude attach client、Codex foreground client、Claude usage probe、ChatGPT browser) に限る。
 
-Codex では、この process identity は `notLoaded` thread の writer lock が daemon 外 runtime に属することを確認するためだけに使う。process identity から thread identity や Activity を推測せず、その process を agentsctl-owned とみなして signal を送ることもしない。
-
-確認不能、process 消失、identity 不一致の場合は fail closed とする。
+provider の session runtime (Claude の background session、Codex の shared daemon と thread) には signal を送らず、停止は provider-native な API で行う。PID などの process 情報から session identity や ownership を推測しない。ownership を確認できない runtime は操作せず fail closed とする。
 
 #### Codex canonical session identity
 
 Codex session の canonical key は常に app-server が返す thread ID を使った `codex:<thread ID>` とする。
 
-`thread/start` が canonical thread ID を同期的に返すため、Codex Dispatch では次を持たない。
+`thread/start` が canonical thread ID を同期的に返すため、Codex の session は Dispatch 直後から canonical key を持つ。
 
-- provisional run identity
-- Dispatch 前の baseline
-- CWD / timestamp による candidate 推測
-- writer ownership による run-to-thread binding
-- Starting row から canonical row への Codex-specific `PreviousKeys` transition
+- Codex は一時的な key で session を公開しない。
+- CWD、timestamp、writer lock などから thread identity を推測しない。
+- Codex は `PreviousKeys` を生成しない。`PreviousKeys` は provider が identity transition を明示するための provider-neutral な仕組みとして残る。
 
 Agent View は Dispatch が返した canonical key が catalog / Observer snapshot に現れた時点で通常どおり選択する。Codex 固有の identity reconstruction を UI に持ち込まない。
 
 #### Foreground Codex TUI lifecycle
 
-Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Agent View の suspend 後、Open-scoped な `ForegroundPTY` が outer physical terminal の raw mode、alternate screen、bracketed paste、resize relay を所有し、その内側の child PTY で Codex foreground TUI を実行する。agentsctl は child の UI state や Codex 固有の画面内容を解釈せず、transport boundary として child の alternate-screen leave を抑止し、forced detach で child 自身の cleanup が走らない場合に keyboard reporting、focus / mouse reporting、alternate scroll、cursor 等を neutralize してから terminal ownership を Agent View へ返す。legacy managed background PTY の output replay や supervisor resize protocol は使用しない。
+Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Agent View の suspend 後、Open-scoped な `ForegroundPTY` が outer physical terminal の raw mode、alternate screen、bracketed paste、resize relay を所有し、その内側の child PTY で Codex foreground TUI を実行する。agentsctl は child の UI state や Codex 固有の画面内容を解釈せず、transport boundary として child の alternate-screen leave を抑止し、forced detach で child 自身の cleanup が走らない場合に keyboard reporting、focus / mouse reporting、alternate scroll、cursor 等を neutralize してから terminal ownership を Agent View へ返す。
 
 agentsctl の `Ctrl+]` detach または Open transport cleanup によって foreground client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。Codex TUI 内からの明示的な quit / exit は Codex 自身の semantics に従う。
 
@@ -1168,12 +1164,9 @@ observerSnapshotSeen
 
 #### OS boundaries
 
-#### OS boundaries
-
 以下には OS 固有機能を利用する。
 
-- process start time の取得
-- Unix socket peer identity の取得
+- advisory file lock (`flock`)
 - process group 操作
 - PTY 操作
 
@@ -1193,18 +1186,6 @@ MVP の対象 OS は以下。
 background work の実行主体を interactive Codex TUI process / PTY にすると、session identity、Stop、Activity observation が local process ownership に結び付く。shared app-server は canonical thread ID、native status event、turn interruptionを提供し、TUI client が存在しなくても turn を継続できる。
 
 そのため Codex runtime は shared app-server daemon に置き、TUI は Open 時だけ接続する foreground client とする。
-
-### PID のみで process を識別する
-
-**不採用。**
-
-PID reuse により、無関係な process を操作する可能性がある。
-
-以下を組み合わせて identity を確認する。
-
-- PID
-- Start time
-- UID
 
 ### Codex thread を CWD や時刻だけで推測する
 
@@ -1227,14 +1208,6 @@ Dispatch 直後から canonical `codex:<thread ID>` を使い、Agent View が C
 **不採用。**
 
 managed daemon は `--session-source` なしで app-server を起動し、その default session source は interactive な `vscode` である。これは `thread/list` の default interactive sources に含まれるため、RPC Dispatch の thread は source filter を変えずに catalog に現れる。`appServer` source kind の追加や originator による filtering は行わない。
-
-### 単発の redraw signal を送る
-
-**不採用。**
-
-underlying PTY size に変化がない場合、CLI 側が redraw 不要と判断できる。
-
-実際の PTY size を一度変更して元へ戻す方式を採用する。
 
 ### `claude --bg --resume <id> --name <name>` を Rename に使う
 

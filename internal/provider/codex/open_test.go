@@ -6,11 +6,9 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"slices"
 	"testing"
 
-	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/session"
 )
 
@@ -46,8 +44,6 @@ func newOpenProvider(t *testing.T, d *fakeDaemon) (*Provider, *scriptedLifecycle
 	fg := &fakeForeground{}
 	p := &Provider{
 		API:        &fakeAPI{},
-		Store:      localstate.New(filepath.Join(t.TempDir(), "state.json")),
-		Runtime:    &fakeManagedRuntime{},
 		Daemon:     lifecycle,
 		Foreground: fg,
 		writerFree: probe.free,
@@ -143,15 +139,13 @@ func TestOpenControlSocketOverrideBypassesDaemonEnsure(t *testing.T) {
 	}
 }
 
-// A failed remote client is Open's failure: no second launch, no legacy
-// runtime call, nothing stopped. A successful exit or a detach stops
-// nothing either.
+// A failed remote client is Open's failure: no second launch, nothing
+// stopped. A successful exit or a detach stops nothing either.
 func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	d := newFakeDaemon(t)
 	d.setThreads(catalogThread("thread-1", 1))
 	d.setLoaded("thread-1", active())
 	p, _, _, fg := newOpenProvider(t, d)
-	legacy := p.Runtime.(*fakeManagedRuntime)
 	fg.err = errBoom
 
 	err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
@@ -162,8 +156,8 @@ func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	if err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if fg.calls != 2 || len(legacy.stopped) != 0 || d.callCount("thread/start") != 0 {
-		t.Fatalf("launches=%d stopped=%v thread/start=%d, want one launch per Open and nothing else", fg.calls, legacy.stopped, d.callCount("thread/start"))
+	if fg.calls != 2 || d.callCount("thread/start") != 0 {
+		t.Fatalf("launches=%d thread/start=%d, want one launch per Open and nothing else", fg.calls, d.callCount("thread/start"))
 	}
 	for _, method := range []string{"turn/interrupt", "thread/unsubscribe"} {
 		if n := d.callCount(method); n != 0 {
@@ -172,66 +166,31 @@ func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	}
 }
 
-func TestOpenRefusesRowsWithoutCanonicalThread(t *testing.T) {
-	d := newFakeDaemon(t)
-	d.setThreads(catalogThread("thread-1", 1), catalogThread("thread-2", 2))
-	for _, tc := range []struct {
-		name string
-		run  localstate.Run
-		row  session.Session
-	}{
-		{"unbound", localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running"}, session.Session{Key: codexKey("run-1"), RunID: "run-1"}},
-		{"unbound rename-only", localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", PendingRename: "foo"}, session.Session{Key: codexKey("run-1"), RunID: "run-1"}},
-		{"run key without RunID", localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running"}, session.Session{Key: codexKey("run-1")}},
-		{"bound to another thread", localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-2"}, session.Session{Key: codexKey("thread-1"), RunID: "run-1"}},
-		{"untracked run", localstate.Run{ID: "run-other", Provider: "codex", State: "running", SessionID: "thread-1"}, session.Session{Key: codexKey("thread-1"), RunID: "run-1"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			p, lifecycle, _, fg := newOpenProvider(t, d)
-			if err := p.Store.StartRun(tc.run); err != nil {
-				t.Fatal(err)
-			}
-			tc.row.Actions = session.Actions{session.ActionOpen: {Available: true}} // stale or hand-built
-			if err := p.Open(context.Background(), tc.row, devNull(t), io.Discard); err == nil {
-				t.Fatal("Open succeeded without a canonical thread")
-			}
-			if lifecycle.calls != 0 || fg.calls != 0 {
-				t.Fatalf("Ensure calls=%d launches=%d, want none", lifecycle.calls, fg.calls)
-			}
-		})
+func TestOpenRefusesRowWithoutThreadID(t *testing.T) {
+	lifecycle := &scriptedLifecycle{results: []lifecycleResult{readyDaemon("unused")}}
+	fg := &fakeForeground{}
+	p := &Provider{API: &fakeAPI{}, Daemon: lifecycle, Foreground: fg}
+	row := session.Session{Key: session.Key{Provider: session.ProviderCodex}, Actions: session.Actions{session.ActionOpen: {Available: true}}}
+	if err := p.Open(context.Background(), row, devNull(t), io.Discard); err == nil {
+		t.Fatal("Open succeeded without a thread ID")
 	}
-}
-
-func TestOpenResumesBoundRunByThreadID(t *testing.T) {
-	d := newFakeDaemon(t)
-	d.setThreads(catalogThread("thread-1", 1))
-	p, _, _, fg := newOpenProvider(t, d)
-	if err := p.Store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-1"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := p.Open(context.Background(), session.Session{Key: codexKey("thread-1"), RunID: "run-1", CWD: "/work"}, devNull(t), io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	if fg.calls != 1 || fg.args[3] != "thread-1" {
-		t.Fatalf("launch args = %q, want resume of the thread, not the run", fg.args)
+	if lifecycle.calls != 0 || fg.calls != 0 {
+		t.Fatalf("Ensure calls=%d launches=%d, want none", lifecycle.calls, fg.calls)
 	}
 }
 
 // The daemon's own status decides; the writer lock matters only for a
-// thread the daemon has not loaded. That holds for a thread a legacy
-// managed run is bound to as well.
+// thread the daemon has not loaded.
 func TestOpenPreflightWriterRules(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		status     ThreadStatus
 		writerHeld bool
-		boundRun   bool
 		launch     bool
 		probes     int
 	}{
 		{name: "notLoaded writer free", status: notLoadedSt, launch: true, probes: 1},
 		{name: "notLoaded writer held", status: notLoadedSt, writerHeld: true, probes: 1},
-		{name: "notLoaded writer held by managed run", status: notLoadedSt, writerHeld: true, boundRun: true, probes: 1},
 		{name: "active writer held", status: active(), writerHeld: true, launch: true},
 		{name: "idle writer held", status: idle, writerHeld: true, launch: true},
 		{name: "systemError writer held", status: ThreadStatus{Type: statusSystemError}, writerHeld: true, launch: true},
@@ -243,15 +202,8 @@ func TestOpenPreflightWriterRules(t *testing.T) {
 			d.setLoaded("thread-1", tc.status)
 			p, _, probe, fg := newOpenProvider(t, d)
 			probe.writers["thread-1"] = tc.writerHeld
-			row := threadSession("thread-1")
-			if tc.boundRun {
-				if err := p.Store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-1"}); err != nil {
-					t.Fatal(err)
-				}
-				row.RunID = "run-1"
-			}
 
-			err := p.Open(context.Background(), row, devNull(t), io.Discard)
+			err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
 			if tc.launch != (err == nil) || tc.launch != (fg.calls == 1) {
 				t.Fatalf("Open = %v with %d launches, want launch=%v", err, fg.calls, tc.launch)
 			}
@@ -306,20 +258,21 @@ func TestOpenRefusesTitleGenerationThread(t *testing.T) {
 	}
 }
 
-// A legacy managed run holding its thread's writer lock outside the shared
-// daemon keeps Stop but is not offered Open.
-func TestListManagedRunOutsideDaemonIsNotOpenable(t *testing.T) {
-	store := localstate.New(filepath.Join(t.TempDir(), "state.json"))
-	if err := store.StartRun(localstate.Run{ID: "run-1", Provider: "codex", CWD: "/work", State: "running", SessionID: "thread-1"}); err != nil {
-		t.Fatal(err)
-	}
+// A thread another process writes outside the shared daemon is offered
+// none of Open, Stop or Archive.
+func TestListExternalWriterOffersNoRuntimeActions(t *testing.T) {
 	api := &fakeAPI{rows: []Thread{{ID: "thread-1", CWD: "/work", Status: notLoadedSt}}}
-	p := &Provider{Store: store, API: api, writerFree: func(string) bool { return false }}
+	p := &Provider{API: api, writerFree: func(string) bool { return false }}
 	rows, err := p.List(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Actions.Available(session.ActionOpen) || !rows[0].Actions.Available(session.ActionStop) {
-		t.Fatalf("rows = %+v, want the managed thread with Stop but no Open", rows)
+	if len(rows) != 1 || rows[0].Runtime != session.RuntimeExternal {
+		t.Fatalf("rows = %+v, want one external thread", rows)
+	}
+	for _, action := range []session.ActionID{session.ActionOpen, session.ActionStop, session.ActionArchive} {
+		if rows[0].Actions.Available(action) {
+			t.Fatalf("%s offered for an external writer: %+v", action, rows[0].Actions)
+		}
 	}
 }

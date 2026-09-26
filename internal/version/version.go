@@ -6,8 +6,7 @@
 //
 //	-ldflags="-X github.com/tingtt/agentsctl/internal/version.Version=v1.2.3"
 //
-// A build without that flag keeps the development default. It is unrelated to
-// supervisor.BuildVersion, which is only a supervisor compatibility marker.
+// A build without that flag keeps the development default.
 package version
 
 // Development is the Version of a build that did not inject a release

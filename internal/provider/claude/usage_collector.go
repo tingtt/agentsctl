@@ -10,8 +10,7 @@ import (
 )
 
 // UsageCollectorCommand is the hidden subcommand name cmd/agentsctl/main.go
-// dispatches to RunUsageCollector -- the same pattern main.go already uses
-// for "daemon" (the Codex supervisor's own re-exec). The dedicated Claude
+// dispatches to RunUsageCollector. The dedicated Claude
 // probe session's statusLine setting (see writeUsageSettings) points at
 // "<agentsctl executable> UsageCollectorCommand --out <path>", so this is
 // the entrypoint Claude Code itself invokes, on the probe's own machine,

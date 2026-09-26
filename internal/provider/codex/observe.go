@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/tingtt/agentsctl/internal/localstate"
 	"github.com/tingtt/agentsctl/internal/session"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
 )
@@ -157,24 +156,20 @@ func (p *Provider) sendObserved(update sessionctl.ProviderUpdate) {
 	}
 }
 
-// observedSessions builds the full Codex catalog from view, merged with the
-// existing managed-run state exactly as List merges it (see sessionRows),
-// without List's reconciliation side effects.
+// observedSessions builds the full Codex catalog from view, exactly as List
+// builds it (see sessionRows).
 func (p *Provider) observedSessions(view runtimeView) []session.Session {
-	var runs map[string]localstate.Run
-	if p.Store != nil {
-		runs, _ = p.Store.Runs()
-	}
-	return p.sessionRows(view.catalog, runs, false, view.observe)
+	return p.sessionRows(view.catalog, false, view.observe)
 }
 
 // syncObservedCatalog installs a catalog List fetched (fetch numbered by
-// beginCatalogFetch) and republishes if it changed, so rows only the
-// existing execution path produces reach the Observer's snapshots.
+// beginCatalogFetch) and republishes, so the Observer's snapshots never lag
+// behind a newer List.
 func (p *Provider) syncObservedCatalog(fetch uint64, threads []Thread) {
 	rt := p.runtime()
 	rt.installCatalog(fetch, threads)
-	// Managed-run state may have changed even when the catalog did not.
+	// A notLoaded thread's writer-lock observation may have changed even
+	// when the catalog did not.
 	rt.kick()
 }
 

@@ -23,7 +23,7 @@ import (
 
 // handoffProvider is a provider-agnostic double: Open runs a hook (the
 // "attached child"), Dispatch records prompts. Nothing here knows a real
-// provider or supervisor.
+// provider.
 type handoffProvider struct {
 	*fakeProvider
 	mu         sync.Mutex

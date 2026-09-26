@@ -67,7 +67,7 @@ func TestRequestedSelectionResolvesProvisionalKeyToCanonicalRowDirectly(t *testi
 	s.selectIndex(0)
 	s.RequestSelection(codexKey("run-1"))
 
-	// The provisional row was never applied: the first Codex catalog
+	// The provisional row was never applied: the provider's first catalog
 	// already carries the canonical row.
 	s.SetRows([]session.Session{{Key: key("a"), CWD: "/work"}, boundRow("thread-1", "run-1")})
 	requireSelected(t, s, codexKey("thread-1"))

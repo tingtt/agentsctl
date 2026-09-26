@@ -350,18 +350,18 @@ func TestRuntimeStopAndArchiveReachProviderAndReload(t *testing.T) {
 	}
 }
 
-// codexIdentityRuntime builds a Runtime over a Codex-shaped fake provider
-// and the real Controller, starting with only the Starting row for run-1.
-// bind swaps the provider's catalog to the bound thread row that names
-// run-1 in PreviousKeys, exactly what a real Codex provider lists once the
-// run-to-thread binding is confirmed.
-func codexIdentityRuntime(t *testing.T) (rt *Runtime, pins *fakePins, bind func()) {
+// identityTransitionRuntime builds a Runtime over a fake provider that
+// states a provisional identity, and the real Controller, starting with
+// only the provisional Starting row run-1. bind swaps the provider's
+// catalog to the canonical row that names run-1 in PreviousKeys, the
+// provider-stated transition session.IdentityTransitions validates.
+func identityTransitionRuntime(t *testing.T) (rt *Runtime, pins *fakePins, bind func()) {
 	t.Helper()
 	runKey := session.Key{Provider: session.ProviderCodex, ID: "run-1"}
 	threadKey := session.Key{Provider: session.ProviderCodex, ID: "thread-1"}
-	starting := session.Session{Key: runKey, Name: "Starting", CWD: "/work", Activity: session.ActivityStarting, RunID: "run-1",
+	starting := session.Session{Key: runKey, Name: "Starting", CWD: "/work", Activity: session.ActivityStarting,
 		Actions: session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}}
-	bound := session.Session{Key: threadKey, CWD: "/work", Activity: session.ActivityWorking, RunID: "run-1", PreviousKeys: []session.Key{runKey},
+	bound := session.Session{Key: threadKey, CWD: "/work", Activity: session.ActivityWorking, PreviousKeys: []session.Key{runKey},
 		Actions: session.Actions{session.ActionOpen: {Available: true}, session.ActionStop: {Available: true}}}
 	other := session.Session{Key: session.Key{Provider: session.ProviderCodex, ID: "other"}, CWD: "/work", Activity: session.ActivityIdle}
 	p := &fakeProvider{id: session.ProviderCodex, rows: []session.Session{starting, other}}
@@ -381,7 +381,7 @@ func codexIdentityRuntime(t *testing.T) (rt *Runtime, pins *fakePins, bind func(
 // selected, its run binds to a thread, the catalog reloads, and the
 // selection is still the same session (now under its thread key).
 func TestRuntimeStartingRowSelectionSurvivesBinding(t *testing.T) {
-	rt, _, bind := codexIdentityRuntime(t)
+	rt, _, bind := identityTransitionRuntime(t)
 	for i, r := range rt.State.Rows {
 		if r.Key.ID == "run-1" {
 			rt.State.selectIndex(i)
@@ -410,7 +410,7 @@ func TestRuntimeStartingRowSelectionSurvivesBinding(t *testing.T) {
 // pin lives only under the thread key, and it can then be unpinned like
 // any other session.
 func TestRuntimeStartingRowPinSurvivesBinding(t *testing.T) {
-	rt, pins, bind := codexIdentityRuntime(t)
+	rt, pins, bind := identityTransitionRuntime(t)
 	for i, r := range rt.State.Rows {
 		if r.Key.ID == "run-1" {
 			rt.State.selectIndex(i)
@@ -452,7 +452,7 @@ func TestRuntimeStartingRowPinSurvivesBinding(t *testing.T) {
 // returning to the overview, then a catalog reload that shows the binding,
 // keeps the "last attached" marker on the same session.
 func TestRuntimeLastAttachedFollowsBinding(t *testing.T) {
-	rt, _, bind := codexIdentityRuntime(t)
+	rt, _, bind := identityTransitionRuntime(t)
 	for i, r := range rt.State.Rows {
 		if r.Key.ID == "run-1" {
 			rt.State.selectIndex(i)

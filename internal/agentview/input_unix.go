@@ -4,9 +4,8 @@
 // state, and rendering for the unified session list and composer. It
 // depends only on internal/session and internal/sessionctl -- never on a
 // concrete provider package (internal/provider/claude,
-// internal/provider/codex), internal/supervisor, or internal/terminal --
-// so a provider capability change, a supervisor implementation detail, or
-// a new provider never requires touching this package (see the
+// internal/provider/codex) or internal/terminal -- so a provider
+// capability change or a new provider never requires touching this package (see the
 // DesignDoc's "TUI must not know provider implementation details").
 package agentview
 

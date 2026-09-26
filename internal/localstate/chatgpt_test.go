@@ -71,14 +71,11 @@ func TestChatGPTCatalogMultipleProjectsStayIsolated(t *testing.T) {
 // TestSaveChatGPTCatalogPreservesUnrelatedState fixes that writing a
 // ChatGPT catalog goes through the same read-modify-write transaction as
 // every other domain write (see (*Store).update), so it must never clobber
-// pins, Codex runs, or Claude overlay state written by a concurrent or
+// pins or Claude overlay state written by a concurrent or
 // prior operation.
 func TestSaveChatGPTCatalogPreservesUnrelatedState(t *testing.T) {
 	s := New(filepath.Join(t.TempDir(), "state.json"))
 	if _, err := s.TogglePinned("claude:session"); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.StartRun(Run{ID: "r1", State: "running"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.SetClaudeArchived("c1"); err != nil {
@@ -93,10 +90,6 @@ func TestSaveChatGPTCatalogPreservesUnrelatedState(t *testing.T) {
 	pins, err := s.ListPinned()
 	if err != nil || !pins["claude:session"] {
 		t.Fatalf("pin lost after saving ChatGPT catalog: %v err=%v", pins, err)
-	}
-	runs, err := s.Runs()
-	if err != nil || runs["r1"].State != "running" {
-		t.Fatalf("run lost after saving ChatGPT catalog: %v err=%v", runs, err)
 	}
 	archived, _, err := s.ClaudeState()
 	if err != nil || !archived["c1"] {

@@ -47,7 +47,7 @@ func (s *Store) ChatGPTCatalog(projectID string) (ChatGPTCatalog, bool, error) {
 // catalog.Conversations is a valid, meaningful replacement -- e.g. a
 // COMPLETE enumeration that legitimately observed zero conversations --
 // and is saved as such, not skipped). Every other Project's catalog, and
-// every other kind of local state (pins, Claude overlays, Codex runs),
+// every other kind of local state (pins, Claude overlays),
 // is preserved untouched by the same read-modify-write transaction (see
 // (*Store).update).
 //

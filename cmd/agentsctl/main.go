@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -17,7 +16,6 @@ import (
 	"github.com/tingtt/agentsctl/internal/provider/codex"
 	"github.com/tingtt/agentsctl/internal/selfupdate"
 	"github.com/tingtt/agentsctl/internal/sessionctl"
-	"github.com/tingtt/agentsctl/internal/supervisor"
 	"github.com/tingtt/agentsctl/internal/terminal"
 	"github.com/tingtt/agentsctl/internal/version"
 	"github.com/tingtt/agentsctl/internal/workspace"
@@ -61,19 +59,9 @@ func runAndRestart(run func() (*agentview.Restart, error), execProcess execFunc,
 func run() (*agentview.Restart, error) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if len(os.Args) > 1 && os.Args[1] == "daemon" {
-		fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
-		statePath := fs.String("state", "", "state path")
-		socket := fs.String("socket", "", "socket path")
-		if err := fs.Parse(os.Args[2:]); err != nil {
-			return nil, err
-		}
-		return nil, (&supervisor.Server{Socket: *socket, Store: localstate.New(*statePath)}).Serve(ctx)
-	}
 	// claude.UsageCollectorCommand is the Claude usage probe's own
 	// statusLine command target (see claude.NewProbe/writeUsageSettings):
-	// this same executable, re-invoked as a hidden subcommand, the same
-	// pattern "daemon" above uses for the Codex supervisor's own re-exec.
+	// this same executable, re-invoked as a hidden subcommand.
 	if len(os.Args) > 1 && os.Args[1] == claude.UsageCollectorCommand {
 		return nil, claude.RunUsageCollector(os.Args[2:], os.Stdin)
 	}
@@ -81,23 +69,10 @@ func run() (*agentview.Restart, error) {
 	if err != nil {
 		return nil, err
 	}
-	statePath := filepath.Join(dir, "state.json")
-	socket := filepath.Join(dir, "supervisor.sock")
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, err
-	}
-	client := supervisor.Client{Socket: socket, DaemonPath: exe, StatePath: statePath}
-	if err := client.Ensure(ctx); err != nil {
-		return nil, err
-	}
-	store := localstate.New(statePath)
+	store := localstate.New(filepath.Join(dir, "state.json"))
 	runner := base.ExecRunner{}
 	api := &codex.CommandAppServer{Path: "codex"}
 	daemon := &codex.CommandDaemon{Path: "codex", Runner: runner}
-	// Codex Dispatch runs on the shared app-server daemon; the supervisor
-	// only still stops legacy managed runs started before it did.
-	legacyCodex := supervisor.Dispatcher{Client: client}
 	usageProbe := claude.NewProbe("claude", filepath.Join(dir, "claude-usage"))
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -105,7 +80,7 @@ func run() (*agentview.Restart, error) {
 	}
 	providers := []sessionctl.Source{
 		&claude.Provider{Path: "claude", Runner: runner, Store: store, Renamer: claude.NewNativeRenamer(), UsageProbe: usageProbe},
-		&codex.Provider{Path: "codex", API: api, Runner: runner, Store: store, Runtime: legacyCodex, Daemon: daemon, Foreground: terminal.ForegroundPTY{}},
+		&codex.Provider{Path: "codex", API: api, Runner: runner, Daemon: daemon, Foreground: terminal.ForegroundPTY{}},
 	}
 	providers, chatGPTProvider := appendChatGPTProvider(cwd, providers, store)
 	if chatGPTProvider != nil {
