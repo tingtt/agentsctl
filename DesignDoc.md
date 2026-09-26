@@ -1000,7 +1000,7 @@ Agent View は Dispatch が返した canonical key が catalog / Observer snapsh
 
 #### Foreground Codex TUI lifecycle
 
-Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Codex 自身の foreground TUI が terminal mode、redraw、paste mode を所有し、agentsctl は managed background PTY の output replay、resize trick、Codex-specific ANSI filteringを行わない。
+Codex Open の terminal lifecycle は provider-neutral な foreground handoff (`suspend -> Open -> resume`) に従う。Agent View の suspend 後、Open-scoped な `ForegroundPTY` が outer physical terminal の raw mode、alternate screen、bracketed paste、resize relay を所有し、その内側の child PTY で Codex foreground TUI を実行する。agentsctl は child の UI state や Codex 固有の画面内容を解釈せず、transport boundary として child の alternate-screen leave を抑止し、forced detach で child 自身の cleanup が走らない場合に keyboard reporting、focus / mouse reporting、alternate scroll、cursor 等を neutralize してから terminal ownership を Agent View へ返す。legacy managed background PTY の output replay や supervisor resize protocol は使用しない。
 
 agentsctl の `Ctrl+]` detach または Open transport cleanup によって foreground client が終了して Agent View に戻っても、shared app-server daemon 上の thread / turn lifecycle には影響しない。Codex TUI 内からの明示的な quit / exit は Codex 自身の semantics に従う。
 
