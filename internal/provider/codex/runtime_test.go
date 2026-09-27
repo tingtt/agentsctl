@@ -46,7 +46,12 @@ func (l *scriptedLifecycle) Ensure(ctx context.Context) (DaemonInfo, error) {
 }
 
 func readyDaemon(socket string) lifecycleResult {
-	return lifecycleResult{info: DaemonInfo{Status: "started", SocketPath: socket}}
+	return lifecycleResult{info: DaemonInfo{
+		Status:           "started",
+		SocketPath:       socket,
+		CLIVersion:       minimumCodexVersion,
+		AppServerVersion: minimumCodexVersion,
+	}}
 }
 
 func TestObserverEnsuresDaemonBeforeConnecting(t *testing.T) {

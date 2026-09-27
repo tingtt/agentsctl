@@ -46,6 +46,12 @@ func (p *Provider) readySocket(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ensure codex app-server daemon: %w", err)
 	}
+	if err := validateCodexVersion("codex CLI", info.CLIVersion); err != nil {
+		return "", err
+	}
+	if err := validateCodexVersion("codex app-server", info.AppServerVersion); err != nil {
+		return "", err
+	}
 	return info.SocketPath, nil
 }
 

@@ -53,8 +53,8 @@ func TestCommandDaemonAcceptsReadyResponses(t *testing.T) {
 			name:     "started",
 			path:     "/opt/codex",
 			wantPath: "/opt/codex",
-			stdout:   `{"status":"started","socketPath":"/tmp/codex.sock","appServerVersion":"0.156.1"}`,
-			want:     DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", AppServerVersion: "0.156.1"},
+			stdout:   `{"status":"started","socketPath":"/tmp/codex.sock","cliVersion":"0.156.1","appServerVersion":"0.156.1"}`,
+			want:     DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.156.1", AppServerVersion: "0.156.1"},
 		},
 		{
 			name:     "already running with installation warning and unknown fields",
@@ -104,6 +104,73 @@ func TestCommandDaemonRejectsFailedOrInvalidResponses(t *testing.T) {
 			}
 			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error=%q, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadySocketRequiresSupportedCodexVersions(t *testing.T) {
+	tests := []struct {
+		name       string
+		info       DaemonInfo
+		wantSocket string
+		wantErr    string
+	}{
+		{
+			name:       "minimum supported versions",
+			info:       DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.156.1", AppServerVersion: "0.156.1"},
+			wantSocket: "/tmp/codex.sock",
+		},
+		{
+			name:       "CLI and daemon versions may differ",
+			info:       DaemonInfo{Status: "alreadyRunning", SocketPath: "/tmp/codex.sock", CLIVersion: "0.157.1", AppServerVersion: "0.156.1"},
+			wantSocket: "/tmp/codex.sock",
+		},
+		{
+			name:    "old CLI",
+			info:    DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.155.0", AppServerVersion: "0.156.1"},
+			wantErr: "codex CLI 0.155.0 is unsupported",
+		},
+		{
+			name:    "old app-server",
+			info:    DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.157.1", AppServerVersion: "0.155.0"},
+			wantErr: "codex app-server 0.155.0 is unsupported",
+		},
+		{
+			name:    "missing CLI version",
+			info:    DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", AppServerVersion: "0.156.1"},
+			wantErr: "codex CLI version is unavailable",
+		},
+		{
+			name:    "missing app-server version",
+			info:    DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.156.1"},
+			wantErr: "codex app-server version is unavailable",
+		},
+		{
+			name:    "invalid app-server version",
+			info:    DaemonInfo{Status: "started", SocketPath: "/tmp/codex.sock", CLIVersion: "0.156.1", AppServerVersion: "development"},
+			wantErr: "codex app-server version \"development\" is invalid",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lifecycle := &scriptedLifecycle{results: []lifecycleResult{{info: tc.info}}}
+			p := &Provider{Daemon: lifecycle}
+			got, err := p.readySocket(context.Background())
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != tc.wantSocket {
+					t.Fatalf("socket=%q, want %q", got, tc.wantSocket)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error=%v, want it to contain %q", err, tc.wantErr)
+			}
+			if got != "" {
+				t.Fatalf("socket=%q on compatibility failure, want empty", got)
 			}
 		})
 	}

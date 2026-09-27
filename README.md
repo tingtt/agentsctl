@@ -8,7 +8,7 @@ ChatGPT Project conversations can also be listed and opened with optional config
 
 agentsctl supports macOS and Linux.
 
-Install `claude` and/or `codex` first, then install agentsctl from a [GitHub Release](https://github.com/tingtt/agentsctl/releases) or with Go 1.25 or later. The command below installs the latest release and embeds its version, which enables update checks:
+Install `claude` and/or `codex` first. Codex integration requires Codex CLI 0.156.1 or later. Then install agentsctl from a [GitHub Release](https://github.com/tingtt/agentsctl/releases) or with Go 1.25 or later. The command below installs the latest release and embeds its version, which enables update checks:
 
 ```sh
 VERSION=$(go list -m -f '{{.Version}}' github.com/tingtt/agentsctl@latest)

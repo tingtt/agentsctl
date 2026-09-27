@@ -30,7 +30,12 @@ func (l *loggingLifecycle) Ensure(context.Context) (DaemonInfo, error) {
 	if l.err != nil {
 		return DaemonInfo{}, l.err
 	}
-	return DaemonInfo{Status: "alreadyRunning", SocketPath: l.d.socket}, nil
+	return DaemonInfo{
+		Status:           "alreadyRunning",
+		SocketPath:       l.d.socket,
+		CLIVersion:       minimumCodexVersion,
+		AppServerVersion: minimumCodexVersion,
+	}, nil
 }
 
 type dispatchFixture struct {
