@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/tingtt/agentsctl/internal/session"
@@ -51,8 +54,8 @@ func newOpenProvider(t *testing.T, d *fakeDaemon) (*Provider, *scriptedLifecycle
 	return p, lifecycle, probe, fg
 }
 
-func threadSession(id string) session.Session {
-	return session.Session{Key: codexKey(id), CWD: "/work/" + id}
+func threadSession(id, cwd string) session.Session {
+	return session.Session{Key: codexKey(id), CWD: cwd}
 }
 
 func devNull(t *testing.T) *os.File {
@@ -87,13 +90,14 @@ func TestOpenLaunchesRemoteResumeAfterEnsureAndPreflight(t *testing.T) {
 		}
 	}
 	in, out := devNull(t), &bytes.Buffer{}
+	cwd := t.TempDir()
 
-	if err := p.Open(context.Background(), threadSession("thread-1"), in, out); err != nil {
+	if err := p.Open(context.Background(), threadSession("thread-1", cwd), in, out); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"--remote", "unix://" + d.socket, "resume", "thread-1"}
-	if fg.calls != 1 || fg.path != "codex" || !slices.Equal(fg.args, want) || fg.cwd != "/work/thread-1" {
-		t.Fatalf("launch = %d x %s %q in %q, want codex %q in /work/thread-1", fg.calls, fg.path, fg.args, fg.cwd, want)
+	if fg.calls != 1 || fg.path != "codex" || !slices.Equal(fg.args, want) || fg.cwd != cwd {
+		t.Fatalf("launch = %d x %s %q in %q, want codex %q in %q", fg.calls, fg.path, fg.args, fg.cwd, want, cwd)
 	}
 	if fg.in != in || fg.out != io.Writer(out) {
 		t.Fatalf("terminal = %v/%v, want the caller's", fg.in, fg.out)
@@ -101,11 +105,75 @@ func TestOpenLaunchesRemoteResumeAfterEnsureAndPreflight(t *testing.T) {
 
 	fg.onStart = nil
 	p.Path = "/opt/bin/codex"
-	if err := p.Open(context.Background(), threadSession("thread-1"), in, out); err != nil {
+	if err := p.Open(context.Background(), threadSession("thread-1", cwd), in, out); err != nil {
 		t.Fatal(err)
 	}
 	if fg.path != "/opt/bin/codex" {
 		t.Fatalf("path = %q, want Provider.Path", fg.path)
+	}
+}
+
+func TestOpenRefusesInvalidSessionWorkingDirectoryBeforeDaemonPreflight(t *testing.T) {
+	tests := []struct {
+		name    string
+		cwd     func(*testing.T) string
+		message string
+	}{
+		{
+			name: "missing",
+			cwd: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "deleted-worktree")
+			},
+			message: "codex session working directory no longer exists",
+		},
+		{
+			name: "not a directory",
+			cwd: func(t *testing.T) string {
+				path := filepath.Join(t.TempDir(), "session-cwd")
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+			message: "codex session working directory is not a directory",
+		},
+		{
+			name:    "empty",
+			cwd:     func(*testing.T) string { return "" },
+			message: "codex session working directory is empty",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newFakeDaemon(t)
+			d.setThreads(catalogThread("thread-1", 1))
+			p, lifecycle, _, fg := newOpenProvider(t, d)
+			cwd := tc.cwd(t)
+
+			err := p.Open(context.Background(), threadSession("thread-1", cwd), devNull(t), io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.message) {
+				t.Fatalf("Open = %v, want error containing %q", err, tc.message)
+			}
+			if cwd != "" && !strings.Contains(err.Error(), cwd) {
+				t.Fatalf("Open = %v, want path %q", err, cwd)
+			}
+			if lifecycle.calls != 0 || d.callCount("initialize") != 0 || d.callCount("thread/read") != 0 || fg.calls != 0 {
+				t.Fatalf("Ensure=%d initialize=%d thread/read=%d launches=%d, want all zero", lifecycle.calls, d.callCount("initialize"), d.callCount("thread/read"), fg.calls)
+			}
+		})
+	}
+}
+
+func TestValidateOpenCWDWrapsStatFailureWithPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "loop")
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+
+	err := validateOpenCWD(path)
+	if !errors.Is(err, syscall.ELOOP) || !strings.Contains(err.Error(), path) {
+		t.Fatalf("validateOpenCWD = %v, want wrapped ELOOP with path %q", err, path)
 	}
 }
 
@@ -115,7 +183,7 @@ func TestOpenEnsureFailureLaunchesNothing(t *testing.T) {
 	p, lifecycle, _, fg := newOpenProvider(t, d)
 	lifecycle.results = []lifecycleResult{{err: errBoom}}
 
-	err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
+	err := p.Open(context.Background(), threadSession("thread-1", t.TempDir()), devNull(t), io.Discard)
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("Open = %v, want the Ensure failure", err)
 	}
@@ -131,7 +199,7 @@ func TestOpenControlSocketOverrideBypassesDaemonEnsure(t *testing.T) {
 	p.ControlSocket = d.socket
 	lifecycle.results = []lifecycleResult{{err: errors.New("real daemon must not be ensured")}}
 
-	if err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard); err != nil {
+	if err := p.Open(context.Background(), threadSession("thread-1", t.TempDir()), devNull(t), io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if lifecycle.calls != 0 || fg.calls != 1 || fg.args[1] != "unix://"+d.socket {
@@ -148,12 +216,13 @@ func TestOpenReturnsRemoteFailureWithoutFallbackOrCleanup(t *testing.T) {
 	p, _, _, fg := newOpenProvider(t, d)
 	fg.err = errBoom
 
-	err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
+	cwd := t.TempDir()
+	err := p.Open(context.Background(), threadSession("thread-1", cwd), devNull(t), io.Discard)
 	if !errors.Is(err, errBoom) {
 		t.Fatalf("Open = %v, want the remote client's failure", err)
 	}
 	fg.err = nil
-	if err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard); err != nil {
+	if err := p.Open(context.Background(), threadSession("thread-1", cwd), devNull(t), io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if fg.calls != 2 || d.callCount("thread/start") != 0 {
@@ -203,7 +272,7 @@ func TestOpenPreflightWriterRules(t *testing.T) {
 			p, _, probe, fg := newOpenProvider(t, d)
 			probe.writers["thread-1"] = tc.writerHeld
 
-			err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard)
+			err := p.Open(context.Background(), threadSession("thread-1", t.TempDir()), devNull(t), io.Discard)
 			if tc.launch != (err == nil) || tc.launch != (fg.calls == 1) {
 				t.Fatalf("Open = %v with %d launches, want launch=%v", err, fg.calls, tc.launch)
 			}
@@ -235,7 +304,7 @@ func TestOpenPreflightFailuresLaunchNothing(t *testing.T) {
 			d.setThreads(catalogThread("thread-1", 1))
 			p, _, _, fg := newOpenProvider(t, d)
 			tc.setup(d, p)
-			if err := p.Open(context.Background(), threadSession("thread-1"), devNull(t), io.Discard); err == nil {
+			if err := p.Open(context.Background(), threadSession("thread-1", t.TempDir()), devNull(t), io.Discard); err == nil {
 				t.Fatal("Open succeeded without an established status")
 			}
 			if fg.calls != 0 {
@@ -250,7 +319,7 @@ func TestOpenRefusesTitleGenerationThread(t *testing.T) {
 	d.setThreads(titleThread("title-1"))
 	d.setLoaded("title-1", idle)
 	p, _, _, fg := newOpenProvider(t, d)
-	if err := p.Open(context.Background(), threadSession("title-1"), devNull(t), io.Discard); err == nil {
+	if err := p.Open(context.Background(), threadSession("title-1", t.TempDir()), devNull(t), io.Discard); err == nil {
 		t.Fatal("Open launched an internal title-generation thread")
 	}
 	if fg.calls != 0 {
