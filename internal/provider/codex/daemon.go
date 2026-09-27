@@ -10,15 +10,20 @@ import (
 	"strings"
 
 	base "github.com/tingtt/agentsctl/internal/provider"
+	"golang.org/x/mod/semver"
 )
 
-const maxDaemonErrorOutput = 4 << 10
+const (
+	maxDaemonErrorOutput = 4 << 10
+	minimumCodexVersion  = "0.156.1"
+)
 
 // DaemonInfo identifies a shared app-server daemon that is ready for a
 // connection. SocketPath is the endpoint resolved by the Codex CLI.
 type DaemonInfo struct {
 	Status           string `json:"status"`
 	SocketPath       string `json:"socketPath"`
+	CLIVersion       string `json:"cliVersion"`
 	AppServerVersion string `json:"appServerVersion"`
 }
 
@@ -84,6 +89,24 @@ func decodeDaemonInfo(stdout []byte) (DaemonInfo, error) {
 		return DaemonInfo{}, errors.New("response has empty socketPath")
 	}
 	return info, nil
+}
+
+func validateCodexVersion(component, version string) error {
+	raw := strings.TrimSpace(version)
+	if raw == "" {
+		return fmt.Errorf("%s version is unavailable; agentsctl requires Codex >= %s", component, minimumCodexVersion)
+	}
+	normalized := raw
+	if !strings.HasPrefix(normalized, "v") {
+		normalized = "v" + normalized
+	}
+	if !semver.IsValid(normalized) {
+		return fmt.Errorf("%s version %q is invalid; agentsctl requires Codex >= %s", component, raw, minimumCodexVersion)
+	}
+	if semver.Compare(normalized, "v"+minimumCodexVersion) < 0 {
+		return fmt.Errorf("%s %s is unsupported; agentsctl requires Codex >= %s", component, raw, minimumCodexVersion)
+	}
+	return nil
 }
 
 func boundedOutput(stderr []byte) string {
