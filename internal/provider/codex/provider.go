@@ -366,6 +366,9 @@ func (p *Provider) Open(ctx context.Context, s session.Session, in *os.File, out
 	if p.Foreground == nil {
 		return errors.New("codex foreground launcher is not configured")
 	}
+	if err := validateOpenCWD(s.CWD); err != nil {
+		return err
+	}
 	socket, err := p.readySocket(ctx)
 	if err != nil {
 		return err
@@ -375,6 +378,23 @@ func (p *Provider) Open(ctx context.Context, s session.Session, in *os.File, out
 	}
 	if err := p.Foreground.Run(ctx, p.path(), remoteResumeArgs(socket, threadID), s.CWD, in, out); err != nil {
 		return fmt.Errorf("codex remote resume %s: %w", threadID, err)
+	}
+	return nil
+}
+
+func validateOpenCWD(cwd string) error {
+	if cwd == "" {
+		return errors.New("codex session working directory is empty")
+	}
+	info, err := os.Stat(cwd)
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("codex session working directory no longer exists: %s", cwd)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect codex session working directory %q: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("codex session working directory is not a directory: %s", cwd)
 	}
 	return nil
 }
