@@ -1,0 +1,104 @@
+name: Bug report
+description: Report a bug or unexpected behavior
+title: "fix(<scope>): "
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        Please use the following title format when possible:
+
+        `fix(<scope>): <summary>`
+
+        Example:
+        `fix(codex): report missing session CWD before resume spawn`
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the problem you encountered
+      placeholder: |
+        Opening a Codex session shows a misleading error message
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the steps required to reproduce the issue
+      placeholder: |
+        1. Start agentsctl
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: Select the provider related to the issue
+      options:
+        - Claude Code
+        - Codex
+        - Both
+        - Provider-independent
+        - Other
+    validations:
+      required: false
+
+  - type: input
+    id: agentsctl-version
+    attributes:
+      label: agentsctl version
+      placeholder: "Example: v0.3.0"
+
+  - type: input
+    id: provider-version
+    attributes:
+      label: Provider version
+      description: Version of Claude Code, Codex, or another provider
+      placeholder: "Example: codex 0.156.1"
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Example: macOS 26.0"
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      placeholder: "Example: iTerm2, Terminal.app, kitty"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and errors
+      description: Paste any relevant logs or error messages
+      render: text
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add related issues, screenshots, frequency, investigation notes, or other context

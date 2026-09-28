@@ -1,0 +1,50 @@
+name: Feature request
+description: Suggest a feature or improvement
+title: "feat(<scope>): "
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement.
+
+        Please use the following title format when possible:
+
+        `feat(<scope>): <summary>`
+
+        Example:
+        `feat(listing): move to group boundary with { and }`
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the current limitation or inconvenience
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the behavior or feature you would like to add
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Describe what should be included or explicitly left out
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Describe any other approaches you considered
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add related issues, reference URLs, screenshots, or other context
