@@ -1,6 +1,6 @@
 name: Bug report
 description: バグや不具合を報告する
-title: ""
+title: "fix(<scope>): "
 
 body:
   - type: markdown
