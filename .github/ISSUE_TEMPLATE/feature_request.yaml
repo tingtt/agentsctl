@@ -1,0 +1,50 @@
+name: Feature request
+description: 機能追加や改善を提案する
+title: ""
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        機能提案ありがとうございます。
+
+        タイトルは可能であれば以下の形式で記載してください。
+
+        `feat(<scope>): <summary>`
+
+        例:
+        `feat(listing): move to group boundary with { and }`
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: 現在どのような不便・制約があるか
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案内容
+      description: どのような動作や機能を追加したいか
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: 対象範囲や、対象外にしたいことがあれば記載してください
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 代替案
+      description: 他に検討した方法があれば記載してください
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: 補足情報
+      description: 関連 Issue、参考 URL、スクリーンショットなど
