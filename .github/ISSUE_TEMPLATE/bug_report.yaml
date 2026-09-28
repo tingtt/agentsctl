@@ -1,37 +1,37 @@
 name: Bug report
-description: バグや不具合を報告する
+description: Report a bug or unexpected behavior
 title: "fix(<scope>): "
 
 body:
   - type: markdown
     attributes:
       value: |
-        バグ報告ありがとうございます。
+        Thanks for reporting a bug.
 
-        タイトルは可能であれば以下の形式で記載してください。
+        Please use the following title format when possible:
 
         `fix(<scope>): <summary>`
 
-        例:
+        Example:
         `fix(codex): report missing session CWD before resume spawn`
 
   - type: textarea
     id: summary
     attributes:
-      label: 概要
-      description: どのような問題が発生しているか
+      label: Summary
+      description: Describe the problem you encountered
       placeholder: |
-        Codex セッションを開くと誤ったエラーメッセージが表示される
+        Opening a Codex session shows a misleading error message
     validations:
       required: true
 
   - type: textarea
     id: steps
     attributes:
-      label: 再現手順
-      description: 問題を再現する手順を記載してください
+      label: Steps to reproduce
+      description: Describe the steps required to reproduce the issue
       placeholder: |
-        1. agentsctl を起動する
+        1. Start agentsctl
         2. ...
         3. ...
     validations:
@@ -40,14 +40,14 @@ body:
   - type: textarea
     id: expected
     attributes:
-      label: 期待される動作
+      label: Expected behavior
     validations:
       required: true
 
   - type: textarea
     id: actual
     attributes:
-      label: 実際の動作
+      label: Actual behavior
     validations:
       required: true
 
@@ -55,7 +55,7 @@ body:
     id: provider
     attributes:
       label: Provider
-      description: 問題に関係する provider を選択してください
+      description: Select the provider related to the issue
       options:
         - Claude Code
         - Codex
@@ -69,36 +69,36 @@ body:
     id: agentsctl-version
     attributes:
       label: agentsctl version
-      placeholder: "例: v0.3.0"
+      placeholder: "Example: v0.3.0"
 
   - type: input
     id: provider-version
     attributes:
       label: Provider version
-      description: Claude Code / Codex などのバージョン
-      placeholder: "例: codex 0.156.1"
+      description: Version of Claude Code, Codex, or another provider
+      placeholder: "Example: codex 0.156.1"
 
   - type: input
     id: os
     attributes:
       label: OS
-      placeholder: "例: macOS 26.0"
+      placeholder: "Example: macOS 26.0"
 
   - type: input
     id: terminal
     attributes:
       label: Terminal
-      placeholder: "例: iTerm2, Terminal.app, kitty"
+      placeholder: "Example: iTerm2, Terminal.app, kitty"
 
   - type: textarea
     id: logs
     attributes:
-      label: ログ・エラー
-      description: 関連するログやエラーメッセージがあれば貼り付けてください
+      label: Logs and errors
+      description: Paste any relevant logs or error messages
       render: text
 
   - type: textarea
     id: additional-context
     attributes:
-      label: 補足情報
-      description: 関連 Issue、スクリーンショット、発生頻度、調査済み事項など
+      label: Additional context
+      description: Add related issues, screenshots, frequency, investigation notes, or other context
